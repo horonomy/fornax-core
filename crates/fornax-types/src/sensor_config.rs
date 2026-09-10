@@ -162,6 +162,31 @@ pub fn default_fornax_home() -> PathBuf {
         })
 }
 
+/// Stable identity for a `$FORNAX_HOME`, used to prove a client is talking
+/// to the daemon actually serving its own home rather than a different
+/// daemon that happens to be bound to the shared default HTTP port
+/// (FORNX-339: `fornax-daemon`'s HTTP API binds a fixed `127.0.0.1:4317`
+/// unless `FORNAX_HTTP_PORT` is set, so two concurrently running
+/// `$FORNAX_HOME`s can otherwise have a client silently read the wrong
+/// one's data). The daemon sends this as a response header on every HTTP
+/// reply; the CLI computes the same value for its own resolved
+/// `$FORNAX_HOME` and refuses to trust a response that doesn't match --
+/// fail closed (`UNAVAILABLE`), never silently attribute another session's
+/// evidence.
+///
+/// A truncated SHA-256 of the canonicalized path, not the raw path itself
+/// — the identity only needs to detect a mismatch, not be reversible, and
+/// a raw filesystem path (often containing a username) has no business in
+/// an HTTP header or a log line.
+pub fn home_identity(home: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+    let canonical = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    let digest = hasher.finalize();
+    hex::encode(&digest[..8])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,5 +277,59 @@ mod tests {
         // process-global env vars shared with other tests) — the contract
         // under test is just "never panics, always returns something".
         let _ = SensorDisableConfig::load_default();
+    }
+
+    #[test]
+    fn home_identity_is_deterministic_for_the_same_path() {
+        let dir =
+            std::env::temp_dir().join(format!("fornax-identity-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let first = home_identity(&dir);
+        let second = home_identity(&dir);
+        assert_eq!(
+            first, second,
+            "same $FORNAX_HOME must yield the same identity every time"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn home_identity_differs_across_distinct_homes() {
+        let dir_a =
+            std::env::temp_dir().join(format!("fornax-identity-a-{}", uuid::Uuid::new_v4()));
+        let dir_b =
+            std::env::temp_dir().join(format!("fornax-identity-b-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+
+        assert_ne!(
+            home_identity(&dir_a),
+            home_identity(&dir_b),
+            "two distinct $FORNAX_HOMEs must never collide on identity -- this is the whole \
+             point of FORNX-339's fix"
+        );
+
+        std::fs::remove_dir_all(&dir_a).unwrap();
+        std::fs::remove_dir_all(&dir_b).unwrap();
+    }
+
+    #[test]
+    fn home_identity_never_leaks_the_raw_path() {
+        let dir =
+            std::env::temp_dir().join(format!("fornax-identity-leak-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let id = home_identity(&dir);
+        assert!(
+            !id.contains(dir.to_string_lossy().as_ref()),
+            "identity must be a hash, never the raw path -- the path can contain a username \
+             and this value is sent in an HTTP response header"
+        );
+        // 8 bytes of SHA-256, hex-encoded.
+        assert_eq!(id.len(), 16);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

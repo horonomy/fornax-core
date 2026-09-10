@@ -57,7 +57,9 @@ pub use sensor::{
     collect_with_disable_check, ClockSource, CollectionMethod, EvidenceSensor, EvidenceSource,
     Freshness, SensorOutcome, TamperBoundary, TrustClass,
 };
-pub use sensor_config::{default_fornax_home, SensorConfigError, SensorDisableConfig};
+pub use sensor_config::{
+    default_fornax_home, home_identity, SensorConfigError, SensorDisableConfig,
+};
 
 /// Which coding-agent runtime an event/capability originated from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
