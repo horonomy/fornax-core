@@ -355,6 +355,12 @@ pub enum ProcessObservationDetail {
         head_commit: Option<String>,
         path_is_dirty: bool,
     },
+    /// FORNX-346: a real, host-computed SHA-256 hash of a contained
+    /// artifact on disk, produced by `fornax-acquire`'s
+    /// `VerifyArtifactHash` probe -- `TrustClass::HostObserved`, since it is
+    /// this host reading the actual file, never a provider's own claim
+    /// about a hash.
+    ArtifactHashVerified { path: String, sha256_hex: String },
     /// FORNX-302: aggregated CI check-run status for one commit SHA, queried
     /// from the CI provider's own API (GitHub Actions, via the `fornax-ci`
     /// crate's `GitHubCiStatusSensor` — the one producer today).
