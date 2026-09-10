@@ -13,11 +13,26 @@ implementation tickets first — never one Jira ticket claimed by multiple PRs.
 
 ## Branch / worktree
 
+`main` is the stable/release line — it only receives the v0.0.1 governance
+history plus unrelated cross-cutting PRs (branding, company governance). All
+release-epic feature work happens on a single rolling **integration branch**,
+`next/v0.0.4` as of this writing (previously `next/v0.0.3`, superseded in
+place — never merged back to `main`, never deleted). One ticket = one branch
+cut from the integration branch's current tip, merged straight back into it —
+there is no per-stage or per-epic aggregation branch layer. Branch name
+version prefix (`v0.0.4`, `v0.6.0`, `v0.7.0`, ...) tracks the target release
+epic, not a separate branch to merge into.
+
 ```
 git fetch origin --prune
 git worktree add ../fornax-core-<TICKET>-<slug> \
-  -b v0.0.1/<TICKET>/<short_summary> origin/main
+  -b <target-release>/<TICKET>/<short_summary> origin/next/v0.0.4
 ```
+
+Base off `origin/main` instead only for work explicitly scoped to the
+stable/release line itself (e.g. governance/branding fixes, a release-freeze
+commit). When the integration branch is promoted to `main` at release time,
+that is a deliberate release action, not a routine PR base.
 
 One ticket = one branch = one worktree. Never implement in the main
 worktree. `<short_summary>` is 2–4 words, snake_case.
