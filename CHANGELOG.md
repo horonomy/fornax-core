@@ -9,6 +9,24 @@ Jira epic FORNX-20.
 
 ### Added
 
+- `fornax-acquire` crate + `fornax acquire-evidence` / `POST
+  /api/acquire-evidence` (FORNX-346, Stage 8): closes the loop from a
+  FORNX-345 ranked evidence-plan candidate to real acquisition. Two
+  auto-safe probes are implemented -- `VerifyArtifactHash` (real SHA-256
+  of a contained file) and `InspectVcsState` (real `fornax-vcs`
+  working-tree query) -- both pure in-process reads, no subprocess spawn,
+  no network call. Every acquisition is re-gated against *current* policy
+  at execution time (never a stale plan), a client selects a candidate by
+  rank only (never a raw request, so gating cannot be bypassed), and
+  targets are contained to an operator-configured allow-list of real
+  directories -- no target resolves anywhere else. On success, the new
+  evidence is persisted, the existing verifier registry re-runs, and
+  fusion is recomputed; the response always carries both the before and
+  after `FusedFinding` together. `RerunTest`/`QueryCiStatus` (needing
+  `ProcessSpawn`/`NetworkCall`) are out of scope pending a human decision
+  on amending the workspace's zero-subprocess-spawn invariant and
+  ADR-0001 D2 -- see `docs/adr/0016-evidence-acquisition-boundary.md` for
+  the full boundary and named gaps.
 - `fornax evidence-plan` + `GET /api/evidence-plan` (FORNX-345, Stage 8):
   ranks concrete evidence-acquisition candidates (rerun a test, inspect VCS
   state, query CI status, verify an artifact hash, a bounded replay
