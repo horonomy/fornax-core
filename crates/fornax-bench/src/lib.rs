@@ -44,4 +44,5 @@ pub mod dataset;
 pub mod harness;
 pub mod manifest;
 pub mod metrics;
+pub mod qualifying;
 pub mod reliability_eval;
