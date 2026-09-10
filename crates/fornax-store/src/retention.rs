@@ -135,8 +135,13 @@ pub const SANITIZED_CANDIDATE_RETENTION: Duration = Duration::from_secs(180 * 24
 /// interpolated) by this module's
 /// `known_record_tables_matches_delete_records_for_tenants_match_arms` test,
 /// so the two cannot silently drift apart.
-pub const KNOWN_RECORD_TABLES: &[&str] =
-    &["agent_events", "claims", "evidence", "findings", "corpus_candidates"];
+pub const KNOWN_RECORD_TABLES: &[&str] = &[
+    "agent_events",
+    "claims",
+    "evidence",
+    "findings",
+    "corpus_candidates",
+];
 
 /// Explicit retention duration for a [`RetentionClass`] (FORNX-106 AC1). See
 /// this module's docs for the full mapping and rationale table.
@@ -897,6 +902,22 @@ mod tests {
         std::env::remove_var("FORNAX_LONGITUDINAL_COLLECTION_ENABLED");
     }
 
+    #[test]
+    fn sanitized_candidate_class_defaults_closed_and_respects_its_own_opt_in_flag() {
+        std::env::remove_var("FORNAX_CORPUS_MINING_ENABLED");
+        assert!(
+            !longitudinal_persistence_allowed(&RetentionClass::SanitizedCandidate),
+            "FORNX-341: mined candidates must not persist without an explicit opt-in"
+        );
+
+        std::env::set_var("FORNAX_CORPUS_MINING_ENABLED", "1");
+        assert!(longitudinal_persistence_allowed(
+            &RetentionClass::SanitizedCandidate
+        ));
+
+        std::env::remove_var("FORNAX_CORPUS_MINING_ENABLED");
+    }
+
     // --- AC5: egress boundary defaults closed, same gate as cloud sync ----
 
     #[test]
@@ -1089,6 +1110,108 @@ mod tests {
             .await
             .expect("query lineage tags");
         assert!(remaining_tags.is_empty());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    // --- FORNX-341: corpus_candidates wired into the same lineage machinery -
+
+    async fn seed_corpus_candidate(store: &Store, session_id: &str) -> String {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO corpus_candidates (id, session_id, schema_version, mined_at, document)
+             VALUES (?1, ?2, 1, '2026-09-10T00:00:00Z', '{}')",
+        )
+        .bind(&id)
+        .bind(session_id)
+        .execute(&store.pool)
+        .await
+        .expect("insert corpus_candidates row directly (fornax-corpus not yet a dependency here)");
+        id
+    }
+
+    #[tokio::test]
+    async fn deletion_propagation_deletes_a_tagged_corpus_candidate() {
+        let path = tmp_db_path("delete-corpus-candidate");
+        let store = Store::open(&path).await.expect("open db");
+
+        let tenant = TenantRef("tenant-corpus".to_string());
+        let candidate_id = seed_corpus_candidate(&store, "s-corpus").await;
+        store
+            .record_lineage_tag(
+                "corpus_candidates",
+                &candidate_id,
+                &DatasetLineageTag::new(RetentionClass::SanitizedCandidate, tenant.clone()),
+            )
+            .await
+            .expect("record lineage tag for candidate");
+
+        let report = store
+            .delete_records_for_tenant(&tenant)
+            .await
+            .expect("delete for tenant");
+        assert_eq!(report.deleted_records.len(), 1);
+        assert!(report.unknown_table_records.is_empty());
+
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM corpus_candidates WHERE id = ?1")
+                .bind(&candidate_id)
+                .fetch_one(&store.pool)
+                .await
+                .expect("count remaining candidate rows");
+        assert_eq!(count, 0, "the tagged candidate row must be gone");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn sweep_hard_deletes_an_expired_corpus_candidate() {
+        let path = tmp_db_path("sweep-corpus-candidate");
+        let store = Store::open(&path).await.expect("open db");
+
+        let tenant = TenantRef("tenant-corpus-sweep".to_string());
+        let candidate_id = seed_corpus_candidate(&store, "s-corpus-sweep").await;
+        store
+            .record_lineage_tag(
+                "corpus_candidates",
+                &candidate_id,
+                &DatasetLineageTag::new(RetentionClass::SanitizedCandidate, tenant),
+            )
+            .await
+            .expect("record lineage tag for candidate");
+
+        // Backdate past SANITIZED_CANDIDATE_RETENTION, same technique as the
+        // evidence-purge sweep tests above.
+        let backdated = (Utc::now()
+            - chrono::Duration::from_std(SANITIZED_CANDIDATE_RETENTION).unwrap()
+            - chrono::Duration::days(1))
+        .to_rfc3339();
+        sqlx::query(
+            "UPDATE dataset_lineage_tags SET recorded_at = ?1 WHERE record_table = 'corpus_candidates' AND record_id = ?2",
+        )
+        .bind(&backdated)
+        .bind(&candidate_id)
+        .execute(&store.pool)
+        .await
+        .expect("backdate candidate lineage tag");
+
+        let report = store
+            .sweep_expired_records(Utc::now(), None, 100)
+            .await
+            .expect("sweep");
+        assert_eq!(report.deleted_records, 1);
+        assert_eq!(
+            report.purged_evidence, 0,
+            "a candidate is hard-deleted, never soft-purged like evidence"
+        );
+
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM corpus_candidates WHERE id = ?1")
+                .bind(&candidate_id)
+                .fetch_one(&store.pool)
+                .await
+                .expect("count remaining candidate rows");
+        assert_eq!(count, 0, "the expired candidate row must be hard-deleted");
 
         std::fs::remove_file(&path).ok();
     }
