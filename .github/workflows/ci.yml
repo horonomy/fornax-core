@@ -17,13 +17,18 @@ permissions:
 
 jobs:
   # Guards against a PR silently targeting a stale/wrong base branch
-  # (FORNX-branch-topology-reconciliation, 2026-09-10) — e.g. a ticket
-  # branch opened against the release line `main` instead of the current
-  # rolling integration branch, or against a superseded integration branch
-  # like `next/v0.0.3` after `next/v0.0.4` took over. `main` stays allowed
-  # for the deliberate exceptions (governance/branding PRs, a release
-  # promotion). Update ALLOWED_BASE when the integration branch is cut
-  # forward (e.g. to `next/v0.0.5`).
+  # (FORNX-358 branch-topology reconciliation, 2026-09-10). A FORNX-ticket
+  # branch (release-epic feature work) must target the current rolling
+  # integration branch, not `main` and not a superseded integration branch
+  # like `next/v0.0.3` after `next/v0.0.4` took over -- matching every one
+  # of the 121 merged PRs to date. A non-FORNX-ticket branch (e.g.
+  # HORO-*, cross-cutting governance/branding) is allowed to target `main`
+  # directly, matching PR #58/#121's historical precedent. Update
+  # INTEGRATION_BRANCH when it is cut forward (e.g. to `next/v0.0.5`).
+  #
+  # This job is informational, not a required status check on `main`
+  # branch protection (only `rust`, see below, is required) -- it surfaces
+  # red on the offending PR but does not itself block merge.
   branch-target:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -31,16 +36,24 @@ jobs:
       - name: Check PR base branch
         env:
           BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
         run: |
-          allowed="main next/v0.0.4"
-          for b in $allowed; do
-            if [ "$BASE_REF" = "$b" ]; then
-              echo "PR base '$BASE_REF' is allowed."
-              exit 0
-            fi
-          done
-          echo "::error::PR base branch '$BASE_REF' is not the current integration branch or 'main'. Allowed: $allowed. See CONTRIBUTING.md#branch--worktree."
-          exit 1
+          integration_branch="next/v0.0.4"
+          case "$HEAD_REF" in
+            */FORNX-*)
+              if [ "$BASE_REF" != "$integration_branch" ]; then
+                echo "::error::PR base branch '$BASE_REF' is not the current integration branch ('$integration_branch') for a FORNX-ticket branch ('$HEAD_REF'). See CONTRIBUTING.md#branch--worktree."
+                exit 1
+              fi
+              ;;
+            *)
+              if [ "$BASE_REF" != "main" ] && [ "$BASE_REF" != "$integration_branch" ]; then
+                echo "::error::PR base branch '$BASE_REF' is neither 'main' nor the current integration branch ('$integration_branch'). See CONTRIBUTING.md#branch--worktree."
+                exit 1
+              fi
+              ;;
+          esac
+          echo "PR base '$BASE_REF' for head '$HEAD_REF' is allowed."
 
   # Conservative affected-surface detection (FORNX-237). Doc-only PRs (e.g.
   # a README/docs/**-only change) currently trigger a full

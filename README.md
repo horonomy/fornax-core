@@ -16,10 +16,14 @@ claims against that evidence — surfacing `VERIFIED` / `UNVERIFIED` /
 Implementation is being replayed ticket-by-ticket as reviewed PRs after a
 one-time history normalization — see
 `docs/migration/0001-pr-governance-migration.md` for what moved where, and
-`docs/adr/` for the architecture invariants. `main` now has a working local
-daemon, verifiers, adapters, and CLI (see Quick Start below); the prior
-bootstrap implementation this was replayed from is preserved in full at tag
-`archive-v0.0.1-bootstrap` / branch `archive/pre-pr-governance-20260828`.
+`docs/adr/` for the architecture invariants. `main` has a working local
+daemon, verifiers, adapters, and CLI (see Quick Start below) as of the
+v0.0.1 release; the prior bootstrap implementation this was replayed from
+is preserved in full at tag `archive-v0.0.1-bootstrap` / branch
+`archive/pre-pr-governance-20260828`. Substantially more capability has
+since landed on the active integration branch (`next/v0.0.4` as of this
+writing — see `CONTRIBUTING.md`) ahead of its next release promotion to
+`main`.
 
 Jira: FORNX-20 (epic), FORNX-52 (this migration).
 
