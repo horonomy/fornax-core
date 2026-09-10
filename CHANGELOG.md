@@ -9,6 +9,23 @@ Jira epic FORNX-20.
 
 ### Added
 
+- `fornax_verify::independence` + `FusionRule::CommonSourceCollapsed` +
+  `Independence::PartiallyCorrelated` (FORNX-347, Stage 8): a read-side
+  `SourceFamilyMap` catches the real, live common-source amplification that
+  FORNX-92's `correlation_group` (never actually written by any shipped
+  sensor) could not -- two sensors reading the same `source_event_id` on
+  the agent-reported channel (e.g. `ClaudeBashExitCodeSensor` +
+  `ClaudeGitOutcomeSensor` on one Bash hook) now collapse to one effective
+  vote, while independently-observing host sensors on the same event never
+  do. Fusion's derived-evidence exclusion (R3) now walks `derived_from`
+  transitively instead of one level. An explicit `correlation_group` can
+  never *prevent* this structural collapse -- unions are purely additive.
+  `GET /api/evidence-graph` and `fornax evidence-graph` surface which
+  records count as one source family, in plain prose, no graph-theory
+  vocabulary. `BaselineFusionPolicy`/`DeterministicVoiPolicy` both bump to
+  policy version 2. See `docs/adr/0017-evidence-source-independence.md` for
+  the full boundary, the fabricated-vs-real ticket-prose correction, and
+  what remains unexercised on real traffic.
 - `fornax-acquire` crate + `fornax acquire-evidence` / `POST
   /api/acquire-evidence` (FORNX-346, Stage 8): closes the loop from a
   FORNX-345 ranked evidence-plan candidate to real acquisition. Two
