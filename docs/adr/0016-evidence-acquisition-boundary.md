@@ -118,21 +118,32 @@ FORNX-346's Jira thread rather than decided unilaterally. Until answered:
 ## Cannot be verified without further work
 
 1. **AC1 is two-of-three**, pending the escalated decision above.
-2. **AC2 ("a representative uncertain finding changes or remains uncertain
+2. ~~**AC2 ("a representative uncertain finding changes or remains uncertain
    based on newly acquired evidence") is achievable only for claims whose
-   evidence carries a resolvable `FileDiff` path.** Most real traffic today
-   has no such evidence row — `fornax_acquire::target::resolve_target`
-   returns an honest `NoTarget` rather than guessing.
+   evidence carries a resolvable `FileDiff` path.**~~ **Closed** in a
+   follow-up commit: `InspectVcsState` is inherently a repo-level question,
+   not a per-file one, so it now falls back to the first configured
+   `AcquisitionRoots` entry (`fornax_acquire::probes::inspect_vcs_state_for_root`)
+   when the claim carries no `FileDiff` target, instead of reporting
+   `Unavailable` purely for lacking one. `VerifyArtifactHash` is unchanged
+   — hashing genuinely needs a specific file, so its remaining gap (no
+   consumer, see below) is a separate issue from this one.
 3. **No shipped verifier yet interprets `ArtifactHashVerified`.** The
    before/after fusion delta this ADR's own test exercises is real for
    `InspectVcsState` (an existing verifier already reads
    `WorkingTreeStatusObserved`); a freshly acquired hash currently has no
    consumer that turns it into a `Supports`/`Contradicts` verdict — that is
    real verifier-authoring work, out of scope for this ticket.
-4. **AC5 (cost/latency/resource budgets, cancellable)** is not implemented
-   in this scope — both delivered probes are sub-second, in-process, and
-   have no meaningful budget to enforce or cancel. Deferred alongside the
-   escalated paths, where a real budget matters.
+4. ~~**AC5 (cost/latency/resource budgets, cancellable)** is not
+   implemented in this scope~~ **Closed** in a follow-up commit:
+   `fornax_acquire::budget::AcquisitionBudget::run` executes a probe on its
+   own thread and reports `AcquisitionOutcome::TimedOut` if it exceeds a
+   configurable `max_latency` (default 5s) rather than blocking
+   indefinitely — real, caller-observable cancellation, since neither
+   probe holds an external resource open that would need a true kill. A
+   separate dollar-cost/request-count budget remains meaningless until
+   `RerunTest`/`QueryCiStatus` (the metered-external-call probes) ship,
+   which stays gated on the escalated decision above.
 5. **AC6 (concurrent sessions cannot cross-attribute acquired evidence)**
    relies entirely on FORNX-339's existing `home_identity` handshake and
    `acquisition_log`/`evidence` being scoped by `session_id` at every read —

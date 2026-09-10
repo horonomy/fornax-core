@@ -108,6 +108,16 @@ Jira epic FORNX-20.
   daemon on a shared port fails closed (`UNAVAILABLE`) instead of
   silently reading another session's data.
 
+### Fixed
+
+- FORNX-346 AC2/AC5 gaps: `InspectVcsState` no longer requires a `FileDiff`
+  target -- it falls back to the first configured `AcquisitionRoots` entry
+  (a repo-level check, not a per-file one) when a claim carries no such
+  evidence, which was true for most real traffic. Added
+  `fornax_acquire::budget::AcquisitionBudget` so every probe now respects a
+  latency budget (default 5s) and reports `AcquisitionOutcome::TimedOut`
+  instead of blocking indefinitely.
+
 ## [v0.0.3] — Extensible Evidence Platform
 
 Engineering complete: epic FORNX-138 and all children (FORNX-155–162,
