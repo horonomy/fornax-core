@@ -26,6 +26,7 @@
 //! - Redaction/classification is a per-[`fornax_types::EvidenceKind`]
 //!   allowlist, not a new redactor — see [`candidate::sanitize`].
 
+pub mod adjudication;
 pub mod candidate;
 pub mod manifest;
 pub mod mining;

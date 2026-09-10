@@ -4,6 +4,7 @@
 
 use clap::{Parser, Subcommand};
 
+mod adjudicate_cmd;
 mod corpus_cmd;
 mod experiment_ux;
 mod timeline;
@@ -249,6 +250,14 @@ enum Commands {
         #[command(subcommand)]
         action: corpus_cmd::CorpusAction,
     },
+    /// Corpus adjudication workflow (FORNX-342): blinded review ->
+    /// disagreement -> adjudication -> frozen gold label -> export. Reads
+    /// `$FORNAX_HOME/fornax.db` directly. Registering a `human` reviewer
+    /// requires `--attested-by` and is itself audited.
+    Adjudicate {
+        #[command(subcommand)]
+        action: adjudicate_cmd::AdjudicateAction,
+    },
 }
 
 /// `fornax audit <action>` (FORNX-315).
@@ -477,6 +486,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Audit { action } => handle_audit_action(action).await?,
         Commands::Timeline { finding, session } => handle_timeline_action(finding, session).await?,
         Commands::Corpus { action } => corpus_cmd::handle(action, &fornax_home()).await?,
+        Commands::Adjudicate { action } => adjudicate_cmd::handle(action, &fornax_home()).await?,
     }
     Ok(())
 }

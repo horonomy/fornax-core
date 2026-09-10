@@ -141,6 +141,9 @@ pub const KNOWN_RECORD_TABLES: &[&str] = &[
     "evidence",
     "findings",
     "corpus_candidates",
+    "adjudication_queue",
+    "adjudication_views",
+    "adjudication_reviews",
 ];
 
 /// Explicit retention duration for a [`RetentionClass`] (FORNX-106 AC1). See
@@ -174,7 +177,10 @@ pub fn retention_class_for_table(record_table: &str) -> RetentionClass {
     match record_table {
         "agent_events" | "claims" | "evidence" => RetentionClass::RawLocal,
         "findings" => RetentionClass::DerivedFinding,
-        "corpus_candidates" => RetentionClass::SanitizedCandidate,
+        "corpus_candidates"
+        | "adjudication_queue"
+        | "adjudication_views"
+        | "adjudication_reviews" => RetentionClass::SanitizedCandidate,
         other => RetentionClass::Unrecognized(other.to_string()),
     }
 }
@@ -402,6 +408,27 @@ impl Store {
                 }
                 "corpus_candidates" => {
                     sqlx::query("DELETE FROM corpus_candidates WHERE id = ?1")
+                        .bind(&record.record_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    true
+                }
+                "adjudication_queue" => {
+                    sqlx::query("DELETE FROM adjudication_queue WHERE case_id = ?1")
+                        .bind(&record.record_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    true
+                }
+                "adjudication_views" => {
+                    sqlx::query("DELETE FROM adjudication_views WHERE id = ?1")
+                        .bind(&record.record_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    true
+                }
+                "adjudication_reviews" => {
+                    sqlx::query("DELETE FROM adjudication_reviews WHERE id = ?1")
                         .bind(&record.record_id)
                         .execute(&mut *tx)
                         .await?;
@@ -643,6 +670,27 @@ impl Store {
                         .await?;
                     report.deleted_records += 1;
                 }
+                "adjudication_queue" => {
+                    sqlx::query("DELETE FROM adjudication_queue WHERE case_id = ?1")
+                        .bind(&record.record_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    report.deleted_records += 1;
+                }
+                "adjudication_views" => {
+                    sqlx::query("DELETE FROM adjudication_views WHERE id = ?1")
+                        .bind(&record.record_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    report.deleted_records += 1;
+                }
+                "adjudication_reviews" => {
+                    sqlx::query("DELETE FROM adjudication_reviews WHERE id = ?1")
+                        .bind(&record.record_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    report.deleted_records += 1;
+                }
                 _ => {
                     report.unknown_table_skipped += 1;
                 }
@@ -859,6 +907,9 @@ mod tests {
             "evidence",
             "findings",
             "corpus_candidates",
+            "adjudication_queue",
+            "adjudication_views",
+            "adjudication_reviews",
         ];
         assert_eq!(KNOWN_RECORD_TABLES, &match_arm_tables);
     }
