@@ -101,8 +101,15 @@ used across Horonom repos.
 
 Gitmoji + scoped imperative subject (`✨ (scope): Description`), matching
 observed `circinus` git log and the global CLAUDE.md commit policy. Branch
-naming `v0.0.1/FORNX-<n>/<type>/<snake_case_slug>`, matching the Horonom
-family's `v<version>/<TICKET>/<type>/<slug>` pattern. PR-only to `main`.
+naming `<release>/FORNX-<n>/<type>/<snake_case_slug>`, matching the Horonom
+family's `v<version>/<TICKET>/<type>/<slug>` pattern.
+
+> **Superseded (FORNX-358, 2026-09-10):** "PR-only to `main`" described only
+> the initial v0.0.1 release-freeze period. The actual, current convention —
+> PRs target a single rolling integration branch (`next/v0.0.4` as of this
+> writing), not `main` directly — is documented in `CONTRIBUTING.md`, the
+> canonical source of truth per its own header. `main` stays the base only
+> for release-line-scoped work (governance/branding, a release promotion).
 
 ## Consequences
 
