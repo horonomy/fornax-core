@@ -9,6 +9,18 @@ Jira epic FORNX-20.
 
 ### Added
 
+- `fornax adjudicate` (FORNX-342, Stage 8): blind-review workflow converting
+  sanitized candidate cases into a human-adjudicated gold corpus — reviewer
+  registration with a required human-attestation gate, blinded/unblinded
+  review, a derived (never stored) adjudication state machine with
+  `Unresolved`/`NotEvaluable` as first-class terminal states, versioned
+  insert-only gold-label revisions with a per-case digest chain, and
+  inter-rater agreement (Cohen's kappa) that reports `Insufficient`/
+  `Undefined` rather than a fabricated number below a real sample-size
+  floor. `promote_gold_label` selects `HumanAdjudicated` only when every
+  contributing reviewer is `Human`; a mechanism-test reviewer anywhere in
+  the chain routes export to `SyntheticMechanismTest`. Fixes a
+  re-mining-aborts-the-run bug in `fornax corpus mine` found along the way.
 - `fornax-corpus` crate + `fornax corpus mine`/`fornax corpus export`
   (FORNX-341, Stage 8): mines real local sessions into sanitized,
   redacted candidate integrity cases (contradiction, high uncertainty,
