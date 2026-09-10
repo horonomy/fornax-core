@@ -216,3 +216,112 @@ impl CandidateCase {
         self.local_verdict != self.replay.recorded_verdict
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn evidence(kind: EvidenceKind, payload: serde_json::Value) -> Evidence {
+        Evidence {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            source_event_id: Uuid::new_v4(),
+            kind,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            payload,
+            provenance: "test".into(),
+            source: None,
+            extension: None,
+            evidence_purged: false,
+        }
+    }
+
+    fn claim() -> Claim {
+        Claim {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            source_event_id: Uuid::new_v4(),
+            text: "the command exited successfully".into(),
+            subject: "command_succeeded".into(),
+            claimed_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn exportable_kind_with_clean_payload_is_kept() {
+        let ev = evidence(EvidenceKind::ExitCode, serde_json::json!({"code": 0}));
+        let (kept, _claim, withheld) = sanitize(vec![ev], claim());
+        assert_eq!(kept.len(), 1);
+        assert!(withheld.is_empty());
+    }
+
+    #[test]
+    fn non_exportable_kind_is_withheld() {
+        let ev = evidence(EvidenceKind::TranscriptExcerpt, serde_json::json!({}));
+        let (kept, _claim, withheld) = sanitize(vec![ev], claim());
+        assert!(kept.is_empty());
+        assert_eq!(withheld.len(), 1);
+        assert_eq!(withheld[0].reason, WithheldReason::KindNotExportable);
+    }
+
+    #[test]
+    fn already_purged_evidence_is_withheld_not_reexported() {
+        let mut ev = evidence(EvidenceKind::ExitCode, serde_json::json!({"code": 0}));
+        ev.evidence_purged = true;
+        let (kept, _claim, withheld) = sanitize(vec![ev], claim());
+        assert!(kept.is_empty());
+        assert_eq!(withheld[0].reason, WithheldReason::AlreadyPurged);
+    }
+
+    #[test]
+    fn oversized_payload_is_withheld() {
+        let big = "x".repeat(MAX_CANDIDATE_PAYLOAD_BYTES + 1);
+        let ev = evidence(EvidenceKind::ExitCode, serde_json::json!({ "code": big }));
+        let (kept, _claim, withheld) = sanitize(vec![ev], claim());
+        assert!(kept.is_empty());
+        assert!(matches!(
+            withheld[0].reason,
+            WithheldReason::OversizedPayload { .. }
+        ));
+    }
+
+    #[test]
+    fn a_secret_that_the_redactor_catches_is_withheld_whole_not_exported_redacted() {
+        let ev = evidence(
+            EvidenceKind::ExitCode,
+            serde_json::json!({"env": "API_KEY=sk-supersecret"}),
+        );
+        let (kept, _claim, withheld) = sanitize(vec![ev.clone()], claim());
+        assert!(
+            kept.is_empty(),
+            "a tripped redactor must withhold, not export a partially-redacted payload"
+        );
+        assert_eq!(withheld[0].reason, WithheldReason::RedactionTripped);
+        // Neither the withheld record nor anything else carries the secret.
+        let serialized = serde_json::to_string(&withheld).unwrap();
+        assert!(!serialized.contains("sk-supersecret"));
+        let _ = ev;
+    }
+
+    #[test]
+    fn claim_text_is_redacted() {
+        let mut c = claim();
+        c.text = "API_KEY=sk-supersecret".into();
+        let (_kept, sanitized_claim, _withheld) = sanitize(vec![], c);
+        assert!(!sanitized_claim.text.contains("sk-supersecret"));
+    }
+
+    #[test]
+    fn withheld_evidence_never_serializes_a_raw_payload_field() {
+        let ev = evidence(
+            EvidenceKind::TranscriptExcerpt,
+            serde_json::json!({"secret": "x"}),
+        );
+        let (_kept, _claim, withheld) = sanitize(vec![ev], claim());
+        let value = serde_json::to_value(&withheld[0]).unwrap();
+        assert!(
+            value.get("payload").is_none(),
+            "WithheldEvidence must never carry the raw payload, only a fingerprint"
+        );
+    }
+}
