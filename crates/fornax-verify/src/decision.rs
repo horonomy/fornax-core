@@ -275,6 +275,60 @@ impl DecisionPolicy for DefaultRiskPolicy {
     }
 }
 
+/// Apply a non-relaxing calibration floor to an already-decided
+/// [`Recommendation`] (FORNX-348). Standalone function, deliberately not a
+/// [`DecisionPolicy`] trait method -- a calibration state is a
+/// live-environment judgment made *after* `decide()` has already produced a
+/// pure `(FusedFinding, RiskClass) -> Recommendation` mapping, not an input
+/// to that mapping itself. See `crate::calibration` module docs, "Why this
+/// never touches `fuse()`".
+///
+/// The only rule: [`RecommendationAction::Proceed`] steps down to
+/// [`RecommendationAction::Review`] under any [`crate::calibration::CalibrationState`]
+/// other than `Valid`/`NoActiveCalibration` -- `NoActiveCalibration`
+/// applies no floor at all, since there is nothing to have gone stale or
+/// drifted relative to yet. `Review`/`Block` are already at or below the
+/// floor and are returned unchanged. The calibration reason is appended to
+/// `rationale_summary`, never replacing the fusion/decision rationale
+/// already recorded there.
+pub fn apply_calibration_floor(
+    rec: Recommendation,
+    state: &crate::calibration::CalibrationState,
+) -> Recommendation {
+    use crate::calibration::CalibrationState;
+
+    let reason = match state {
+        CalibrationState::Valid | CalibrationState::NoActiveCalibration => None,
+        CalibrationState::Stale { changed_dimensions } => Some(format!(
+            "calibration stale (changed: {})",
+            changed_dimensions.join(", ")
+        )),
+        CalibrationState::Suspect { drift_state } => {
+            Some(format!("calibration suspect (drift: {:?})", drift_state))
+        }
+        CalibrationState::InsufficientSupport { .. } => {
+            Some("calibration support insufficient to confirm validity".to_string())
+        }
+    };
+
+    let Some(reason) = reason else {
+        return rec;
+    };
+
+    if rec.action != RecommendationAction::Proceed {
+        return rec;
+    }
+
+    Recommendation {
+        action: RecommendationAction::Review,
+        rationale_summary: format!(
+            "{} | calibration floor applied: {} -> review (FORNX-348 non-relaxing floor)",
+            rec.rationale_summary, reason
+        ),
+        ..rec
+    }
+}
+
 #[cfg(test)]
 mod decision_tests {
     use super::*;
@@ -651,5 +705,90 @@ mod decision_tests {
         let rec = DefaultRiskPolicy.decide(&f, RiskClass::Balanced);
         assert_eq!(rec.policy_name, "default_risk_policy_v1");
         assert_ne!(rec.policy_name, f.policy_name);
+    }
+
+    // --- apply_calibration_floor (FORNX-348) --------------------------
+
+    use crate::calibration::CalibrationState;
+    use crate::reliability::DriftState;
+
+    fn proceed_rec() -> Recommendation {
+        let f = fused(Verdict::Verified, UncertaintyBand::Corroborated, false);
+        DefaultRiskPolicy.decide(&f, RiskClass::Balanced)
+    }
+
+    #[test]
+    fn valid_calibration_never_touches_a_recommendation() {
+        let rec = proceed_rec();
+        let floored = apply_calibration_floor(rec.clone(), &CalibrationState::Valid);
+        assert_eq!(floored, rec);
+    }
+
+    #[test]
+    fn no_active_calibration_never_touches_a_recommendation() {
+        let rec = proceed_rec();
+        let floored = apply_calibration_floor(rec.clone(), &CalibrationState::NoActiveCalibration);
+        assert_eq!(floored, rec);
+    }
+
+    #[test]
+    fn stale_calibration_steps_proceed_down_to_review() {
+        let rec = proceed_rec();
+        assert_eq!(rec.action, RecommendationAction::Proceed);
+        let floored = apply_calibration_floor(
+            rec,
+            &CalibrationState::Stale {
+                changed_dimensions: vec!["adapter_version".to_string()],
+            },
+        );
+        assert_eq!(floored.action, RecommendationAction::Review);
+        assert!(floored
+            .rationale_summary
+            .contains("calibration floor applied"));
+        assert!(floored.rationale_summary.contains("adapter_version"));
+    }
+
+    #[test]
+    fn suspect_calibration_steps_proceed_down_to_review() {
+        let rec = proceed_rec();
+        let floored = apply_calibration_floor(
+            rec,
+            &CalibrationState::Suspect {
+                drift_state: DriftState::Drifted,
+            },
+        );
+        assert_eq!(floored.action, RecommendationAction::Review);
+    }
+
+    #[test]
+    fn insufficient_support_steps_proceed_down_to_review() {
+        let rec = proceed_rec();
+        let floored = apply_calibration_floor(
+            rec,
+            &CalibrationState::InsufficientSupport {
+                sample_support: fornax_types::SampleSupport::InsufficientSupport {
+                    sample_count: 2,
+                    minimum_required: 30,
+                },
+            },
+        );
+        assert_eq!(floored.action, RecommendationAction::Review);
+    }
+
+    #[test]
+    fn floor_never_relaxes_an_already_review_or_block_action() {
+        let f = fused(Verdict::Contradicted, UncertaintyBand::Corroborated, false);
+        let rec = DefaultRiskPolicy.decide(&f, RiskClass::Balanced);
+        assert_eq!(rec.action, RecommendationAction::Block);
+        let floored = apply_calibration_floor(
+            rec.clone(),
+            &CalibrationState::Stale {
+                changed_dimensions: vec!["adapter_version".to_string()],
+            },
+        );
+        // Still Block -- the floor only ever steps Proceed down, never
+        // touches an action already at or below the floor.
+        assert_eq!(floored.action, RecommendationAction::Block);
+        assert_eq!(floored.rationale_summary, rec.rationale_summary);
     }
 }
