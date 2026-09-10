@@ -10,8 +10,8 @@ use axum::response::Response;
 use axum::routing::get;
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
-use fornax_store::policy_cache::RevocationIngestOutcome;
 use fornax_experiment_runner::GlobalExperimentPolicy;
+use fornax_store::policy_cache::RevocationIngestOutcome;
 use fornax_types::redact::{redact_json, redact_text};
 use fornax_types::{
     compute_posture, home_identity, verify_bundle, verify_revocation_list, ActivationOutcome,
@@ -396,6 +396,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/fusion", get(api_fusion))
         .route("/api/decision", get(api_decision))
         .route("/api/judge", get(api_judge))
+        .route("/api/evidence-plan", get(api_evidence_plan))
         .route("/api/reliability", get(api_reliability))
         .route("/api/policy", get(api_policy))
         .route("/dashboard", get(dashboard))
@@ -1399,6 +1400,118 @@ async fn api_judge(
                 "judge": output,
                 "judge_evidence": judge_evidence,
                 "fused": fused,
+            }))
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct EvidencePlanQuery {
+    claim: String,
+    session: String,
+    /// Same contract as `DecisionQuery::risk` -- defaults to `balanced`.
+    #[serde(default)]
+    risk: Option<String>,
+}
+
+/// FORNX-345: `GET /api/evidence-plan?claim=&session=&risk=`.
+///
+/// Reuses `compute_fusion` (the same graph-loading/projection logic behind
+/// `/api/fusion`/`/api/decision`/`/api/judge`) so this endpoint never
+/// re-derives the claim/graph/evidence pool a second time. Builds the
+/// `fornax_verify::voi::AcquisitionPolicy` gate from the daemon's own
+/// startup-loaded `experiment_policy`/`sensor_disable` state (never a
+/// fabricated `AUTO_SAFE`/`REQUIRE_APPROVAL`/`FORBIDDEN` model -- see ADR
+/// 0015), then runs `DeterministicVoiPolicy::plan` over it.
+///
+/// Reads `Store::capabilities_for_session` (all announcing providers), the
+/// same choice `/api/capabilities` makes over the in-memory single-provider
+/// `state.caps` cache, since under-reporting a provider here would silently
+/// under-report `EvidenceGapKind::SignalClassUnobservable`/
+/// `ExpectedSignalMissing` gaps.
+///
+/// Always returns the recommendation and the full `FusedFinding` alongside
+/// the plan -- same "never show one instead of the other" discipline as
+/// `/api/decision` -- plus the plan's own `outcome`, ranked/unavailable
+/// candidates, and gaps.
+async fn api_evidence_plan(
+    State(state): State<AppState>,
+    Query(q): Query<EvidencePlanQuery>,
+) -> Json<serde_json::Value> {
+    use fornax_types::experiment::{SideEffectAllowList, SideEffectClass};
+    use fornax_verify::decision::{DecisionPolicy, DefaultRiskPolicy};
+    use fornax_verify::voi::{AcquisitionPolicy, DeterministicVoiPolicy, PlanInput, VoiPolicy};
+
+    let risk = match parse_risk_class(q.risk.as_deref()) {
+        Ok(r) => r,
+        Err(message) => {
+            return Json(
+                serde_json::json!({ "claim": q.claim, "session": q.session, "error": message }),
+            )
+        }
+    };
+
+    let capabilities = match state.store.capabilities_for_session(&q.session).await {
+        Ok(caps) => caps,
+        Err(e) => {
+            return Json(
+                serde_json::json!({ "claim": q.claim, "session": q.session, "error": e.to_string() }),
+            )
+        }
+    };
+
+    match compute_fusion(&state, &q.claim, &q.session).await {
+        FusionOutcome::Error { message } => {
+            Json(serde_json::json!({ "claim": q.claim, "session": q.session, "error": message }))
+        }
+        FusionOutcome::NotFound { reason } => Json(serde_json::json!({
+            "claim": q.claim,
+            "session": q.session,
+            "found": false,
+            "reason": reason,
+        })),
+        FusionOutcome::Found(found) => {
+            let recommendation = DefaultRiskPolicy.decide(&found.fused, risk);
+            // FORNX-345: `GlobalExperimentPolicy` exposes only a
+            // per-class `permits` check, not an iterable set -- rebuild the
+            // equivalent `SideEffectAllowList` by probing all four known
+            // classes, exactly what `is_permitted`'s own two-layer check
+            // does one class at a time.
+            let granted_side_effects = SideEffectAllowList::new(
+                [
+                    SideEffectClass::EphemeralWorktreeMutation,
+                    SideEffectClass::ProcessSpawn,
+                    SideEffectClass::NetworkCall,
+                    SideEffectClass::FilesystemWriteOutsideWorktree,
+                ]
+                .into_iter()
+                .filter(|class| state.experiment_policy.permits(*class)),
+            );
+            let acquisition = AcquisitionPolicy {
+                granted_side_effects,
+                egress_allowed: fornax_types::privacy::cloud_sync_allowed(),
+                disabled_sensors: (*state.sensor_disable).clone(),
+            };
+            let input = PlanInput {
+                claim: &found.claim,
+                graph: &found.graph,
+                evidence: &found.evidence_pool,
+                fused: &found.fused,
+                risk,
+                capabilities: &capabilities,
+                acquisition: &acquisition,
+            };
+            let computed_at = chrono::Utc::now().to_rfc3339();
+            let plan = DeterministicVoiPolicy.plan(&input, &computed_at);
+
+            Json(serde_json::json!({
+                "claim": q.claim,
+                "session": q.session,
+                "found": true,
+                "graph_source": found.graph_source,
+                "recommendation": recommendation,
+                "fused": found.fused,
+                "plan": plan,
             }))
         }
     }

@@ -307,6 +307,10 @@ mod tests {
             policy: std::sync::Arc::new(tokio::sync::RwLock::new(
                 crate::PolicyCacheSnapshot::empty(),
             )),
+            experiment_policy: std::sync::Arc::new(
+                fornax_experiment_runner::GlobalExperimentPolicy::new(std::iter::empty()),
+            ),
+            sensor_disable: std::sync::Arc::new(fornax_types::SensorDisableConfig::empty()),
         };
 
         let config = SweepConfig {
