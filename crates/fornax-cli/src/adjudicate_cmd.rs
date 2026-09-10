@@ -14,7 +14,12 @@ use fornax_corpus::adjudication::{
     Confidence, FailureClass, QueueEntry, RelabelReason, ReviewOutcome, ReviewRecord, ReviewerKind,
     ReviewerRef, ReviewerRole,
 };
-use fornax_corpus::CandidateCase;
+use fornax_corpus::{
+    signals_for_case, CandidateCase, DeterministicSamplingPolicy, ReviewBudget, ReviewFeedback,
+    SamplingPolicy,
+};
+use fornax_verify::fusion::{BaselineFusionPolicy, FusionInput, FusionPolicy};
+use fornax_verify::voi::derive_gaps;
 use uuid::Uuid;
 
 #[derive(Subcommand)]
@@ -91,6 +96,21 @@ pub enum AdjudicateAction {
         out: std::path::PathBuf,
         #[arg(long)]
         dataset_version: String,
+    },
+    /// Rank every mined candidate case by real, named signals (unresolved
+    /// conflict, cross-sensor disagreement, high uncertainty, correlated
+    /// evidence, sanitization-altered outcome, verdict instability, human
+    /// feedback disagreement -- FORNX-349) and enqueue the top `--budget`
+    /// for review, bounded by `--max-per-pattern` near-duplicate cases per
+    /// mining-shape pattern. Never displaces an already-enqueued case.
+    Sample {
+        #[arg(long, default_value_t = 10)]
+        budget: usize,
+        #[arg(long)]
+        max_per_pattern: Option<usize>,
+        /// Print the plan without enqueueing anything.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -557,6 +577,114 @@ pub async fn handle(action: AdjudicateAction, fornax_home: &std::path::Path) -> 
                 "cohen's kappa: {:?}",
                 fornax_corpus::adjudication::cohens_kappa(&pairs)
             );
+        }
+        AdjudicateAction::Sample {
+            budget,
+            max_per_pattern,
+            dry_run,
+        } => {
+            let already_enqueued: std::collections::HashSet<Uuid> = store
+                .all_queue_entries()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .into_iter()
+                .filter_map(|row| Uuid::parse_str(&row.case_id).ok())
+                .collect();
+
+            let all_feedback: Vec<ReviewFeedback> = store
+                .all_feedback()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .into_iter()
+                .map(|row| serde_json::from_str(&row.document))
+                .collect::<Result<_, _>>()?;
+
+            let mut candidates_by_case = std::collections::HashMap::new();
+            let mut case_signals = Vec::new();
+            for row in store
+                .all_corpus_candidates()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+            {
+                let candidate: CandidateCase = serde_json::from_str(&row.document)?;
+                if already_enqueued.contains(&candidate.id) {
+                    continue;
+                }
+                let policy = BaselineFusionPolicy;
+                let fused = policy.fuse(
+                    &FusionInput {
+                        claim: &candidate.replay.claim,
+                        graph: &candidate.replay.evidence_graph,
+                        evidence: &candidate.replay.evidence_pool,
+                    },
+                    &candidate.replay.recorded_at,
+                );
+                let gaps = derive_gaps(
+                    &candidate.replay.claim,
+                    &candidate.replay.evidence_graph,
+                    &candidate.replay.evidence_pool,
+                    &fused,
+                    &[],
+                );
+                case_signals.push(signals_for_case(&candidate, &gaps, &all_feedback));
+                candidates_by_case.insert(candidate.id, candidate);
+            }
+
+            let mut review_budget = ReviewBudget::new(budget);
+            if let Some(max_per_pattern) = max_per_pattern {
+                review_budget.max_per_pattern = max_per_pattern;
+            }
+            let policy = DeterministicSamplingPolicy;
+            let plan = policy.rank(&case_signals, &review_budget);
+
+            println!(
+                "fornax adjudicate sample: {} selected, {} deferred, {} distinct patterns, budget_exhausted={}",
+                plan.selected.len(),
+                plan.deferred.len(),
+                plan.distinct_patterns_available,
+                plan.budget_exhausted
+            );
+            for selected in &plan.selected {
+                println!(
+                    "  #{} {} signals={:?} reason={:?}",
+                    selected.rank, selected.case_id, selected.signals, selected.selection_reason
+                );
+            }
+            if dry_run {
+                for deferred in &plan.deferred {
+                    println!(
+                        "  deferred {} reason={:?}",
+                        deferred.case_id, deferred.reason
+                    );
+                }
+                println!("fornax adjudicate sample: dry run, nothing enqueued");
+            } else {
+                for selected in &plan.selected {
+                    let case_id_str = selected.case_id.to_string();
+                    let candidate = candidates_by_case
+                        .get(&selected.case_id)
+                        .expect("selected case came from candidates_by_case");
+                    let entry = QueueEntry {
+                        case_id: selected.case_id,
+                        double_review_required: false,
+                        selection_reason: selected.selection_reason.clone(),
+                        enqueued_at: now.clone(),
+                    };
+                    store
+                        .insert_queue_entry(
+                            &case_id_str,
+                            &candidate.session_id,
+                            &serde_json::to_string(&entry)?,
+                            vec![candidate.id],
+                        )
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                }
+                println!(
+                    "fornax adjudicate sample: enqueued {} case(s)",
+                    plan.selected.len()
+                );
+            }
         }
         AdjudicateAction::Export {
             out,

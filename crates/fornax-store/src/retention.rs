@@ -145,6 +145,7 @@ pub const KNOWN_RECORD_TABLES: &[&str] = &[
     "adjudication_views",
     "adjudication_reviews",
     "acquisition_log",
+    "review_feedback",
 ];
 
 /// Explicit retention duration for a [`RetentionClass`] (FORNX-106 AC1). See
@@ -181,7 +182,8 @@ pub fn retention_class_for_table(record_table: &str) -> RetentionClass {
         "corpus_candidates"
         | "adjudication_queue"
         | "adjudication_views"
-        | "adjudication_reviews" => RetentionClass::SanitizedCandidate,
+        | "adjudication_reviews"
+        | "review_feedback" => RetentionClass::SanitizedCandidate,
         other => RetentionClass::Unrecognized(other.to_string()),
     }
 }
@@ -437,6 +439,13 @@ impl Store {
                 }
                 "acquisition_log" => {
                     sqlx::query("DELETE FROM acquisition_log WHERE id = ?1")
+                        .bind(&record.record_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    true
+                }
+                "review_feedback" => {
+                    sqlx::query("DELETE FROM review_feedback WHERE id = ?1")
                         .bind(&record.record_id)
                         .execute(&mut *tx)
                         .await?;
@@ -706,6 +715,13 @@ impl Store {
                         .await?;
                     report.deleted_records += 1;
                 }
+                "review_feedback" => {
+                    sqlx::query("DELETE FROM review_feedback WHERE id = ?1")
+                        .bind(&record.record_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    report.deleted_records += 1;
+                }
                 _ => {
                     report.unknown_table_skipped += 1;
                 }
@@ -926,6 +942,7 @@ mod tests {
             "adjudication_views",
             "adjudication_reviews",
             "acquisition_log",
+            "review_feedback",
         ];
         assert_eq!(KNOWN_RECORD_TABLES, &match_arm_tables);
     }
