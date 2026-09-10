@@ -106,3 +106,128 @@ pub fn build_corpus_manifest(
         mined_at,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mining::MiningStrategy;
+    use fornax_replay::manifest::REPLAY_MANIFEST_SCHEMA_VERSION;
+    use fornax_types::{Claim, EvidenceGraph, Provider, Verdict};
+    use fornax_verify::decision::{RecommendationAction, RiskClass};
+    use fornax_verify::fusion::UncertaintyBand;
+    use uuid::Uuid;
+
+    fn candidate(mined_by: Vec<MiningStrategy>) -> CandidateCase {
+        let claim = Claim {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            source_event_id: Uuid::new_v4(),
+            text: "the command exited successfully".into(),
+            subject: "command_succeeded".into(),
+            claimed_at: "2026-01-01T00:00:00Z".into(),
+        };
+        let replay = fornax_replay::manifest::ReplayManifest {
+            manifest_schema_version: REPLAY_MANIFEST_SCHEMA_VERSION,
+            adapter_provider: Provider::ClaudeCode,
+            adapter_runtime_version: "1.0.0".into(),
+            fusion_policy_name: "baseline".into(),
+            fusion_policy_version: 1,
+            decision_policy_name: "default".into(),
+            decision_policy_version: 1,
+            risk_class: RiskClass::Balanced,
+            disabled_sensors: Default::default(),
+            claim: claim.clone(),
+            evidence_pool: vec![],
+            evidence_graph: EvidenceGraph::default(),
+            recorded_verdict: Verdict::Verified,
+            recorded_uncertainty: UncertaintyBand::Qualified,
+            recorded_action: RecommendationAction::Proceed,
+            recorded_at: "2026-01-01T00:00:00Z".into(),
+        };
+        CandidateCase {
+            schema_version: crate::candidate::CANDIDATE_SCHEMA_VERSION,
+            id: CandidateCase::derive_id("s1", &replay),
+            session_id: "s1".into(),
+            replay,
+            context: None,
+            local_verdict: Verdict::Verified,
+            local_uncertainty: UncertaintyBand::Qualified,
+            mined_by,
+            withheld_evidence: vec![],
+            mined_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn refuses_to_build_when_candidates_exist_with_zero_controls() {
+        let candidates = vec![candidate(vec![MiningStrategy::EvidenceContradiction])];
+        let err = build_corpus_manifest(
+            candidates,
+            "v1".into(),
+            "home-abc".into(),
+            "2026-01-01T00:00:00Z".into(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            CorpusError::ControlsAbsent { candidate_count: 1 }
+        ));
+    }
+
+    #[test]
+    fn an_empty_corpus_is_not_an_error() {
+        let manifest = build_corpus_manifest(
+            vec![],
+            "v1".into(),
+            "home-abc".into(),
+            "2026-01-01T00:00:00Z".into(),
+        )
+        .expect("empty corpus must not trip the controls-present gate");
+        assert_eq!(manifest.candidate_count, 0);
+    }
+
+    #[test]
+    fn builds_successfully_once_a_control_is_present_and_reports_it() {
+        let candidates = vec![
+            candidate(vec![MiningStrategy::EvidenceContradiction]),
+            candidate(vec![MiningStrategy::BenignControl]),
+        ];
+        let manifest = build_corpus_manifest(
+            candidates,
+            "v1".into(),
+            "home-abc".into(),
+            "2026-01-01T00:00:00Z".into(),
+        )
+        .expect("one control present must satisfy the gate");
+        assert_eq!(manifest.candidate_count, 2);
+        assert_eq!(manifest.control_count, 1);
+        assert!(!manifest.contains_adjudicated_labels);
+    }
+
+    #[test]
+    fn manifest_building_is_deterministic_across_shuffled_input_order() {
+        let a = candidate(vec![MiningStrategy::EvidenceContradiction]);
+        let b = candidate(vec![MiningStrategy::BenignControl]);
+
+        let m1 = build_corpus_manifest(
+            vec![a.clone(), b.clone()],
+            "v1".into(),
+            "home-abc".into(),
+            "2026-01-01T00:00:00Z".into(),
+        )
+        .unwrap();
+        let m2 = build_corpus_manifest(
+            vec![b, a],
+            "v1".into(),
+            "home-abc".into(),
+            "2026-01-01T00:00:00Z".into(),
+        )
+        .unwrap();
+
+        assert_eq!(m1.content_hash, m2.content_hash);
+        assert_eq!(
+            m1.candidates.iter().map(|c| c.id).collect::<Vec<_>>(),
+            m2.candidates.iter().map(|c| c.id).collect::<Vec<_>>()
+        );
+    }
+}
