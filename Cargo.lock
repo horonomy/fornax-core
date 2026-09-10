@@ -857,8 +857,10 @@ name = "fornax-types"
 version = "0.0.1"
 dependencies = [
  "chrono",
+ "hex",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "toml_edit",
  "uuid",
