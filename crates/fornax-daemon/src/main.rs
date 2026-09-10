@@ -3230,6 +3230,110 @@ mod tests {
         assert!(v.get("error").is_some());
     }
 
+    // --- FORNX-345: /api/evidence-plan -----------------------------------
+
+    /// Real end-to-end flow, no mocking: a claim with a single `Supports`
+    /// link whose evidence carries no `source` (so no trust class/
+    /// correlation group is recorded) is persisted to a real store, then
+    /// `api_evidence_plan` is called against it -- the same
+    /// `IndependenceUnverified` caveat `api_decision_returns_recommendation_
+    /// and_full_fused_finding_together` exercises for `/api/decision` also
+    /// derives a real `EvidenceGap` here. Under `test_state()`'s deny-all
+    /// `GlobalExperimentPolicy`, the gap's `QueryCiStatus` probe (needs
+    /// `NetworkCall`, ungranted) comes back `RequiresApproval` naming
+    /// exactly that grant, while its zero-side-effect `HumanReview` probe
+    /// stays `Available` -- confirming this daemon wiring reaches the same
+    /// per-candidate gating the `fornax-verify` unit tests already prove in
+    /// isolation, now through a real persisted claim/evidence/link.
+    #[tokio::test]
+    async fn api_evidence_plan_surfaces_a_real_independence_gap_and_gates_its_candidates() {
+        let state = test_state().await;
+        let session_id = "fornx-345-evidence-plan-real-graph";
+        let event_id = test_event(&state, session_id).await;
+        let claim = test_claim(session_id, event_id);
+        let evidence = test_evidence(session_id, event_id);
+        state
+            .store
+            .insert_claim(&claim)
+            .await
+            .expect("insert claim");
+        state
+            .store
+            .insert_evidence(&evidence)
+            .await
+            .expect("insert evidence");
+        let link = fornax_types::EvidenceLink {
+            id: Uuid::new_v4(),
+            session_id: session_id.to_string(),
+            claim_id: claim.id,
+            evidence_id: evidence.id,
+            relation: fornax_types::EvidenceRelation::Supports,
+            linked_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        state
+            .store
+            .insert_evidence_link(&link)
+            .await
+            .expect("insert evidence link");
+
+        let response = api_evidence_plan(
+            State(state),
+            Query(EvidencePlanQuery {
+                claim: claim.id.to_string(),
+                session: session_id.to_string(),
+                risk: None,
+            }),
+        )
+        .await;
+        let v = response.0;
+
+        assert_eq!(v["found"], serde_json::json!(true));
+        // Same recommendation + full fusion detail /api/decision returns --
+        // never shown without the underlying evidence.
+        assert_eq!(v["recommendation"]["action"], serde_json::json!("review"));
+        assert_eq!(v["fused"]["uncertainty"], serde_json::json!("qualified"));
+
+        let plan = &v["plan"];
+        let gaps = plan["gaps"].as_array().expect("gaps array");
+        assert!(
+            gaps.iter()
+                .any(|g| g["kind"] == serde_json::json!("independence_unverified")),
+            "expected an independence_unverified gap, got: {gaps:?}"
+        );
+        assert_eq!(
+            plan["outcome"],
+            serde_json::json!("candidates_ranked"),
+            "the gap's zero-side-effect HumanReview probe is always Available"
+        );
+        let candidates = plan["candidates"].as_array().expect("candidates array");
+        // Never silently dropped -- the ungranted NetworkCall candidate is
+        // still listed, naming exactly what to grant.
+        assert!(candidates.iter().any(|c| c["availability"]["kind"]
+            == serde_json::json!("requires_approval")
+            && c["availability"]["missing_grant"] == serde_json::json!("NetworkCall")));
+        // ...alongside the one candidate that genuinely needs no grant.
+        assert!(candidates.iter().any(|c| c["request"]["kind"]
+            == serde_json::json!("human_review")
+            && c["availability"]["kind"] == serde_json::json!("available")));
+    }
+
+    #[tokio::test]
+    async fn api_evidence_plan_reports_not_found_for_unknown_claim() {
+        let state = test_state().await;
+        let response = api_evidence_plan(
+            State(state),
+            Query(EvidencePlanQuery {
+                claim: Uuid::new_v4().to_string(),
+                session: "fornx-345-evidence-plan-unknown-claim".to_string(),
+                risk: None,
+            }),
+        )
+        .await;
+        let v = response.0;
+        assert_eq!(v["found"], serde_json::json!(false));
+        assert!(v.get("plan").is_none());
+    }
+
     // --- FORNX-94: /api/judge -------------------------------------------
 
     /// Deliberately does not assert `judge.verdict` is a specific value --
