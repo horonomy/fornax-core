@@ -476,6 +476,7 @@ mod tests {
             provenance: "test".into(),
             source: None,
             extension: None,
+            evidence_purged: false,
         }
     }
 

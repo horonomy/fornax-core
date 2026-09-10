@@ -17,3 +17,14 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+# FORNX-311: background policy bundle poll transport. The workspace
+# `reqwest` dependency does not set `default-features = false`, so a
+# member-level override of that flag is ignored by Cargo (warns "could
+# become a hard error"); `rustls-tls` is added as an extra feature
+# alongside the workspace default instead of trying to strip native-tls.
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+
+[dev-dependencies]
+base64.workspace = true
+ed25519-dalek.workspace = true
+sqlx.workspace = true

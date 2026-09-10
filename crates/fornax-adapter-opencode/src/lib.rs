@@ -305,6 +305,7 @@ impl EvidenceSensor for OpenCodeExitCodeSensor {
                 self.collector_version(),
             )),
             extension,
+            evidence_purged: false,
         }])
     }
 }
@@ -428,6 +429,7 @@ impl EvidenceSensor for OpenCodeCommandDurationSensor {
                 self.collector_version(),
             )),
             extension: None,
+            evidence_purged: false,
         }])
     }
 }

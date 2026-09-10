@@ -782,6 +782,7 @@ pub fn judge_output_to_evidence(
         ),
         source: Some(source),
         extension: None,
+        evidence_purged: false,
     }
 }
 
@@ -962,6 +963,7 @@ mod judge_tests {
             provenance: "test".into(),
             source: None,
             extension: None,
+            evidence_purged: false,
         };
         let summary = evidence_payload_summary(&ev, false);
         assert!(
@@ -984,6 +986,7 @@ mod judge_tests {
             provenance: "test".into(),
             source: None,
             extension: None,
+            evidence_purged: false,
         };
         let link = EvidenceLink {
             id: Uuid::new_v4(),

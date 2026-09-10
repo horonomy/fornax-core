@@ -257,6 +257,7 @@ impl EvidenceSensor for CodexExecCommandEndSensor {
                 self.collector_version(),
             )),
             extension: None,
+            evidence_purged: false,
         }])
     }
 }
@@ -375,6 +376,7 @@ impl EvidenceSensor for CodexCustomToolCallOutputSensor {
                     self.collector_version(),
                 )),
                 extension: None,
+                evidence_purged: false,
             }]);
         }
 
@@ -414,6 +416,7 @@ impl EvidenceSensor for CodexCustomToolCallOutputSensor {
                 self.collector_version(),
             )),
             extension: None,
+            evidence_purged: false,
         }])
     }
 }

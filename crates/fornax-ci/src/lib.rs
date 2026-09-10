@@ -329,6 +329,7 @@ impl<S: CheckRunSource> GitHubCiStatusSensor<S> {
                 self.collector_version(),
             )),
             extension: None,
+            evidence_purged: false,
         }
     }
 }

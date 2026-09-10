@@ -145,6 +145,16 @@ impl SensorDisableConfig {
     pub fn is_disabled(&self, sensor_name: &str) -> bool {
         self.disabled.contains(sensor_name)
     }
+
+    /// The full set of disabled sensor names (FORNX-116: the policy-as-data
+    /// `LocalUser` layer maps this into `policy::SensorScope::disabled`).
+    /// Empty and "never configured" are indistinguishable here by design —
+    /// see the module docs — which is safe for that mapping because
+    /// `SensorScope::disabled`'s precedence meet is union: an empty set
+    /// folded into any other level's set is a no-op either way.
+    pub fn disabled_names(&self) -> &HashSet<String> {
+        &self.disabled
+    }
 }
 
 /// `$FORNAX_HOME` if set, else `$HOME/.fornax` — the same resolution

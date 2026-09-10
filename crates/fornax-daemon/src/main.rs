@@ -9,8 +9,14 @@ use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::get;
 use axum::{Json, Router};
+use chrono::{DateTime, Utc};
+use fornax_store::policy_cache::RevocationIngestOutcome;
 use fornax_types::redact::{redact_json, redact_text};
-use fornax_types::{home_identity, Finding, IngestMessage, RuntimeCapabilities};
+use fornax_types::{
+    compute_posture, home_identity, verify_bundle, verify_revocation_list, ActivationOutcome,
+    ActivationRejection, BoundRevision, CacheSlotKind, Finding, IngestMessage, PolicyCacheState,
+    PolicyContent, PolicyDiagnostic, RuntimeCapabilities, TrustedVerificationKeys,
+};
 use fornax_verify::fusion::{project_graph, BaselineFusionPolicy, FusionInput, FusionPolicy};
 use fornax_verify::{
     CommandExecutedVerifier, CommandSuccessVerifier, FileModifiedVerifier, GitOperationVerifier,
@@ -21,7 +27,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
+
+mod audit_checkpoint_submit;
+mod policy_poll;
+mod retention_sweep;
 
 fn fornax_home() -> PathBuf {
     std::env::var("FORNAX_HOME")
@@ -124,6 +134,118 @@ struct AppState {
     /// daemon serving its own home rather than a different one that won the
     /// race for the shared default port — see [`fornax_types::home_identity`].
     home_id: Arc<str>,
+    /// FORNX-119: never `None` if `resolve_trust_store` found and parsed a
+    /// trust store at startup; static configuration, never re-read at
+    /// runtime (trust roots do not rotate mid-process).
+    trust: Arc<Option<TrustedVerificationKeys>>,
+    /// FORNX-119: the daemon's live view of the local policy cache. Loaded
+    /// once at startup (`Store::load_policy_cache`, before `axum::serve`)
+    /// and refreshed after every successful `submit_policy_bundle` call
+    /// from the UDS ingest path -- never abandoned on a policy failure
+    /// (ADR-0001 D2).
+    policy: Arc<RwLock<PolicyCacheSnapshot>>,
+}
+
+/// FORNX-311: the background policy poll task's most recent attempt.
+/// In-memory only -- no persistence, no migration -- mirroring
+/// `LastPolicyRejection`'s own precedent exactly.
+#[derive(Clone)]
+struct LastPolicyPoll {
+    attempted_at: DateTime<Utc>,
+    /// One of: "ok" | "disabled" | "unreachable" | "auth_failed" |
+    /// "http_error" | "too_large" | "malformed" | "panicked".
+    outcome: &'static str,
+    /// Never contains the credential value or any URL query string.
+    detail: String,
+    bundles_received: usize,
+    consecutive_failures: u32,
+    next_attempt_at: DateTime<Utc>,
+}
+
+/// In-memory snapshot `GET /api/policy` reads. See
+/// `docs/adr/0008-local-policy-cache-and-activation.md`.
+#[derive(Clone)]
+struct PolicyCacheSnapshot {
+    state: PolicyCacheState,
+    #[allow(dead_code)]
+    // surfaced via `state`'s own generations; kept for future enforcement wiring.
+    usable: Vec<BoundRevision>,
+    loaded_slot: Option<CacheSlotKind>,
+    diagnostics: Vec<PolicyDiagnostic>,
+    /// In-memory only -- no persistence, no migration needed for it.
+    last_rejection: Option<LastPolicyRejection>,
+    /// FORNX-311: in-memory only -- no persistence, no migration needed.
+    last_poll: Option<LastPolicyPoll>,
+}
+
+impl PolicyCacheSnapshot {
+    fn empty() -> Self {
+        Self {
+            state: PolicyCacheState {
+                schema_version: fornax_types::POLICY_CACHE_SCHEMA_VERSION,
+                active: None,
+                pending: None,
+                last_known_good: None,
+                high_water: std::collections::BTreeMap::new(),
+                ever_configured: false,
+                revocations: fornax_types::RevocationSet::default(),
+            },
+            usable: Vec::new(),
+            loaded_slot: None,
+            diagnostics: Vec::new(),
+            last_rejection: None,
+            last_poll: None,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct LastPolicyRejection {
+    payload_digest: Option<String>,
+    code: &'static str,
+    message: String,
+    remediation: String,
+    at: DateTime<Utc>,
+}
+
+/// Short, stable snake_case label for one [`ActivationRejection`] variant --
+/// surfaced on `GET /api/policy`'s `last_rejection.code`.
+fn activation_rejection_code(r: &ActivationRejection) -> &'static str {
+    match r {
+        ActivationRejection::NotVerified(_) => "not_verified",
+        ActivationRejection::SequenceNotAdvanced { .. } => "sequence_not_advanced",
+        ActivationRejection::SequenceReused { .. } => "sequence_reused",
+        ActivationRejection::IssuerMismatchForLineage { .. } => "issuer_mismatch_for_lineage",
+        ActivationRejection::BindingsUnusable(_) => "bindings_unusable",
+        ActivationRejection::Persistence { .. } => "persistence",
+        ActivationRejection::Revoked { .. } => "revoked",
+    }
+}
+
+fn remediation_for_rejection(r: &ActivationRejection) -> &'static str {
+    match r {
+        ActivationRejection::NotVerified(_) => {
+            "re-export a bundle signed by a currently-trusted key, in-window and correctly formed"
+        }
+        ActivationRejection::SequenceNotAdvanced { .. }
+        | ActivationRejection::SequenceReused { .. } => {
+            "publish a new bundle with a sequence number strictly greater than the last one seen \
+             for this issuer/policy_id"
+        }
+        ActivationRejection::IssuerMismatchForLineage { .. } => {
+            "publish this policy_id's next revision from the same issuer that first claimed it, \
+             or publish under a new policy_id"
+        }
+        ActivationRejection::BindingsUnusable(_) => {
+            "remove pinned_fields from any binding targeted at TargetLevel::LocalUser"
+        }
+        ActivationRejection::Persistence { .. } => {
+            "retry the import; if it persists, check disk space"
+        }
+        ActivationRejection::Revoked { .. } => {
+            "this artifact must never be re-trusted; publish a fresh, unrevoked bundle instead"
+        }
+    }
 }
 
 /// Response header carrying [`AppState::home_id`] — checked by
@@ -171,11 +293,41 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let store = fornax_store::Store::open(&db_path).await?;
+
+    // FORNX-119: never abort startup on a policy failure (ADR-0001 D2).
+    // Absent/malformed trust store or cache -> log and continue with a
+    // degraded (possibly empty) policy snapshot.
+    let (trusted, trust_diagnostics) = fornax_types::resolve_trust_store(&home);
+    for d in &trust_diagnostics {
+        tracing::warn!(code = ?d.code, message = %d.message, "policy trust store diagnostic");
+    }
+    let policy_snapshot = match store.load_policy_cache(trusted.as_ref(), Utc::now()).await {
+        Ok(load) => {
+            for d in &load.diagnostics {
+                tracing::warn!(code = ?d.code, message = %d.message, "policy cache diagnostic");
+            }
+            PolicyCacheSnapshot {
+                state: load.state,
+                usable: load.usable,
+                loaded_slot: load.loaded_slot,
+                diagnostics: load.diagnostics,
+                last_rejection: None,
+                last_poll: None,
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "failed to load policy cache; continuing with an empty one");
+            PolicyCacheSnapshot::empty()
+        }
+    };
+
     let state = AppState {
         store,
         caps: Arc::new(Mutex::new(HashMap::new())),
         processing: Arc::new(Mutex::new(())),
         home_id: Arc::from(home_identity(&home).as_str()),
+        trust: Arc::new(trusted),
+        policy: Arc::new(RwLock::new(policy_snapshot)),
     };
 
     let uds_sock_path = sock_path.clone();
@@ -186,6 +338,23 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // FORNX-311: background policy bundle poll transport, alongside the UDS
+    // ingest task. Disabled by default (no FORNAX_POLICY_POLL_URL) -- see
+    // `policy_poll::resolve_poll_config`.
+    let poll_task = policy_poll::spawn(state.clone(), home.clone());
+
+    // FORNX-317: background audit checkpoint submission transport, best-
+    // effort and never load-bearing for the local critical path (ADR-0001
+    // D2). Disabled by default (no FORNAX_AUDIT_CHECKPOINT_URL / cloud sync
+    // not enabled) -- see `audit_checkpoint_submit::resolve_submit_config`.
+    let checkpoint_task = audit_checkpoint_submit::spawn(state.clone(), home.clone());
+
+    // FORNX-319: background retention sweep, alongside the UDS ingest and
+    // policy poll tasks. Always enabled (unlike policy polling, which
+    // requires opt-in configuration) — see `retention_sweep`'s module docs
+    // for why it deliberately does not hold `AppState::processing`.
+    let retention_sweep_task = retention_sweep::spawn(state.clone(), db_path.clone());
+
     let app = Router::new()
         .route("/api/status", get(api_status))
         .route("/api/findings/recent", get(api_findings_recent))
@@ -195,6 +364,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/decision", get(api_decision))
         .route("/api/judge", get(api_judge))
         .route("/api/reliability", get(api_reliability))
+        .route("/api/policy", get(api_policy))
         .route("/dashboard", get(dashboard))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -217,6 +387,9 @@ async fn main() -> anyhow::Result<()> {
     // doesn't have to distinguish "stale from a clean stop" from "stale from
     // a crash" — there's nothing left to distinguish.
     uds_task.abort();
+    poll_task.abort();
+    checkpoint_task.abort();
+    retention_sweep_task.abort();
     let _ = std::fs::remove_file(&sock_path);
     let _ = std::fs::remove_file(&pid_path);
     tracing::info!("fornaxd stopped");
@@ -356,6 +529,12 @@ async fn handle_message(
             }
             state.store.insert_evidence(&ev).await?;
         }
+        IngestMessage::PolicyBundle { envelope } => {
+            handle_policy_bundle_ingest(state, envelope.into_bytes()).await;
+        }
+        IngestMessage::PolicyRevocation { envelope } => {
+            handle_policy_revocation_ingest(state, envelope.into_bytes()).await;
+        }
         IngestMessage::Claim(mut claim) => {
             *session_hint = Some(claim.session_id.clone());
             // FORNX-280: claim text is derived from agent/user transcript
@@ -425,6 +604,241 @@ async fn handle_message(
 /// here: it would put a DB round trip on the verify hot path the `caps`
 /// in-memory cache exists specifically to avoid. Further provider plumbing
 /// through the claim path, if ever needed, is FORNX-138 scope.
+/// FORNX-119: submits a policy bundle envelope to the store and refreshes
+/// `state.policy` accordingly. Never propagates an error up to
+/// `handle_message`'s caller -- a malformed/unverifiable bundle is an
+/// ordinary rejection outcome, not an ingest failure, and a genuine store
+/// failure is logged, matching every other ingest arm's best-effort
+/// posture.
+async fn handle_policy_bundle_ingest(state: &AppState, envelope_bytes: Vec<u8>) {
+    let Some(trusted) = state.trust.as_ref() else {
+        tracing::warn!(
+            "dropping policy bundle ingest message: no trust store configured \
+             (set FORNAX_POLICY_TRUST_STORE or create <home>/policy-trust.json)"
+        );
+        return;
+    };
+
+    let now = Utc::now();
+    let outcome = match state
+        .store
+        .submit_policy_bundle(&envelope_bytes, trusted, now)
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            tracing::error!(error = %e, "policy bundle submission failed");
+            return;
+        }
+    };
+
+    match outcome {
+        ActivationOutcome::Activated { generation, .. }
+        | ActivationOutcome::Confirmed { generation, .. } => {
+            match state.store.load_policy_cache(Some(trusted), now).await {
+                Ok(load) => {
+                    let mut policy = state.policy.write().await;
+                    policy.state = load.state;
+                    policy.usable = load.usable;
+                    policy.loaded_slot = load.loaded_slot;
+                    policy.diagnostics = load.diagnostics;
+                    policy.last_rejection = None;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to reload policy cache after activation");
+                }
+            }
+            tracing::info!(generation, "policy bundle activated/confirmed");
+        }
+        ActivationOutcome::Rejected {
+            rejection,
+            active_generation,
+        } => {
+            // Best-effort re-derivation of the candidate's payload_digest
+            // for the diagnostic surface only -- verify_bundle has no side
+            // effects, so re-running it here is safe and cheap (ingest is
+            // not a hot path). `None` when verification itself failed
+            // (there is no authenticated payload_digest to report).
+            let payload_digest = verify_bundle(&envelope_bytes, trusted, now)
+                .ok()
+                .map(|v| v.payload_digest().to_string());
+            tracing::warn!(
+                code = activation_rejection_code(&rejection),
+                active_generation,
+                "policy bundle rejected: {rejection}"
+            );
+            let mut policy = state.policy.write().await;
+            policy.last_rejection = Some(LastPolicyRejection {
+                payload_digest,
+                code: activation_rejection_code(&rejection),
+                message: rejection.to_string(),
+                remediation: remediation_for_rejection(&rejection).to_string(),
+                at: now,
+            });
+        }
+    }
+}
+
+/// FORNX-123: submits a policy revocation list envelope to the store and
+/// refreshes `state.policy` accordingly. Mirrors
+/// `handle_policy_bundle_ingest`'s best-effort posture exactly -- never
+/// propagates an error up to `handle_message`'s caller, and refreshes the
+/// in-memory snapshot after every successful apply/confirm so revocation
+/// takes effect immediately in a running daemon rather than at next
+/// restart.
+async fn handle_policy_revocation_ingest(state: &AppState, envelope_bytes: Vec<u8>) {
+    let Some(trusted) = state.trust.as_ref() else {
+        tracing::warn!(
+            "dropping policy revocation ingest message: no trust store configured \
+             (set FORNAX_POLICY_TRUST_STORE or create <home>/policy-trust.json)"
+        );
+        return;
+    };
+
+    let now = Utc::now();
+    let outcome = match state
+        .store
+        .submit_policy_revocation(&envelope_bytes, trusted, now)
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            tracing::error!(error = %e, "policy revocation submission failed");
+            return;
+        }
+    };
+
+    match outcome {
+        RevocationIngestOutcome::Applied {
+            issuer,
+            sequence,
+            new_entry_count,
+            ..
+        } => {
+            match state.store.load_policy_cache(Some(trusted), now).await {
+                Ok(load) => {
+                    let mut policy = state.policy.write().await;
+                    policy.state = load.state;
+                    policy.usable = load.usable;
+                    policy.loaded_slot = load.loaded_slot;
+                    policy.diagnostics = load.diagnostics;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to reload policy cache after revocation");
+                }
+            }
+            tracing::info!(
+                issuer,
+                sequence,
+                new_entry_count,
+                "policy revocation list applied"
+            );
+        }
+        RevocationIngestOutcome::AlreadyCurrent { issuer, sequence } => {
+            tracing::info!(issuer, sequence, "policy revocation list already current");
+        }
+        RevocationIngestOutcome::Rejected { rejection } => {
+            // Best-effort re-derivation of the candidate's payload_digest,
+            // mirroring `handle_policy_bundle_ingest`'s own precedent --
+            // `verify_revocation_list` has no side effects.
+            let payload_digest = verify_revocation_list(&envelope_bytes, trusted, now)
+                .ok()
+                .map(|v| v.payload_digest().to_string());
+            tracing::warn!(
+                payload_digest,
+                "policy revocation list rejected: {rejection}"
+            );
+        }
+    }
+}
+
+/// `GET /api/policy` (FORNX-119): the local policy cache's status. Never
+/// surfaces `PolicyRevisionBody`/`PolicyContent`, a display name, a binding
+/// `TargetScope` identifier, or envelope bytes -- only identifiers,
+/// digests, key ids, timestamps, tiers, flags, and this daemon's own
+/// diagnostic strings. `basis` is always `"baseline"` in this ticket -- no
+/// `DeviceContext` exists to resolve against yet (`RuntimeCapabilities` in
+/// this codebase are per-session, not per-device).
+async fn api_policy(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let snapshot = state.policy.read().await.clone();
+    let baseline = PolicyContent::baseline();
+    let members: Vec<fornax_types::CachedBundleRef> = snapshot
+        .state
+        .active
+        .as_ref()
+        .map(|g| g.members.clone())
+        .unwrap_or_default();
+    let pf = fornax_types::freshness(
+        &members,
+        snapshot.state.ever_configured,
+        baseline.cache_max_age_seconds_by_risk,
+        baseline.cache_offline_grace_seconds,
+        Utc::now(),
+    );
+    let degraded = !matches!(snapshot.loaded_slot, Some(CacheSlotKind::Active))
+        || !snapshot.diagnostics.is_empty();
+
+    let last_rejection = snapshot.last_rejection.as_ref().map(|r| {
+        serde_json::json!({
+            "payload_digest": r.payload_digest,
+            "code": r.code,
+            "message": r.message,
+            "remediation": r.remediation,
+            "at": r.at,
+        })
+    });
+
+    // FORNX-123: `posture` is separate from the pre-existing `degraded`
+    // bool above -- `degraded` fires on ANY diagnostic (even a Warning) or
+    // a mere LKG fallback; `posture` only degrades when `usable` is
+    // actually empty, with an explicit precedence over which cause is
+    // reported (see `compute_posture`'s own doc comment).
+    let posture = compute_posture(
+        snapshot.state.ever_configured,
+        snapshot.usable.is_empty(),
+        &snapshot.diagnostics,
+    );
+
+    // FORNX-311: `null` before the first poll cycle completes (or forever,
+    // for an install with polling disabled/not configured).
+    let last_poll = snapshot.last_poll.as_ref().map(|p| {
+        serde_json::json!({
+            "attempted_at": p.attempted_at,
+            "outcome": p.outcome,
+            "detail": p.detail,
+            "bundles_received": p.bundles_received,
+            "consecutive_failures": p.consecutive_failures,
+            "next_attempt_at": p.next_attempt_at,
+        })
+    });
+
+    Json(serde_json::json!({
+        "schema_version": fornax_types::POLICY_CACHE_SCHEMA_VERSION,
+        "configured": snapshot.state.ever_configured,
+        "loaded_slot": snapshot.loaded_slot,
+        "active": snapshot.state.active,
+        "pending": serde_json::Value::Null,
+        "last_known_good": snapshot.state.last_known_good,
+        "freshness": {
+            "basis": "baseline",
+            "evaluated_at": pf.evaluated_at,
+            "tier_by_risk": pf.tier_by_risk,
+            "members": pf.members,
+        },
+        "revocations": {
+            "entry_count": snapshot.state.revocations.revision_digests.len()
+                + snapshot.state.revocations.payload_digests.len(),
+            "unrecognized_entry_count": snapshot.state.revocations.unrecognized_entry_count,
+            "max_sequence_by_issuer": snapshot.state.revocations.max_sequence_by_issuer,
+        },
+        "posture": posture,
+        "degraded": degraded,
+        "diagnostics": snapshot.diagnostics,
+        "last_rejection": last_rejection,
+        "last_poll": last_poll,
+    }))
+}
+
 fn default_unknown_caps() -> RuntimeCapabilities {
     RuntimeCapabilities {
         schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
@@ -545,13 +959,37 @@ async fn api_evidence_graph(
         .evidence_graph_for_claim(&q.claim, &q.session)
         .await
     {
-        Ok(graph) => Json(serde_json::json!({
-            "claim": q.claim,
-            "session": q.session,
-            "found": true,
-            "links": graph.links,
-            "missing": graph.missing,
-        })),
+        Ok(graph) => {
+            // FORNX-319 AC3: annotate each link with whether its evidence
+            // has since been purged, so a renderer can say "evidence
+            // expired" explicitly instead of rendering the payload as if
+            // nothing was ever collected. A lookup failure (should not
+            // happen for a real evidence id) degrades to `false` — never
+            // fabricate "expired" for a row this call couldn't actually
+            // read.
+            let mut links_json = Vec::with_capacity(graph.links.len());
+            for link in &graph.links {
+                let purged = state
+                    .store
+                    .is_evidence_purged(&link.evidence_id.to_string())
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or(false);
+                let mut value = serde_json::to_value(link).unwrap_or(serde_json::Value::Null);
+                if let serde_json::Value::Object(ref mut map) = value {
+                    map.insert("evidence_purged".to_string(), serde_json::json!(purged));
+                }
+                links_json.push(value);
+            }
+            Json(serde_json::json!({
+                "claim": q.claim,
+                "session": q.session,
+                "found": true,
+                "links": links_json,
+                "missing": graph.missing,
+            }))
+        }
         Err(e) => Json(
             serde_json::json!({ "claim": q.claim, "session": q.session, "error": e.to_string() }),
         ),
@@ -1235,6 +1673,8 @@ mod tests {
             caps: Arc::new(Mutex::new(HashMap::new())),
             processing: Arc::new(Mutex::new(())),
             home_id: Arc::from(format!("test-home-{}", Uuid::new_v4()).as_str()),
+            trust: Arc::new(None),
+            policy: Arc::new(RwLock::new(PolicyCacheSnapshot::empty())),
         }
     }
 
@@ -1356,6 +1796,7 @@ mod tests {
             provenance: "claude_code:1.2.3:PostToolUse:Edit#heuristic:tool_input".to_string(),
             source: None,
             extension: None,
+            evidence_purged: false,
         };
         handle_message(&state, IngestMessage::Evidence(evidence), &mut hint)
             .await
@@ -1432,6 +1873,7 @@ mod tests {
             provenance: "opencode:1.18.25:PostToolUse:bash#tool_response".to_string(),
             source: None,
             extension: Some(extension),
+            evidence_purged: false,
         };
         handle_message(&state, IngestMessage::Evidence(evidence), &mut hint)
             .await
@@ -1519,6 +1961,7 @@ mod tests {
             provenance: "claude_code:1.2.3:PostToolUse:Bash#tool_response:git_commit".to_string(),
             source: None,
             extension: None,
+            evidence_purged: false,
         };
         handle_message(&state, IngestMessage::Evidence(evidence), &mut hint)
             .await
@@ -1692,6 +2135,7 @@ mod tests {
                 Some("0.0.1".to_string()),
             )),
             extension: None,
+            evidence_purged: false,
         };
         handle_message(&state, IngestMessage::Evidence(evidence), &mut hint)
             .await
@@ -1892,6 +2336,7 @@ mod tests {
             provenance: "claude_code:1.2.3:PostToolUse:Bash#tool_response".to_string(),
             source: None,
             extension: None,
+            evidence_purged: false,
         };
         handle_message(&state, IngestMessage::Evidence(evidence), &mut hint)
             .await
@@ -1938,6 +2383,95 @@ mod tests {
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0]["signal_class"], "process_result");
         assert_eq!(missing[0]["availability"], "unavailable");
+    }
+
+    /// FORNX-319 AC3: once evidence is purged, `/api/evidence-graph` must
+    /// say so explicitly on the affected link rather than rendering as if
+    /// the evidence were still fully present.
+    #[tokio::test]
+    async fn api_evidence_graph_marks_a_purged_evidence_link_as_evidence_purged() {
+        use fornax_types::{EvidenceLink, EvidenceRelation};
+
+        let state = test_state().await;
+        let mut hint = None;
+        let session_id = "fornx-319-evidence-graph-purge".to_string();
+
+        let event_id = Uuid::new_v4();
+        let event = AgentEvent {
+            id: event_id,
+            session_id: session_id.clone(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-09-01T00:00:00Z".to_string(),
+            tool_name: Some("Bash".to_string()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        handle_message(&state, IngestMessage::Event(event), &mut hint)
+            .await
+            .expect("handle event");
+
+        let claim = Claim {
+            id: Uuid::new_v4(),
+            session_id: session_id.clone(),
+            source_event_id: event_id,
+            text: "all tests passed".to_string(),
+            subject: "test_result".to_string(),
+            claimed_at: "2026-09-01T00:00:00Z".to_string(),
+        };
+        handle_message(&state, IngestMessage::Claim(claim.clone()), &mut hint)
+            .await
+            .expect("handle claim");
+
+        let evidence_id = Uuid::new_v4();
+        let evidence = fornax_types::Evidence {
+            id: evidence_id,
+            session_id: session_id.clone(),
+            source_event_id: event_id,
+            kind: fornax_types::EvidenceKind::ExitCode,
+            observed_at: "2026-09-01T00:00:00Z".to_string(),
+            payload: serde_json::json!({"command": [], "exit_code": 0}),
+            provenance: "claude_code:1.2.3:PostToolUse:Bash#tool_response".to_string(),
+            source: None,
+            extension: None,
+            evidence_purged: false,
+        };
+        handle_message(&state, IngestMessage::Evidence(evidence), &mut hint)
+            .await
+            .expect("handle evidence");
+
+        state
+            .store
+            .insert_evidence_link(&EvidenceLink {
+                id: Uuid::new_v4(),
+                session_id: session_id.clone(),
+                claim_id: claim.id,
+                evidence_id,
+                relation: EvidenceRelation::Supports,
+                linked_at: "2026-09-01T00:00:01Z".to_string(),
+            })
+            .await
+            .expect("insert evidence link");
+
+        state
+            .store
+            .purge_evidence_payload(&evidence_id.to_string(), Utc::now())
+            .await
+            .expect("purge evidence payload");
+
+        let query = Query(EvidenceGraphQuery {
+            claim: claim.id.to_string(),
+            session: session_id,
+        });
+        let resp = api_evidence_graph(State(state), query).await;
+        let links = resp.0["links"].as_array().expect("links must be an array");
+        assert_eq!(links.len(), 1);
+        assert_eq!(
+            links[0]["evidence_purged"],
+            serde_json::json!(true),
+            "the link for purged evidence must be explicitly marked"
+        );
     }
 
     /// FORNX-90 regression: an unknown claim id must report `found: false`,
@@ -2065,6 +2599,7 @@ mod tests {
             provenance: "claude_code:1.2.3:PostToolUse:Bash#tool_response".to_string(),
             source: None,
             extension: None,
+            evidence_purged: false,
         };
         handle_message(&state, IngestMessage::Evidence(evidence), &mut hint)
             .await
@@ -2222,6 +2757,7 @@ mod tests {
             provenance: "test".to_string(),
             source: None,
             extension: None,
+            evidence_purged: false,
         }
     }
 
@@ -2860,5 +3396,273 @@ mod tests {
         assert_eq!(v["capabilities_announced"], serde_json::json!(false));
         let reason = v["reason"].as_str().unwrap_or("");
         assert!(reason.contains("codex"), "reason was: {reason}");
+    }
+
+    // ========================================================================
+    // FORNX-119 -- local policy cache: T78 (confidentiality allowlist), T79
+    // (degraded-startup never panics).
+    // ========================================================================
+
+    fn policy_test_signing_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32])
+    }
+
+    fn policy_test_trust(
+        key_id: &str,
+        sk: &ed25519_dalek::SigningKey,
+    ) -> fornax_types::TrustedVerificationKeys {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+        fornax_types::TrustedVerificationKeys {
+            schema_version: 1,
+            keys: vec![fornax_types::policy::TrustedKey {
+                key_id: fornax_types::KeyId(key_id.to_string()),
+                algorithm: fornax_types::policy::SignatureAlgorithm::Ed25519,
+                public_key_b64: STANDARD.encode(sk.verifying_key().to_bytes()),
+                not_before: None,
+                not_after: None,
+                comment: None,
+            }],
+        }
+    }
+
+    /// Builds a signed envelope whose revision carries `display_name` and a
+    /// `sensors.disabled` entry the caller supplies, so T78 can prove
+    /// neither ever reaches `GET /api/policy`.
+    fn build_policy_test_envelope(
+        display_name: &str,
+        disabled_sensor: &str,
+        key_id: &str,
+        sk: &ed25519_dalek::SigningKey,
+    ) -> Vec<u8> {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+        use ed25519_dalek::Signer;
+        use fornax_types::policy::{
+            BundlePayload, BundleProvenance, BundleSignature, PolicyBinding, PolicyDraft, PolicyId,
+            SignatureAlgorithm, SignedPolicyBundle, TargetScope, TargetSelector,
+        };
+        use fornax_types::PolicyContent;
+
+        let mut content = PolicyContent::default();
+        let mut disabled = std::collections::BTreeSet::new();
+        disabled.insert(disabled_sensor.to_string());
+        content.sensors.disabled = Some(disabled);
+
+        let draft = PolicyDraft {
+            policy_id: PolicyId(Uuid::new_v4()),
+            revision: 1,
+            supersedes: None,
+            display_name: display_name.to_string(),
+            content,
+            pinned_fields: std::collections::BTreeSet::new(),
+        };
+        let revision = draft
+            .publish("2026-01-01T00:00:00Z".to_string())
+            .expect("draft should publish");
+
+        let binding = PolicyBinding {
+            binding_id: Uuid::new_v4(),
+            scope: TargetScope::Org {
+                org_id: "org-1".to_string(),
+            },
+            selector: TargetSelector::default(),
+            revision_ref: revision.reference(),
+        };
+        let payload = BundlePayload {
+            bundle_schema_version: 1,
+            bundle_id: Uuid::new_v4(),
+            sequence: 1,
+            issued_at: "2026-01-01T00:00:00Z".to_string(),
+            not_before: "2026-01-01T00:00:00Z".to_string(),
+            expires_at: "2027-01-01T00:00:00Z".to_string(),
+            provenance: BundleProvenance {
+                issuer: "issuer-a".to_string(),
+                audit_ref: None,
+                authorized_by: None,
+            },
+            revision,
+            bindings: vec![binding],
+        };
+        let payload_bytes = serde_json::to_vec(&payload).unwrap();
+
+        let mut signed_message = Vec::new();
+        signed_message.extend_from_slice(fornax_types::policy::BUNDLE_SIGNING_DOMAIN);
+        signed_message.extend_from_slice(&payload_bytes);
+        let signature = sk.sign(&signed_message);
+
+        let envelope = SignedPolicyBundle {
+            bundle_schema_version: 1,
+            payload_b64: STANDARD.encode(&payload_bytes),
+            signatures: vec![BundleSignature {
+                key_id: fornax_types::KeyId(key_id.to_string()),
+                algorithm: SignatureAlgorithm::Ed25519,
+                signature_b64: STANDARD.encode(signature.to_bytes()),
+            }],
+        };
+        serde_json::to_vec(&envelope).unwrap()
+    }
+
+    fn assert_exact_keys(v: &serde_json::Value, expected: &[&str], where_: &str) {
+        let obj = v
+            .as_object()
+            .unwrap_or_else(|| panic!("{where_} must be a JSON object"));
+        let mut actual: Vec<&str> = obj.keys().map(String::as_str).collect();
+        actual.sort_unstable();
+        let mut expected_sorted: Vec<&str> = expected.to_vec();
+        expected_sorted.sort_unstable();
+        assert_eq!(actual, expected_sorted, "unexpected key set at {where_}");
+    }
+
+    /// T78: positive-allowlist confidentiality proof for `GET /api/policy`.
+    /// Asserts the exact key set at every nesting level (not a denylist),
+    /// and that neither a distinctive `display_name` nor a distinctive
+    /// `sensors.disabled` entry appears anywhere in the serialized body.
+    #[tokio::test]
+    async fn t78_api_policy_never_leaks_display_name_or_sensor_names() {
+        let mut state = test_state().await;
+        let sk = policy_test_signing_key();
+        let trust = policy_test_trust("k1", &sk);
+        state.trust = Arc::new(Some(trust.clone()));
+
+        let secret_display_name = "FORNX-T78-SECRET-DISPLAY-NAME-MUST-NOT-LEAK";
+        let secret_sensor = "FORNX-T78-SECRET-SENSOR-MUST-NOT-LEAK";
+        let envelope = build_policy_test_envelope(secret_display_name, secret_sensor, "k1", &sk);
+
+        let outcome = state
+            .store
+            .submit_policy_bundle(&envelope, &trust, Utc::now())
+            .await
+            .expect("submit policy bundle");
+        assert!(matches!(outcome, ActivationOutcome::Activated { .. }));
+
+        let load = state
+            .store
+            .load_policy_cache(Some(&trust), Utc::now())
+            .await
+            .expect("load policy cache");
+        {
+            let mut policy = state.policy.write().await;
+            policy.state = load.state;
+            policy.usable = load.usable;
+            policy.loaded_slot = load.loaded_slot;
+            policy.diagnostics = load.diagnostics;
+        }
+
+        let response = api_policy(State(state.clone())).await;
+        let body = response.0;
+        let serialized = serde_json::to_string(&body).unwrap();
+
+        assert!(
+            !serialized.contains(secret_display_name),
+            "display_name must never be surfaced on GET /api/policy"
+        );
+        assert!(
+            !serialized.contains(secret_sensor),
+            "a disabled sensor name must never be surfaced on GET /api/policy"
+        );
+
+        assert_exact_keys(
+            &body,
+            &[
+                "schema_version",
+                "configured",
+                "loaded_slot",
+                "active",
+                "pending",
+                "last_known_good",
+                "freshness",
+                "revocations",
+                "posture",
+                "degraded",
+                "diagnostics",
+                "last_rejection",
+                "last_poll",
+            ],
+            "top level",
+        );
+        assert_eq!(body["pending"], serde_json::Value::Null);
+
+        let active = &body["active"];
+        assert_exact_keys(active, &["generation", "members", "written_at"], "active");
+        let members = active["members"].as_array().unwrap();
+        assert_eq!(members.len(), 1);
+        assert_exact_keys(
+            &members[0],
+            &[
+                "bundle_id",
+                "issuer",
+                "sequence",
+                "policy_id",
+                "revision",
+                "revision_digest",
+                "payload_digest",
+                "verified_by",
+                "not_before",
+                "expires_at",
+                "first_activated_at",
+                "confirmed_at",
+            ],
+            "active.members[0]",
+        );
+
+        let freshness = &body["freshness"];
+        assert_exact_keys(
+            freshness,
+            &["basis", "evaluated_at", "tier_by_risk", "members"],
+            "freshness",
+        );
+        assert_eq!(freshness["basis"], serde_json::json!("baseline"));
+        assert_exact_keys(
+            &freshness["tier_by_risk"],
+            &["low", "elevated", "high", "critical"],
+            "freshness.tier_by_risk",
+        );
+        let freshness_members = freshness["members"].as_array().unwrap();
+        assert_eq!(freshness_members.len(), 1);
+        assert_exact_keys(
+            &freshness_members[0],
+            &[
+                "bundle_id",
+                "policy_id",
+                "confirmed_at",
+                "expires_at",
+                "age_seconds",
+                "tier_by_risk",
+            ],
+            "freshness.members[0]",
+        );
+    }
+
+    /// T79: the daemon's policy surface must never panic or block startup
+    /// when there is no trust store, no cache, or an unreadable trust store
+    /// -- `configured` reads `false`, `GET /api/policy` still answers.
+    #[tokio::test]
+    async fn t79_degraded_policy_state_never_panics_and_reports_unconfigured() {
+        // No trust store, no cache -- the exact state `test_state()`
+        // already constructs (trust: None, empty PolicyCacheSnapshot).
+        let state = test_state().await;
+        let response = api_policy(State(state.clone())).await;
+        let body = response.0;
+        assert_eq!(body["configured"], serde_json::json!(false));
+        assert_eq!(body["loaded_slot"], serde_json::Value::Null);
+        assert_eq!(body["active"], serde_json::Value::Null);
+        assert_eq!(body["last_known_good"], serde_json::Value::Null);
+
+        // An unreadable/malformed trust store must resolve to `None` plus a
+        // diagnostic, never a panic or an `Err` that aborts startup.
+        let bad_home = std::env::temp_dir().join(format!("fornax-t79-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&bad_home).unwrap();
+        std::fs::write(bad_home.join("policy-trust.json"), "not json").unwrap();
+        let (trusted, diagnostics) = fornax_types::resolve_trust_store(&bad_home);
+        assert!(trusted.is_none());
+        assert!(!diagnostics.is_empty());
+        let load = state
+            .store
+            .load_policy_cache(trusted.as_ref(), Utc::now())
+            .await
+            .expect("load_policy_cache must never fail for a missing trust store");
+        assert!(load.usable.is_empty());
+        std::fs::remove_dir_all(&bad_home).ok();
     }
 }

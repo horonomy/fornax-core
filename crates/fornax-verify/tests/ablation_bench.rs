@@ -57,6 +57,7 @@ fn exit_code_evidence(id: u128, command: &[&str], exit_code: i64) -> Evidence {
         provenance: "bench:fixture:exec_command_end".into(),
         source: None,
         extension: None,
+        evidence_purged: false,
     }
 }
 
@@ -74,6 +75,7 @@ fn exit_code_evidence_missing_field(id: u128, command: &[&str]) -> Evidence {
         provenance: "bench:fixture:exec_command_end".into(),
         source: None,
         extension: None,
+        evidence_purged: false,
     }
 }
 

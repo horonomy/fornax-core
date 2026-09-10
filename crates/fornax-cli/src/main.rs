@@ -5,6 +5,7 @@
 use clap::{Parser, Subcommand};
 
 mod experiment_ux;
+mod timeline;
 
 #[derive(Parser)]
 #[command(
@@ -208,6 +209,78 @@ enum Commands {
         #[command(subcommand)]
         action: experiment_ux::ExperimentAction,
     },
+    /// Local policy cache (FORNX-119): status and file-based import of a
+    /// signed policy bundle over the existing UDS ingest channel.
+    Policy {
+        #[command(subcommand)]
+        action: PolicyAction,
+    },
+    /// Local append-only, hash-chained audit ledger (FORNX-315). Reads
+    /// `$FORNAX_HOME/fornax.db` directly (`fornax_store::Store`), mirroring
+    /// `export-spool`'s direct-store access rather than the daemon's HTTP
+    /// API -- the ledger is local file state, not a daemon-mediated view.
+    Audit {
+        #[command(subcommand)]
+        action: AuditAction,
+    },
+    /// Incident timeline (FORNX-321): reconstructs one finding's -- or one
+    /// session's -- full local provenance (evidence with per-item trust
+    /// class, the fused five-state verdict, the verifier name, current
+    /// local policy state, and the local audit ledger). Reads
+    /// `$FORNAX_HOME/fornax.db` directly, matching `audit`'s direct-store
+    /// access -- works fully offline, no daemon required. See
+    /// `timeline.rs`'s module doc comment for this command's honest scope
+    /// boundary. Exactly one of `--finding`/`--session` must be given.
+    Timeline {
+        /// Look up one finding by id.
+        #[arg(long)]
+        finding: Option<String>,
+        /// Look up every finding for one session by id.
+        #[arg(long)]
+        session: Option<String>,
+    },
+}
+
+/// `fornax audit <action>` (FORNX-315).
+#[derive(Subcommand)]
+enum AuditAction {
+    /// Verifies the local audit ledger's hash chain end-to-end
+    /// (`fornax_store::Store::verify_audit_chain`). Prints the typed
+    /// `ChainVerification` result and exits non-zero on `Diverged` -- see
+    /// `crates/fornax-store/src/audit_ledger.rs`'s module doc comment for
+    /// what a `Valid` result does and does not attest to.
+    Verify,
+    /// Lists every appended audit event, oldest first.
+    List,
+    /// Generates a reproducible, evidence-backed local compliance report
+    /// (FORNX-322): ledger integrity, checkpoint anchoring, and retention
+    /// coverage, each traced to a real query against this store -- never a
+    /// hardcoded pass/fail verdict, and never a claim for a capability not
+    /// actually evidenced in this deployment (see
+    /// `crates/fornax-store/src/compliance_report.rs`'s module doc comment).
+    /// Prints the digest-stamped report as JSON and appends a
+    /// `ComplianceReportGenerated` audit event to the local ledger.
+    Report,
+}
+
+/// `fornax policy <action>` (FORNX-119).
+#[derive(Subcommand)]
+enum PolicyAction {
+    /// Renders the local policy cache's slots, per-member freshness tiers,
+    /// and degraded/diagnostic state (`GET /api/policy`). Never collapses
+    /// the 4-tier x 4-risk-class matrix into one boolean.
+    Status,
+    /// Reads a signed policy bundle envelope from `path` and submits it to
+    /// the daemon over the existing UDS ingest channel
+    /// (`IngestMessage::PolicyBundle`, fire-and-forget, no ack). Since
+    /// there is no ack, this then re-reads `GET /api/policy` (after a short
+    /// delay for the daemon to process the message) and reports whether
+    /// the submitted bundle's payload digest is now an active member --
+    /// falling back to `last_rejection` for the reason if not.
+    Import {
+        /// Path to a signed policy bundle envelope JSON file.
+        path: std::path::PathBuf,
+    },
 }
 
 /// Args for `fornax reliability` (FORNX-105), factored out of the `Commands`
@@ -390,8 +463,392 @@ async fn main() -> anyhow::Result<()> {
         Commands::InstallCodex => install_codex()?,
         Commands::UninstallCodex => uninstall_codex()?,
         Commands::Experiment { action } => experiment_ux::handle(action, &fornax_home())?,
+        Commands::Policy { action } => handle_policy_action(action).await?,
+        Commands::Audit { action } => handle_audit_action(action).await?,
+        Commands::Timeline { finding, session } => handle_timeline_action(finding, session).await?,
     }
     Ok(())
+}
+
+async fn handle_timeline_action(
+    finding: Option<String>,
+    session: Option<String>,
+) -> anyhow::Result<()> {
+    let db_path = fornax_home().join("fornax.db");
+    let store = fornax_store::Store::open(&db_path).await?;
+    match (finding, session) {
+        (Some(finding_id), None) => {
+            print!(
+                "{}",
+                timeline::render_finding_timeline(&store, &finding_id).await?
+            );
+        }
+        (None, Some(session_id)) => {
+            print!(
+                "{}",
+                timeline::render_session_timeline(&store, &session_id).await?
+            );
+        }
+        (Some(_), Some(_)) => {
+            anyhow::bail!("fornax timeline: pass exactly one of --finding or --session, not both");
+        }
+        (None, None) => {
+            anyhow::bail!("fornax timeline: pass one of --finding <id> or --session <id>");
+        }
+    }
+    Ok(())
+}
+
+async fn handle_audit_action(action: AuditAction) -> anyhow::Result<()> {
+    let db_path = fornax_home().join("fornax.db");
+    let store = fornax_store::Store::open(&db_path).await?;
+    match action {
+        AuditAction::Verify => {
+            let result = store.verify_audit_chain().await?;
+            let diverged = matches!(result, fornax_store::ChainVerification::Diverged { .. });
+            println!("{}", render_audit_verification(&result));
+            if diverged {
+                std::process::exit(1);
+            }
+        }
+        AuditAction::List => {
+            let events = store.audit_events().await?;
+            print!("{}", render_audit_list(&events));
+        }
+        AuditAction::Report => {
+            let report = store.generate_compliance_report(chrono::Utc::now()).await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).expect("ComplianceReport always serializes")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn render_audit_verification(v: &fornax_store::ChainVerification) -> String {
+    match v {
+        fornax_store::ChainVerification::Valid => {
+            "audit ledger: valid (hash chain intact)".to_string()
+        }
+        fornax_store::ChainVerification::Diverged {
+            first_bad_seq,
+            kind,
+        } => {
+            format!("audit ledger: DIVERGED at seq={first_bad_seq} kind={kind:?}")
+        }
+    }
+}
+
+fn render_audit_list(events: &[fornax_store::AuditLedgerEntry]) -> String {
+    if events.is_empty() {
+        return "audit ledger: no events recorded\n".to_string();
+    }
+    let mut out = String::new();
+    for e in events {
+        out.push_str(&format!(
+            "seq={} event_id={} recorded_at={} action={:?} outcome={:?} export_class={} entry_hash={}\n",
+            e.seq,
+            e.event.event_id,
+            e.recorded_at,
+            e.event.action,
+            e.event.outcome,
+            e.export_class,
+            e.entry_hash,
+        ));
+    }
+    out
+}
+
+async fn handle_policy_action(action: PolicyAction) -> anyhow::Result<()> {
+    match action {
+        PolicyAction::Status => match fetch_json(&format!("{}/api/policy", base_url())).await {
+            Ok(v) => print!("{}", render_policy_status(&v)),
+            Err(_) => println!("fornax: daemon unreachable (is `fornax-daemon` running?)"),
+        },
+        PolicyAction::Import { path } => policy_import(&path).await?,
+    }
+    Ok(())
+}
+
+/// Digests the raw envelope bytes the same way `fornax_types::policy::bundle`
+/// digests a verified payload -- used only to compare against `GET
+/// /api/policy`'s reported member `payload_digest`s locally, so this CLI
+/// command can report "did my import take effect" without needing an ack
+/// from the fire-and-forget UDS protocol. This is a best-effort match on
+/// the *envelope* file's own payload bytes decoded the same way
+/// `verify_bundle` does -- not a re-implementation of verification.
+fn compute_payload_digest_hint(envelope_bytes: &[u8]) -> Option<String> {
+    let envelope: serde_json::Value = serde_json::from_slice(envelope_bytes).ok()?;
+    let payload_b64 = envelope.get("payload_b64")?.as_str()?;
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    let payload_bytes = STANDARD.decode(payload_b64).ok()?;
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(&payload_bytes);
+    let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+    Some(format!("sha256:{hex}"))
+}
+
+/// FORNX-123: which artifact kind an imported file names, by its own
+/// top-level shape -- an emergency responder must not have to pick the
+/// right subcommand. Unknown/ambiguous shape refuses with a clear message
+/// rather than guessing.
+enum PolicyArtifactKind {
+    Bundle,
+    Revocation,
+}
+
+fn detect_artifact_kind(envelope_bytes: &[u8]) -> anyhow::Result<PolicyArtifactKind> {
+    let envelope: serde_json::Value = serde_json::from_slice(envelope_bytes)
+        .map_err(|e| anyhow::anyhow!("not valid JSON: {e}"))?;
+    let has_bundle_key = envelope.get("bundle_schema_version").is_some();
+    let has_revocation_key = envelope.get("revocation_schema_version").is_some();
+    match (has_bundle_key, has_revocation_key) {
+        (true, false) => Ok(PolicyArtifactKind::Bundle),
+        (false, true) => Ok(PolicyArtifactKind::Revocation),
+        (true, true) => Err(anyhow::anyhow!(
+            "ambiguous artifact: carries both bundle_schema_version and \
+             revocation_schema_version -- refusing to guess which kind this is"
+        )),
+        (false, false) => Err(anyhow::anyhow!(
+            "unrecognized artifact: carries neither bundle_schema_version nor \
+             revocation_schema_version at the top level"
+        )),
+    }
+}
+
+async fn policy_import(path: &std::path::Path) -> anyhow::Result<()> {
+    let envelope_bytes = std::fs::read(path)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
+    let envelope_text = String::from_utf8(envelope_bytes.clone())
+        .map_err(|e| anyhow::anyhow!("{} is not valid UTF-8: {e}", path.display()))?;
+
+    let kind = match detect_artifact_kind(&envelope_bytes) {
+        Ok(k) => k,
+        Err(e) => {
+            println!("fornax: refusing to import {}: {e}", path.display());
+            return Ok(());
+        }
+    };
+
+    let expected_digest = compute_payload_digest_hint(&envelope_bytes);
+
+    let sock_path = fornax_home().join("fornax.sock");
+    let mut stream = match tokio::net::UnixStream::connect(&sock_path).await {
+        Ok(s) => s,
+        Err(e) => {
+            println!(
+                "fornax: could not reach fornax-daemon at {} ({e}) -- is it running?",
+                sock_path.display()
+            );
+            return Ok(());
+        }
+    };
+    let msg = match kind {
+        PolicyArtifactKind::Bundle => fornax_types::IngestMessage::PolicyBundle {
+            envelope: envelope_text,
+        },
+        PolicyArtifactKind::Revocation => fornax_types::IngestMessage::PolicyRevocation {
+            envelope: envelope_text,
+        },
+    };
+    let mut line = serde_json::to_string(&msg)?;
+    line.push('\n');
+    use tokio::io::AsyncWriteExt;
+    stream.write_all(line.as_bytes()).await?;
+    drop(stream);
+
+    // Fire-and-forget over UDS carries no ack (FORNX-281 precedent) -- give
+    // the daemon a moment to process the message before polling for the
+    // result.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let status = match fetch_json(&format!("{}/api/policy", base_url())).await {
+        Ok(v) => v,
+        Err(_) => {
+            println!("fornax: submitted, but could not reach the daemon's HTTP API to confirm");
+            return Ok(());
+        }
+    };
+
+    match kind {
+        PolicyArtifactKind::Bundle => {
+            let active_digests: Vec<String> = status["active"]["members"]
+                .as_array()
+                .map(|members| {
+                    members
+                        .iter()
+                        .filter_map(|m| m["payload_digest"].as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            match &expected_digest {
+                Some(digest) if active_digests.iter().any(|d| d == digest) => {
+                    println!(
+                        "fornax: policy bundle imported and is now an active member ({digest})"
+                    );
+                }
+                _ => {
+                    if let Some(rejection) = status["last_rejection"].as_object() {
+                        println!(
+                            "fornax: policy bundle was NOT activated -- {} ({})\n  remediation: {}",
+                            rejection
+                                .get("message")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown reason"),
+                            rejection
+                                .get("code")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown_code"),
+                            rejection
+                                .get("remediation")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("none")
+                        );
+                    } else {
+                        println!(
+                            "fornax: submitted, but could not confirm activation yet -- \
+                             run `fornax policy status` to check current state"
+                        );
+                    }
+                }
+            }
+        }
+        PolicyArtifactKind::Revocation => {
+            // A revocation never becomes an "active member" -- there is no
+            // digest-in-active-generation check to make here. The issuer
+            // lives inside the signed payload, not the plaintext envelope,
+            // so there is nothing authenticated client-side to compare
+            // against `revocations.max_sequence_by_issuer` -- report the
+            // current state instead of a specific "your list took effect"
+            // confirmation.
+            println!(
+                "fornax: revocation list submitted -- run `fornax policy status` to confirm \
+                 the issuer's max_sequence advanced and see the current revocation count"
+            );
+            if let Some(revocations) = status.get("revocations") {
+                println!(
+                    "  revocations: entry_count={} unrecognized_entry_count={} max_sequence_by_issuer={}",
+                    revocations
+                        .get("entry_count")
+                        .unwrap_or(&serde_json::Value::Null),
+                    revocations
+                        .get("unrecognized_entry_count")
+                        .unwrap_or(&serde_json::Value::Null),
+                    revocations
+                        .get("max_sequence_by_issuer")
+                        .unwrap_or(&serde_json::Value::Null),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn render_policy_status(v: &serde_json::Value) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "configured: {}  degraded: {}  loaded_slot: {}\n",
+        v.get("configured").unwrap_or(&serde_json::Value::Null),
+        v.get("degraded").unwrap_or(&serde_json::Value::Null),
+        v.get("loaded_slot")
+            .and_then(|s| s.as_str())
+            .unwrap_or("none")
+    ));
+    // FORNX-123: posture is rendered as its own line, never collapsed into
+    // the pre-existing `degraded` boolean above -- `degraded` and `posture`
+    // answer different questions (see `compute_posture`'s doc comment).
+    if let Some(posture) = v.get("posture") {
+        out.push_str(&format!("posture: {posture}\n"));
+    }
+    if let Some(revocations) = v.get("revocations") {
+        out.push_str(&format!(
+            "revocations: entry_count={} unrecognized_entry_count={} max_sequence_by_issuer={}\n",
+            revocations
+                .get("entry_count")
+                .unwrap_or(&serde_json::Value::Null),
+            revocations
+                .get("unrecognized_entry_count")
+                .unwrap_or(&serde_json::Value::Null),
+            revocations
+                .get("max_sequence_by_issuer")
+                .unwrap_or(&serde_json::Value::Null),
+        ));
+    }
+    if let Some(tiers) = v.get("freshness").and_then(|f| f.get("tier_by_risk")) {
+        out.push_str(&format!(
+            "freshness (baseline): low={} elevated={} high={} critical={}\n",
+            tiers.get("low").unwrap_or(&serde_json::Value::Null),
+            tiers.get("elevated").unwrap_or(&serde_json::Value::Null),
+            tiers.get("high").unwrap_or(&serde_json::Value::Null),
+            tiers.get("critical").unwrap_or(&serde_json::Value::Null),
+        ));
+    }
+    if let Some(members) = v
+        .get("active")
+        .and_then(|a| a.get("members"))
+        .and_then(|m| m.as_array())
+    {
+        out.push_str(&format!("active generation members: {}\n", members.len()));
+        for m in members {
+            out.push_str(&format!(
+                "  - policy_id={} sequence={} revision={} verified_by={} expires_at={}\n",
+                m.get("policy_id").unwrap_or(&serde_json::Value::Null),
+                m.get("sequence").unwrap_or(&serde_json::Value::Null),
+                m.get("revision").unwrap_or(&serde_json::Value::Null),
+                m.get("verified_by").unwrap_or(&serde_json::Value::Null),
+                m.get("expires_at").unwrap_or(&serde_json::Value::Null),
+            ));
+        }
+    } else {
+        out.push_str("active generation: none\n");
+    }
+    if let Some(diags) = v.get("diagnostics").and_then(|d| d.as_array()) {
+        if !diags.is_empty() {
+            out.push_str(&format!("diagnostics ({}):\n", diags.len()));
+            for d in diags {
+                out.push_str(&format!(
+                    "  - [{}] {}: {}\n",
+                    d.get("severity").unwrap_or(&serde_json::Value::Null),
+                    d.get("code").unwrap_or(&serde_json::Value::Null),
+                    d.get("message").and_then(|m| m.as_str()).unwrap_or(""),
+                ));
+            }
+        }
+    }
+    if let Some(rejection) = v.get("last_rejection").and_then(|r| r.as_object()) {
+        out.push_str(&format!(
+            "last_rejection: [{}] {}\n",
+            rejection.get("code").unwrap_or(&serde_json::Value::Null),
+            rejection
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or(""),
+        ));
+    }
+    // FORNX-311: rendered as its own line, one of 8 outcomes -- never
+    // collapsed into a boolean.
+    match v.get("last_poll") {
+        Some(poll) if !poll.is_null() => {
+            out.push_str(&format!(
+                "last_poll: [{}] {} (bundles_received={} consecutive_failures={} \
+                 attempted_at={} next_attempt_at={})\n",
+                poll.get("outcome").unwrap_or(&serde_json::Value::Null),
+                poll.get("detail").and_then(|m| m.as_str()).unwrap_or(""),
+                poll.get("bundles_received")
+                    .unwrap_or(&serde_json::Value::Null),
+                poll.get("consecutive_failures")
+                    .unwrap_or(&serde_json::Value::Null),
+                poll.get("attempted_at").unwrap_or(&serde_json::Value::Null),
+                poll.get("next_attempt_at")
+                    .unwrap_or(&serde_json::Value::Null),
+            ));
+        }
+        _ => out.push_str("last_poll: none (no poll cycle has completed yet)\n"),
+    }
+    out
 }
 
 fn fornax_home() -> std::path::PathBuf {
@@ -1161,9 +1618,24 @@ fn render_evidence_graph(v: &serde_json::Value) -> String {
                     .get("linked_at")
                     .and_then(|s| s.as_str())
                     .unwrap_or("?");
-                out.push_str(&format!(
-                    "    evidence: {evidence_id}  linked_at: {linked_at}\n"
-                ));
+                // FORNX-319 AC3: never let a purged evidence row render as
+                // if it were simply absent or UNAVAILABLE — say explicitly
+                // that it expired. The finding/verdict this evidence once
+                // supported is unaffected; only the raw payload is gone.
+                let purged = link
+                    .get("evidence_purged")
+                    .and_then(|b| b.as_bool())
+                    .unwrap_or(false);
+                if purged {
+                    out.push_str(&format!(
+                        "    evidence: {evidence_id}  linked_at: {linked_at}  \
+                         [EVIDENCE EXPIRED — raw payload purged per retention policy]\n"
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "    evidence: {evidence_id}  linked_at: {linked_at}\n"
+                    ));
+                }
             }
         }
     }
@@ -1846,6 +2318,30 @@ mod tests {
         assert!(!rendered.contains("no evidence linked"));
     }
 
+    /// FORNX-319 AC3: a link whose evidence has been purged must render an
+    /// explicit "evidence expired" statement, never silently look identical
+    /// to an ordinary, still-present evidence link.
+    #[test]
+    fn render_evidence_graph_marks_purged_evidence_as_expired_not_silently_present() {
+        let v = serde_json::json!({
+            "claim": "c1", "session": "s1", "found": true,
+            "links": [
+                {"evidence_id": "e1", "relation": "supports", "linked_at": "2026-09-01T00:00:00Z", "evidence_purged": true},
+                {"evidence_id": "e2", "relation": "supports", "linked_at": "2026-09-01T00:00:01Z", "evidence_purged": false},
+            ],
+            "missing": [],
+        });
+        let rendered = render_evidence_graph(&v);
+        assert!(rendered.contains("evidence: e1"));
+        assert!(rendered.contains("EVIDENCE EXPIRED"));
+        // e2 is not purged — its line must not carry the expired marker.
+        let e2_line = rendered
+            .lines()
+            .find(|l| l.contains("evidence: e2"))
+            .expect("e2's line must be present");
+        assert!(!e2_line.contains("EVIDENCE EXPIRED"));
+    }
+
     /// FORNX-90 regression: a link with an unrecognized relation tag must
     /// still be shown, never silently dropped — "show each item" applies
     /// even to a state this renderer doesn't yet name.
@@ -2426,6 +2922,7 @@ trust_level = \"trusted\"\n";
                 provenance: "codex:rollout:exec_command_end".into(),
                 source: None,
                 extension: None,
+                evidence_purged: false,
             };
             store
                 .insert_evidence(&evidence)
@@ -2704,6 +3201,7 @@ trust_level = \"trusted\"\n";
                     derived_from: Vec::new(),
                 }),
                 extension: None,
+                evidence_purged: false,
             };
             store
                 .insert_evidence(&evidence)
@@ -2789,6 +3287,7 @@ trust_level = \"trusted\"\n";
                 provenance: "claude_code:PostToolUse:Bash#heuristic:stderr_empty".into(),
                 source: None,
                 extension: Some(extension),
+                evidence_purged: false,
             };
             store
                 .insert_evidence(&evidence)
@@ -3319,5 +3818,74 @@ trust_level = \"trusted\"\n";
             drift_state_label(&serde_json::json!("quantum_pending")),
             "◌ quantum_pending"
         );
+    }
+
+    #[test]
+    fn render_audit_verification_reports_valid() {
+        let rendered = render_audit_verification(&fornax_store::ChainVerification::Valid);
+        assert_eq!(rendered, "audit ledger: valid (hash chain intact)");
+    }
+
+    #[test]
+    fn render_audit_verification_reports_diverged_with_seq_and_kind() {
+        let rendered = render_audit_verification(&fornax_store::ChainVerification::Diverged {
+            first_bad_seq: 5,
+            kind: fornax_store::DivergenceKind::HashMismatch,
+        });
+        assert_eq!(
+            rendered,
+            "audit ledger: DIVERGED at seq=5 kind=HashMismatch"
+        );
+    }
+
+    #[test]
+    fn render_audit_list_reports_empty_ledger() {
+        assert_eq!(render_audit_list(&[]), "audit ledger: no events recorded\n");
+    }
+
+    /// FORNX-315: `fornax audit list`/`fornax audit verify` read the same
+    /// `fornax_store::Store` `export-spool` does (direct-store access, not
+    /// the daemon's HTTP API) -- proven end to end here, mirroring
+    /// `export_spool_from_store`'s own test pattern above of taking an
+    /// already-open `Store` rather than touching `$FORNAX_HOME`.
+    #[tokio::test]
+    async fn audit_verify_and_list_round_trip_through_a_real_store() {
+        use fornax_types::{
+            AuditAction as EventAction, AuditActor, AuditExportClass, AuditOutcome, AuditTarget,
+        };
+
+        let path =
+            std::env::temp_dir().join(format!("fornax-cli-audit-test-{}.db", uuid::Uuid::new_v4()));
+        let store = fornax_store::Store::open(&path).await.expect("open db");
+
+        let event = fornax_types::AuditEvent::new(
+            "e1",
+            "2026-09-03T00:00:00Z",
+            AuditActor::System,
+            EventAction::PermissionCheck,
+            AuditTarget::Permission {
+                target_id: "read_findings".into(),
+            },
+            AuditOutcome::Granted,
+            AuditExportClass::Metadata,
+        );
+        store
+            .append_audit_event(&event, "2026-09-03T00:00:00Z".parse().unwrap())
+            .await
+            .expect("append audit event");
+
+        let result = store.verify_audit_chain().await.expect("verify chain");
+        assert_eq!(
+            render_audit_verification(&result),
+            "audit ledger: valid (hash chain intact)"
+        );
+
+        let events = store.audit_events().await.expect("list events");
+        let rendered = render_audit_list(&events);
+        assert!(rendered.contains("seq=1"));
+        assert!(rendered.contains("event_id=e1"));
+        assert!(rendered.contains("PermissionCheck"));
+
+        std::fs::remove_file(&path).ok();
     }
 }

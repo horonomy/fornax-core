@@ -59,6 +59,15 @@ pub fn provider_is_stamped_consistently<A: AgentAdapter>(
                         // (see `fornax_types::Claim`/`Evidence`) — nothing
                         // to assert here.
                     }
+                    IngestMessage::PolicyBundle { .. } => {
+                        // FORNX-119: never emitted by an `AgentAdapter::normalize`
+                        // implementation — this variant is CLI/daemon-only
+                        // (`fornax policy import`) and carries no provider
+                        // field. Nothing to assert here.
+                    }
+                    IngestMessage::PolicyRevocation { .. } => {
+                        // FORNX-123: same reasoning as `PolicyBundle` above.
+                    }
                 }
             }
         }
