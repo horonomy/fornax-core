@@ -52,7 +52,7 @@ use std::collections::{BTreeSet, HashSet};
 
 use fornax_types::{Evidence, EvidenceGraph, SignalAvailability, Verdict};
 use fornax_verify::decision::{DecisionPolicy, DefaultRiskPolicy, RecommendationAction, RiskClass};
-use fornax_verify::fusion::{BaselineFusionPolicy, FusionInput, FusionPolicy};
+use fornax_verify::fusion::{BaselineFusionPolicy, FusionInput, FusionPolicy, UncertaintyBand};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -95,7 +95,7 @@ impl HarnessConfig {
 /// `fornax_verify::decision`'s own "policy identity is separate from fusion
 /// policy identity" split — a caller must be able to tell whether a
 /// disagreement came from fusion or from the risk mapping on top of it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PredictionRecord {
     pub trajectory_id: String,
     pub claim_id: Uuid,
@@ -103,6 +103,17 @@ pub struct PredictionRecord {
     pub predicted_action: RecommendationAction,
     pub expected_verdict: Verdict,
     pub critical_failure: bool,
+    /// [`FusedFinding::uncertainty`] verbatim -- carried so
+    /// [`crate::regression::compare`] can report an uncertainty-band
+    /// regression on a case whose verdict/action did not change (FORNX-344
+    /// AC 3: "compares ... at case level").
+    pub uncertainty: UncertaintyBand,
+    /// [`FusedFinding::counted_link_ids`] verbatim.
+    pub counted_link_ids: Vec<Uuid>,
+    /// [`FusedFinding::discounted_link_ids`] verbatim.
+    pub discounted_link_ids: Vec<Uuid>,
+    /// [`FusedFinding::missing_evidence_ids`] verbatim.
+    pub missing_evidence_ids: Vec<Uuid>,
     /// True when the evidence this trajectory needed was not actually
     /// resolvable at fusion time — determined from the *input* state
     /// (concerning missing-evidence notes, unresolvable links, or this run's
@@ -278,6 +289,10 @@ pub fn run_harness(
                 predicted_action: recommendation.action,
                 expected_verdict: t.adjudicated_expected_outcome.expected_verdict,
                 critical_failure: t.adjudicated_expected_outcome.critical_failure,
+                uncertainty: fused.uncertainty,
+                counted_link_ids: fused.counted_link_ids.clone(),
+                discounted_link_ids: fused.discounted_link_ids.clone(),
+                missing_evidence_ids: fused.missing_evidence_ids.clone(),
                 evidence_unavailable,
                 ablation_removed_evidence,
                 is_synthetic: t.labeling_provenance.is_synthetic(),

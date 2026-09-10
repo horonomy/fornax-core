@@ -158,6 +158,7 @@ pub fn compute_metrics(predictions: &[PredictionRecord]) -> MetricsReport {
 mod metrics_tests {
     use super::*;
     use fornax_types::Verdict;
+    use fornax_verify::fusion::UncertaintyBand;
     use uuid::Uuid;
 
     fn record(
@@ -174,6 +175,10 @@ mod metrics_tests {
             predicted_action,
             expected_verdict,
             critical_failure,
+            uncertainty: UncertaintyBand::Qualified,
+            counted_link_ids: Vec::new(),
+            discounted_link_ids: Vec::new(),
+            missing_evidence_ids: Vec::new(),
             evidence_unavailable,
             ablation_removed_evidence: false,
             is_synthetic: true,
