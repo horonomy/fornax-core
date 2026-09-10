@@ -278,3 +278,48 @@ jobs:
       - name: cargo audit
         if: steps.has_crates.outputs.present == 'true'
         run: cargo audit
+
+  # FORNX-344: mechanism-verification only, over the committed synthetic
+  # fixtures in crates/fornax-bench/fixtures/integrity-lab/ -- proves the
+  # regress freeze/compare/gate mechanism itself works, never a real
+  # calibration benchmark result (no real labeled corpus exists yet; see
+  # docs/adr/0020-integrity-regression-lab.md). Deliberately NOT a required
+  # status check on `main` branch protection (only `rust` is) -- promoting
+  # it once a real corpus exists is an explicit, deferred, owner-only
+  # decision, not something this job should force by going red.
+  # Path-filtered like `changes`/`rust` above, but scoped to this crate's
+  # own dependency surface, and runs `-p fornax-bench` only, never
+  # `--workspace`.
+  integrity-lab:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          fetch-depth: 0
+      - name: determine affected surface
+        id: filter
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "non-PR event (${{ github.event_name }}): always running"
+            exit 0
+          fi
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          changed="$(git diff --name-only "$base...$head" || true)"
+          if [ -z "$changed" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if echo "$changed" | grep -Eq '^crates/fornax-bench/|^crates/fornax-types/|^crates/fornax-verify/|^\.github/workflows/ci\.yml$'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.filter.outputs.code == 'true'
+      - uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3 # v2
+        if: steps.filter.outputs.code == 'true'
+      - name: cargo test -p fornax-bench
+        if: steps.filter.outputs.code == 'true'
+        run: cargo test -p fornax-bench
