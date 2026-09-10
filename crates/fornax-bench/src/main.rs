@@ -10,10 +10,14 @@ use fornax_verify::decision::{DefaultRiskPolicy, RiskClass};
 use fornax_verify::fusion::BaselineFusionPolicy;
 
 use fornax_bench::ablation::run_ablation;
+use fornax_bench::baseline::{freeze_baseline, BaselineReport};
 use fornax_bench::dataset::Dataset;
+use fornax_bench::gate::{evaluate_gate, GateVerdict, RegressionBudget};
 use fornax_bench::harness::{run_harness, HarnessConfig};
 use fornax_bench::manifest::build_manifest;
 use fornax_bench::metrics::compute_metrics;
+use fornax_bench::regression::compare;
+use fornax_bench::slice::compute_slices;
 
 #[derive(Parser)]
 #[command(
@@ -62,6 +66,49 @@ enum Command {
         /// (`Dataset::known_sensor_names`).
         #[arg(long)]
         sensors: Option<String>,
+    },
+    /// The integrity regression lab (FORNX-344): freeze a baseline run, or
+    /// compare a fresh run against a previously frozen one.
+    Regress {
+        #[command(subcommand)]
+        action: RegressAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum RegressAction {
+    /// Run the pipeline over `--dataset` and write a `BaselineReport` to
+    /// `--out` -- the artifact `regress compare` diffs a later run against.
+    Freeze {
+        #[arg(long)]
+        dataset: PathBuf,
+        #[arg(long, default_value = "balanced")]
+        risk: String,
+        #[arg(long, default_value = "")]
+        disable_sensor: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Run the pipeline over `--dataset` and compare it against the frozen
+    /// `--baseline`, printing the case-level `RegressionComparison` plus
+    /// the gate's `GateReason` as JSON. Exits non-zero only on
+    /// `GateVerdict::Block` -- `Untested`/`Inconclusive` are printed but do
+    /// not fail the process, since neither one is itself a detected defect.
+    Compare {
+        #[arg(long)]
+        dataset: PathBuf,
+        #[arg(long, default_value = "balanced")]
+        risk: String,
+        #[arg(long, default_value = "")]
+        disable_sensor: String,
+        #[arg(long)]
+        baseline: PathBuf,
+        /// Path to a `RegressionBudget` JSON file. When omitted, uses
+        /// `{"calibrated": false, "rules": []}` -- the same honestly-
+        /// uncalibrated default this crate's own committed fixture ships,
+        /// which always resolves to `Untested`.
+        #[arg(long)]
+        budget: Option<PathBuf>,
     },
 }
 
@@ -139,6 +186,62 @@ fn main() -> anyhow::Result<()> {
             });
             println!("{}", serde_json::to_string_pretty(&output)?);
         }
+        Command::Regress { action } => match action {
+            RegressAction::Freeze {
+                dataset,
+                risk,
+                disable_sensor,
+                out,
+            } => {
+                let dataset = Dataset::load(&dataset)?;
+                let risk_class = parse_risk_class(&risk).map_err(anyhow::Error::msg)?;
+                let mut config = HarnessConfig::new(risk_class);
+                config.disabled_sensors = parse_sensor_list(&disable_sensor);
+
+                let baseline = freeze_baseline(&dataset, &config, &run_at);
+                std::fs::write(&out, serde_json::to_string_pretty(&baseline)?)?;
+                println!(
+                    "fornax-bench regress freeze: wrote baseline ({} trajectories) to {}",
+                    baseline.predictions.len(),
+                    out.display()
+                );
+            }
+            RegressAction::Compare {
+                dataset,
+                risk,
+                disable_sensor,
+                baseline,
+                budget,
+            } => {
+                let dataset = Dataset::load(&dataset)?;
+                let risk_class = parse_risk_class(&risk).map_err(anyhow::Error::msg)?;
+                let mut config = HarnessConfig::new(risk_class);
+                config.disabled_sensors = parse_sensor_list(&disable_sensor);
+
+                let current = freeze_baseline(&dataset, &config, &run_at);
+                let baseline: BaselineReport = serde_json::from_slice(&std::fs::read(&baseline)?)?;
+                let comparison = compare(&baseline, &current);
+                let slices = compute_slices(&dataset.trajectories);
+                let regression_budget: RegressionBudget = match budget {
+                    Some(path) => serde_json::from_slice(&std::fs::read(&path)?)?,
+                    None => RegressionBudget {
+                        calibrated: false,
+                        rules: Vec::new(),
+                    },
+                };
+                let gate = evaluate_gate(&comparison, &slices, &regression_budget);
+
+                let output = serde_json::json!({
+                    "comparison": comparison,
+                    "gate": gate,
+                });
+                println!("{}", serde_json::to_string_pretty(&output)?);
+
+                if gate.verdict == GateVerdict::Block {
+                    anyhow::bail!("fornax-bench regress compare: gate verdict is Block");
+                }
+            }
+        },
     }
 
     Ok(())
