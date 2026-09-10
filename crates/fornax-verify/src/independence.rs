@@ -62,7 +62,8 @@ use uuid::Uuid;
 /// type names the *strongest* one this module recorded for a given union),
 /// but the family itself is the operative unit -- `bases` on
 /// [`SourceFamily`] lists every distinct reason found across the family.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FamilyBasis {
     /// FORNX-92's explicit `correlation_group`, honored when a sensor
     /// actually stamps one -- see this module's docs for why that's rare on
@@ -80,7 +81,7 @@ pub enum FamilyBasis {
 
 /// One set of evidence ids judged to count as a single effective source,
 /// plus every distinct reason recorded for the union.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SourceFamily {
     /// Sorted, so two families with the same membership always compare and
     /// serialize identically regardless of build order.
