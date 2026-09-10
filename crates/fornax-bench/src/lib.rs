@@ -44,10 +44,14 @@
 //!   config, the frozen artifact [`regression::compare`] diffs against.
 //! - [`regression`] — FORNX-344: case-level comparison between a frozen
 //!   baseline and a fresh run over the same dataset.
+//! - [`gate`] — FORNX-344: the fail-closed PASS/BLOCK/INCONCLUSIVE/UNTESTED
+//!   verdict over a `RegressionComparison`, per
+//!   `docs/release-assurance-policy.md`'s verdict vocabulary.
 
 pub mod ablation;
 pub mod baseline;
 pub mod dataset;
+pub mod gate;
 pub mod harness;
 pub mod manifest;
 pub mod metrics;
