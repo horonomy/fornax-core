@@ -121,17 +121,33 @@ many candidates were produced. Benign controls are mandatory —
 `fornax corpus export` refuses a controls-absent corpus, so mine enough
 sessions that at least one produces a clean, uncontroversial control case.
 
-## Phase 2 — enqueue for review (automated, one command per candidate)
+## Phase 2 — select and enqueue for review (automated, one command)
 
-List what was mined, then enqueue each case id:
+Updated since this doc was first written (FORNX-349): don't hand-pick cases
+with `enqueue` — rank every mined candidate by real, named signals
+(unresolved conflict, cross-sensor disagreement, high uncertainty,
+correlated evidence, sanitization-altered outcome, verdict instability, and
+any recorded `fornax feedback` disagreement) and enqueue the top N in one
+step:
 
 ```bash
-sqlite3 "$FORNAX_HOME/fornax.db" \
-  "SELECT id, session_id, json_extract(document, '$.mined_by') FROM corpus_candidates ORDER BY mined_at;"
+fornax adjudicate sample --budget 12 --dry-run   # inspect the plan first
+fornax adjudicate sample --budget 12             # enqueue for real
+```
 
-for case in <case-id-1> <case-id-2> ...; do
-  fornax adjudicate enqueue --case "$case"
-done
+`--dry-run` prints the selected cases with the exact signal(s) each was
+picked for, plus every deferred case and why (pattern quota reached, budget
+exhausted, or no signal at all) — nothing is silently dropped. The
+`--max-per-pattern` flag (default 2) bounds how many near-duplicate cases
+from one mining shape can consume the pilot's budget, so a repeated pattern
+cannot crowd out a genuinely distinct one.
+
+If you need to enqueue a *specific* case `sample` didn't select — e.g. one
+you already reviewed informally and want a second opinion on — the original
+manual path still works:
+
+```bash
+fornax adjudicate enqueue --case <case-id> --reason "manual: <why>"
 ```
 
 Add `--double-review` on the subset (≥20, if you later go for a real kappa)

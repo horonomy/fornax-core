@@ -19,6 +19,7 @@ pub mod audit_ledger;
 pub mod calibration;
 pub mod compliance_report;
 pub mod corpus;
+pub mod feedback;
 pub mod policy_cache;
 pub mod retention;
 

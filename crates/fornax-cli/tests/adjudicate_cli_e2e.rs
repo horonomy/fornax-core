@@ -515,3 +515,76 @@ fn view_id_from(output: &str) -> String {
         .trim_start_matches("view: ")
         .to_string()
 }
+
+/// FORNX-349 AC1/AC2/AC3/AC4: `fornax feedback submit` records an
+/// agent-authored disagreement, and `fornax adjudicate sample` picks the
+/// disagreed-with case up as a real, named `HumanFeedbackDisagreement`
+/// signal -- without that feedback ever becoming a `ReviewOutcome`/
+/// `CaseLabel` (see `feedback_module_never_references_adjudication_label_or_gold_types`
+/// in `fornax-corpus` for the structural half of that guarantee).
+#[tokio::test]
+async fn feedback_disagreement_surfaces_in_sample_and_is_enqueued_once() {
+    let home = temp_home("sample-feedback");
+    let case_ids = seed_contradiction_sessions(&home, 1).await;
+    let case = &case_ids[0];
+
+    let submit_out = run(
+        &home,
+        &[
+            "feedback",
+            "submit",
+            "--case",
+            case,
+            "--disposition",
+            "disagrees-with-finding",
+            "--reason",
+            "the exit-code contradiction looks like a flaky retry, not a real conflict",
+            "--confidence",
+            "medium",
+            "--as-agent",
+            "fixture-agent-1",
+        ],
+    );
+    assert!(submit_out.contains("recorded"), "{submit_out}");
+
+    let dry_run_out = run(
+        &home,
+        &["adjudicate", "sample", "--budget", "5", "--dry-run"],
+    );
+    assert!(
+        dry_run_out.contains(case.as_str()),
+        "case with feedback disagreement must be selected: {dry_run_out}"
+    );
+    assert!(
+        dry_run_out.contains("HumanFeedbackDisagreement"),
+        "selection must be attributed to the real signal it was found by: {dry_run_out}"
+    );
+    assert!(
+        dry_run_out.contains("dry run, nothing enqueued"),
+        "{dry_run_out}"
+    );
+
+    let queue_after_dry_run = run(&home, &["adjudicate", "queue"]);
+    assert!(
+        !queue_after_dry_run.contains(case.as_str()),
+        "dry run must not enqueue: {queue_after_dry_run}"
+    );
+
+    let sample_out = run(&home, &["adjudicate", "sample", "--budget", "5"]);
+    assert!(sample_out.contains("enqueued 1 case"), "{sample_out}");
+
+    let queue_after_sample = run(&home, &["adjudicate", "queue"]);
+    assert!(
+        queue_after_sample.contains(case.as_str()),
+        "{queue_after_sample}"
+    );
+
+    // Running `sample` again must never double-enqueue the same case.
+    let second_sample_out = run(&home, &["adjudicate", "sample", "--budget", "5"]);
+    assert!(
+        second_sample_out.contains("0 selected"),
+        "already-enqueued case must be excluded: {second_sample_out}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}

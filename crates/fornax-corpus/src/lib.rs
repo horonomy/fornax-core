@@ -28,16 +28,27 @@
 
 pub mod adjudication;
 pub mod candidate;
+pub mod feedback;
 pub mod manifest;
 pub mod mining;
 pub mod promote;
+pub mod sampling;
 
 pub use candidate::{
     sanitize, CandidateCase, WithheldEvidence, WithheldReason, CANDIDATE_SCHEMA_VERSION,
     EXPORTABLE_EVIDENCE_KINDS, MAX_CANDIDATE_PAYLOAD_BYTES,
+};
+pub use feedback::{
+    FeedbackAuthor, FeedbackBinding, FeedbackDisposition, ReviewFeedback, FEEDBACK_SCHEMA_VERSION,
 };
 pub use manifest::{
     build_corpus_manifest, CandidateCorpusManifest, CorpusError, CORPUS_MANIFEST_SCHEMA_VERSION,
 };
 pub use mining::{evaluate, MiningInput, MiningStrategy};
 pub use promote::promote_to_labeled_trajectory;
+pub use sampling::{
+    derived_verdict_agreement, signals_for_case, CaseSignals, DeferralReason, DeferredCase,
+    DeterministicSamplingPolicy, PatternKey, ReviewBudget, SamplingPlan, SamplingPolicy,
+    SamplingSignal, SelectedCase, VerdictAgreement, DEFAULT_MAX_PER_PATTERN,
+    SAMPLING_POLICY_VERSION,
+};
