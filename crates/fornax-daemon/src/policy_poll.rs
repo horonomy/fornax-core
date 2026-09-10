@@ -1014,6 +1014,7 @@ mod tests {
             store,
             caps: Arc::new(TokioMutex::new(std::collections::HashMap::new())),
             processing: Arc::new(TokioMutex::new(())),
+            home_id: Arc::from(format!("test-home-{}", uuid::Uuid::new_v4()).as_str()),
             trust: Arc::new(trust),
             policy: Arc::new(TokioRwLock::new(crate::PolicyCacheSnapshot::empty())),
         };
