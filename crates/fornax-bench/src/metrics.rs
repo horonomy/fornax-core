@@ -89,6 +89,15 @@ pub struct MetricsReport {
     pub contains_synthetic_labels: bool,
 }
 
+/// A `PredictionRecord` is "correct" iff evidence was available and its
+/// predicted verdict matches the adjudicated expected one -- the same
+/// predicate `compute_metrics` uses for `correct_count`/`incorrect_count`,
+/// pulled out so [`crate::regression::compare`] classifies a case's
+/// correctness identically rather than duplicating the definition.
+pub fn is_correct(p: &PredictionRecord) -> bool {
+    !p.evidence_unavailable && p.predicted_verdict == p.expected_verdict
+}
+
 fn ratio(numerator: usize, denominator: usize) -> Option<f64> {
     if denominator == 0 {
         None
@@ -111,10 +120,7 @@ pub fn compute_metrics(predictions: &[PredictionRecord]) -> MetricsReport {
         .collect();
     let evaluable_count = evaluable.len();
 
-    let correct_count = evaluable
-        .iter()
-        .filter(|p| p.predicted_verdict == p.expected_verdict)
-        .count();
+    let correct_count = evaluable.iter().filter(|p| is_correct(p)).count();
     let incorrect_count = evaluable_count - correct_count;
 
     let true_positives = evaluable
@@ -158,6 +164,7 @@ pub fn compute_metrics(predictions: &[PredictionRecord]) -> MetricsReport {
 mod metrics_tests {
     use super::*;
     use fornax_types::Verdict;
+    use fornax_verify::fusion::UncertaintyBand;
     use uuid::Uuid;
 
     fn record(
@@ -174,6 +181,10 @@ mod metrics_tests {
             predicted_action,
             expected_verdict,
             critical_failure,
+            uncertainty: UncertaintyBand::Qualified,
+            counted_link_ids: Vec::new(),
+            discounted_link_ids: Vec::new(),
+            missing_evidence_ids: Vec::new(),
             evidence_unavailable,
             ablation_removed_evidence: false,
             is_synthetic: true,

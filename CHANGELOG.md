@@ -9,6 +9,19 @@ Jira epic FORNX-20.
 
 ### Added
 
+- `fornax-bench regress freeze/compare` (FORNX-344, Stage 8): an integrity
+  regression lab reusing `docs/release-assurance-policy.md`'s own
+  PASS/BLOCK/INCONCLUSIVE/UNTESTED verdict vocabulary for a fail-closed
+  gate over case-level regressions, matched by trajectory id (never by
+  position) between a frozen baseline and a fresh run. Breaks a comparison
+  down by the only trajectory dimensions this codebase can actually
+  observe (sensor, provider) via a new `slice` module. An empty or
+  uncalibrated regression budget resolves to `Untested`, never a vacuous
+  `Pass`, from `Iterator::all` over zero rules. Commits synthetic
+  mechanism-verification fixtures under
+  `crates/fornax-bench/fixtures/integrity-lab/` -- no numeric regression
+  threshold is committed, since no real corpus exists yet to calibrate one
+  from. See `docs/adr/0020-integrity-regression-lab.md`.
 - `fornax feedback submit/list` + `fornax adjudicate sample` (FORNX-349,
   Stage 8): a product-feedback channel structurally kept out of the
   adjudication/gold-label pipeline (`ReviewFeedback` carries a

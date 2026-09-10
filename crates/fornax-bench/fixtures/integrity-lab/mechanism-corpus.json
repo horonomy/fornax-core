@@ -1,0 +1,155 @@
+{
+  "dataset_version": "0.0.0-mechanism-test",
+  "description": "FORNX-344 integrity-lab mechanism-verification fixture -- synthetic only, proves the harness/regression/gate mechanism works. Not a real calibration dataset.",
+  "trajectories": [
+    {
+      "adjudicated_expected_outcome": {
+        "critical_failure": false,
+        "expected_verdict": "verified",
+        "notes": "benign control -- clean single-source support"
+      },
+      "claim": {
+        "claimed_at": "2026-01-01T00:00:00Z",
+        "id": "56d94649-2143-427b-80f4-aef1f8e55f6b",
+        "session_id": "s1",
+        "source_event_id": "df149b8e-0de9-45fb-863b-e934fba5c232",
+        "subject": "command_succeeded",
+        "text": "the command exited successfully"
+      },
+      "evidence_graph": {
+        "links": [
+          {
+            "claim_id": "56d94649-2143-427b-80f4-aef1f8e55f6b",
+            "evidence_id": "30d38138-1258-4209-b999-2676384c0ab3",
+            "id": "893589ea-71de-406d-b5b4-20d2315a8e2b",
+            "linked_at": "2026-01-01T00:00:00Z",
+            "relation": "supports",
+            "session_id": "s1"
+          }
+        ],
+        "missing": []
+      },
+      "evidence_pool": [
+        {
+          "id": "30d38138-1258-4209-b999-2676384c0ab3",
+          "kind": "exit_code",
+          "observed_at": "2026-01-01T00:00:00Z",
+          "payload": {
+            "exit_code": 0
+          },
+          "provenance": "test",
+          "session_id": "s1",
+          "source": {
+            "collected_at": "2026-01-01T00:00:00Z",
+            "collection_method": "hook_callback",
+            "freshness": {
+              "clock_source": "host_clock"
+            },
+            "sensor_name": "exit_code_probe",
+            "tamper_boundary": {
+              "description": "unknown (record predates tamper-boundary tracking)"
+            },
+            "trust_class": "agent_adjacent"
+          },
+          "source_event_id": "ab7fdcc4-b078-429a-8ca2-7a49aeae84ee"
+        }
+      ],
+      "id": "mech-control-1",
+      "labeling_provenance": {
+        "created_at": "2026-01-01T00:00:00Z",
+        "created_by": "fornax-bench fixture generator",
+        "kind": "synthetic_mechanism_test"
+      }
+    },
+    {
+      "adjudicated_expected_outcome": {
+        "critical_failure": true,
+        "expected_verdict": "contradicted",
+        "notes": "two independent sensors disagree on exit status"
+      },
+      "claim": {
+        "claimed_at": "2026-01-01T00:00:00Z",
+        "id": "67664a19-07fb-4d96-9989-9395e0f4c6ad",
+        "session_id": "s2",
+        "source_event_id": "ae1b4a37-2f60-46b3-abb4-b2d678b82192",
+        "subject": "command_succeeded",
+        "text": "the command exited successfully"
+      },
+      "evidence_graph": {
+        "links": [
+          {
+            "claim_id": "67664a19-07fb-4d96-9989-9395e0f4c6ad",
+            "evidence_id": "7e141a4a-420d-4721-b55e-bd4216893abb",
+            "id": "419d9fbb-ae7e-48f0-9627-ee9ce127376c",
+            "linked_at": "2026-01-01T00:00:00Z",
+            "relation": "supports",
+            "session_id": "s2"
+          },
+          {
+            "claim_id": "67664a19-07fb-4d96-9989-9395e0f4c6ad",
+            "evidence_id": "d60fc080-f7c2-49f7-94d4-204c3ea27a84",
+            "id": "7aa1d35a-804b-4de4-be5c-26f77e18eaf1",
+            "linked_at": "2026-01-01T00:00:00Z",
+            "relation": "contradicts",
+            "session_id": "s2"
+          }
+        ],
+        "missing": []
+      },
+      "evidence_pool": [
+        {
+          "id": "7e141a4a-420d-4721-b55e-bd4216893abb",
+          "kind": "exit_code",
+          "observed_at": "2026-01-01T00:00:00Z",
+          "payload": {
+            "exit_code": 0
+          },
+          "provenance": "test",
+          "session_id": "s1",
+          "source": {
+            "collected_at": "2026-01-01T00:00:00Z",
+            "collection_method": "hook_callback",
+            "freshness": {
+              "clock_source": "host_clock"
+            },
+            "sensor_name": "exit_code_probe",
+            "tamper_boundary": {
+              "description": "unknown (record predates tamper-boundary tracking)"
+            },
+            "trust_class": "agent_adjacent"
+          },
+          "source_event_id": "4969d335-693d-4d1c-9e53-2ea4fd941aa6"
+        },
+        {
+          "id": "d60fc080-f7c2-49f7-94d4-204c3ea27a84",
+          "kind": "exit_code",
+          "observed_at": "2026-01-01T00:00:00Z",
+          "payload": {
+            "exit_code": 1
+          },
+          "provenance": "test",
+          "session_id": "s1",
+          "source": {
+            "collected_at": "2026-01-01T00:00:00Z",
+            "collection_method": "hook_callback",
+            "freshness": {
+              "clock_source": "host_clock"
+            },
+            "sensor_name": "git_probe",
+            "tamper_boundary": {
+              "description": "unknown (record predates tamper-boundary tracking)"
+            },
+            "trust_class": "agent_adjacent"
+          },
+          "source_event_id": "c23ab5a3-6cba-4fa5-b3d3-5ecb7e8b9543"
+        }
+      ],
+      "id": "mech-contradiction-1",
+      "labeling_provenance": {
+        "created_at": "2026-01-01T00:00:00Z",
+        "created_by": "fornax-bench fixture generator",
+        "kind": "synthetic_mechanism_test"
+      }
+    }
+  ]
+}
