@@ -12,6 +12,7 @@ use sqlx::SqlitePool;
 use std::path::Path;
 use std::str::FromStr;
 
+pub mod adjudication;
 pub mod audit_checkpoint;
 pub mod audit_ledger;
 pub mod compliance_report;
@@ -66,6 +67,12 @@ pub enum StoreError {
         "corpus mining is disabled -- set FORNAX_CORPUS_MINING_ENABLED=1 to opt in (FORNX-341)"
     )]
     CorpusMiningDisabled,
+    /// FORNX-342: `gold_labels` is insert-only (`(case_id, revision)` is its
+    /// primary key) -- a caller must compute the next revision number via
+    /// `fornax_corpus::adjudication::next_revision`, never overwrite an
+    /// existing one.
+    #[error("gold label revision {case_id}#{revision} is already frozen -- relabeling must use the next revision number, never overwrite one")]
+    GoldLabelAlreadyFrozen { case_id: String, revision: u32 },
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
