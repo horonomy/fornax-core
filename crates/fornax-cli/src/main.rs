@@ -9,6 +9,7 @@ mod corpus_cmd;
 mod evidence_plan_cmd;
 mod experiment_ux;
 mod feedback_cmd;
+mod receipt_cmd;
 mod timeline;
 
 #[derive(Parser)]
@@ -329,6 +330,14 @@ enum Commands {
         #[command(subcommand)]
         action: feedback_cmd::FeedbackAction,
     },
+    /// Portable integrity receipts (FORNX-350): issue a deterministic,
+    /// reference-only receipt from a real local finding, or verify one
+    /// against a gate policy. Verification-only -- `receipt issue` never
+    /// signs anything; see `fornax_types::receipt`'s module docs.
+    Receipt {
+        #[command(subcommand)]
+        action: receipt_cmd::ReceiptAction,
+    },
 }
 
 /// `fornax audit <action>` (FORNX-315).
@@ -602,6 +611,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Corpus { action } => corpus_cmd::handle(action, &fornax_home()).await?,
         Commands::Adjudicate { action } => adjudicate_cmd::handle(action, &fornax_home()).await?,
         Commands::Feedback { action } => feedback_cmd::handle(action, &fornax_home()).await?,
+        Commands::Receipt { action } => receipt_cmd::handle(action, &fornax_home()).await?,
     }
     Ok(())
 }

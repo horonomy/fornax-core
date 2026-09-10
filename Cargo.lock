@@ -923,6 +923,7 @@ dependencies = [
  "fornax-bench",
  "fornax-corpus",
  "fornax-experiment-runner",
+ "fornax-receipt",
  "fornax-replay",
  "fornax-store",
  "fornax-types",
