@@ -45,7 +45,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::reliability::{DriftAssessment, DriftState};
+use crate::reliability::{DriftAssessment, DriftState, ReliabilitySignal};
 use fornax_types::calibration::CalibrationProvenance;
 use fornax_types::SampleSupport;
 
@@ -191,10 +191,67 @@ pub fn assess_calibration(
     }
 }
 
+/// The single human-readable explanation of *why* a [`CalibrationState`]
+/// suppresses a numeric estimate, shared by every consumer that needs to
+/// say so — [`crate::decision::apply_calibration_floor`]'s rationale
+/// appendix and [`CalibratedReliabilityView`] below both call this rather
+/// than each writing their own wording, so the two can never drift apart
+/// on what "stale" or "suspect" means in prose.
+///
+/// `None` for [`CalibrationState::Valid`]/[`CalibrationState::NoActiveCalibration`]
+/// — neither suppresses anything.
+pub fn suppression_reason(state: &CalibrationState) -> Option<String> {
+    match state {
+        CalibrationState::Valid | CalibrationState::NoActiveCalibration => None,
+        CalibrationState::Stale { changed_dimensions } => Some(format!(
+            "calibration stale (changed: {})",
+            changed_dimensions.join(", ")
+        )),
+        CalibrationState::Suspect { drift_state } => {
+            Some(format!("calibration suspect (drift: {:?})", drift_state))
+        }
+        CalibrationState::InsufficientSupport { .. } => {
+            Some("calibration support insufficient to confirm validity".to_string())
+        }
+    }
+}
+
+/// A [`ReliabilitySignal`] paired with the [`CalibrationState`] it was read
+/// under (FORNX-348). Replaces the ad-hoc `superseded_by_drift: bool`
+/// parameter `fornax-cli`'s renderer used to take — that boolean could only
+/// ever say "drift superseded this", never "stale provenance superseded
+/// this" or "insufficient support superseded this". `estimate_suppressed_because`
+/// is `None` exactly when `signal.reliability_estimate` may still be shown
+/// as current; whenever it is `Some`, a consumer must not render the
+/// numeric estimate even if one is present on `signal`, and should show
+/// this reason string instead.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CalibratedReliabilityView {
+    pub signal: ReliabilitySignal,
+    pub calibration_state: CalibrationState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate_suppressed_because: Option<String>,
+}
+
+impl CalibratedReliabilityView {
+    /// Builds the view, deriving `estimate_suppressed_because` from
+    /// `calibration_state` via [`suppression_reason`] — never computed
+    /// independently, so a caller cannot construct a view whose reason
+    /// string disagrees with what the state actually implies.
+    pub fn new(signal: ReliabilitySignal, calibration_state: CalibrationState) -> Self {
+        let estimate_suppressed_because = suppression_reason(&calibration_state);
+        Self {
+            signal,
+            calibration_state,
+            estimate_suppressed_because,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reliability::{ConfidenceInterval, ReliabilityEstimate, ReliabilitySignal};
+    use crate::reliability::{ConfidenceInterval, ReliabilityEstimate};
     use fornax_types::{
         aggregate_context, CapabilitySignal, ModelFamily, RawReliabilityContext,
         RawRepositoryContext, ReliabilityContextKey, RepositoryClass, RuntimeCapabilities,

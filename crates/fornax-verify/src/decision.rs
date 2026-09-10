@@ -295,23 +295,7 @@ pub fn apply_calibration_floor(
     rec: Recommendation,
     state: &crate::calibration::CalibrationState,
 ) -> Recommendation {
-    use crate::calibration::CalibrationState;
-
-    let reason = match state {
-        CalibrationState::Valid | CalibrationState::NoActiveCalibration => None,
-        CalibrationState::Stale { changed_dimensions } => Some(format!(
-            "calibration stale (changed: {})",
-            changed_dimensions.join(", ")
-        )),
-        CalibrationState::Suspect { drift_state } => {
-            Some(format!("calibration suspect (drift: {:?})", drift_state))
-        }
-        CalibrationState::InsufficientSupport { .. } => {
-            Some("calibration support insufficient to confirm validity".to_string())
-        }
-    };
-
-    let Some(reason) = reason else {
+    let Some(reason) = crate::calibration::suppression_reason(state) else {
         return rec;
     };
 
