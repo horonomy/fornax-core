@@ -226,3 +226,83 @@ pub(crate) fn render_evidence_plan(v: &serde_json::Value) -> String {
 
     out
 }
+
+/// Icon for an `AcquisitionOutcome` variant name, mirroring
+/// `verdict_icon`/`recommendation_icon`'s never-collapse-the-vocabulary
+/// discipline.
+fn acquisition_outcome_icon(outcome: &str) -> &'static str {
+    match outcome {
+        "acquired" => "✓",
+        "refused" => "!",
+        "unavailable" => "?",
+        "failed" => "✕",
+        "unsupported" => "-",
+        _ => "?",
+    }
+}
+
+/// Renders `POST /api/acquire-evidence`'s response: `fused_before` (via
+/// `render_fusion`, wrapped into the envelope shape it expects), the
+/// acquisition outcome, and `fused_after` when the probe actually acquired
+/// something -- never one without the other when both are present.
+pub(crate) fn render_acquire_evidence(v: &serde_json::Value) -> String {
+    let claim = v.get("claim").and_then(|s| s.as_str()).unwrap_or("?");
+    let session = v.get("session").and_then(|s| s.as_str()).unwrap_or("?");
+    let mut out = String::new();
+
+    if let Some(error) = v.get("error").and_then(|s| s.as_str()) {
+        out.push_str(&format!(
+            "claim: {claim}\nsession: {session}\n  error: {error}\n"
+        ));
+        return out;
+    }
+    let found = v.get("found").and_then(|b| b.as_bool()).unwrap_or(false);
+    if !found {
+        let reason = v
+            .get("reason")
+            .and_then(|s| s.as_str())
+            .unwrap_or("no claim with this id is on record for this session");
+        out.push_str(&format!(
+            "claim: {claim}\nsession: {session}\n  no such claim on record ({reason})\n"
+        ));
+        return out;
+    }
+
+    if let Some(fused_before) = v.get("fused_before") {
+        out.push_str("before:\n");
+        out.push_str(&crate::render_fusion(&serde_json::json!({
+            "claim": claim,
+            "session": session,
+            "found": true,
+            "graph_source": "acquire-evidence",
+            "fused": fused_before,
+        })));
+    }
+
+    let outcome = v.get("outcome").and_then(|s| s.as_str()).unwrap_or("?");
+    let detail_reason = v
+        .get("detail")
+        .and_then(|d| d.get("reason"))
+        .and_then(|s| s.as_str());
+    out.push_str(&format!(
+        "\nacquisition: {} {}\n",
+        acquisition_outcome_icon(outcome),
+        outcome.to_uppercase()
+    ));
+    if let Some(reason) = detail_reason {
+        out.push_str(&format!("  {reason}\n"));
+    }
+
+    if let Some(fused_after) = v.get("fused_after").filter(|f| !f.is_null()) {
+        out.push_str("\nafter:\n");
+        out.push_str(&crate::render_fusion(&serde_json::json!({
+            "claim": claim,
+            "session": session,
+            "found": true,
+            "graph_source": "acquire-evidence",
+            "fused": fused_after,
+        })));
+    }
+
+    out
+}

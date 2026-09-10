@@ -119,6 +119,32 @@ enum Commands {
         #[arg(long, default_value = "balanced")]
         risk: String,
     },
+    /// Executes one ranked candidate from `fornax evidence-plan` for real
+    /// (FORNX-346): `POST /api/acquire-evidence`. `rank` must be a rank
+    /// shown by a current `fornax evidence-plan` run for the same claim --
+    /// this command never accepts a raw probe request, only a rank, so it
+    /// cannot be used to smuggle a request the daemon's own plan didn't
+    /// produce.
+    ///
+    /// Renders the same recommendation + full fusion detail
+    /// `evidence-plan`/`decision` render for `fused_before`, then the
+    /// acquisition outcome, then `fused_after` if the probe actually
+    /// acquired anything -- so a caller sees exactly what changed, never
+    /// one without the other.
+    AcquireEvidence {
+        /// Claim id to look up.
+        claim: String,
+        /// Session id the claim belongs to.
+        session: String,
+        /// 1-based rank of the candidate to execute, from a current
+        /// `fornax evidence-plan` run.
+        #[arg(long)]
+        rank: u32,
+        /// Risk class the plan is recomputed under -- must match the run
+        /// `rank` came from. Defaults to `balanced`.
+        #[arg(long, default_value = "balanced")]
+        risk: String,
+    },
     /// Semantic Judge opinion for one claim (FORNX-94): sends the claim plus
     /// a bounded, structured evidence-graph excerpt to the configured local
     /// self-hosted judge (Ollama-compatible endpoint, `[semantic_judge]` in
@@ -465,6 +491,25 @@ async fn main() -> anyhow::Result<()> {
             );
             match fetch_json(&url).await {
                 Ok(v) => print!("{}", evidence_plan_cmd::render_evidence_plan(&v)),
+                Err(e) => println!("fornax: {e}"),
+            }
+        }
+        Commands::AcquireEvidence {
+            claim,
+            session,
+            rank,
+            risk,
+        } => {
+            let url = format!(
+                "{}/api/acquire-evidence?claim={}&session={}&rank={}&risk={}",
+                base_url(),
+                claim,
+                session,
+                rank,
+                risk
+            );
+            match post_json(&url).await {
+                Ok(v) => print!("{}", evidence_plan_cmd::render_acquire_evidence(&v)),
                 Err(e) => println!("fornax: {e}"),
             }
         }
@@ -1406,6 +1451,20 @@ const HOME_IDENTITY_HEADER: &str = "x-fornax-home-id";
 
 async fn fetch_json(url: &str) -> anyhow::Result<serde_json::Value> {
     let response = reqwest::get(url)
+        .await
+        .map_err(|_| anyhow::anyhow!("daemon unreachable (is `fornax-daemon` running?)"))?;
+    verify_daemon_identity(&response)?;
+    Ok(response.json::<serde_json::Value>().await?)
+}
+
+/// FORNX-346: `POST` counterpart of [`fetch_json`] -- same daemon-identity
+/// verification, for the one endpoint (`/api/acquire-evidence`) that
+/// performs a real side effect and so is not a `GET`.
+async fn post_json(url: &str) -> anyhow::Result<serde_json::Value> {
+    let client = reqwest::Client::new();
+    let response = client
+        .post(url)
+        .send()
         .await
         .map_err(|_| anyhow::anyhow!("daemon unreachable (is `fornax-daemon` running?)"))?;
     verify_daemon_identity(&response)?;
