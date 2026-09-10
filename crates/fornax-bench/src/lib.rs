@@ -40,8 +40,11 @@
 //!   synthetic data — see that module's docs.
 //! - [`slice`] — FORNX-344: breaks down metrics by the only trajectory
 //!   dimensions this codebase can actually observe (sensor, provider).
+//! - [`baseline`] — FORNX-344: freezes a `BaselineReport` for a dataset +
+//!   config, the frozen artifact a later comparison diffs against.
 
 pub mod ablation;
+pub mod baseline;
 pub mod dataset;
 pub mod harness;
 pub mod manifest;
