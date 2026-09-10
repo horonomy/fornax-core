@@ -8,6 +8,7 @@ license.workspace = true
 fornax-types = { path = "../fornax-types" }
 fornax-store = { path = "../fornax-store" }
 fornax-verify = { path = "../fornax-verify" }
+fornax-experiment-runner = { path = "../fornax-experiment-runner" }
 tokio.workspace = true
 axum.workspace = true
 serde.workspace = true

@@ -11,11 +11,13 @@ use axum::routing::get;
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use fornax_store::policy_cache::RevocationIngestOutcome;
+use fornax_experiment_runner::GlobalExperimentPolicy;
 use fornax_types::redact::{redact_json, redact_text};
 use fornax_types::{
     compute_posture, home_identity, verify_bundle, verify_revocation_list, ActivationOutcome,
     ActivationRejection, BoundRevision, CacheSlotKind, Finding, IngestMessage, PolicyCacheState,
-    PolicyContent, PolicyDiagnostic, RuntimeCapabilities, TrustedVerificationKeys,
+    PolicyContent, PolicyDiagnostic, RuntimeCapabilities, SensorDisableConfig,
+    TrustedVerificationKeys,
 };
 use fornax_verify::fusion::{project_graph, BaselineFusionPolicy, FusionInput, FusionPolicy};
 use fornax_verify::{
@@ -144,6 +146,16 @@ struct AppState {
     /// from the UDS ingest path -- never abandoned on a policy failure
     /// (ADR-0001 D2).
     policy: Arc<RwLock<PolicyCacheSnapshot>>,
+    /// FORNX-345: the real side-effect grant boundary `/api/evidence-plan`
+    /// gates acquisition candidates against -- loaded once at startup from
+    /// `$FORNAX_HOME/config.toml` (`GlobalExperimentPolicy::load`), same as
+    /// `trust`/`policy` above. Static for the process lifetime: side-effect
+    /// grants do not rotate mid-process any more than trust roots do.
+    experiment_policy: Arc<GlobalExperimentPolicy>,
+    /// FORNX-345: which sensors are administratively disabled -- loaded once
+    /// at startup (`SensorDisableConfig::load`), fed into
+    /// `fornax_verify::voi::AcquisitionPolicy::disabled_sensors`.
+    sensor_disable: Arc<SensorDisableConfig>,
 }
 
 /// FORNX-311: the background policy poll task's most recent attempt.
@@ -321,6 +333,25 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // FORNX-345: never abort startup on a malformed experiment-policy or
+    // sensor-disable config (same ADR-0001 D2 discipline as the trust
+    // store/policy cache above) -- log and continue with the empty/default
+    // config, which denies every side effect and disables nothing.
+    let experiment_policy = match GlobalExperimentPolicy::load(&home) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load experiment policy; denying all side effects");
+            GlobalExperimentPolicy::new(std::iter::empty())
+        }
+    };
+    let sensor_disable = match SensorDisableConfig::load(&home) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load sensor disable config; treating no sensors as disabled");
+            SensorDisableConfig::empty()
+        }
+    };
+
     let state = AppState {
         store,
         caps: Arc::new(Mutex::new(HashMap::new())),
@@ -328,6 +359,8 @@ async fn main() -> anyhow::Result<()> {
         home_id: Arc::from(home_identity(&home).as_str()),
         trust: Arc::new(trusted),
         policy: Arc::new(RwLock::new(policy_snapshot)),
+        experiment_policy: Arc::new(experiment_policy),
+        sensor_disable: Arc::new(sensor_disable),
     };
 
     let uds_sock_path = sock_path.clone();
@@ -1675,6 +1708,8 @@ mod tests {
             home_id: Arc::from(format!("test-home-{}", Uuid::new_v4()).as_str()),
             trust: Arc::new(None),
             policy: Arc::new(RwLock::new(PolicyCacheSnapshot::empty())),
+            experiment_policy: Arc::new(GlobalExperimentPolicy::new(std::iter::empty())),
+            sensor_disable: Arc::new(SensorDisableConfig::empty()),
         }
     }
 
