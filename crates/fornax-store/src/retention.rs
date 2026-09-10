@@ -904,6 +904,7 @@ mod tests {
 
     #[test]
     fn sanitized_candidate_class_defaults_closed_and_respects_its_own_opt_in_flag() {
+        let _guard = crate::CORPUS_MINING_GATE_TEST_LOCK.lock().unwrap();
         std::env::remove_var("FORNAX_CORPUS_MINING_ENABLED");
         assert!(
             !longitudinal_persistence_allowed(&RetentionClass::SanitizedCandidate),
