@@ -38,6 +38,19 @@ pub fn longitudinal_reliability_collection_allowed() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether real sessions may be mined into sanitized `fornax-corpus`
+/// candidate integrity cases at all (FORNX-341). A third, independent gate
+/// following the same shape as the two above — mining reaches across a
+/// single session's evidence pool to build a `CandidateCase`, which is
+/// neither ordinary single-session collection nor cross-session
+/// aggregation, so it gets its own opt-in rather than reusing either
+/// existing flag. Defaults to `false`.
+pub fn corpus_mining_allowed() -> bool {
+    std::env::var("FORNAX_CORPUS_MINING_ENABLED")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,5 +101,30 @@ mod tests {
         );
 
         std::env::remove_var("FORNAX_LONGITUDINAL_COLLECTION_ENABLED");
+    }
+
+    // One test, not several — same std::env::set_var race-avoidance reason
+    // as the two gates above.
+    #[test]
+    fn corpus_mining_gate_defaults_closed_and_requires_an_explicit_true_value() {
+        std::env::remove_var("FORNAX_CORPUS_MINING_ENABLED");
+        assert!(
+            !corpus_mining_allowed(),
+            "must default to disabled when unset"
+        );
+
+        std::env::set_var("FORNAX_CORPUS_MINING_ENABLED", "1");
+        assert!(corpus_mining_allowed());
+
+        std::env::set_var("FORNAX_CORPUS_MINING_ENABLED", "true");
+        assert!(corpus_mining_allowed());
+
+        std::env::set_var("FORNAX_CORPUS_MINING_ENABLED", "yes");
+        assert!(
+            !corpus_mining_allowed(),
+            "only '1'/'true' enable mining, not other truthy-looking strings"
+        );
+
+        std::env::remove_var("FORNAX_CORPUS_MINING_ENABLED");
     }
 }
