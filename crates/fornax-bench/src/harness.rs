@@ -401,6 +401,90 @@ mod harness_tests {
         assert!(p.is_synthetic);
     }
 
+    /// FORNX-347 AC5: the naive-counting false-uplift regression fixture.
+    ///
+    /// Three `AgentAdjacent` Supports votes, each stamped with its OWN
+    /// distinct `correlation_group` -- naive per-group counting sees three
+    /// genuinely distinct sources, which would band this `Corroborated`
+    /// (no discounted link, no unrecorded-group caveat) and, under
+    /// `DefaultRiskPolicy`, `Proceed`. Two of the three, however, share the
+    /// same real `source_event_id` on the agent-reported channel -- the
+    /// live common-source-amplification shape this ticket exists for.
+    /// `fornax_verify::independence::SourceFamilyMap` catches this even
+    /// though the explicit groups differ (FORNX-347's additive-union
+    /// invariant: an explicit correlation_group can never *prevent* a
+    /// structural same-event collapse), so the real pipeline discounts one
+    /// of the two and correctly bands `Qualified` -> `Review`.
+    ///
+    /// This is a real fixture-vs-reality assertion, not a mock: both halves
+    /// are checked explicitly since there is no "naive" code path left to
+    /// literally run for comparison (this ticket replaced it).
+    #[test]
+    fn naive_group_counting_would_have_proceeded_the_real_pipeline_reviews() {
+        let event_a = Uuid::new_v4();
+        let make_ev = |group: Uuid, source_event_id: Uuid| Evidence {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            source_event_id,
+            kind: EvidenceKind::ToolResult,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            payload: serde_json::json!({}),
+            provenance: "test".into(),
+            source: Some(EvidenceSource {
+                sensor_name: "test_sensor".into(),
+                trust_class: TrustClass::AgentAdjacent,
+                collected_at: "2026-01-01T00:00:00Z".into(),
+                provider: None,
+                collection_method: CollectionMethod::HookCallback,
+                collector_version: None,
+                freshness: Freshness {
+                    clock_source: ClockSource::HostClock,
+                    caveat: None,
+                },
+                tamper_boundary: Default::default(),
+                correlation_group: Some(group),
+                derived_from: vec![],
+            }),
+            extension: None,
+            evidence_purged: false,
+        };
+
+        // ev_a and ev_b share source_event_id (the real collapse basis);
+        // ev_c is on a genuinely different event. All three carry distinct
+        // explicit correlation groups.
+        let ev_a = make_ev(Uuid::new_v4(), event_a);
+        let ev_b = make_ev(Uuid::new_v4(), event_a);
+        let ev_c = make_ev(Uuid::new_v4(), Uuid::new_v4());
+        let distinct_groups: std::collections::BTreeSet<Uuid> = [&ev_a, &ev_b, &ev_c]
+            .iter()
+            .filter_map(|e| e.source.as_ref().and_then(|s| s.correlation_group))
+            .collect();
+        assert_eq!(
+            distinct_groups.len(),
+            3,
+            "fixture precondition: naive per-group counting must see 3 distinct sources"
+        );
+
+        let t = trajectory(
+            "traj-false-uplift",
+            vec![ev_a, ev_b, ev_c],
+            EvidenceRelation::Supports,
+        );
+        let dataset = dataset_of(vec![t]);
+        let config = HarnessConfig::new(RiskClass::Balanced);
+
+        let predictions = run_harness(&dataset, &config, "2026-01-02T00:00:00Z");
+        assert_eq!(predictions.len(), 1);
+        let p = &predictions[0];
+        assert_eq!(p.predicted_verdict, Verdict::Verified);
+        // The naive/false-safe reading (3 distinct groups -> Corroborated
+        // -> Proceed) never happens: FORNX-347's common-source-family
+        // collapse discounts one of the two same-event votes, forcing
+        // Qualified, which DefaultRiskPolicy never lets Proceed under any
+        // risk class.
+        assert_eq!(p.predicted_action, RecommendationAction::Review);
+    }
+
     #[test]
     fn run_is_deterministic_regardless_of_dataset_row_order() {
         let t1 = trajectory(
