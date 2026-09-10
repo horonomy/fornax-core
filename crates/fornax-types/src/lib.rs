@@ -23,6 +23,7 @@ pub mod extension;
 pub mod graph;
 pub mod policy;
 pub mod privacy;
+pub mod receipt;
 pub mod redact;
 pub mod reliability_context;
 pub mod sensor;
@@ -110,6 +111,20 @@ pub enum Provider {
     /// separate, closed ingest enum, which does not know this variant.
     /// `default_unknown_caps()` is the only producer of this value.
     Unknown,
+}
+
+impl Provider {
+    /// This variant's own `#[serde(rename_all = "snake_case")]` wire tag
+    /// (e.g. `ClaudeCode` -> `"claude_code"`), derived from the real
+    /// serialization rather than a second, hand-maintained string table
+    /// that could drift from it. Falls back to `"unknown"` only if
+    /// serialization itself ever fails (never true for this enum today).
+    pub fn wire_tag(self) -> String {
+        serde_json::to_value(self)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_else(|| "unknown".to_string())
+    }
 }
 
 /// Normalized lifecycle event kind. One variant per canonical concept a

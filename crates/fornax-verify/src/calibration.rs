@@ -248,6 +248,53 @@ impl CalibratedReliabilityView {
     }
 }
 
+/// Builds the live [`CalibrationProvenance`] this deployment observes right
+/// now, for one session's already-resolved [`fornax_types::RuntimeCapabilities`]
+/// (FORNX-350, extracted from `fornax-daemon`'s prior private
+/// `build_calibration_provenance` so `fornax receipt issue` can build the
+/// same provenance the daemon's own calibration path does, without a
+/// daemon dependency or a second, divergent implementation). Pure and
+/// sync — `active_policy_revision_digest` is resolved by the caller (an
+/// async policy-cache read in the daemon's case) and passed in rather than
+/// looked up here, keeping this function on the same clock-free, I/O-free
+/// footing as [`crate::fusion::FusionPolicy::fuse`].
+///
+/// `model_version`/`model_family` are only ever the caller-supplied
+/// values passed in; nothing here infers or defaults them (see
+/// [`CalibrationProvenance`]'s own docs on why no local source observes a
+/// model release).
+pub fn live_provenance(
+    capabilities: &fornax_types::RuntimeCapabilities,
+    disabled_sensors: &std::collections::HashSet<String>,
+    active_policy_revision_digest: Option<String>,
+    model_version: Option<String>,
+    model_family: Option<String>,
+) -> CalibrationProvenance {
+    use crate::decision::{DecisionPolicy, DefaultRiskPolicy};
+    use crate::fusion::{BaselineFusionPolicy, FusionPolicy};
+    use fornax_types::reliability_context::capability_fingerprint;
+
+    let fusion_policy = BaselineFusionPolicy;
+    let decision_policy = DefaultRiskPolicy;
+
+    CalibrationProvenance {
+        schema_version: fornax_types::calibration::CALIBRATION_SCHEMA_VERSION,
+        provider: capabilities.provider.wire_tag(),
+        adapter_version: capabilities.notes.get("adapter_version").cloned(),
+        capability_schema_version: capabilities.schema_version,
+        capability_fingerprint: capability_fingerprint(capabilities),
+        fusion_policy_name: fusion_policy.name().to_string(),
+        fusion_policy_version: fusion_policy.policy_version(),
+        decision_policy_name: decision_policy.name().to_string(),
+        decision_policy_version: decision_policy.policy_version(),
+        reliability_policy_version: crate::reliability::RELIABILITY_POLICY_VERSION,
+        disabled_sensors: CalibrationProvenance::disabled_sensors_from(disabled_sensors),
+        active_policy_revision_digest,
+        model_version,
+        model_family,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
