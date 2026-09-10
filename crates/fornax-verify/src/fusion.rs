@@ -294,7 +294,11 @@ impl FusionPolicy for BaselineFusionPolicy {
     }
 
     fn policy_version(&self) -> u32 {
-        1
+        // v2 (FORNX-347): R3 now walks derived_from transitively instead of
+        // one level, and R5 gains a common-source-family collapse rule (see
+        // `FusionRule::CommonSourceCollapsed`) -- both are real behavior
+        // changes, so the version bumps once to cover both.
+        2
     }
 
     fn fuse(&self, input: &FusionInput<'_>, computed_at: &str) -> FusedFinding {
@@ -352,23 +356,24 @@ impl FusionPolicy for BaselineFusionPolicy {
         }
 
         // --- R3: derived-evidence double-count exclusion -------------------
+        // FORNX-347: walks the FULL transitive `derived_from` ancestry
+        // (`independence::ancestors_of`, over the whole evidence pool -- not
+        // just this claim's directly-linked candidates), so a record
+        // derived through an unlinked intermediate no longer escapes this
+        // rule. Direct parents (the original, one-level behavior) are
+        // included in the transitive closure, so this is a strict widening.
         let candidate_evidence_ids: HashSet<Uuid> =
             candidates.iter().map(|c| c.link.evidence_id).collect();
         let mut after_r3: Vec<Candidate<'_>> = Vec::new();
         for c in candidates {
-            let derived_from = c
-                .evidence
-                .source
-                .as_ref()
-                .map(|s| s.derived_from.as_slice())
-                .unwrap_or(&[]);
-            if derived_from.is_empty() {
+            let ancestry = crate::independence::ancestors_of(c.evidence.id, input.evidence);
+            if ancestry.is_empty() {
                 after_r3.push(c);
                 continue;
             }
-            let parent_hits: Vec<Uuid> = derived_from
+            let parent_hits: Vec<Uuid> = ancestry
                 .iter()
-                .filter(|p| **p != c.link.evidence_id && candidate_evidence_ids.contains(p))
+                .filter(|p| candidate_evidence_ids.contains(p))
                 .cloned()
                 .collect();
             if parent_hits.is_empty() {
@@ -1205,6 +1210,59 @@ mod fusion_tests {
             .iter()
             .any(|r| r.rule == FusionRule::DerivedFromCountedParent
                 && r.link_ids == vec![derived_link.id]));
+    }
+
+    /// FORNX-347: R3 must walk `derived_from` transitively, not just one
+    /// level -- a record derived from an UNLINKED intermediate (itself
+    /// derived from a counted parent) must still be discounted, not counted
+    /// with only a `DerivedEvidence` caveat. Before this widening, this
+    /// case escaped R3 entirely (the intermediate was never a "counted
+    /// candidate" itself, so the one-level scan never found the real
+    /// ancestor).
+    #[test]
+    fn evidence_derived_through_an_unlinked_intermediate_is_still_discounted() {
+        let c = claim();
+        let root_ev = evidence(EvidenceKind::ExitCode, "2026-01-01T00:00:00Z");
+        let mut mid_ev = evidence(EvidenceKind::ExitCode, "2026-01-01T00:00:00Z");
+        mid_ev.source = Some(EvidenceSource::derived(
+            "mid_sensor",
+            TrustClass::AgentAdjacent,
+            None,
+            None,
+            vec![root_ev.id],
+        ));
+        let mut leaf_ev = evidence(EvidenceKind::ExitCode, "2026-01-01T00:00:00Z");
+        leaf_ev.source = Some(EvidenceSource::derived(
+            "leaf_sensor",
+            TrustClass::AgentAdjacent,
+            None,
+            None,
+            vec![mid_ev.id],
+        ));
+
+        // Only root and leaf are linked to the claim -- mid is in the
+        // evidence pool (so its ancestry is walkable) but has no link.
+        let root_link = link(c.id, root_ev.id, EvidenceRelation::Supports);
+        let leaf_link = link(c.id, leaf_ev.id, EvidenceRelation::Supports);
+        let graph = EvidenceGraph {
+            links: vec![root_link.clone(), leaf_link.clone()],
+            missing: vec![],
+        };
+        let evs = vec![root_ev, mid_ev, leaf_ev];
+        let policy = BaselineFusionPolicy;
+        let input = FusionInput {
+            claim: &c,
+            graph: &graph,
+            evidence: &evs,
+        };
+        let out = policy.fuse(&input, "2026-01-02T00:00:00Z");
+        assert_eq!(out.counted_link_ids, vec![root_link.id]);
+        assert_eq!(out.discounted_link_ids, vec![leaf_link.id]);
+        assert!(out
+            .rationale
+            .iter()
+            .any(|r| r.rule == FusionRule::DerivedFromCountedParent
+                && r.link_ids == vec![leaf_link.id]));
     }
 
     // --- 8. Staleness asymmetry ---------------------------------------------
