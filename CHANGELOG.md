@@ -9,6 +9,25 @@ Jira epic FORNX-20.
 
 ### Added
 
+- `fornax feedback submit/list` + `fornax adjudicate sample` (FORNX-349,
+  Stage 8): a product-feedback channel structurally kept out of the
+  adjudication/gold-label pipeline (`ReviewFeedback` carries a
+  `FeedbackDisposition`, never a `CaseLabel`/`ReviewOutcome`, and a
+  source-scanning guard test pins that no conversion path exists), and an
+  active-sampling policy (`DeterministicSamplingPolicy`) that ranks mined
+  candidates by real, named signals -- unresolved conflict, cross-sensor
+  disagreement, high uncertainty, correlated evidence, sanitization-altered
+  outcome, verdict instability, and recorded human-feedback disagreement --
+  reusing `fornax_verify::voi::derive_gaps` rather than inventing a second
+  scoring mechanism. Near-duplicate cases are bounded per mining-shape
+  pattern (`--max-per-pattern`, default 2) so one repeated pattern cannot
+  consume the whole review budget. `fornax feedback submit --as-agent` lets
+  an automated agent flag a case for review without ever being able to
+  masquerade as human adjudication. See
+  `docs/adr/0019-human-feedback-loop-and-active-sampling.md` for the
+  AC-by-AC honest coverage table, including why AC6's random-sampling
+  comparison was deliberately not built (no gold-labeled corpus exists yet
+  to compare against, and the comparison would otherwise be tautological).
 - `fornax_verify::calibration` + `GET /api/calibration` + `fornax
   calibration` (FORNX-348, Stage 8): a non-relaxing calibration floor on
   `/api/decision`'s `Recommendation`. `CalibrationProvenance` snapshots
