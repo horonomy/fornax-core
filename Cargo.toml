@@ -25,5 +25,6 @@ uuid = { version = "1", features = ["v4", "v5", "serde"] }
 axum = "0.7"
 toml_edit = "0.25"
 sha2 = "0.11"
+hex = "0.4"
 ed25519-dalek = { version = "3", default-features = false }
 base64 = "0.23"

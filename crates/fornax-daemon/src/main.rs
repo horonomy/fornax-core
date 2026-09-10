@@ -3,16 +3,19 @@
 //! status line, detail command, and dashboard (FORNX-30/31/32). No cloud
 //! dependency on the critical path (D2, ADR 0001).
 
-use axum::extract::{Query, State};
+use axum::extract::{Query, Request, State};
+use axum::http::HeaderValue;
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use axum::routing::get;
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use fornax_store::policy_cache::RevocationIngestOutcome;
 use fornax_types::redact::{redact_json, redact_text};
 use fornax_types::{
-    compute_posture, verify_bundle, verify_revocation_list, ActivationOutcome, ActivationRejection,
-    BoundRevision, CacheSlotKind, Finding, IngestMessage, PolicyCacheState, PolicyContent,
-    PolicyDiagnostic, RuntimeCapabilities, TrustedVerificationKeys,
+    compute_posture, home_identity, verify_bundle, verify_revocation_list, ActivationOutcome,
+    ActivationRejection, BoundRevision, CacheSlotKind, Finding, IngestMessage, PolicyCacheState,
+    PolicyContent, PolicyDiagnostic, RuntimeCapabilities, TrustedVerificationKeys,
 };
 use fornax_verify::fusion::{project_graph, BaselineFusionPolicy, FusionInput, FusionPolicy};
 use fornax_verify::{
@@ -126,6 +129,11 @@ struct AppState {
     /// serialized in arrival order, not to make verification tolerant of
     /// partial evidence. Held for the full duration of `handle_message`.
     processing: Arc<Mutex<()>>,
+    /// FORNX-339: this daemon's `$FORNAX_HOME` identity, sent as a response
+    /// header on every HTTP reply so a client can prove it's talking to the
+    /// daemon serving its own home rather than a different one that won the
+    /// race for the shared default port — see [`fornax_types::home_identity`].
+    home_id: Arc<str>,
     /// FORNX-119: never `None` if `resolve_trust_store` found and parsed a
     /// trust store at startup; static configuration, never re-read at
     /// runtime (trust roots do not rotate mid-process).
@@ -240,6 +248,26 @@ fn remediation_for_rejection(r: &ActivationRejection) -> &'static str {
     }
 }
 
+/// Response header carrying [`AppState::home_id`] — checked by
+/// `fornax-cli`'s `verify_daemon_identity` before trusting any response
+/// body (FORNX-339).
+const HOME_IDENTITY_HEADER: &str = "x-fornax-home-id";
+
+/// Axum middleware: stamp every HTTP response with this daemon's home
+/// identity, unconditionally — including error responses, so a client never
+/// has a code path that skips the check.
+async fn stamp_home_identity(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    if let Ok(value) = HeaderValue::from_str(&state.home_id) {
+        response.headers_mut().insert(HOME_IDENTITY_HEADER, value);
+    }
+    response
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -297,6 +325,7 @@ async fn main() -> anyhow::Result<()> {
         store,
         caps: Arc::new(Mutex::new(HashMap::new())),
         processing: Arc::new(Mutex::new(())),
+        home_id: Arc::from(home_identity(&home).as_str()),
         trust: Arc::new(trusted),
         policy: Arc::new(RwLock::new(policy_snapshot)),
     };
@@ -337,6 +366,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/reliability", get(api_reliability))
         .route("/api/policy", get(api_policy))
         .route("/dashboard", get(dashboard))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            stamp_home_identity,
+        ))
         .with_state(state);
 
     let port: u16 = std::env::var("FORNAX_HTTP_PORT")
@@ -1639,6 +1672,7 @@ mod tests {
             store,
             caps: Arc::new(Mutex::new(HashMap::new())),
             processing: Arc::new(Mutex::new(())),
+            home_id: Arc::from(format!("test-home-{}", Uuid::new_v4()).as_str()),
             trust: Arc::new(None),
             policy: Arc::new(RwLock::new(PolicyCacheSnapshot::empty())),
         }

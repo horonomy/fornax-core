@@ -342,19 +342,27 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Status => match fetch_json(&format!("{}/api/status", base_url())).await {
             Ok(v) => println!("{}", render_status_line(&v)),
-            Err(_) => println!("🛡 fornax: daemon unreachable"),
+            // `status` keeps its historical short "daemon unreachable" text
+            // (no parenthetical) for the plain-connectivity case — other
+            // tooling (this repo's own daemon-readiness test harnesses)
+            // string-matches on it. An identity mismatch is a materially
+            // different, more specific failure and always prints in full.
+            Err(e) if e.to_string().starts_with("daemon unreachable") => {
+                println!("🛡 fornax: daemon unreachable")
+            }
+            Err(e) => println!("🛡 fornax: {e}"),
         },
         Commands::Detail => {
             match fetch_json(&format!("{}/api/findings/recent", base_url())).await {
                 Ok(v) => print_detail(&v),
-                Err(_) => println!("fornax: daemon unreachable (is `fornax-daemon` running?)"),
+                Err(e) => println!("fornax: {e}"),
             }
         }
         Commands::Capabilities { session } => {
             let url = format!("{}/api/capabilities?session={}", base_url(), session);
             match fetch_json(&url).await {
                 Ok(v) => print!("{}", render_capabilities(&v)),
-                Err(_) => println!("fornax: daemon unreachable (is `fornax-daemon` running?)"),
+                Err(e) => println!("fornax: {e}"),
             }
         }
         Commands::EvidenceGraph { claim, session } => {
@@ -366,7 +374,7 @@ async fn main() -> anyhow::Result<()> {
             );
             match fetch_json(&url).await {
                 Ok(v) => print!("{}", render_evidence_graph(&v)),
-                Err(_) => println!("fornax: daemon unreachable (is `fornax-daemon` running?)"),
+                Err(e) => println!("fornax: {e}"),
             }
         }
         Commands::Fusion { claim, session } => {
@@ -378,7 +386,7 @@ async fn main() -> anyhow::Result<()> {
             );
             match fetch_json(&url).await {
                 Ok(v) => print!("{}", render_fusion(&v)),
-                Err(_) => println!("fornax: daemon unreachable (is `fornax-daemon` running?)"),
+                Err(e) => println!("fornax: {e}"),
             }
         }
         Commands::Decision {
@@ -395,7 +403,7 @@ async fn main() -> anyhow::Result<()> {
             );
             match fetch_json(&url).await {
                 Ok(v) => print!("{}", render_decision(&v)),
-                Err(_) => println!("fornax: daemon unreachable (is `fornax-daemon` running?)"),
+                Err(e) => println!("fornax: {e}"),
             }
         }
         Commands::Judge {
@@ -412,7 +420,7 @@ async fn main() -> anyhow::Result<()> {
             );
             match fetch_json(&url).await {
                 Ok(v) => print!("{}", render_judge(&v)),
-                Err(_) => println!("fornax: daemon unreachable (is `fornax-daemon` running?)"),
+                Err(e) => println!("fornax: {e}"),
             }
         }
         Commands::Reliability(args) => {
@@ -446,7 +454,7 @@ async fn main() -> anyhow::Result<()> {
             }
             match fetch_json(&url).await {
                 Ok(v) => print!("{}", render_reliability(&v)),
-                Err(_) => println!("fornax: daemon unreachable (is `fornax-daemon` running?)"),
+                Err(e) => println!("fornax: {e}"),
             }
         }
         Commands::ExportSpool { session, out } => export_spool(&session, &out).await?,
@@ -1327,8 +1335,44 @@ async fn export_spool_from_store(
     Ok(())
 }
 
+/// Header the daemon stamps on every HTTP response with its `$FORNAX_HOME`
+/// identity — see `fornax_types::home_identity` and
+/// `fornax-daemon`'s `stamp_home_identity` middleware (FORNX-339).
+const HOME_IDENTITY_HEADER: &str = "x-fornax-home-id";
+
 async fn fetch_json(url: &str) -> anyhow::Result<serde_json::Value> {
-    Ok(reqwest::get(url).await?.json::<serde_json::Value>().await?)
+    let response = reqwest::get(url)
+        .await
+        .map_err(|_| anyhow::anyhow!("daemon unreachable (is `fornax-daemon` running?)"))?;
+    verify_daemon_identity(&response)?;
+    Ok(response.json::<serde_json::Value>().await?)
+}
+
+/// FORNX-339: refuse to trust a response from a daemon that isn't serving
+/// this process's own `$FORNAX_HOME` — fail closed (an error, surfaced by
+/// every call site as `UNAVAILABLE`-style text) rather than silently
+/// showing another session's evidence. This is the actual invariant: a
+/// client must be able to prove which daemon/home it's talking to, and any
+/// mismatch is a hard stop, never a best-effort guess.
+fn verify_daemon_identity(response: &reqwest::Response) -> anyhow::Result<()> {
+    let expected = fornax_types::home_identity(&fornax_home());
+    match response
+        .headers()
+        .get(HOME_IDENTITY_HEADER)
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(actual) if actual == expected => Ok(()),
+        Some(actual) => Err(anyhow::anyhow!(
+            "UNAVAILABLE: daemon identity mismatch (this daemon is serving a different \
+             $FORNAX_HOME than expected: got {actual}, expected {expected}) -- another \
+             session's daemon is bound to this port; set a distinct FORNAX_HTTP_PORT per \
+             session or stop the other daemon first (FORNX-339)"
+        )),
+        None => Err(anyhow::anyhow!(
+            "UNAVAILABLE: daemon did not report its $FORNAX_HOME identity -- refusing to trust \
+             its response (FORNX-339)"
+        )),
+    }
 }
 
 fn render_status_line(v: &serde_json::Value) -> String {

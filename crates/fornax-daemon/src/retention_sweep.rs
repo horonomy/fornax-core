@@ -302,6 +302,7 @@ mod tests {
             store,
             caps: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             processing: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            home_id: std::sync::Arc::from(format!("test-home-{}", uuid::Uuid::new_v4()).as_str()),
             trust: std::sync::Arc::new(None),
             policy: std::sync::Arc::new(tokio::sync::RwLock::new(
                 crate::PolicyCacheSnapshot::empty(),
