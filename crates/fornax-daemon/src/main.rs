@@ -7,7 +7,7 @@ use axum::extract::{Query, Request, State};
 use axum::http::HeaderValue;
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use fornax_experiment_runner::GlobalExperimentPolicy;
@@ -156,6 +156,11 @@ struct AppState {
     /// at startup (`SensorDisableConfig::load`), fed into
     /// `fornax_verify::voi::AcquisitionPolicy::disabled_sensors`.
     sensor_disable: Arc<SensorDisableConfig>,
+    /// FORNX-346: the operator-approved set of real directories
+    /// `/api/acquire-evidence` may ever read a target from -- loaded once at
+    /// startup (`AcquisitionRoots::load`), empty (deny-all) by default. See
+    /// `fornax_acquire::containment`'s module docs.
+    acquisition_roots: Arc<fornax_acquire::AcquisitionRoots>,
 }
 
 /// FORNX-311: the background policy poll task's most recent attempt.
@@ -351,6 +356,15 @@ async fn main() -> anyhow::Result<()> {
             SensorDisableConfig::empty()
         }
     };
+    // FORNX-346: same discipline -- a malformed [acquisition] table never
+    // aborts startup, it degrades to the empty (deny-all) default.
+    let acquisition_roots = match fornax_acquire::AcquisitionRoots::load(&home) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load acquisition roots; denying every acquisition target");
+            fornax_acquire::AcquisitionRoots::default()
+        }
+    };
 
     let state = AppState {
         store,
@@ -361,6 +375,7 @@ async fn main() -> anyhow::Result<()> {
         policy: Arc::new(RwLock::new(policy_snapshot)),
         experiment_policy: Arc::new(experiment_policy),
         sensor_disable: Arc::new(sensor_disable),
+        acquisition_roots: Arc::new(acquisition_roots),
     };
 
     let uds_sock_path = sock_path.clone();
@@ -397,6 +412,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/decision", get(api_decision))
         .route("/api/judge", get(api_judge))
         .route("/api/evidence-plan", get(api_evidence_plan))
+        .route("/api/acquire-evidence", post(api_acquire_evidence))
         .route("/api/reliability", get(api_reliability))
         .route("/api/policy", get(api_policy))
         .route("/dashboard", get(dashboard))
@@ -596,23 +612,7 @@ async fn handle_message(
                 );
             }
             let evidence = evidence_read.evidence;
-
-            // FORNX-14: registry stays a flat Vec, per the ticket's own
-            // maintainability requirement ("verifier registry/dispatch only
-            // as complex as the first real verifier set requires") — five
-            // verifiers dispatched by `applies_to` doesn't yet justify more.
-            let verifiers: Vec<Box<dyn Verifier + Send + Sync>> = vec![
-                Box::new(TestResultVerifier),
-                Box::new(CommandExecutedVerifier),
-                Box::new(CommandSuccessVerifier),
-                Box::new(FileModifiedVerifier),
-                Box::new(GitOperationVerifier),
-            ];
-            for verifier in verifiers.iter().filter(|v| v.applies_to(&claim)) {
-                let finding = verifier.verify(&claim, &evidence, &caps);
-                tracing::info!(verdict = ?finding.verdict, claim = %claim.text, "finding computed");
-                state.store.insert_finding(&finding).await?;
-            }
+            run_verifiers_and_persist_findings(state, &claim, &evidence, &caps).await?;
         }
     }
     Ok(())
@@ -1053,6 +1053,37 @@ fn finding_row_to_finding(row: &fornax_store::FindingRow) -> anyhow::Result<Find
     })
 }
 
+/// Runs the fixed verifier registry against `claim`/`evidence`/`caps` and
+/// persists every resulting `Finding` -- extracted (FORNX-346) from the
+/// `IngestMessage::Claim` handler so `/api/acquire-evidence` can re-run the
+/// exact same real re-verification after newly acquired evidence lands,
+/// rather than duplicating this dispatch loop or inventing a second one.
+///
+/// FORNX-14: registry stays a flat Vec, per the ticket's own
+/// maintainability requirement ("verifier registry/dispatch only as complex
+/// as the first real verifier set requires") — five verifiers dispatched by
+/// `applies_to` doesn't yet justify more.
+async fn run_verifiers_and_persist_findings(
+    state: &AppState,
+    claim: &fornax_types::Claim,
+    evidence: &[fornax_types::Evidence],
+    caps: &RuntimeCapabilities,
+) -> anyhow::Result<()> {
+    let verifiers: Vec<Box<dyn Verifier + Send + Sync>> = vec![
+        Box::new(TestResultVerifier),
+        Box::new(CommandExecutedVerifier),
+        Box::new(CommandSuccessVerifier),
+        Box::new(FileModifiedVerifier),
+        Box::new(GitOperationVerifier),
+    ];
+    for verifier in verifiers.iter().filter(|v| v.applies_to(claim)) {
+        let finding = verifier.verify(claim, evidence, caps);
+        tracing::info!(verdict = ?finding.verdict, claim = %claim.text, "finding computed");
+        state.store.insert_finding(&finding).await?;
+    }
+    Ok(())
+}
+
 /// Outcome of [`compute_fusion`] — the shared claim-lookup/graph-resolution/
 /// fusion logic behind both `/api/fusion` (FORNX-304) and `/api/decision`
 /// (FORNX-96), factored out so neither endpoint duplicates the other's
@@ -1405,6 +1436,32 @@ async fn api_judge(
     }
 }
 
+/// Rebuilds the effective `SideEffectAllowList` `GlobalExperimentPolicy`
+/// currently grants (FORNX-345: `GlobalExperimentPolicy` exposes only a
+/// per-class `permits` check, not an iterable set) and wraps it, alongside
+/// `cloud_sync_allowed()`/`state.sensor_disable`, into the
+/// `fornax_verify::voi::AcquisitionPolicy` gate both `/api/evidence-plan`
+/// (FORNX-345) and `/api/acquire-evidence` (FORNX-346) use -- never a
+/// fabricated `AUTO_SAFE`/`REQUIRE_APPROVAL`/`FORBIDDEN` model.
+fn build_acquisition_policy(state: &AppState) -> fornax_verify::voi::AcquisitionPolicy {
+    use fornax_types::experiment::{SideEffectAllowList, SideEffectClass};
+    let granted_side_effects = SideEffectAllowList::new(
+        [
+            SideEffectClass::EphemeralWorktreeMutation,
+            SideEffectClass::ProcessSpawn,
+            SideEffectClass::NetworkCall,
+            SideEffectClass::FilesystemWriteOutsideWorktree,
+        ]
+        .into_iter()
+        .filter(|class| state.experiment_policy.permits(*class)),
+    );
+    fornax_verify::voi::AcquisitionPolicy {
+        granted_side_effects,
+        egress_allowed: fornax_types::privacy::cloud_sync_allowed(),
+        disabled_sensors: (*state.sensor_disable).clone(),
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct EvidencePlanQuery {
     claim: String,
@@ -1438,9 +1495,8 @@ async fn api_evidence_plan(
     State(state): State<AppState>,
     Query(q): Query<EvidencePlanQuery>,
 ) -> Json<serde_json::Value> {
-    use fornax_types::experiment::{SideEffectAllowList, SideEffectClass};
     use fornax_verify::decision::{DecisionPolicy, DefaultRiskPolicy};
-    use fornax_verify::voi::{AcquisitionPolicy, DeterministicVoiPolicy, PlanInput, VoiPolicy};
+    use fornax_verify::voi::{DeterministicVoiPolicy, PlanInput, VoiPolicy};
 
     let risk = match parse_risk_class(q.risk.as_deref()) {
         Ok(r) => r,
@@ -1472,26 +1528,7 @@ async fn api_evidence_plan(
         })),
         FusionOutcome::Found(found) => {
             let recommendation = DefaultRiskPolicy.decide(&found.fused, risk);
-            // FORNX-345: `GlobalExperimentPolicy` exposes only a
-            // per-class `permits` check, not an iterable set -- rebuild the
-            // equivalent `SideEffectAllowList` by probing all four known
-            // classes, exactly what `is_permitted`'s own two-layer check
-            // does one class at a time.
-            let granted_side_effects = SideEffectAllowList::new(
-                [
-                    SideEffectClass::EphemeralWorktreeMutation,
-                    SideEffectClass::ProcessSpawn,
-                    SideEffectClass::NetworkCall,
-                    SideEffectClass::FilesystemWriteOutsideWorktree,
-                ]
-                .into_iter()
-                .filter(|class| state.experiment_policy.permits(*class)),
-            );
-            let acquisition = AcquisitionPolicy {
-                granted_side_effects,
-                egress_allowed: fornax_types::privacy::cloud_sync_allowed(),
-                disabled_sensors: (*state.sensor_disable).clone(),
-            };
+            let acquisition = build_acquisition_policy(&state);
             let input = PlanInput {
                 claim: &found.claim,
                 graph: &found.graph,
@@ -1515,6 +1552,215 @@ async fn api_evidence_plan(
             }))
         }
     }
+}
+
+#[derive(serde::Deserialize)]
+struct AcquireEvidenceQuery {
+    claim: String,
+    session: String,
+    /// 1-based `AcquisitionCandidate::rank` from a freshly computed
+    /// `EvidencePlan` -- never a client-supplied `EvidenceRequest`. Accepting
+    /// an arbitrary request from the caller would let a client craft a
+    /// fake low-side-effect request and bypass gating entirely; selecting
+    /// by rank out of a plan this endpoint computes itself is what keeps
+    /// every acquisition gated by the server's own current policy.
+    rank: u32,
+    /// Same contract as `DecisionQuery::risk` -- defaults to `balanced`.
+    /// Affects only the plan's candidate ranking, not the gate itself.
+    #[serde(default)]
+    risk: Option<String>,
+}
+
+/// FORNX-346: `POST /api/acquire-evidence?claim=&session=&rank=&risk=`.
+///
+/// Closes the loop from FORNX-345's ranked plan to real evidence: recomputes
+/// the exact same `EvidencePlan` `/api/evidence-plan` would for this
+/// `(claim, session, risk)` (never trusts a stale plan a client might hold),
+/// selects the candidate at `rank`, and calls
+/// `fornax_acquire::acquire_evidence` -- which re-gates against *current*
+/// policy itself before touching anything.
+///
+/// On `Acquired`, the new evidence is persisted, `run_verifiers_and_persist_findings`
+/// re-runs the same real verifier registry the `Claim` ingest path uses (no
+/// separate/parallel interpretation logic invented here), and fusion is
+/// recomputed -- the response carries both `fused_before` and `fused_after`
+/// together, never one without the other, so a caller can see exactly what
+/// changed. Every attempt (whatever its outcome) is persisted to
+/// `acquisition_log`.
+async fn api_acquire_evidence(
+    State(state): State<AppState>,
+    Query(q): Query<AcquireEvidenceQuery>,
+) -> Json<serde_json::Value> {
+    use fornax_verify::voi::{DeterministicVoiPolicy, PlanInput, VoiPolicy};
+
+    let risk = match parse_risk_class(q.risk.as_deref()) {
+        Ok(r) => r,
+        Err(message) => {
+            return Json(
+                serde_json::json!({ "claim": q.claim, "session": q.session, "error": message }),
+            )
+        }
+    };
+    let capabilities = match state.store.capabilities_for_session(&q.session).await {
+        Ok(caps) => caps,
+        Err(e) => {
+            return Json(
+                serde_json::json!({ "claim": q.claim, "session": q.session, "error": e.to_string() }),
+            )
+        }
+    };
+
+    let found = match compute_fusion(&state, &q.claim, &q.session).await {
+        FusionOutcome::Error { message } => {
+            return Json(
+                serde_json::json!({ "claim": q.claim, "session": q.session, "error": message }),
+            )
+        }
+        FusionOutcome::NotFound { reason } => {
+            return Json(serde_json::json!({
+                "claim": q.claim,
+                "session": q.session,
+                "found": false,
+                "reason": reason,
+            }))
+        }
+        FusionOutcome::Found(found) => found,
+    };
+    let fused_before = found.fused.clone();
+
+    let acquisition = build_acquisition_policy(&state);
+    let plan_input = PlanInput {
+        claim: &found.claim,
+        graph: &found.graph,
+        evidence: &found.evidence_pool,
+        fused: &found.fused,
+        risk,
+        capabilities: &capabilities,
+        acquisition: &acquisition,
+    };
+    let computed_at = chrono::Utc::now().to_rfc3339();
+    let plan = DeterministicVoiPolicy.plan(&plan_input, &computed_at);
+
+    let Some(candidate) = plan.candidates.iter().find(|c| c.rank == Some(q.rank)) else {
+        return Json(serde_json::json!({
+            "claim": q.claim,
+            "session": q.session,
+            "found": true,
+            "error": format!("no candidate with rank {} in the current plan", q.rank),
+        }));
+    };
+
+    let outcome = fornax_acquire::acquire_evidence(
+        candidate,
+        &found.evidence_pool,
+        &q.session,
+        found.claim.source_event_id,
+        &state.acquisition_roots,
+        &state.experiment_policy,
+        &computed_at,
+    );
+
+    let (outcome_kind, outcome_json): (&str, serde_json::Value) = match &outcome {
+        fornax_acquire::AcquisitionOutcome::Acquired(evidence) => {
+            ("acquired", serde_json::json!({ "evidence": evidence }))
+        }
+        fornax_acquire::AcquisitionOutcome::Refused { reason } => {
+            ("refused", serde_json::json!({ "reason": reason }))
+        }
+        fornax_acquire::AcquisitionOutcome::Unavailable { reason } => {
+            ("unavailable", serde_json::json!({ "reason": reason }))
+        }
+        fornax_acquire::AcquisitionOutcome::Failed { reason } => {
+            ("failed", serde_json::json!({ "reason": reason }))
+        }
+        fornax_acquire::AcquisitionOutcome::Unsupported { reason } => {
+            ("unsupported", serde_json::json!({ "reason": reason }))
+        }
+    };
+
+    let log_document = serde_json::json!({
+        "request": candidate.request,
+        "outcome": outcome_json,
+    });
+    if let Err(e) = state
+        .store
+        .insert_acquisition_log_entry(
+            &uuid::Uuid::new_v4().to_string(),
+            &q.session,
+            &q.claim,
+            &format!("{:?}", candidate.request.kind),
+            &plan.policy_name,
+            plan.policy_version,
+            outcome_kind,
+            &computed_at,
+            &log_document.to_string(),
+        )
+        .await
+    {
+        tracing::warn!(error = %e, "failed to persist acquisition_log entry");
+    }
+
+    let fused_after = if let fornax_acquire::AcquisitionOutcome::Acquired(evidence) = outcome {
+        if let Err(e) = state.store.insert_evidence(&evidence).await {
+            return Json(serde_json::json!({
+                "claim": q.claim,
+                "session": q.session,
+                "found": true,
+                "outcome": outcome_kind,
+                "error": format!("acquired evidence but failed to persist it: {e}"),
+                "fused_before": fused_before,
+            }));
+        }
+        let caps = state
+            .caps
+            .lock()
+            .await
+            .get(&q.session)
+            .cloned()
+            .unwrap_or_else(default_unknown_caps);
+        let evidence_after = match state.store.evidence_for_session(&q.session).await {
+            Ok(read) => read.evidence,
+            Err(e) => {
+                return Json(serde_json::json!({
+                    "claim": q.claim,
+                    "session": q.session,
+                    "found": true,
+                    "outcome": outcome_kind,
+                    "error": format!("failed to re-read evidence after acquisition: {e}"),
+                    "fused_before": fused_before,
+                }))
+            }
+        };
+        if let Err(e) =
+            run_verifiers_and_persist_findings(&state, &found.claim, &evidence_after, &caps).await
+        {
+            return Json(serde_json::json!({
+                "claim": q.claim,
+                "session": q.session,
+                "found": true,
+                "outcome": outcome_kind,
+                "error": format!("failed to re-verify after acquisition: {e}"),
+                "fused_before": fused_before,
+            }));
+        }
+        match compute_fusion(&state, &q.claim, &q.session).await {
+            FusionOutcome::Found(after) => Some(after.fused),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    Json(serde_json::json!({
+        "claim": q.claim,
+        "session": q.session,
+        "found": true,
+        "rank": q.rank,
+        "outcome": outcome_kind,
+        "detail": outcome_json,
+        "fused_before": fused_before,
+        "fused_after": fused_after,
+    }))
 }
 
 /// FORNX-105: `GET /api/reliability?session=&provider=&model_family=&model_version=&
@@ -1823,6 +2069,7 @@ mod tests {
             policy: Arc::new(RwLock::new(PolicyCacheSnapshot::empty())),
             experiment_policy: Arc::new(GlobalExperimentPolicy::new(std::iter::empty())),
             sensor_disable: Arc::new(SensorDisableConfig::empty()),
+            acquisition_roots: Arc::new(fornax_acquire::AcquisitionRoots::default()),
         }
     }
 
@@ -3332,6 +3579,225 @@ mod tests {
         let v = response.0;
         assert_eq!(v["found"], serde_json::json!(false));
         assert!(v.get("plan").is_none());
+    }
+
+    // --- FORNX-346: /api/acquire-evidence ---------------------------------
+
+    /// Real end-to-end flow, no mocking: a claim with a real `FileDiff`
+    /// evidence row (pointing at a real temp file) and a real
+    /// `MissingEvidence` note for `ToolResultPayload` is persisted to a
+    /// seeded store; `AcquisitionRoots` is configured to contain the temp
+    /// file's directory. Calls `/api/evidence-plan` to find the real rank
+    /// `VerifyArtifactHash` was assigned (never hardcoded -- ranking is an
+    /// implementation detail of `DeterministicVoiPolicy::plan`), then calls
+    /// `/api/acquire-evidence` with that rank and confirms: the probe
+    /// actually ran (real SHA-256 of the real file content), the resulting
+    /// evidence was persisted, verifiers re-ran, fusion was recomputed, and
+    /// an `acquisition_log` row was written.
+    #[tokio::test]
+    async fn api_acquire_evidence_runs_a_real_verify_artifact_hash_probe_end_to_end() {
+        use fornax_types::graph::MissingEvidence;
+        use fornax_types::SignalAvailability;
+        use fornax_types::SignalClass;
+        use sha2::Digest;
+
+        let target =
+            std::env::temp_dir().join(format!("fornax-acquire-e2e-{}.txt", Uuid::new_v4()));
+        std::fs::write(&target, b"claimed content").unwrap();
+        let root = target.parent().unwrap().to_path_buf();
+
+        let db_path = std::env::temp_dir().join(format!("fornax-test-{}.db", Uuid::new_v4()));
+        let store = fornax_store::Store::open(&db_path)
+            .await
+            .expect("open test store");
+        let state = AppState {
+            store,
+            caps: Arc::new(Mutex::new(HashMap::new())),
+            processing: Arc::new(Mutex::new(())),
+            home_id: Arc::from(format!("test-home-{}", Uuid::new_v4()).as_str()),
+            trust: Arc::new(None),
+            policy: Arc::new(RwLock::new(PolicyCacheSnapshot::empty())),
+            experiment_policy: Arc::new(GlobalExperimentPolicy::new(std::iter::empty())),
+            sensor_disable: Arc::new(SensorDisableConfig::empty()),
+            acquisition_roots: Arc::new(fornax_acquire::AcquisitionRoots::new([root])),
+        };
+
+        let session_id = "fornx-346-acquire-evidence-real-probe";
+        let event_id = test_event(&state, session_id).await;
+        let claim = test_claim(session_id, event_id);
+        state
+            .store
+            .insert_claim(&claim)
+            .await
+            .expect("insert claim");
+        state
+            .store
+            .insert_missing_evidence(&MissingEvidence {
+                id: Uuid::new_v4(),
+                session_id: session_id.to_string(),
+                claim_id: claim.id,
+                signal_class: SignalClass::ToolResultPayload,
+                availability: SignalAvailability::Unavailable,
+                detail: None,
+                noted_at: "2026-01-01T00:00:00Z".to_string(),
+            })
+            .await
+            .expect("insert missing evidence");
+        let file_diff = fornax_types::Evidence {
+            id: Uuid::new_v4(),
+            session_id: session_id.to_string(),
+            source_event_id: event_id,
+            kind: fornax_types::EvidenceKind::FileDiff,
+            observed_at: "2026-01-01T00:00:00Z".to_string(),
+            payload: serde_json::json!({ "path": target.to_string_lossy(), "diff": "" }),
+            provenance: "test".to_string(),
+            source: None,
+            extension: None,
+            evidence_purged: false,
+        };
+        state
+            .store
+            .insert_evidence(&file_diff)
+            .await
+            .expect("insert file diff evidence");
+
+        // Find the real rank VerifyArtifactHash was assigned.
+        let plan_response = api_evidence_plan(
+            State(state.clone()),
+            Query(EvidencePlanQuery {
+                claim: claim.id.to_string(),
+                session: session_id.to_string(),
+                risk: None,
+            }),
+        )
+        .await;
+        let candidates = plan_response.0["plan"]["candidates"]
+            .as_array()
+            .cloned()
+            .expect("candidates array");
+        let rank = candidates
+            .iter()
+            .find(|c| c["request"]["kind"] == serde_json::json!("verify_artifact_hash"))
+            .and_then(|c| c["rank"].as_u64())
+            .expect(
+                "VerifyArtifactHash must be a ranked candidate given an empty acquisition policy",
+            ) as u32;
+
+        let response = api_acquire_evidence(
+            State(state.clone()),
+            Query(AcquireEvidenceQuery {
+                claim: claim.id.to_string(),
+                session: session_id.to_string(),
+                rank,
+                risk: None,
+            }),
+        )
+        .await;
+        let v = response.0;
+
+        assert_eq!(v["found"], serde_json::json!(true));
+        assert_eq!(v["outcome"], serde_json::json!("acquired"));
+        let sha256_hex = v["detail"]["evidence"]["payload"]["observation"]["sha256_hex"]
+            .as_str()
+            .expect("sha256_hex present");
+        // sha256("claimed content")
+        assert_eq!(
+            sha256_hex,
+            hex::encode(sha2::Sha256::digest(b"claimed content"))
+        );
+        assert!(v.get("fused_before").is_some());
+        assert!(v.get("fused_after").is_some());
+
+        // The acquired evidence was actually persisted, not just returned.
+        let evidence_after = state
+            .store
+            .evidence_for_session(session_id)
+            .await
+            .expect("read evidence")
+            .evidence;
+        assert!(evidence_after
+            .iter()
+            .any(|e| e.kind == fornax_types::EvidenceKind::ProcessObservation));
+
+        // The attempt was logged.
+        let log = state
+            .store
+            .acquisition_log_for_claim(session_id, &claim.id.to_string())
+            .await
+            .expect("read acquisition log");
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].outcome_kind, "acquired");
+
+        std::fs::remove_file(&target).ok();
+    }
+
+    /// A candidate that needs an ungranted side effect must be refused, not
+    /// silently executed -- the actual enforcement of "approval-required
+    /// and forbidden probes cannot silently execute" (FORNX-346 AC3).
+    #[tokio::test]
+    async fn api_acquire_evidence_refuses_a_candidate_requiring_an_ungranted_side_effect() {
+        use fornax_types::graph::MissingEvidence;
+        use fornax_types::SignalAvailability;
+        use fornax_types::SignalClass;
+
+        let state = test_state().await;
+        let session_id = "fornx-346-acquire-evidence-refused";
+        let event_id = test_event(&state, session_id).await;
+        let claim = test_claim(session_id, event_id);
+        state
+            .store
+            .insert_claim(&claim)
+            .await
+            .expect("insert claim");
+        state
+            .store
+            .insert_missing_evidence(&MissingEvidence {
+                id: Uuid::new_v4(),
+                session_id: session_id.to_string(),
+                claim_id: claim.id,
+                signal_class: SignalClass::ProcessResult,
+                availability: SignalAvailability::Unavailable,
+                detail: None,
+                noted_at: "2026-01-01T00:00:00Z".to_string(),
+            })
+            .await
+            .expect("insert missing evidence");
+
+        // ProcessResult's only probe is RerunTest, which requires
+        // ProcessSpawn -- never granted by test_state()'s empty policy.
+        let plan_response = api_evidence_plan(
+            State(state.clone()),
+            Query(EvidencePlanQuery {
+                claim: claim.id.to_string(),
+                session: session_id.to_string(),
+                risk: None,
+            }),
+        )
+        .await;
+        let candidates = plan_response.0["plan"]["candidates"]
+            .as_array()
+            .cloned()
+            .expect("candidates array");
+        let rank = candidates
+            .iter()
+            .find(|c| c["request"]["kind"] == serde_json::json!("rerun_test"))
+            .and_then(|c| c["rank"].as_u64())
+            .expect("RerunTest must still be a listed (RequiresApproval) candidate")
+            as u32;
+
+        let response = api_acquire_evidence(
+            State(state),
+            Query(AcquireEvidenceQuery {
+                claim: claim.id.to_string(),
+                session: session_id.to_string(),
+                rank,
+                risk: None,
+            }),
+        )
+        .await;
+        let v = response.0;
+        assert_eq!(v["outcome"], serde_json::json!("refused"));
+        assert!(v["fused_after"].is_null());
     }
 
     // --- FORNX-94: /api/judge -------------------------------------------

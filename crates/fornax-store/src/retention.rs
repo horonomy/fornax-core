@@ -144,6 +144,7 @@ pub const KNOWN_RECORD_TABLES: &[&str] = &[
     "adjudication_queue",
     "adjudication_views",
     "adjudication_reviews",
+    "acquisition_log",
 ];
 
 /// Explicit retention duration for a [`RetentionClass`] (FORNX-106 AC1). See
@@ -175,7 +176,7 @@ pub fn retention_duration_for(class: &RetentionClass) -> Duration {
 /// it forever.
 pub fn retention_class_for_table(record_table: &str) -> RetentionClass {
     match record_table {
-        "agent_events" | "claims" | "evidence" => RetentionClass::RawLocal,
+        "agent_events" | "claims" | "evidence" | "acquisition_log" => RetentionClass::RawLocal,
         "findings" => RetentionClass::DerivedFinding,
         "corpus_candidates"
         | "adjudication_queue"
@@ -429,6 +430,13 @@ impl Store {
                 }
                 "adjudication_reviews" => {
                     sqlx::query("DELETE FROM adjudication_reviews WHERE id = ?1")
+                        .bind(&record.record_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    true
+                }
+                "acquisition_log" => {
+                    sqlx::query("DELETE FROM acquisition_log WHERE id = ?1")
                         .bind(&record.record_id)
                         .execute(&mut *tx)
                         .await?;
@@ -691,6 +699,13 @@ impl Store {
                         .await?;
                     report.deleted_records += 1;
                 }
+                "acquisition_log" => {
+                    sqlx::query("DELETE FROM acquisition_log WHERE id = ?1")
+                        .bind(&record.record_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    report.deleted_records += 1;
+                }
                 _ => {
                     report.unknown_table_skipped += 1;
                 }
@@ -910,6 +925,7 @@ mod tests {
             "adjudication_queue",
             "adjudication_views",
             "adjudication_reviews",
+            "acquisition_log",
         ];
         assert_eq!(KNOWN_RECORD_TABLES, &match_arm_tables);
     }

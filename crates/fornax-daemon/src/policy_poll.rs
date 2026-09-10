@@ -1021,6 +1021,7 @@ mod tests {
                 std::iter::empty(),
             )),
             sensor_disable: Arc::new(fornax_types::SensorDisableConfig::empty()),
+            acquisition_roots: Arc::new(fornax_acquire::AcquisitionRoots::default()),
         };
         TestFixture { state, dir }
     }

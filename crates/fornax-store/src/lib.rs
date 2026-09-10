@@ -12,6 +12,7 @@ use sqlx::SqlitePool;
 use std::path::Path;
 use std::str::FromStr;
 
+pub mod acquisition;
 pub mod adjudication;
 pub mod audit_checkpoint;
 pub mod audit_ledger;
