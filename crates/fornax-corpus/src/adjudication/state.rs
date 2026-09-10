@@ -126,6 +126,15 @@ pub fn derive_state(
                 }
             };
         }
+        // An adjudicator's Label outcome is final -- it resolves the case
+        // regardless of what the primary/secondary reviewers said. This is
+        // the only way a Disagreed case ever leaves that state (short of an
+        // adjudicator instead choosing Unresolved/NotEvaluable above).
+        if matches!(review.outcome, ReviewOutcome::Label { .. }) {
+            return AdjudicationState::Resolved {
+                basis: ResolutionBasis::AdjudicatorDecision,
+            };
+        }
     }
 
     let primary_secondary: Vec<&ReviewRecord> = reviews
@@ -275,6 +284,22 @@ mod tests {
         assert_eq!(
             derive_state(&q, &reviews, None),
             AdjudicationState::Disagreed
+        );
+    }
+
+    #[test]
+    fn an_adjudicators_label_outcome_resolves_a_disagreement() {
+        let q = queue(true);
+        let reviews = vec![
+            label_review("r1", ReviewerRole::Primary, CaseLabel::Reliable),
+            label_review("r2", ReviewerRole::Secondary, CaseLabel::Contradicted),
+            label_review("adj1", ReviewerRole::Adjudicator, CaseLabel::Contradicted),
+        ];
+        assert_eq!(
+            derive_state(&q, &reviews, None),
+            AdjudicationState::Resolved {
+                basis: ResolutionBasis::AdjudicatorDecision
+            }
         );
     }
 
