@@ -9,6 +9,28 @@ Jira epic FORNX-20.
 
 ### Added
 
+- `fornax receipt issue/verify` (FORNX-350, Stage 8): portable, offline-
+  inspectable integrity receipts. `receipt issue` re-fuses a claim's real
+  evidence graph and projects it into a deterministic, reference-only
+  receipt -- every evidence item is a reference plus a payload fingerprint,
+  never the raw payload; claim text is fingerprinted only after redaction.
+  A `#[serde(try_from = ...)]` digest recompute-and-reject (the same
+  tamper detector `PublishedPolicyRevision` already uses) catches
+  accidental/naive edits; a new `fornax_types::receipt` module adds the
+  signed-envelope verification layer reusing the existing
+  `verify_signed_envelope` under its own signing domain -- **verification-
+  only by explicit owner decision**, no production signing path exists in
+  this ticket. `receipt verify` evaluates a receipt against a
+  `ReceiptGatePolicy` (a third verdict vocabulary,
+  Accept/Reject/Hold/Untested, distinct from `Verdict`/`RecommendationAction`)
+  and exits 0/10/11/12 accordingly; an empty or uncalibrated policy always
+  resolves `Untested`, never a vacuous `Accept` (lifted from
+  `fornax_bench::gate`'s identical fail-closed trap). Default policy blocks
+  only on `NoEvidenceAtAll`/`UnresolvedConflict`/`AllVotesDiscounted` --
+  `IndependenceUnverified` is reported but never a default blocker, since
+  no shipped sensor stamps `correlation_group` yet. See
+  `docs/adr/0021-portable-integrity-receipts.md` and
+  `docs/receipt-consumer-guide.md`.
 - `fornax-bench regress freeze/compare` (FORNX-344, Stage 8): an integrity
   regression lab reusing `docs/release-assurance-policy.md`'s own
   PASS/BLOCK/INCONCLUSIVE/UNTESTED verdict vocabulary for a fail-closed

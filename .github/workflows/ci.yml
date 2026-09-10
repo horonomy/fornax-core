@@ -323,3 +323,47 @@ jobs:
       - name: cargo test -p fornax-bench
         if: steps.filter.outputs.code == 'true'
         run: cargo test -p fornax-bench
+
+  # FORNX-350: verification-only mechanism check over the committed policy
+  # fixtures in crates/fornax-cli/fixtures/receipts/ -- proves fornax
+  # receipt issue/verify's own mechanism (issue -> digest -> freshness ->
+  # gate) works, including the empty/uncalibrated-policy fail-closed trap
+  # (see docs/adr/0021-portable-integrity-receipts.md). Deliberately NOT a
+  # required status check on `main` branch protection -- same deferred,
+  # owner-only promotion decision as `integrity-lab`. Path-filtered to this
+  # ticket's own dependency surface; needs fornax-cli's binary built, so
+  # runs `cargo test -p fornax-receipt -p fornax-cli --test
+  # receipt_cli_e2e`, never `--workspace`.
+  receipt-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          fetch-depth: 0
+      - name: determine affected surface
+        id: filter
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "non-PR event (${{ github.event_name }}): always running"
+            exit 0
+          fi
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          changed="$(git diff --name-only "$base...$head" || true)"
+          if [ -z "$changed" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if echo "$changed" | grep -Eq '^crates/fornax-receipt/|^crates/fornax-cli/|^crates/fornax-types/|^crates/fornax-verify/|^\.github/workflows/ci\.yml$'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.filter.outputs.code == 'true'
+      - uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3 # v2
+        if: steps.filter.outputs.code == 'true'
+      - name: cargo test -p fornax-receipt -p fornax-cli --test receipt_cli_e2e
+        if: steps.filter.outputs.code == 'true'
+        run: cargo test -p fornax-receipt -p fornax-cli --test receipt_cli_e2e
