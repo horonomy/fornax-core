@@ -11,6 +11,9 @@ path = "src/main.rs"
 [dependencies]
 fornax-types = { path = "../fornax-types" }
 fornax-store = { path = "../fornax-store" }
+fornax-verify = { path = "../fornax-verify" }
+fornax-replay = { path = "../fornax-replay" }
+fornax-corpus = { path = "../fornax-corpus" }
 fornax-experiment-runner = { path = "../fornax-experiment-runner" }
 clap.workspace = true
 serde.workspace = true

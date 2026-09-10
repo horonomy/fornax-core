@@ -455,6 +455,11 @@ pub enum RetentionClass {
     /// A sanitized fixture derived from raw data for replay/testing, with
     /// identifying content already stripped.
     SanitizedReplayFixture,
+    /// A mined, redacted candidate integrity case (FORNX-341) awaiting human
+    /// adjudication — distinct from `SanitizedReplayFixture` because it feeds
+    /// `fornax audit report`'s replay-fixture accounting and must not be
+    /// reported as one.
+    SanitizedCandidate,
     /// A computed aggregate feature (e.g. a per-cohort statistic) — no longer
     /// traceable to a single session without following `source_record_ids`.
     AggregatedFeature,

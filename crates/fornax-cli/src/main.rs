@@ -4,6 +4,7 @@
 
 use clap::{Parser, Subcommand};
 
+mod corpus_cmd;
 mod experiment_ux;
 mod timeline;
 
@@ -239,6 +240,15 @@ enum Commands {
         #[arg(long)]
         session: Option<String>,
     },
+    /// Integrity Corpus Factory (FORNX-341): mine real sessions into
+    /// sanitized candidate integrity cases, and export a versioned corpus
+    /// manifest. Reads `$FORNAX_HOME/fornax.db` directly, matching
+    /// `audit`/`timeline`'s precedent. Requires an explicit opt-in --
+    /// `FORNAX_CORPUS_MINING_ENABLED=1` -- before anything is persisted.
+    Corpus {
+        #[command(subcommand)]
+        action: corpus_cmd::CorpusAction,
+    },
 }
 
 /// `fornax audit <action>` (FORNX-315).
@@ -466,6 +476,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Policy { action } => handle_policy_action(action).await?,
         Commands::Audit { action } => handle_audit_action(action).await?,
         Commands::Timeline { finding, session } => handle_timeline_action(finding, session).await?,
+        Commands::Corpus { action } => corpus_cmd::handle(action, &fornax_home()).await?,
     }
     Ok(())
 }
