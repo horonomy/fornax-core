@@ -1996,18 +1996,6 @@ async fn reliability_response(
     }
 }
 
-/// Stable wire tag for a [`fornax_types::Provider`], reusing its own serde
-/// representation rather than hand-maintaining a second mapping --
-/// mirrors `fornax_types::reliability_context::capability_fingerprint`'s
-/// own documented technique of sorting by "their serde wire representation"
-/// instead of adding ad-hoc `Display` impls.
-fn provider_wire_tag(provider: fornax_types::Provider) -> String {
-    serde_json::to_value(provider)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
 /// The active policy bundle's revision digest(s), if any are currently
 /// loaded (FORNX-348). `state.policy`'s active generation can carry more
 /// than one bundle member; every member's digest is included, sorted, so
@@ -2031,43 +2019,25 @@ async fn active_policy_revision_digests(state: &AppState) -> Option<String> {
 
 /// Build the live [`fornax_types::calibration::CalibrationProvenance`] this
 /// deployment observes right now, for one session's already-resolved
-/// [`RuntimeCapabilities`] (FORNX-348). Reuses every existing identity
-/// source verbatim -- `BaselineFusionPolicy`/`DefaultRiskPolicy`'s own
-/// `name()`/`policy_version()`, `RELIABILITY_POLICY_VERSION`,
-/// `capability_fingerprint`, `state.sensor_disable` -- never re-derives or
-/// hardcodes any of them a second time. `model_version`/`model_family` are
-/// only ever the caller-supplied values passed in; nothing here infers or
-/// defaults them (see `CalibrationProvenance`'s own docs).
+/// [`RuntimeCapabilities`] (FORNX-348). Thin async wrapper resolving the one
+/// input that requires I/O (`active_policy_revision_digests`) and
+/// delegating everything else to [`fornax_verify::calibration::live_provenance`]
+/// (FORNX-350, extracted so `fornax receipt issue` can build the identical
+/// provenance without a daemon dependency or a second implementation).
 async fn build_calibration_provenance(
     state: &AppState,
     capabilities: &RuntimeCapabilities,
     model_version: Option<String>,
     model_family: Option<String>,
 ) -> fornax_types::calibration::CalibrationProvenance {
-    use fornax_types::reliability_context::capability_fingerprint;
-    use fornax_verify::decision::{DecisionPolicy, DefaultRiskPolicy};
-
-    let fusion_policy = BaselineFusionPolicy;
-    let decision_policy = DefaultRiskPolicy;
-
-    fornax_types::calibration::CalibrationProvenance {
-        schema_version: fornax_types::calibration::CALIBRATION_SCHEMA_VERSION,
-        provider: provider_wire_tag(capabilities.provider),
-        adapter_version: capabilities.notes.get("adapter_version").cloned(),
-        capability_schema_version: capabilities.schema_version,
-        capability_fingerprint: capability_fingerprint(capabilities),
-        fusion_policy_name: fusion_policy.name().to_string(),
-        fusion_policy_version: fusion_policy.policy_version(),
-        decision_policy_name: decision_policy.name().to_string(),
-        decision_policy_version: decision_policy.policy_version(),
-        reliability_policy_version: fornax_verify::reliability::RELIABILITY_POLICY_VERSION,
-        disabled_sensors: fornax_types::calibration::CalibrationProvenance::disabled_sensors_from(
-            state.sensor_disable.disabled_names(),
-        ),
-        active_policy_revision_digest: active_policy_revision_digests(state).await,
+    let active_policy_revision_digest = active_policy_revision_digests(state).await;
+    fornax_verify::calibration::live_provenance(
+        capabilities,
+        state.sensor_disable.disabled_names(),
+        active_policy_revision_digest,
         model_version,
         model_family,
-    }
+    )
 }
 
 /// The most recently recorded calibration revision's provenance, if one has

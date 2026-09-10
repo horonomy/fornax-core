@@ -112,6 +112,20 @@ pub enum Provider {
     Unknown,
 }
 
+impl Provider {
+    /// This variant's own `#[serde(rename_all = "snake_case")]` wire tag
+    /// (e.g. `ClaudeCode` -> `"claude_code"`), derived from the real
+    /// serialization rather than a second, hand-maintained string table
+    /// that could drift from it. Falls back to `"unknown"` only if
+    /// serialization itself ever fails (never true for this enum today).
+    pub fn wire_tag(self) -> String {
+        serde_json::to_value(self)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+}
+
 /// Normalized lifecycle event kind. One variant per canonical concept a
 /// provider *might* expose; a provider that doesn't expose a given kind
 /// simply never emits it (see `RuntimeCapabilities`), it is not synthesized.
