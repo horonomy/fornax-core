@@ -30,6 +30,14 @@ impl Store {
     /// enforcement point for that gate; nothing upstream of this call
     /// already checks it (unlike the two longitudinal-collection classes,
     /// which have no other write path to guard).
+    ///
+    /// **Idempotent** (FORNX-342 fix): `id` is content-derived
+    /// (`CandidateCase::derive_id`), so re-mining an unchanged session
+    /// produces the same id. `INSERT OR IGNORE` plus checking rows-affected
+    /// makes a duplicate insert a silent no-op instead of a `UNIQUE`
+    /// constraint error — before this fix, `fornax corpus mine` re-run
+    /// against an already-mined session aborted the rest of that mining
+    /// run on the first duplicate claim.
     pub async fn insert_corpus_candidate(
         &self,
         id: &str,
@@ -45,8 +53,8 @@ impl Store {
         }
 
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        sqlx::query(
-            "INSERT INTO corpus_candidates (id, session_id, schema_version, mined_at, document)
+        let result = sqlx::query(
+            "INSERT OR IGNORE INTO corpus_candidates (id, session_id, schema_version, mined_at, document)
              VALUES (?1, ?2, ?3, ?4, ?5)",
         )
         .bind(id)
@@ -56,6 +64,14 @@ impl Store {
         .bind(document)
         .execute(&mut *tx)
         .await?;
+
+        if result.rows_affected() == 0 {
+            // Already present (same content-derived id) -- the lineage tag
+            // was written the first time this id was inserted; nothing more
+            // to do.
+            tx.commit().await?;
+            return Ok(());
+        }
 
         let lineage_tag = DatasetLineageTag::new(
             RetentionClass::SanitizedCandidate,
@@ -181,6 +197,47 @@ mod tests {
             b_after.len(),
             1,
             "deleting one session's candidate must leave another session's untouched"
+        );
+
+        std::env::remove_var("FORNAX_CORPUS_MINING_ENABLED");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn inserting_the_same_candidate_id_twice_is_idempotent_not_an_error() {
+        let _guard = crate::CORPUS_MINING_GATE_TEST_LOCK.lock().unwrap();
+        std::env::set_var("FORNAX_CORPUS_MINING_ENABLED", "1");
+        let path = tmp_db_path("idempotent-insert");
+        let store = Store::open(&path).await.expect("open db");
+
+        store
+            .insert_corpus_candidate("c1", "s1", 1, "2026-01-01T00:00:00Z", "{\"k\":1}", vec![])
+            .await
+            .expect("first insert");
+        store
+            .insert_corpus_candidate("c1", "s1", 1, "2026-01-01T00:00:00Z", "{\"k\":1}", vec![])
+            .await
+            .expect("re-mining the same content-derived id must not error");
+
+        let rows = store
+            .corpus_candidates_for_session("s1")
+            .await
+            .expect("query by session");
+        assert_eq!(
+            rows.len(),
+            1,
+            "duplicate insert must not create a second row"
+        );
+
+        let tags = store
+            .lineage_tags_for_tenant(&TenantRef("s1".to_string()))
+            .await
+            .expect("query lineage tags");
+        assert_eq!(
+            tags.len(),
+            1,
+            "duplicate insert must not create a second lineage tag either"
         );
 
         std::env::remove_var("FORNAX_CORPUS_MINING_ENABLED");
