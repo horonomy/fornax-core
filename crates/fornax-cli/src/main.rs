@@ -1783,7 +1783,90 @@ fn render_evidence_graph(v: &serde_json::Value) -> String {
         }
     }
 
+    // FORNX-347: plain prose, no graph-theory vocabulary -- "why several
+    // records may count as one correlated source family" (this ticket's
+    // AC6). Only rendered when at least one family genuinely groups more
+    // than one record; a graph made entirely of singleton families adds
+    // nothing worth saying here.
+    let families = v
+        .get("source_families")
+        .and_then(|f| f.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let multi_member_count = families
+        .iter()
+        .filter(|f| {
+            f.get("evidence_ids")
+                .and_then(|e| e.as_array())
+                .map(|e| e.len() > 1)
+                .unwrap_or(false)
+        })
+        .count();
+    if multi_member_count > 0 {
+        out.push_str(&format!("  ⚯ source families ({})\n", families.len()));
+        for (i, family) in families.iter().enumerate() {
+            let evidence_ids: Vec<&str> = family
+                .get("evidence_ids")
+                .and_then(|e| e.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str())
+                .collect();
+            let bases = family
+                .get("bases")
+                .and_then(|b| b.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if evidence_ids.len() > 1 {
+                out.push_str(&format!(
+                    "    family {} -- {} records, counted as ONE source\n",
+                    i + 1,
+                    evidence_ids.len()
+                ));
+                for basis in &bases {
+                    out.push_str(&format!("      why: {}\n", describe_family_basis(basis)));
+                }
+            } else {
+                out.push_str(&format!("    family {} -- 1 record, independent\n", i + 1));
+            }
+            for evidence_id in &evidence_ids {
+                out.push_str(&format!("      evidence: {evidence_id}\n"));
+            }
+        }
+    }
+
     out
+}
+
+/// Plain-prose description of one `independence::FamilyBasis` JSON value --
+/// no graph/union-find vocabulary, per FORNX-347 AC6.
+fn describe_family_basis(basis: &serde_json::Value) -> String {
+    if basis.as_str() == Some("unknown_provenance") {
+        return "no recorded provenance".to_string();
+    }
+    if let Some(obj) = basis.as_object() {
+        if let Some(group) = obj
+            .get("explicit_correlation_group")
+            .and_then(|v| v.as_str())
+        {
+            return format!("recorded correlation group {group}");
+        }
+        if let Some(ancestry) = obj.get("derivation_ancestry") {
+            let parent = ancestry
+                .get("parent")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            return format!("derived from evidence {parent}");
+        }
+        if let Some(turn) = obj.get("same_agent_turn") {
+            let event = turn
+                .get("source_event_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            return format!("same agent turn (event {event})");
+        }
+    }
+    "unrecognized basis".to_string()
 }
 
 /// Icon for a `RuleEffect` tag, mirroring `verdict_icon`/`availability_icon`'s
@@ -2439,6 +2522,53 @@ mod tests {
         assert!(rendered.contains("evidence: e2"));
         assert!(rendered.contains("evidence: e3"));
         assert!(!rendered.contains("no evidence linked"));
+    }
+
+    /// FORNX-347 AC6: source-family rationale is rendered in plain prose,
+    /// no graph-theory vocabulary, and only when a family genuinely groups
+    /// more than one record.
+    #[test]
+    fn render_evidence_graph_explains_a_multi_record_source_family_in_plain_prose() {
+        let event = "1a2b3c4d-0000-0000-0000-000000000000";
+        let v = serde_json::json!({
+            "claim": "c1", "session": "s1", "found": true,
+            "links": [
+                {"evidence_id": "e1", "relation": "supports", "linked_at": "2026-09-01T00:00:00Z", "source_family": 0},
+                {"evidence_id": "e2", "relation": "supports", "linked_at": "2026-09-01T00:00:01Z", "source_family": 0},
+            ],
+            "missing": [],
+            "source_families": [
+                {
+                    "evidence_ids": ["e1", "e2"],
+                    "bases": [{"same_agent_turn": {"source_event_id": event}}],
+                },
+            ],
+        });
+        let rendered = render_evidence_graph(&v);
+        assert!(rendered.contains("⚯ source families (1)"));
+        assert!(rendered.contains("2 records, counted as ONE source"));
+        assert!(rendered.contains(&format!("same agent turn (event {event})")));
+        // No graph/union-find jargon.
+        assert!(!rendered.to_lowercase().contains("union"));
+        assert!(!rendered.to_lowercase().contains("dag"));
+    }
+
+    /// A graph made entirely of singleton families adds nothing worth
+    /// saying -- the section is omitted rather than printed as noise.
+    #[test]
+    fn render_evidence_graph_omits_source_families_section_when_all_are_singletons() {
+        let v = serde_json::json!({
+            "claim": "c1", "session": "s1", "found": true,
+            "links": [
+                {"evidence_id": "e1", "relation": "supports", "linked_at": "2026-09-01T00:00:00Z", "source_family": 0},
+            ],
+            "missing": [],
+            "source_families": [
+                {"evidence_ids": ["e1"], "bases": []},
+            ],
+        });
+        let rendered = render_evidence_graph(&v);
+        assert!(!rendered.contains("source families"));
     }
 
     /// FORNX-319 AC3: a link whose evidence has been purged must render an

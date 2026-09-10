@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 pub mod decision;
 pub mod fusion;
+pub mod independence;
 pub mod judge;
 pub mod reliability;
 pub mod voi;

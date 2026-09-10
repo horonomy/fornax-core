@@ -994,6 +994,40 @@ async fn api_evidence_graph(
         .await
     {
         Ok(graph) => {
+            // FORNX-347: build the source-family map over the FULL session
+            // evidence pool (ancestry/event-union can run through evidence
+            // not directly linked to this claim), same
+            // Store::evidence_for_session call `compute_fusion` already
+            // uses -- no new store method. Only families containing at
+            // least one evidence id linked on THIS claim are surfaced, so
+            // the response never leaks unrelated session families.
+            let family_map = match state.store.evidence_for_session(&q.session).await {
+                Ok(read) => Some(fornax_verify::independence::SourceFamilyMap::build(
+                    &read.evidence,
+                )),
+                Err(_) => None,
+            };
+            let claim_evidence_ids: Vec<uuid::Uuid> =
+                graph.links.iter().map(|l| l.evidence_id).collect();
+            let relevant_families = family_map
+                .as_ref()
+                .map(|m| m.families_among(&claim_evidence_ids))
+                .unwrap_or_default();
+            let mut family_index_by_evidence: HashMap<uuid::Uuid, usize> = HashMap::new();
+            let source_families_json: Vec<serde_json::Value> = relevant_families
+                .iter()
+                .enumerate()
+                .map(|(i, family)| {
+                    for id in &family.evidence_ids {
+                        family_index_by_evidence.insert(*id, i);
+                    }
+                    serde_json::json!({
+                        "evidence_ids": family.evidence_ids,
+                        "bases": family.bases,
+                    })
+                })
+                .collect();
+
             // FORNX-319 AC3: annotate each link with whether its evidence
             // has since been purged, so a renderer can say "evidence
             // expired" explicitly instead of rendering the payload as if
@@ -1013,6 +1047,13 @@ async fn api_evidence_graph(
                 let mut value = serde_json::to_value(link).unwrap_or(serde_json::Value::Null);
                 if let serde_json::Value::Object(ref mut map) = value {
                     map.insert("evidence_purged".to_string(), serde_json::json!(purged));
+                    map.insert(
+                        "source_family".to_string(),
+                        family_index_by_evidence
+                            .get(&link.evidence_id)
+                            .map(|i| serde_json::json!(i))
+                            .unwrap_or(serde_json::Value::Null),
+                    );
                 }
                 links_json.push(value);
             }
@@ -1022,6 +1063,7 @@ async fn api_evidence_graph(
                 "found": true,
                 "links": links_json,
                 "missing": graph.missing,
+                "source_families": source_families_json,
             }))
         }
         Err(e) => Json(
@@ -2778,6 +2820,148 @@ mod tests {
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0]["signal_class"], "process_result");
         assert_eq!(missing[0]["availability"], "unavailable");
+    }
+
+    /// FORNX-347: two `AgentAdjacent` evidence rows sharing one
+    /// `source_event_id` must be surfaced as one `source_families` entry,
+    /// with both links pointing at the same `source_family` index -- the
+    /// real, live common-source-amplification shape (two sensors reading
+    /// one PostToolUse hook), not a fixture-only correlation_group case.
+    #[tokio::test]
+    async fn api_evidence_graph_surfaces_a_real_common_source_family() {
+        use fornax_types::graph::{EvidenceLink, EvidenceRelation};
+        use fornax_types::sensor::{
+            ClockSource, CollectionMethod, EvidenceSource, Freshness, TamperBoundary, TrustClass,
+        };
+
+        let state = test_state().await;
+        let mut hint = None;
+        let session_id = "fornx-347-evidence-graph-source-family".to_string();
+
+        let event_id = Uuid::new_v4();
+        let event = AgentEvent {
+            id: event_id,
+            session_id: session_id.clone(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-09-01T00:00:00Z".to_string(),
+            tool_name: Some("Bash".to_string()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        handle_message(&state, IngestMessage::Event(event), &mut hint)
+            .await
+            .expect("handle event");
+
+        let claim = Claim {
+            id: Uuid::new_v4(),
+            session_id: session_id.clone(),
+            source_event_id: event_id,
+            text: "git commit succeeded".to_string(),
+            subject: "command_succeeded".to_string(),
+            claimed_at: "2026-09-01T00:00:00Z".to_string(),
+        };
+        handle_message(&state, IngestMessage::Claim(claim.clone()), &mut hint)
+            .await
+            .expect("handle claim");
+
+        let agent_source = |sensor_name: &'static str| EvidenceSource {
+            sensor_name: sensor_name.to_string(),
+            trust_class: TrustClass::AgentAdjacent,
+            collected_at: "2026-09-01T00:00:00Z".to_string(),
+            provider: None,
+            collection_method: CollectionMethod::HookCallback,
+            collector_version: None,
+            freshness: Freshness {
+                clock_source: ClockSource::HostClock,
+                caveat: None,
+            },
+            tamper_boundary: TamperBoundary::default(),
+            correlation_group: None,
+            derived_from: vec![],
+        };
+
+        let ev_a_id = Uuid::new_v4();
+        let ev_a = fornax_types::Evidence {
+            id: ev_a_id,
+            session_id: session_id.clone(),
+            source_event_id: event_id,
+            kind: fornax_types::EvidenceKind::ExitCode,
+            observed_at: "2026-09-01T00:00:00Z".to_string(),
+            payload: serde_json::json!({}),
+            provenance: "claude_code:1.2.3:PostToolUse:Bash#exit_code".to_string(),
+            source: Some(agent_source("claude_bash_exit_code_sensor_v1")),
+            extension: None,
+            evidence_purged: false,
+        };
+        let ev_b_id = Uuid::new_v4();
+        let ev_b = fornax_types::Evidence {
+            id: ev_b_id,
+            session_id: session_id.clone(),
+            source_event_id: event_id,
+            kind: fornax_types::EvidenceKind::ProcessObservation,
+            observed_at: "2026-09-01T00:00:00Z".to_string(),
+            payload: serde_json::json!({}),
+            provenance: "claude_code:1.2.3:PostToolUse:Bash#git_outcome".to_string(),
+            source: Some(agent_source("claude_git_outcome_sensor_v1")),
+            extension: None,
+            evidence_purged: false,
+        };
+        handle_message(&state, IngestMessage::Evidence(ev_a), &mut hint)
+            .await
+            .expect("handle evidence a");
+        handle_message(&state, IngestMessage::Evidence(ev_b), &mut hint)
+            .await
+            .expect("handle evidence b");
+
+        for evidence_id in [ev_a_id, ev_b_id] {
+            state
+                .store
+                .insert_evidence_link(&EvidenceLink {
+                    id: Uuid::new_v4(),
+                    session_id: session_id.clone(),
+                    claim_id: claim.id,
+                    evidence_id,
+                    relation: EvidenceRelation::Supports,
+                    linked_at: "2026-09-01T00:00:01Z".to_string(),
+                })
+                .await
+                .expect("insert evidence link");
+        }
+
+        let query = Query(EvidenceGraphQuery {
+            claim: claim.id.to_string(),
+            session: session_id,
+        });
+        let resp = api_evidence_graph(State(state), query).await;
+        let links = resp.0["links"].as_array().expect("links must be an array");
+        assert_eq!(links.len(), 2);
+        let family_indices: Vec<u64> = links
+            .iter()
+            .map(|l| l["source_family"].as_u64().expect("source_family present"))
+            .collect();
+        assert_eq!(
+            family_indices[0], family_indices[1],
+            "two AgentAdjacent evidence rows on the same source_event_id must be one family"
+        );
+
+        let families = resp.0["source_families"]
+            .as_array()
+            .expect("source_families array");
+        assert_eq!(families.len(), 1);
+        let family_evidence_ids: Vec<String> = families[0]["evidence_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(family_evidence_ids.len(), 2);
+        assert!(families[0]["bases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b.get("same_agent_turn").is_some()));
     }
 
     /// FORNX-319 AC3: once evidence is purged, `/api/evidence-graph` must

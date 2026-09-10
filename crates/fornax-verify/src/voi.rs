@@ -144,7 +144,21 @@ pub fn derive_gaps(
         }
     }
 
-    if counted_correlation_groups(fused, graph, evidence).len() == 1
+    // FORNX-347: re-keyed on independence::SourceFamilyMap rather than raw
+    // correlation_group equality -- since fusion's own R5b already
+    // collapses same-family/same-relation votes to one, this can now only
+    // fire in the narrow case where a single family spans BOTH relations
+    // (one Supports and one Contradicts counted vote from the same
+    // underlying source). Genuinely real and interesting, but a much
+    // narrower trigger than before this ticket.
+    let family_map = crate::independence::SourceFamilyMap::build(evidence);
+    let counted_evidence_ids: Vec<Uuid> = fused
+        .counted_link_ids
+        .iter()
+        .filter_map(|link_id| graph.links.iter().find(|l| &l.id == link_id))
+        .map(|l| l.evidence_id)
+        .collect();
+    if family_map.families_among(&counted_evidence_ids).len() == 1
         && fused.counted_link_ids.len() >= 2
     {
         gaps.push(EvidenceGap {
@@ -152,7 +166,7 @@ pub fn derive_gaps(
             claim_id: claim.id,
             link_ids: fused.counted_link_ids.clone(),
             missing_evidence_ids: vec![],
-            detail: "every counted vote shares one correlation group".to_string(),
+            detail: "every counted vote traces back to one source family".to_string(),
         });
     }
 
@@ -296,6 +310,10 @@ pub enum Independence {
     Unverified,
 }
 
+/// FORNX-347: reads `independence::SourceFamilyMap` (structural: explicit
+/// `correlation_group`, transitive `derived_from`, and same-event/
+/// agent-channel union) rather than raw `correlation_group` equality alone
+/// -- the real source of same-source amplification on live traffic.
 fn independence_of(
     probe_trust_class: &TrustClass,
     fused: &FusedFinding,
@@ -307,15 +325,34 @@ fn independence_of(
     if !counted_classes.contains(&key) {
         return Independence::IndependentOfCounted;
     }
-    // The probe's trust class was already counted -- independent only if
-    // fusion recorded no correlation group for that counted evidence
-    // (Unverified, not rewarded as independent), otherwise it's the same
-    // correlated source.
-    if counted_correlation_groups(fused, graph, evidence).is_empty() {
-        Independence::Unverified
-    } else {
-        Independence::SameSourceAsCounted
+
+    let family_map = crate::independence::SourceFamilyMap::build(evidence);
+    let counted_evidence_ids: Vec<Uuid> = fused
+        .counted_link_ids
+        .iter()
+        .filter_map(|link_id| graph.links.iter().find(|l| &l.id == link_id))
+        .map(|l| l.evidence_id)
+        .collect();
+    let families = family_map.families_among(&counted_evidence_ids);
+
+    // No recorded correlation group AND everything counted collapses to at
+    // most one family -- genuinely unverified, never rewarded as
+    // independent (the original semantics, preserved exactly).
+    if counted_correlation_groups(fused, graph, evidence).is_empty() && families.len() <= 1 {
+        return Independence::Unverified;
     }
+    // The probe's trust class matches counted evidence spanning two or
+    // more distinct source families -- partially, not fully, correlated:
+    // some of what fusion counted really is a different source, but not
+    // all of it.
+    if families.len() >= 2 {
+        return Independence::PartiallyCorrelated;
+    }
+    // Exactly one family -- either an explicit correlation_group was
+    // recorded, or fusion's own R5b already collapsed everything of this
+    // class to one source. Either way, a probe of the same trust class is
+    // the same correlated source, never independent confirmation.
+    Independence::SameSourceAsCounted
 }
 
 // --- Candidate evidence requests ----------------------------------------
@@ -858,7 +895,11 @@ impl VoiPolicy for DeterministicVoiPolicy {
     }
 
     fn policy_version(&self) -> u32 {
-        1
+        // v2 (FORNX-347): independence_of and SingleSourceCorroboration are
+        // now keyed on independence::SourceFamilyMap, making
+        // Independence::PartiallyCorrelated reachable and re-scoping
+        // SingleSourceCorroboration to fusion's own post-collapse output.
+        2
     }
 
     fn plan(&self, input: &PlanInput<'_>, computed_at: &str) -> EvidencePlan {
@@ -1038,6 +1079,28 @@ mod tests {
             id: Uuid::new_v4(),
             session_id: "s1".into(),
             source_event_id: Uuid::new_v4(),
+            kind,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            payload: serde_json::json!({}),
+            provenance: "test".into(),
+            source: Some(source(trust, group)),
+            extension: None,
+            evidence_purged: false,
+        }
+    }
+
+    /// FORNX-347: like `evidence()`, but with an explicit `source_event_id`
+    /// -- needed to build the same-agent-turn family union tests exercise.
+    fn evidence_with_event(
+        kind: EvidenceKind,
+        trust: TrustClass,
+        group: Option<Uuid>,
+        source_event_id: Uuid,
+    ) -> Evidence {
+        Evidence {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            source_event_id,
             kind,
             observed_at: "2026-01-01T00:00:00Z".into(),
             payload: serde_json::json!({}),
@@ -1269,6 +1332,65 @@ mod tests {
         };
         let f = fused(c.id, vec![l.id], false);
         (c, graph, vec![ev], f)
+    }
+
+    /// FORNX-347: `Independence::PartiallyCorrelated` is now reachable --
+    /// two counted votes of the SAME trust class as the probe, but from two
+    /// genuinely distinct source families (no shared event, no shared
+    /// group), must read as partially -- not fully -- correlated.
+    #[test]
+    fn two_distinct_families_of_the_same_trust_class_read_as_partially_correlated() {
+        let c = claim();
+        let ev_a = evidence(EvidenceKind::ToolResult, TrustClass::AgentAdjacent, None);
+        let ev_b = evidence(EvidenceKind::ToolResult, TrustClass::AgentAdjacent, None);
+        let l_a = link(c.id, ev_a.id, EvidenceRelation::Supports);
+        let l_b = link(c.id, ev_b.id, EvidenceRelation::Contradicts);
+        let graph = EvidenceGraph {
+            links: vec![l_a.clone(), l_b.clone()],
+            missing: vec![],
+        };
+        let evidence_pool = vec![ev_a, ev_b];
+        let f = fused(c.id, vec![l_a.id, l_b.id], true);
+
+        let independence = independence_of(&TrustClass::AgentAdjacent, &f, &graph, &evidence_pool);
+        assert_eq!(independence, Independence::PartiallyCorrelated);
+    }
+
+    /// FORNX-347: `SingleSourceCorroboration` is now a narrow trigger --
+    /// fusion's own R5b already collapses same-family/same-relation votes,
+    /// so this can only fire when ONE family spans BOTH relations (a
+    /// source that both supports and contradicts the claim).
+    #[test]
+    fn single_source_corroboration_fires_only_when_one_family_spans_both_relations() {
+        let c = claim();
+        let event = Uuid::new_v4();
+        let ev_supports = evidence_with_event(
+            EvidenceKind::ExitCode,
+            TrustClass::AgentAdjacent,
+            None,
+            event,
+        );
+        let ev_contradicts = evidence_with_event(
+            EvidenceKind::ProcessObservation,
+            TrustClass::AgentAdjacent,
+            None,
+            event,
+        );
+        let l_s = link(c.id, ev_supports.id, EvidenceRelation::Supports);
+        let l_c = link(c.id, ev_contradicts.id, EvidenceRelation::Contradicts);
+        let graph = EvidenceGraph {
+            links: vec![l_s.clone(), l_c.clone()],
+            missing: vec![],
+        };
+        let evidence_pool = vec![ev_supports, ev_contradicts];
+        let f = fused(c.id, vec![l_s.id, l_c.id], true);
+
+        let gaps = derive_gaps(&c, &graph, &evidence_pool, &f, &[]);
+        assert!(
+            gaps.iter()
+                .any(|g| g.kind == EvidenceGapKind::SingleSourceCorroboration),
+            "expected SingleSourceCorroboration, got: {gaps:?}"
+        );
     }
 
     #[test]
