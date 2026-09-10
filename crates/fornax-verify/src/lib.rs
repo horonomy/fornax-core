@@ -13,6 +13,7 @@ pub mod decision;
 pub mod fusion;
 pub mod judge;
 pub mod reliability;
+pub mod voi;
 
 pub trait Verifier {
     /// Verifier's stable name, recorded on every `Finding` it produces.
