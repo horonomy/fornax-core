@@ -775,4 +775,99 @@ mod decision_tests {
         assert_eq!(floored.action, RecommendationAction::Block);
         assert_eq!(floored.rationale_summary, rec.rationale_summary);
     }
+
+    // --- End-to-end AC6 regression: assess_calibration -> apply_calibration_floor
+
+    fn revision_provenance() -> fornax_types::calibration::CalibrationProvenance {
+        fornax_types::calibration::CalibrationProvenance {
+            schema_version: 1,
+            provider: "claude_code".to_string(),
+            adapter_version: Some("claude-adapter-0.3.0".to_string()),
+            capability_schema_version: 1,
+            capability_fingerprint: vec![("tool_invocation".to_string(), "available".to_string())],
+            fusion_policy_name: "deterministic_baseline_v1".to_string(),
+            fusion_policy_version: 2,
+            decision_policy_name: "default_risk_policy_v1".to_string(),
+            decision_policy_version: 1,
+            reliability_policy_version: 1,
+            disabled_sensors: vec![],
+            active_policy_revision_digest: None,
+            model_version: None,
+            model_family: None,
+        }
+    }
+
+    /// FORNX-348 AC6: a calibration revision recorded at one
+    /// `adapter_version` must never be treated as still valid once live
+    /// provenance reports a different one -- proven end-to-end through both
+    /// halves this ticket built: `assess_calibration` must classify the
+    /// mismatch as `Stale`, and `apply_calibration_floor` must then step a
+    /// `Proceed` recommendation down to `Review` because of it.
+    #[test]
+    fn stale_adapter_version_cannot_cross_the_boundary_and_never_relaxes_to_proceed() {
+        let recorded = revision_provenance();
+        let mut live = revision_provenance();
+        live.adapter_version = Some("claude-adapter-0.4.0".to_string());
+
+        let assessment =
+            crate::calibration::assess_calibration(Some(&recorded), &live, None, false);
+        assert_eq!(
+            assessment.state,
+            crate::calibration::CalibrationState::Stale {
+                changed_dimensions: vec!["adapter_version".to_string()]
+            }
+        );
+
+        let f = fused(Verdict::Verified, UncertaintyBand::Corroborated, false);
+        let rec = DefaultRiskPolicy.decide(&f, RiskClass::Balanced);
+        assert_eq!(rec.action, RecommendationAction::Proceed);
+        let floored = apply_calibration_floor(rec, &assessment.state);
+        assert_eq!(floored.action, RecommendationAction::Review);
+    }
+
+    /// Negative arm of the same AC6 property: identical provenance never
+    /// falsely reports `Stale`, and a `Proceed` recommendation is left
+    /// completely untouched.
+    #[test]
+    fn matching_adapter_version_never_falsely_reports_stale_or_touches_proceed() {
+        let recorded = revision_provenance();
+        let live = revision_provenance();
+
+        let assessment =
+            crate::calibration::assess_calibration(Some(&recorded), &live, None, false);
+        assert_eq!(
+            assessment.state,
+            crate::calibration::CalibrationState::Valid
+        );
+
+        let f = fused(Verdict::Verified, UncertaintyBand::Corroborated, false);
+        let rec = DefaultRiskPolicy.decide(&f, RiskClass::Balanced);
+        let floored = apply_calibration_floor(rec.clone(), &assessment.state);
+        assert_eq!(floored, rec);
+    }
+
+    /// Second arm of AC6: a `capability_fingerprint` mismatch is exactly as
+    /// disqualifying as an `adapter_version` mismatch -- the floor does not
+    /// special-case one observable dimension over the other.
+    #[test]
+    fn stale_capability_fingerprint_also_never_relaxes_to_proceed() {
+        let recorded = revision_provenance();
+        let mut live = revision_provenance();
+        live.capability_fingerprint =
+            vec![("tool_invocation".to_string(), "unavailable".to_string())];
+
+        let assessment =
+            crate::calibration::assess_calibration(Some(&recorded), &live, None, false);
+        assert_eq!(
+            assessment.state,
+            crate::calibration::CalibrationState::Stale {
+                changed_dimensions: vec!["capability_fingerprint".to_string()]
+            }
+        );
+
+        let f = fused(Verdict::Verified, UncertaintyBand::Corroborated, false);
+        let rec = DefaultRiskPolicy.decide(&f, RiskClass::Balanced);
+        let floored = apply_calibration_floor(rec, &assessment.state);
+        assert_eq!(floored.action, RecommendationAction::Review);
+    }
 }
