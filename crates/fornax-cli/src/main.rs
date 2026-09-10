@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 
 mod adjudicate_cmd;
 mod corpus_cmd;
+mod evidence_plan_cmd;
 mod experiment_ux;
 mod timeline;
 
@@ -90,6 +91,31 @@ enum Commands {
         /// Risk class to evaluate under: `strict`, `balanced`, or
         /// `lenient`. Defaults to `balanced` — the class every hard safety
         /// floor in `fornax_verify::decision` is written against.
+        #[arg(long, default_value = "balanced")]
+        risk: String,
+    },
+    /// Ranked evidence-acquisition plan for one claim (FORNX-345): which
+    /// concrete probes (rerun a test, inspect VCS state, query CI status,
+    /// verify an artifact hash, a bounded replay experiment, human review)
+    /// would close today's evidence gaps, ranked by discrimination,
+    /// independence from what fusion already counted, recency, cost,
+    /// latency, privacy sensitivity, and action risk. Reads
+    /// `GET /api/evidence-plan` on the daemon.
+    ///
+    /// Never shows the plan alone — always renders the same recommendation
+    /// and full fusion detail `decision` renders first, reusing that
+    /// rendering rather than duplicating it. A candidate that requires an
+    /// ungranted side effect or is administratively forbidden is always
+    /// listed, never silently dropped -- this planner only ranks candidates
+    /// for acquisition, it never decides or executes anything (FORNX-346 is
+    /// the executor).
+    EvidencePlan {
+        /// Claim id to look up.
+        claim: String,
+        /// Session id the claim belongs to.
+        session: String,
+        /// Risk class to evaluate under: `strict`, `balanced`, or
+        /// `lenient`. Defaults to `balanced`.
         #[arg(long, default_value = "balanced")]
         risk: String,
     },
@@ -422,6 +448,23 @@ async fn main() -> anyhow::Result<()> {
             );
             match fetch_json(&url).await {
                 Ok(v) => print!("{}", render_decision(&v)),
+                Err(e) => println!("fornax: {e}"),
+            }
+        }
+        Commands::EvidencePlan {
+            claim,
+            session,
+            risk,
+        } => {
+            let url = format!(
+                "{}/api/evidence-plan?claim={}&session={}&risk={}",
+                base_url(),
+                claim,
+                session,
+                risk
+            );
+            match fetch_json(&url).await {
+                Ok(v) => print!("{}", evidence_plan_cmd::render_evidence_plan(&v)),
                 Err(e) => println!("fornax: {e}"),
             }
         }

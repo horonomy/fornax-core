@@ -10,12 +10,14 @@ use axum::response::Response;
 use axum::routing::get;
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
+use fornax_experiment_runner::GlobalExperimentPolicy;
 use fornax_store::policy_cache::RevocationIngestOutcome;
 use fornax_types::redact::{redact_json, redact_text};
 use fornax_types::{
     compute_posture, home_identity, verify_bundle, verify_revocation_list, ActivationOutcome,
     ActivationRejection, BoundRevision, CacheSlotKind, Finding, IngestMessage, PolicyCacheState,
-    PolicyContent, PolicyDiagnostic, RuntimeCapabilities, TrustedVerificationKeys,
+    PolicyContent, PolicyDiagnostic, RuntimeCapabilities, SensorDisableConfig,
+    TrustedVerificationKeys,
 };
 use fornax_verify::fusion::{project_graph, BaselineFusionPolicy, FusionInput, FusionPolicy};
 use fornax_verify::{
@@ -144,6 +146,16 @@ struct AppState {
     /// from the UDS ingest path -- never abandoned on a policy failure
     /// (ADR-0001 D2).
     policy: Arc<RwLock<PolicyCacheSnapshot>>,
+    /// FORNX-345: the real side-effect grant boundary `/api/evidence-plan`
+    /// gates acquisition candidates against -- loaded once at startup from
+    /// `$FORNAX_HOME/config.toml` (`GlobalExperimentPolicy::load`), same as
+    /// `trust`/`policy` above. Static for the process lifetime: side-effect
+    /// grants do not rotate mid-process any more than trust roots do.
+    experiment_policy: Arc<GlobalExperimentPolicy>,
+    /// FORNX-345: which sensors are administratively disabled -- loaded once
+    /// at startup (`SensorDisableConfig::load`), fed into
+    /// `fornax_verify::voi::AcquisitionPolicy::disabled_sensors`.
+    sensor_disable: Arc<SensorDisableConfig>,
 }
 
 /// FORNX-311: the background policy poll task's most recent attempt.
@@ -321,6 +333,25 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // FORNX-345: never abort startup on a malformed experiment-policy or
+    // sensor-disable config (same ADR-0001 D2 discipline as the trust
+    // store/policy cache above) -- log and continue with the empty/default
+    // config, which denies every side effect and disables nothing.
+    let experiment_policy = match GlobalExperimentPolicy::load(&home) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load experiment policy; denying all side effects");
+            GlobalExperimentPolicy::new(std::iter::empty())
+        }
+    };
+    let sensor_disable = match SensorDisableConfig::load(&home) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load sensor disable config; treating no sensors as disabled");
+            SensorDisableConfig::empty()
+        }
+    };
+
     let state = AppState {
         store,
         caps: Arc::new(Mutex::new(HashMap::new())),
@@ -328,6 +359,8 @@ async fn main() -> anyhow::Result<()> {
         home_id: Arc::from(home_identity(&home).as_str()),
         trust: Arc::new(trusted),
         policy: Arc::new(RwLock::new(policy_snapshot)),
+        experiment_policy: Arc::new(experiment_policy),
+        sensor_disable: Arc::new(sensor_disable),
     };
 
     let uds_sock_path = sock_path.clone();
@@ -363,6 +396,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/fusion", get(api_fusion))
         .route("/api/decision", get(api_decision))
         .route("/api/judge", get(api_judge))
+        .route("/api/evidence-plan", get(api_evidence_plan))
         .route("/api/reliability", get(api_reliability))
         .route("/api/policy", get(api_policy))
         .route("/dashboard", get(dashboard))
@@ -1371,6 +1405,118 @@ async fn api_judge(
     }
 }
 
+#[derive(serde::Deserialize)]
+struct EvidencePlanQuery {
+    claim: String,
+    session: String,
+    /// Same contract as `DecisionQuery::risk` -- defaults to `balanced`.
+    #[serde(default)]
+    risk: Option<String>,
+}
+
+/// FORNX-345: `GET /api/evidence-plan?claim=&session=&risk=`.
+///
+/// Reuses `compute_fusion` (the same graph-loading/projection logic behind
+/// `/api/fusion`/`/api/decision`/`/api/judge`) so this endpoint never
+/// re-derives the claim/graph/evidence pool a second time. Builds the
+/// `fornax_verify::voi::AcquisitionPolicy` gate from the daemon's own
+/// startup-loaded `experiment_policy`/`sensor_disable` state (never a
+/// fabricated `AUTO_SAFE`/`REQUIRE_APPROVAL`/`FORBIDDEN` model -- see ADR
+/// 0015), then runs `DeterministicVoiPolicy::plan` over it.
+///
+/// Reads `Store::capabilities_for_session` (all announcing providers), the
+/// same choice `/api/capabilities` makes over the in-memory single-provider
+/// `state.caps` cache, since under-reporting a provider here would silently
+/// under-report `EvidenceGapKind::SignalClassUnobservable`/
+/// `ExpectedSignalMissing` gaps.
+///
+/// Always returns the recommendation and the full `FusedFinding` alongside
+/// the plan -- same "never show one instead of the other" discipline as
+/// `/api/decision` -- plus the plan's own `outcome`, ranked/unavailable
+/// candidates, and gaps.
+async fn api_evidence_plan(
+    State(state): State<AppState>,
+    Query(q): Query<EvidencePlanQuery>,
+) -> Json<serde_json::Value> {
+    use fornax_types::experiment::{SideEffectAllowList, SideEffectClass};
+    use fornax_verify::decision::{DecisionPolicy, DefaultRiskPolicy};
+    use fornax_verify::voi::{AcquisitionPolicy, DeterministicVoiPolicy, PlanInput, VoiPolicy};
+
+    let risk = match parse_risk_class(q.risk.as_deref()) {
+        Ok(r) => r,
+        Err(message) => {
+            return Json(
+                serde_json::json!({ "claim": q.claim, "session": q.session, "error": message }),
+            )
+        }
+    };
+
+    let capabilities = match state.store.capabilities_for_session(&q.session).await {
+        Ok(caps) => caps,
+        Err(e) => {
+            return Json(
+                serde_json::json!({ "claim": q.claim, "session": q.session, "error": e.to_string() }),
+            )
+        }
+    };
+
+    match compute_fusion(&state, &q.claim, &q.session).await {
+        FusionOutcome::Error { message } => {
+            Json(serde_json::json!({ "claim": q.claim, "session": q.session, "error": message }))
+        }
+        FusionOutcome::NotFound { reason } => Json(serde_json::json!({
+            "claim": q.claim,
+            "session": q.session,
+            "found": false,
+            "reason": reason,
+        })),
+        FusionOutcome::Found(found) => {
+            let recommendation = DefaultRiskPolicy.decide(&found.fused, risk);
+            // FORNX-345: `GlobalExperimentPolicy` exposes only a
+            // per-class `permits` check, not an iterable set -- rebuild the
+            // equivalent `SideEffectAllowList` by probing all four known
+            // classes, exactly what `is_permitted`'s own two-layer check
+            // does one class at a time.
+            let granted_side_effects = SideEffectAllowList::new(
+                [
+                    SideEffectClass::EphemeralWorktreeMutation,
+                    SideEffectClass::ProcessSpawn,
+                    SideEffectClass::NetworkCall,
+                    SideEffectClass::FilesystemWriteOutsideWorktree,
+                ]
+                .into_iter()
+                .filter(|class| state.experiment_policy.permits(*class)),
+            );
+            let acquisition = AcquisitionPolicy {
+                granted_side_effects,
+                egress_allowed: fornax_types::privacy::cloud_sync_allowed(),
+                disabled_sensors: (*state.sensor_disable).clone(),
+            };
+            let input = PlanInput {
+                claim: &found.claim,
+                graph: &found.graph,
+                evidence: &found.evidence_pool,
+                fused: &found.fused,
+                risk,
+                capabilities: &capabilities,
+                acquisition: &acquisition,
+            };
+            let computed_at = chrono::Utc::now().to_rfc3339();
+            let plan = DeterministicVoiPolicy.plan(&input, &computed_at);
+
+            Json(serde_json::json!({
+                "claim": q.claim,
+                "session": q.session,
+                "found": true,
+                "graph_source": found.graph_source,
+                "recommendation": recommendation,
+                "fused": found.fused,
+                "plan": plan,
+            }))
+        }
+    }
+}
+
 /// FORNX-105: `GET /api/reliability?session=&provider=&model_family=&model_version=&
 /// adapter_version=&task_class=&toolset=&repository_class=&policy_version=&
 /// verifier_version=&fusion_version=[&compare_model_version=&compare_adapter_version=]`.
@@ -1675,6 +1821,8 @@ mod tests {
             home_id: Arc::from(format!("test-home-{}", Uuid::new_v4()).as_str()),
             trust: Arc::new(None),
             policy: Arc::new(RwLock::new(PolicyCacheSnapshot::empty())),
+            experiment_policy: Arc::new(GlobalExperimentPolicy::new(std::iter::empty())),
+            sensor_disable: Arc::new(SensorDisableConfig::empty()),
         }
     }
 
@@ -3080,6 +3228,110 @@ mod tests {
         .await;
         let v = response.0;
         assert!(v.get("error").is_some());
+    }
+
+    // --- FORNX-345: /api/evidence-plan -----------------------------------
+
+    /// Real end-to-end flow, no mocking: a claim with a single `Supports`
+    /// link whose evidence carries no `source` (so no trust class/
+    /// correlation group is recorded) is persisted to a real store, then
+    /// `api_evidence_plan` is called against it -- the same
+    /// `IndependenceUnverified` caveat `api_decision_returns_recommendation_
+    /// and_full_fused_finding_together` exercises for `/api/decision` also
+    /// derives a real `EvidenceGap` here. Under `test_state()`'s deny-all
+    /// `GlobalExperimentPolicy`, the gap's `QueryCiStatus` probe (needs
+    /// `NetworkCall`, ungranted) comes back `RequiresApproval` naming
+    /// exactly that grant, while its zero-side-effect `HumanReview` probe
+    /// stays `Available` -- confirming this daemon wiring reaches the same
+    /// per-candidate gating the `fornax-verify` unit tests already prove in
+    /// isolation, now through a real persisted claim/evidence/link.
+    #[tokio::test]
+    async fn api_evidence_plan_surfaces_a_real_independence_gap_and_gates_its_candidates() {
+        let state = test_state().await;
+        let session_id = "fornx-345-evidence-plan-real-graph";
+        let event_id = test_event(&state, session_id).await;
+        let claim = test_claim(session_id, event_id);
+        let evidence = test_evidence(session_id, event_id);
+        state
+            .store
+            .insert_claim(&claim)
+            .await
+            .expect("insert claim");
+        state
+            .store
+            .insert_evidence(&evidence)
+            .await
+            .expect("insert evidence");
+        let link = fornax_types::EvidenceLink {
+            id: Uuid::new_v4(),
+            session_id: session_id.to_string(),
+            claim_id: claim.id,
+            evidence_id: evidence.id,
+            relation: fornax_types::EvidenceRelation::Supports,
+            linked_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        state
+            .store
+            .insert_evidence_link(&link)
+            .await
+            .expect("insert evidence link");
+
+        let response = api_evidence_plan(
+            State(state),
+            Query(EvidencePlanQuery {
+                claim: claim.id.to_string(),
+                session: session_id.to_string(),
+                risk: None,
+            }),
+        )
+        .await;
+        let v = response.0;
+
+        assert_eq!(v["found"], serde_json::json!(true));
+        // Same recommendation + full fusion detail /api/decision returns --
+        // never shown without the underlying evidence.
+        assert_eq!(v["recommendation"]["action"], serde_json::json!("review"));
+        assert_eq!(v["fused"]["uncertainty"], serde_json::json!("qualified"));
+
+        let plan = &v["plan"];
+        let gaps = plan["gaps"].as_array().expect("gaps array");
+        assert!(
+            gaps.iter()
+                .any(|g| g["kind"] == serde_json::json!("independence_unverified")),
+            "expected an independence_unverified gap, got: {gaps:?}"
+        );
+        assert_eq!(
+            plan["outcome"],
+            serde_json::json!("candidates_ranked"),
+            "the gap's zero-side-effect HumanReview probe is always Available"
+        );
+        let candidates = plan["candidates"].as_array().expect("candidates array");
+        // Never silently dropped -- the ungranted NetworkCall candidate is
+        // still listed, naming exactly what to grant.
+        assert!(candidates.iter().any(|c| c["availability"]["kind"]
+            == serde_json::json!("requires_approval")
+            && c["availability"]["missing_grant"] == serde_json::json!("NetworkCall")));
+        // ...alongside the one candidate that genuinely needs no grant.
+        assert!(candidates.iter().any(|c| c["request"]["kind"]
+            == serde_json::json!("human_review")
+            && c["availability"]["kind"] == serde_json::json!("available")));
+    }
+
+    #[tokio::test]
+    async fn api_evidence_plan_reports_not_found_for_unknown_claim() {
+        let state = test_state().await;
+        let response = api_evidence_plan(
+            State(state),
+            Query(EvidencePlanQuery {
+                claim: Uuid::new_v4().to_string(),
+                session: "fornx-345-evidence-plan-unknown-claim".to_string(),
+                risk: None,
+            }),
+        )
+        .await;
+        let v = response.0;
+        assert_eq!(v["found"], serde_json::json!(false));
+        assert!(v.get("plan").is_none());
     }
 
     // --- FORNX-94: /api/judge -------------------------------------------

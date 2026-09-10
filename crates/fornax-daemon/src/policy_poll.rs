@@ -1017,6 +1017,10 @@ mod tests {
             home_id: Arc::from(format!("test-home-{}", uuid::Uuid::new_v4()).as_str()),
             trust: Arc::new(trust),
             policy: Arc::new(TokioRwLock::new(crate::PolicyCacheSnapshot::empty())),
+            experiment_policy: Arc::new(fornax_experiment_runner::GlobalExperimentPolicy::new(
+                std::iter::empty(),
+            )),
+            sensor_disable: Arc::new(fornax_types::SensorDisableConfig::empty()),
         };
         TestFixture { state, dir }
     }
