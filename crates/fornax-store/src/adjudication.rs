@@ -298,6 +298,42 @@ impl Store {
 mod tests {
     use super::*;
 
+    /// AC (gold labels are versioned, never rewritten): scans this crate's
+    /// own source for any write path that could mutate or remove a frozen
+    /// `gold_labels` row -- same technique as `audit_ledger.rs`'s
+    /// `no_write_path_other_than_append_audit_event_touches_audit_events`.
+    #[test]
+    fn no_write_path_other_than_insert_gold_label_touches_gold_labels() {
+        let full_source = include_str!("adjudication.rs");
+        let production_source = full_source
+            .split_once("#[cfg(test)]")
+            .expect("this module has a #[cfg(test)] mod tests block")
+            .0;
+
+        let insert_count = production_source.matches("INTO gold_labels").count();
+        assert_eq!(
+            insert_count, 1,
+            "exactly one INSERT ... INTO gold_labels is expected, in insert_gold_label"
+        );
+
+        for crate_source in [
+            production_source,
+            include_str!("lib.rs"),
+            include_str!("retention.rs"),
+            include_str!("corpus.rs"),
+        ] {
+            assert!(
+                !crate_source.contains("UPDATE gold_labels"),
+                "no UPDATE statement may ever target gold_labels -- it is insert-only"
+            );
+            assert!(
+                !crate_source.contains("DELETE FROM gold_labels"),
+                "no DELETE statement may ever target gold_labels -- relabeling adds a revision, \
+                 it never removes one"
+            );
+        }
+    }
+
     fn tmp_db_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
             "fornax-adjudication-store-test-{name}-{}.db",
