@@ -311,6 +311,7 @@ mod tests {
                 fornax_experiment_runner::GlobalExperimentPolicy::new(std::iter::empty()),
             ),
             sensor_disable: std::sync::Arc::new(fornax_types::SensorDisableConfig::empty()),
+            acquisition_roots: std::sync::Arc::new(fornax_acquire::AcquisitionRoots::default()),
         };
 
         let config = SweepConfig {
