@@ -64,6 +64,7 @@ pub const COMPLIANCE_REPORT_SCHEMA_VERSION: u32 = 1;
 const REPORTED_RETENTION_CLASSES: &[RetentionClass] = &[
     RetentionClass::RawLocal,
     RetentionClass::SanitizedReplayFixture,
+    RetentionClass::SanitizedCandidate,
     RetentionClass::AggregatedFeature,
     RetentionClass::DerivedFinding,
 ];
@@ -496,7 +497,7 @@ mod tests {
             .await
             .expect("generate report");
 
-        assert_eq!(report.body.retention.classes.len(), 4);
+        assert_eq!(report.body.retention.classes.len(), 5);
         for observation in &report.body.retention.classes {
             assert_eq!(
                 observation.configured_retention_seconds,

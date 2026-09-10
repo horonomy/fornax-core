@@ -28,6 +28,7 @@
 //! | `fornax-replay`'s `ReplayManifest`-shaped sanitized fixture files | [`RetentionClass::SanitizedReplayFixture`] | [`SANITIZED_REPLAY_FIXTURE_RETENTION`] (180 days) | Already frozen and self-contained (FORNX-98: claim/evidence/graph plus recorded verdict, no raw transcript), used for regression comparison across a longer window than a single raw session is useful for — but still bounded, not an unlimited archive. |
 //! | `fornax-verify::reliability`'s `ReliabilitySignal` / a cohort's aggregated feature | [`RetentionClass::AggregatedFeature`] | [`AGGREGATED_FEATURE_RETENTION`] (365 days) | No longer traceable to a single session without following `source_record_ids` (FORNX-103's own description of this class); needs to persist across at least one model-release cycle for `DriftState` comparisons to be meaningful, but is not kept forever. |
 //! | Causal/interventional findings (`fornax_types::causal`, FORNX-102) and fusion/decision `findings` rows | [`RetentionClass::DerivedFinding`] | [`DERIVED_FINDING_RETENTION`] (365 days) | A conclusion drawn from aggregated features; retained on the same horizon as the aggregates it was drawn from; a finding that outlives its own aggregate's rationale window is no longer well-supported. |
+//! | `fornax-corpus`'s mined, redacted `CandidateCase` rows (`corpus_candidates`, FORNX-341) | [`RetentionClass::SanitizedCandidate`] | [`SANITIZED_CANDIDATE_RETENTION`] (180 days) | Already frozen and sanitized (redacted, kind-allowlisted evidence pool), same horizon as `SanitizedReplayFixture` for the same reason — used across a longer adjudication window than a single raw session, but still bounded. Gated behind [`fornax_types::privacy::corpus_mining_allowed`], an explicit opt-in. |
 //! | An `Unrecognized(String)` retention class (forward-compat tail) | n/a | [`RAW_LOCAL_RETENTION`] (30 days, the shortest defined duration) | A tag this binary does not recognize is treated as maximally sensitive by default — the safe failure mode is deleting it sooner, not accidentally retaining unknown data indefinitely. |
 //!
 //! # AC2: protected local raw evidence is not centralized merely to build
@@ -118,6 +119,12 @@ pub const AGGREGATED_FEATURE_RETENTION: Duration = Duration::from_secs(365 * 24 
 /// table.
 pub const DERIVED_FINDING_RETENTION: Duration = Duration::from_secs(365 * 24 * 3600);
 
+/// Mined, redacted candidate integrity cases (FORNX-341). Same horizon as
+/// [`SANITIZED_REPLAY_FIXTURE_RETENTION`] — both are already frozen,
+/// self-contained, sanitized artifacts used for a longer regression/
+/// adjudication window than a single raw session.
+pub const SANITIZED_CANDIDATE_RETENTION: Duration = Duration::from_secs(180 * 24 * 3600);
+
 /// The store tables [`Store::delete_records_for_tenant`] knows how to delete
 /// a row from. A lineage tag naming any other `record_table` value still has
 /// its lineage row removed, but the (unrecognized) underlying record is left
@@ -128,7 +135,8 @@ pub const DERIVED_FINDING_RETENTION: Duration = Duration::from_secs(365 * 24 * 3
 /// interpolated) by this module's
 /// `known_record_tables_matches_delete_records_for_tenants_match_arms` test,
 /// so the two cannot silently drift apart.
-pub const KNOWN_RECORD_TABLES: &[&str] = &["agent_events", "claims", "evidence", "findings"];
+pub const KNOWN_RECORD_TABLES: &[&str] =
+    &["agent_events", "claims", "evidence", "findings", "corpus_candidates"];
 
 /// Explicit retention duration for a [`RetentionClass`] (FORNX-106 AC1). See
 /// this module's docs for the full mapping and rationale table.
@@ -136,6 +144,7 @@ pub fn retention_duration_for(class: &RetentionClass) -> Duration {
     match class {
         RetentionClass::RawLocal => RAW_LOCAL_RETENTION,
         RetentionClass::SanitizedReplayFixture => SANITIZED_REPLAY_FIXTURE_RETENTION,
+        RetentionClass::SanitizedCandidate => SANITIZED_CANDIDATE_RETENTION,
         RetentionClass::AggregatedFeature => AGGREGATED_FEATURE_RETENTION,
         RetentionClass::DerivedFinding => DERIVED_FINDING_RETENTION,
         // An unrecognized tag is treated as the most sensitive, shortest-
@@ -160,6 +169,7 @@ pub fn retention_class_for_table(record_table: &str) -> RetentionClass {
     match record_table {
         "agent_events" | "claims" | "evidence" => RetentionClass::RawLocal,
         "findings" => RetentionClass::DerivedFinding,
+        "corpus_candidates" => RetentionClass::SanitizedCandidate,
         other => RetentionClass::Unrecognized(other.to_string()),
     }
 }
@@ -171,6 +181,7 @@ pub fn retention_class_for_table(record_table: &str) -> RetentionClass {
 pub fn longitudinal_persistence_allowed(class: &RetentionClass) -> bool {
     match class {
         RetentionClass::RawLocal | RetentionClass::SanitizedReplayFixture => true,
+        RetentionClass::SanitizedCandidate => fornax_types::privacy::corpus_mining_allowed(),
         RetentionClass::AggregatedFeature
         | RetentionClass::DerivedFinding
         | RetentionClass::Unrecognized(_) => {
@@ -379,6 +390,13 @@ impl Store {
                 }
                 "findings" => {
                     sqlx::query("DELETE FROM findings WHERE id = ?1")
+                        .bind(&record.record_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    true
+                }
+                "corpus_candidates" => {
+                    sqlx::query("DELETE FROM corpus_candidates WHERE id = ?1")
                         .bind(&record.record_id)
                         .execute(&mut *tx)
                         .await?;
@@ -610,6 +628,16 @@ impl Store {
                         .await?;
                     report.deleted_records += 1;
                 }
+                "corpus_candidates" => {
+                    // Hard delete, not a soft-purge like `evidence` above —
+                    // no local verdict/rationale depends on a candidate's
+                    // payload staying readable after it expires.
+                    sqlx::query("DELETE FROM corpus_candidates WHERE id = ?1")
+                        .bind(&record.record_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    report.deleted_records += 1;
+                }
                 _ => {
                     report.unknown_table_skipped += 1;
                 }
@@ -820,7 +848,13 @@ mod tests {
         // `Store::delete_records_for_tenant` (the actual guard against SQL
         // interpolation). If someone adds a table to one without the other,
         // this test catches it.
-        let match_arm_tables = ["agent_events", "claims", "evidence", "findings"];
+        let match_arm_tables = [
+            "agent_events",
+            "claims",
+            "evidence",
+            "findings",
+            "corpus_candidates",
+        ];
         assert_eq!(KNOWN_RECORD_TABLES, &match_arm_tables);
     }
 
