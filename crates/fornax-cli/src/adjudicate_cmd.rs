@@ -583,12 +583,12 @@ pub async fn handle(action: AdjudicateAction, fornax_home: &std::path::Path) -> 
             max_per_pattern,
             dry_run,
         } => {
-            let already_enqueued: std::collections::HashSet<String> = store
+            let already_enqueued: std::collections::HashSet<Uuid> = store
                 .all_queue_entries()
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?
                 .into_iter()
-                .map(|row| row.case_id)
+                .filter_map(|row| Uuid::parse_str(&row.case_id).ok())
                 .collect();
 
             let all_feedback: Vec<ReviewFeedback> = store
@@ -606,10 +606,10 @@ pub async fn handle(action: AdjudicateAction, fornax_home: &std::path::Path) -> 
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?
             {
-                if already_enqueued.contains(&row.id) {
+                let candidate: CandidateCase = serde_json::from_str(&row.document)?;
+                if already_enqueued.contains(&candidate.id) {
                     continue;
                 }
-                let candidate: CandidateCase = serde_json::from_str(&row.document)?;
                 let policy = BaselineFusionPolicy;
                 let fused = policy.fuse(
                     &FusionInput {
@@ -617,7 +617,7 @@ pub async fn handle(action: AdjudicateAction, fornax_home: &std::path::Path) -> 
                         graph: &candidate.replay.evidence_graph,
                         evidence: &candidate.replay.evidence_pool,
                     },
-                    &candidate.replay.claim.claimed_at,
+                    &candidate.replay.recorded_at,
                 );
                 let gaps = derive_gaps(
                     &candidate.replay.claim,
