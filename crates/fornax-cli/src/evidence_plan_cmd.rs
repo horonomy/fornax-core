@@ -237,6 +237,7 @@ fn acquisition_outcome_icon(outcome: &str) -> &'static str {
         "unavailable" => "?",
         "failed" => "✕",
         "unsupported" => "-",
+        "timed_out" => "⏱",
         _ => "?",
     }
 }

@@ -1732,6 +1732,10 @@ async fn api_acquire_evidence(
         fornax_acquire::AcquisitionOutcome::Unsupported { reason } => {
             ("unsupported", serde_json::json!({ "reason": reason }))
         }
+        fornax_acquire::AcquisitionOutcome::TimedOut { reason, elapsed_ms } => (
+            "timed_out",
+            serde_json::json!({ "reason": reason, "elapsed_ms": elapsed_ms }),
+        ),
     };
 
     let log_document = serde_json::json!({

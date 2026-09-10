@@ -72,6 +72,17 @@ impl AcquisitionRoots {
         }
     }
 
+    /// The first configured root, if any (FORNX-346 AC2 gap fix). Used by
+    /// [`crate::probes::inspect_vcs_state_for_root`] as the repo-level
+    /// target for a VCS-state probe when the claim carries no `FileDiff`
+    /// target to inspect instead -- an operator-configured root is already
+    /// trusted, so no per-target containment check is needed against it.
+    /// `None` when no root is configured at all (deny-by-default posture
+    /// unchanged).
+    pub fn primary_root(&self) -> Option<&Path> {
+        self.roots.first().map(PathBuf::as_path)
+    }
+
     fn from_toml_str_with_path(contents: &str, path: &Path) -> Result<Self, ContainmentError> {
         let doc: toml_edit::DocumentMut =
             contents.parse().map_err(|source| ContainmentError::Parse {
@@ -181,6 +192,17 @@ mod tests {
             roots.resolve_contained("anything.txt"),
             Err(ContainmentError::NoRootsConfigured)
         ));
+    }
+
+    #[test]
+    fn primary_root_is_none_when_no_root_is_configured() {
+        assert_eq!(AcquisitionRoots::default().primary_root(), None);
+    }
+
+    #[test]
+    fn primary_root_is_the_first_configured_root() {
+        let roots = AcquisitionRoots::new([PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]);
+        assert_eq!(roots.primary_root(), Some(Path::new("/tmp/a")));
     }
 
     #[test]
