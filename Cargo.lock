@@ -993,6 +993,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "fornax-receipt"
+version = "0.0.1"
+dependencies = [
+ "base64 0.23.1",
+ "chrono",
+ "ed25519-dalek",
+ "fornax-types",
+ "fornax-verify",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "fornax-replay"
 version = "0.0.1"
 dependencies = [
