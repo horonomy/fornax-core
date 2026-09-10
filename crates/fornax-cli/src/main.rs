@@ -8,6 +8,7 @@ mod adjudicate_cmd;
 mod corpus_cmd;
 mod evidence_plan_cmd;
 mod experiment_ux;
+mod feedback_cmd;
 mod timeline;
 
 #[derive(Parser)]
@@ -320,6 +321,14 @@ enum Commands {
         #[command(subcommand)]
         action: adjudicate_cmd::AdjudicateAction,
     },
+    /// Product feedback on a live finding/recommendation (FORNX-349),
+    /// structurally separate from `fornax adjudicate` -- feedback here can
+    /// never become a frozen gold label. Reads `$FORNAX_HOME/fornax.db`
+    /// directly.
+    Feedback {
+        #[command(subcommand)]
+        action: feedback_cmd::FeedbackAction,
+    },
 }
 
 /// `fornax audit <action>` (FORNX-315).
@@ -592,6 +601,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Timeline { finding, session } => handle_timeline_action(finding, session).await?,
         Commands::Corpus { action } => corpus_cmd::handle(action, &fornax_home()).await?,
         Commands::Adjudicate { action } => adjudicate_cmd::handle(action, &fornax_home()).await?,
+        Commands::Feedback { action } => feedback_cmd::handle(action, &fornax_home()).await?,
     }
     Ok(())
 }
