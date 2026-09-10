@@ -367,7 +367,9 @@ fn probes_for_class(signal_class: &SignalClass) -> Vec<EvidenceRequest> {
             describe(
                 ProbeKind::InspectVcsState,
                 TrustClass::HostObserved,
-                &[SideEffectClass::ProcessSpawn],
+                // fornax-vcs is a pure in-process `gix` reimplementation --
+                // no subprocess spawn, no ProcessSpawn grant needed.
+                &[],
                 "inspect current git/filesystem state directly",
             ),
             describe(
@@ -409,7 +411,7 @@ fn probes_for_gap(gap: &EvidenceGap) -> Vec<EvidenceRequest> {
                 ProbeKind::InspectVcsState,
                 SignalClass::ToolTrace,
                 TrustClass::HostObserved,
-                &[SideEffectClass::ProcessSpawn],
+                &[],
                 "re-observe current state now -- the counted evidence is stale",
             ),
             describe(
@@ -432,7 +434,7 @@ fn probes_for_gap(gap: &EvidenceGap) -> Vec<EvidenceRequest> {
                 ProbeKind::InspectVcsState,
                 SignalClass::ToolTrace,
                 TrustClass::HostObserved,
-                &[SideEffectClass::ProcessSpawn],
+                &[],
                 "a host-observed check is independent of an agent-reported source",
             ),
             describe(
@@ -455,7 +457,7 @@ fn probes_for_gap(gap: &EvidenceGap) -> Vec<EvidenceRequest> {
                 ProbeKind::InspectVcsState,
                 SignalClass::ToolTrace,
                 TrustClass::HostObserved,
-                &[SideEffectClass::ProcessSpawn],
+                &[],
                 "inspect current state directly",
             ),
         ],
@@ -464,7 +466,7 @@ fn probes_for_gap(gap: &EvidenceGap) -> Vec<EvidenceRequest> {
                 ProbeKind::InspectVcsState,
                 SignalClass::ToolTrace,
                 TrustClass::HostObserved,
-                &[SideEffectClass::ProcessSpawn],
+                &[],
                 "inspect current state to help resolve the conflict",
             ),
             describe(
@@ -1460,5 +1462,62 @@ mod tests {
             serde_json::to_string(&plan_a).unwrap(),
             serde_json::to_string(&plan_b).unwrap()
         );
+    }
+
+    /// FORNX-346 regression: `fornax-vcs` is a pure in-process `gix`
+    /// reimplementation (no subprocess spawn, see its own module docs) --
+    /// every `InspectVcsState` request must declare an empty
+    /// `required_side_effects`, never `ProcessSpawn`. A prior version of
+    /// this module wrongly required `ProcessSpawn` for every
+    /// `InspectVcsState` candidate, which gated an actually auto-safe,
+    /// read-only probe behind a grant it never needed under
+    /// `GlobalExperimentPolicy::default()` (which permits only
+    /// `EphemeralWorktreeMutation`).
+    #[test]
+    fn inspect_vcs_state_never_requires_process_spawn() {
+        for signal_class in [SignalClass::ToolTrace, SignalClass::ToolResultPayload] {
+            for request in probes_for_class(&signal_class) {
+                if request.kind == ProbeKind::InspectVcsState {
+                    assert!(
+                        request.required_side_effects.is_read_only(),
+                        "InspectVcsState for {signal_class:?} must be read-only, got {:?}",
+                        request.required_side_effects
+                    );
+                }
+            }
+        }
+
+        let c = claim();
+        for gap_kind in [
+            EvidenceGapKind::StaleSupport,
+            EvidenceGapKind::IndependenceUnverified,
+            EvidenceGapKind::SingleSourceCorroboration,
+            EvidenceGapKind::AllVotesDiscounted,
+            EvidenceGapKind::UnresolvedConflict,
+        ] {
+            let gap = EvidenceGap {
+                kind: gap_kind.clone(),
+                claim_id: c.id,
+                link_ids: vec![],
+                missing_evidence_ids: vec![],
+                detail: "test".to_string(),
+            };
+            for request in probes_for_gap(&gap) {
+                if request.kind == ProbeKind::InspectVcsState {
+                    assert!(
+                        request.required_side_effects.is_read_only(),
+                        "InspectVcsState for gap {gap_kind:?} must be read-only, got {:?}",
+                        request.required_side_effects
+                    );
+                    // Available under the default (EphemeralWorktreeMutation-
+                    // only) policy -- the whole point of the fix.
+                    let acquisition = acquisition_policy(&[]);
+                    assert_eq!(
+                        classify_availability(&request, &[], &acquisition),
+                        CandidateAvailability::Available
+                    );
+                }
+            }
+        }
     }
 }
