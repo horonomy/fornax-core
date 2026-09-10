@@ -30,4 +30,9 @@ pub enum AcquisitionOutcome {
     /// This candidate's `ProbeKind` has no implementation in this crate
     /// (FORNX-346 scope: only `VerifyArtifactHash`/`InspectVcsState`).
     Unsupported { reason: String },
+    /// The probe exceeded its [`crate::budget::AcquisitionBudget`] and the
+    /// caller stopped waiting (FORNX-346 AC5) -- never fabricated into
+    /// `Failed` (which implies the probe itself errored) or `Acquired`
+    /// (which implies it actually produced a result in time).
+    TimedOut { reason: String, elapsed_ms: u64 },
 }
