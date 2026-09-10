@@ -7,7 +7,21 @@ Jira epic FORNX-20.
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- `fornax-corpus` crate + `fornax corpus mine`/`fornax corpus export`
+  (FORNX-341, Stage 8): mines real local sessions into sanitized,
+  redacted candidate integrity cases (contradiction, high uncertainty,
+  sensor disagreement, verdict-changed-across-findings, and benign
+  controls), and exports a deterministic corpus manifest. No automatic
+  ground-truth labeling, no raw-telemetry centralization — everything is
+  gated behind an explicit `FORNAX_CORPUS_MINING_ENABLED` opt-in and
+  wired into the existing FORNX-106 retention/deletion mechanism via a
+  new `RetentionClass::SanitizedCandidate`.
+- FORNX-339: daemon/CLI now perform an explicit `$FORNAX_HOME` identity
+  handshake (`x-fornax-home-id` header) so a CLI talking to the wrong
+  daemon on a shared port fails closed (`UNAVAILABLE`) instead of
+  silently reading another session's data.
 
 ## [v0.0.3] — Extensible Evidence Platform
 
