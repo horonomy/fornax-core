@@ -102,3 +102,211 @@ pub fn evaluate(input: &MiningInput) -> Vec<MiningStrategy> {
 
     fired
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fornax_types::{
+        ClockSource, CollectionMethod, EvidenceLink, EvidenceRelation, EvidenceSource, TrustClass,
+    };
+    use uuid::Uuid;
+
+    fn claim() -> Claim {
+        Claim {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            source_event_id: Uuid::new_v4(),
+            text: "the command exited successfully".into(),
+            subject: "command_succeeded".into(),
+            claimed_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    fn evidence_with_sensor(sensor_name: &str) -> Evidence {
+        Evidence {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            source_event_id: Uuid::new_v4(),
+            kind: fornax_types::EvidenceKind::ExitCode,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            payload: serde_json::json!({}),
+            provenance: "test".into(),
+            source: Some(EvidenceSource {
+                sensor_name: sensor_name.into(),
+                trust_class: TrustClass::AgentAdjacent,
+                collected_at: "2026-01-01T00:00:00Z".into(),
+                provider: None,
+                collection_method: CollectionMethod::HookCallback,
+                collector_version: None,
+                freshness: fornax_types::Freshness {
+                    clock_source: ClockSource::HostClock,
+                    caveat: None,
+                },
+                tamper_boundary: Default::default(),
+                correlation_group: None,
+                derived_from: vec![],
+            }),
+            extension: None,
+            evidence_purged: false,
+        }
+    }
+
+    fn link(
+        claim_id: uuid::Uuid,
+        evidence_id: uuid::Uuid,
+        relation: EvidenceRelation,
+    ) -> EvidenceLink {
+        EvidenceLink {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            claim_id,
+            evidence_id,
+            relation,
+            linked_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    fn fused(verdict: Verdict, uncertainty: UncertaintyBand, claim_id: uuid::Uuid) -> FusedFinding {
+        FusedFinding {
+            claim_id,
+            verdict,
+            uncertainty,
+            rationale: vec![],
+            counted_link_ids: vec![],
+            discounted_link_ids: vec![],
+            missing_evidence_ids: vec![],
+            unresolved_conflict: false,
+            policy_name: "test".into(),
+            policy_version: 1,
+            computed_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn contradiction_and_sensor_disagreement_fire_together_for_a_real_conflict() {
+        let c = claim();
+        let e1 = evidence_with_sensor("sensor_a");
+        let e2 = evidence_with_sensor("sensor_b");
+        let graph = EvidenceGraph {
+            links: vec![
+                link(c.id, e1.id, EvidenceRelation::Supports),
+                link(c.id, e2.id, EvidenceRelation::Contradicts),
+            ],
+            missing: vec![],
+        };
+        let pool = vec![e1, e2];
+        let f = fused(Verdict::Review, UncertaintyBand::Conflicted, c.id);
+        let input = MiningInput {
+            claim: &c,
+            graph: &graph,
+            evidence_pool: &pool,
+            fused: &f,
+            prior_verdicts: &[],
+        };
+        let strategies = evaluate(&input);
+        assert!(strategies.contains(&MiningStrategy::EvidenceContradiction));
+        assert!(strategies.contains(&MiningStrategy::SensorDisagreement));
+        assert!(strategies.contains(&MiningStrategy::HighUncertainty));
+        assert!(!strategies.contains(&MiningStrategy::BenignControl));
+    }
+
+    #[test]
+    fn qualified_band_is_not_high_uncertainty() {
+        // Qualified is where every real vote lands today (no sensor stamps
+        // correlation_group) -- it must never be treated as high
+        // uncertainty, or this would fire on ~all real traffic.
+        let c = claim();
+        let graph = EvidenceGraph::default();
+        let f = fused(Verdict::Verified, UncertaintyBand::Qualified, c.id);
+        let input = MiningInput {
+            claim: &c,
+            graph: &graph,
+            evidence_pool: &[],
+            fused: &f,
+            prior_verdicts: &[],
+        };
+        assert!(!evaluate(&input).contains(&MiningStrategy::HighUncertainty));
+    }
+
+    #[test]
+    fn verdict_changed_across_findings_fires_on_a_real_disagreement() {
+        let c = claim();
+        let graph = EvidenceGraph::default();
+        let f = fused(Verdict::Verified, UncertaintyBand::Qualified, c.id);
+        let prior = [Verdict::Contradicted, Verdict::Verified];
+        let input = MiningInput {
+            claim: &c,
+            graph: &graph,
+            evidence_pool: &[],
+            fused: &f,
+            prior_verdicts: &prior,
+        };
+        assert!(evaluate(&input).contains(&MiningStrategy::VerdictChangedAcrossFindings));
+    }
+
+    #[test]
+    fn stable_repeated_verdicts_do_not_fire_verdict_changed() {
+        let c = claim();
+        let graph = EvidenceGraph::default();
+        let f = fused(Verdict::Verified, UncertaintyBand::Qualified, c.id);
+        let prior = [Verdict::Verified, Verdict::Verified];
+        let input = MiningInput {
+            claim: &c,
+            graph: &graph,
+            evidence_pool: &[],
+            fused: &f,
+            prior_verdicts: &prior,
+        };
+        assert!(!evaluate(&input).contains(&MiningStrategy::VerdictChangedAcrossFindings));
+    }
+
+    #[test]
+    fn a_clean_verified_claim_with_no_conflict_is_mined_as_a_benign_control() {
+        let c = claim();
+        let graph = EvidenceGraph::default();
+        let f = fused(Verdict::Verified, UncertaintyBand::Qualified, c.id);
+        let input = MiningInput {
+            claim: &c,
+            graph: &graph,
+            evidence_pool: &[],
+            fused: &f,
+            prior_verdicts: &[],
+        };
+        assert_eq!(evaluate(&input), vec![MiningStrategy::BenignControl]);
+    }
+
+    #[test]
+    fn benign_control_is_exclusive_and_never_joins_a_real_finding() {
+        let c = claim();
+        let graph = EvidenceGraph::default();
+        // Verified + Qualified but a verdict change did occur -- must not
+        // also claim BenignControl.
+        let f = fused(Verdict::Verified, UncertaintyBand::Qualified, c.id);
+        let prior = [Verdict::Contradicted, Verdict::Verified];
+        let input = MiningInput {
+            claim: &c,
+            graph: &graph,
+            evidence_pool: &[],
+            fused: &f,
+            prior_verdicts: &prior,
+        };
+        let strategies = evaluate(&input);
+        assert!(strategies.contains(&MiningStrategy::VerdictChangedAcrossFindings));
+        assert!(!strategies.contains(&MiningStrategy::BenignControl));
+    }
+
+    #[test]
+    fn no_strategy_fires_for_an_unremarkable_unverified_claim() {
+        let c = claim();
+        let graph = EvidenceGraph::default();
+        let f = fused(Verdict::Unverified, UncertaintyBand::Qualified, c.id);
+        let input = MiningInput {
+            claim: &c,
+            graph: &graph,
+            evidence_pool: &[],
+            fused: &f,
+            prior_verdicts: &[],
+        };
+        assert!(evaluate(&input).is_empty());
+    }
+}
