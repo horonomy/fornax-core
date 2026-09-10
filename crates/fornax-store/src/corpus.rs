@@ -99,6 +99,20 @@ impl Store {
         Ok(rows)
     }
 
+    /// One candidate by its own id, if it has not been deleted/expired
+    /// (FORNX-342: the adjudication workflow looks candidates up by id, not
+    /// by session).
+    pub async fn get_corpus_candidate(&self, id: &str) -> Result<Option<CorpusCandidateRow>> {
+        let row = sqlx::query_as::<_, CorpusCandidateRow>(
+            "SELECT id, session_id, schema_version, mined_at, document
+             FROM corpus_candidates WHERE id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
     /// Every mined candidate in this store, oldest first — the input
     /// `fornax corpus export` reads to build a manifest.
     pub async fn all_corpus_candidates(&self) -> Result<Vec<CorpusCandidateRow>> {
