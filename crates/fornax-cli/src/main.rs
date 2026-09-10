@@ -196,6 +196,16 @@ enum Commands {
     // every other variant's size -- boxing keeps `Commands` itself cheap to
     // move/match regardless of which subcommand is chosen.
     Reliability(Box<ReliabilityArgs>),
+    /// Report whether the live environment (adapter version, capability
+    /// fingerprint, fusion/decision policy identity, disabled sensors)
+    /// still matches the most recently recorded calibration revision
+    /// (FORNX-348). Plain prose over `GET /api/calibration` -- never a bare
+    /// percentage.
+    Calibration {
+        /// Session id whose announced capabilities supply the live
+        /// provenance's capability fingerprint.
+        session: String,
+    },
     /// Export one session's events/claims/evidence/capabilities from the
     /// local store into a directory-based spool, as one wire-compatible
     /// envelope JSON file per message (FORNX-60, FORNX-62). Reads
@@ -561,6 +571,13 @@ async fn main() -> anyhow::Result<()> {
             }
             match fetch_json(&url).await {
                 Ok(v) => print!("{}", render_reliability(&v)),
+                Err(e) => println!("fornax: {e}"),
+            }
+        }
+        Commands::Calibration { session } => {
+            let url = format!("{}/api/calibration?session={session}", base_url());
+            match fetch_json(&url).await {
+                Ok(v) => print!("{}", render_calibration(&v)),
                 Err(e) => println!("fornax: {e}"),
             }
         }
@@ -2231,15 +2248,20 @@ fn render_reliability_estimate(estimate: &serde_json::Value) -> String {
 /// prints an estimate without the context dimensions already present in the
 /// same returned string.
 ///
-/// `superseded_by_drift`, when `true` (FORNX-105 AC: "drift ... does not
-/// silently reuse stale confidence"), replaces the estimate line with an
-/// explicit stale/superseded marker instead of the numeric estimate — used
-/// by [`render_drift_assessment`] on the baseline side of a `Drifted`
-/// comparison.
+/// `suppressed_because`, when `Some` (FORNX-105 AC: "drift ... does not
+/// silently reuse stale confidence"; widened by FORNX-348 to cover any
+/// calibration-suppression reason, not just drift), replaces the estimate
+/// line with an explicit stale/superseded marker naming the actual reason,
+/// instead of the numeric estimate — used by [`render_drift_assessment`] on
+/// the baseline side of a `Drifted` comparison, and by
+/// [`render_calibration`] whenever `estimate_suppressed_because` is present
+/// on a `CalibratedReliabilityView`. Was a bare `superseded_by_drift: bool`
+/// before FORNX-348 — that could only ever say "drift superseded this",
+/// never "stale provenance" or "insufficient support".
 fn render_reliability_signal(
     label: &str,
     signal: &serde_json::Value,
-    superseded_by_drift: bool,
+    suppressed_because: Option<&str>,
 ) -> String {
     let mut out = String::new();
     let Some(context_block) = signal
@@ -2260,8 +2282,10 @@ fn render_reliability_signal(
             out.push_str(&format!("  not evaluable: {not_evaluable}\n"));
         }
     }
-    if superseded_by_drift {
-        out.push_str("  ⚠ stale -- superseded by drift, not shown as current confidence\n");
+    if let Some(reason) = suppressed_because {
+        out.push_str(&format!(
+            "  ⚠ stale -- not shown as current confidence ({reason})\n"
+        ));
     } else if let Some(estimate) = signal.get("reliability_estimate") {
         out.push_str(&render_reliability_estimate(estimate));
     }
@@ -2338,7 +2362,7 @@ fn render_reliability(v: &serde_json::Value) -> String {
     }
 
     if let Some(signal) = v.get("signal") {
-        out.push_str(&render_reliability_signal("  ", signal, false));
+        out.push_str(&render_reliability_signal("  ", signal, None));
         return out;
     }
 
@@ -2349,19 +2373,114 @@ fn render_reliability(v: &serde_json::Value) -> String {
             .unwrap_or(serde_json::Value::Null);
         out.push_str(&format!("  drift: {}\n", drift_state_label(&state)));
         let is_drifted = state.as_str() == Some("drifted");
+        let drift_reason = is_drifted.then_some("superseded by drift");
 
         if let Some(baseline) = assessment.get("baseline_signal") {
             out.push_str("  baseline:\n");
-            out.push_str(&render_reliability_signal("    ", baseline, is_drifted));
+            out.push_str(&render_reliability_signal("    ", baseline, drift_reason));
         }
         if let Some(comparison) = assessment.get("comparison_signal") {
             out.push_str("  comparison:\n");
-            out.push_str(&render_reliability_signal("    ", comparison, false));
+            out.push_str(&render_reliability_signal("    ", comparison, None));
         }
         return out;
     }
 
     out.push_str("  no reliability data returned\n");
+    out
+}
+
+/// Renders a serialized `CalibrationState` (FORNX-348), covering all five
+/// states distinctly plus a forward-compat fallback -- mirroring
+/// `drift_state_label`'s own never-collapse-the-taxonomy convention.
+/// `Stale` names every changed dimension explicitly; `Suspect` reuses
+/// `drift_state_label` for its nested `DriftState` rather than
+/// re-describing it.
+fn calibration_state_label(state: &serde_json::Value) -> String {
+    if let Some(s) = state.as_str() {
+        return match s {
+            "valid" => "✓ valid -- live environment matches the recorded calibration".to_string(),
+            "no_active_calibration" => "◌ no active calibration has been recorded yet".to_string(),
+            other => format!("◌ {other}"),
+        };
+    }
+    if let Some(stale) = state.get("stale") {
+        let dims: Vec<&str> = stale
+            .get("changed_dimensions")
+            .and_then(|d| d.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        return format!(
+            "⚠ stale -- environment changed since the recorded calibration: {}",
+            dims.join(", ")
+        );
+    }
+    if let Some(suspect) = state.get("suspect") {
+        let drift = suspect
+            .get("drift_state")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        return format!(
+            "⚠ suspect -- {}",
+            drift_state_label(&drift).trim_start_matches("⚠ ")
+        );
+    }
+    if let Some(insufficient) = state.get("insufficient_support") {
+        return format!(
+            "? insufficient support -- not enough observations to confirm validity: {}",
+            render_sample_support(
+                insufficient
+                    .get("sample_support")
+                    .unwrap_or(&serde_json::Value::Null)
+            )
+            .trim()
+        );
+    }
+    "◌ unrecognized calibration state".to_string()
+}
+
+/// Renders `GET /api/calibration`'s response (FORNX-348): whether the live
+/// environment still matches the most recently recorded calibration
+/// revision. Distinguishes "no capabilities announced" (a live provenance
+/// read cannot be built) from an actual assessment, same discipline as
+/// `render_reliability`. Returns the rendered text so it can be asserted on
+/// in tests.
+fn render_calibration(v: &serde_json::Value) -> String {
+    let mut out = String::new();
+    let session = v.get("session").and_then(|s| s.as_str()).unwrap_or("?");
+    out.push_str(&format!("session: {session}\n"));
+
+    if let Some(error) = v.get("error").and_then(|s| s.as_str()) {
+        out.push_str(&format!("  error: {error}\n"));
+        return out;
+    }
+
+    if let Some(false) = v.get("capabilities_announced").and_then(|b| b.as_bool()) {
+        let reason = v
+            .get("reason")
+            .and_then(|s| s.as_str())
+            .unwrap_or("no capabilities announced yet for this session");
+        out.push_str(&format!("  {reason}\n"));
+        return out;
+    }
+
+    if let Some(assessment) = v.get("assessment") {
+        let state = assessment
+            .get("state")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        out.push_str(&format!(
+            "  calibration: {}\n",
+            calibration_state_label(&state)
+        ));
+        let policy_version = assessment
+            .get("policy_version")
+            .and_then(|p| p.as_u64())
+            .unwrap_or(0);
+        out.push_str(&format!("  policy_version: {policy_version}\n"));
+    } else {
+        out.push_str("  no calibration data returned\n");
+    }
     out
 }
 
@@ -3967,10 +4086,71 @@ trust_level = \"trusted\"\n";
         // -- this must never be reachable as a rendered percentage.
         let mut signal = confident_signal_fixture("claude-sonnet-5", 0.93);
         signal.as_object_mut().unwrap().remove("context_key");
-        let rendered = render_reliability_signal("  ", &signal, false);
+        let rendered = render_reliability_signal("  ", &signal, None);
         assert!(!rendered.contains("93.0%"));
         assert!(!rendered.contains("reliability estimate:"));
         assert!(rendered.contains("context key incomplete"));
+    }
+
+    #[test]
+    fn render_reliability_signal_names_the_suppression_reason_when_given_one() {
+        let signal = confident_signal_fixture("claude-sonnet-5", 0.93);
+        let rendered = render_reliability_signal("  ", &signal, Some("calibration stale"));
+        assert!(!rendered.contains("93.0%"));
+        assert!(rendered.contains("calibration stale"));
+    }
+
+    // --- render_calibration (FORNX-348) ---------------------------------
+
+    #[test]
+    fn render_calibration_reports_no_capabilities_announced() {
+        let v = serde_json::json!({
+            "session": "s1",
+            "capabilities_announced": false,
+            "reason": "no capabilities announced for this session -- a live calibration \
+                       provenance read cannot be built without one",
+        });
+        let rendered = render_calibration(&v);
+        assert!(rendered.contains("s1"));
+        assert!(rendered.contains("no capabilities announced"));
+    }
+
+    #[test]
+    fn render_calibration_names_every_changed_dimension_for_a_stale_state() {
+        let v = serde_json::json!({
+            "session": "s1",
+            "capabilities_announced": true,
+            "assessment": {
+                "state": { "stale": { "changed_dimensions": ["adapter_version", "disabled_sensors"] } },
+                "policy_version": 1,
+            },
+        });
+        let rendered = render_calibration(&v);
+        assert!(rendered.contains("stale"));
+        assert!(rendered.contains("adapter_version"));
+        assert!(rendered.contains("disabled_sensors"));
+    }
+
+    #[test]
+    fn render_calibration_reports_valid() {
+        let v = serde_json::json!({
+            "session": "s1",
+            "capabilities_announced": true,
+            "assessment": { "state": "valid", "policy_version": 1 },
+        });
+        let rendered = render_calibration(&v);
+        assert!(rendered.contains("✓ valid"));
+    }
+
+    #[test]
+    fn render_calibration_reports_no_active_calibration() {
+        let v = serde_json::json!({
+            "session": "s1",
+            "capabilities_announced": true,
+            "assessment": { "state": "no_active_calibration", "policy_version": 1 },
+        });
+        let rendered = render_calibration(&v);
+        assert!(rendered.contains("no active calibration"));
     }
 
     #[test]
@@ -3993,7 +4173,7 @@ trust_level = \"trusted\"\n";
         // ...but the baseline's stale confidence must be qualified, never
         // shown plain beside the new one (AC4).
         assert!(!rendered.contains("95.0%"));
-        assert!(rendered.contains("stale -- superseded by drift"));
+        assert!(rendered.contains("stale -- not shown as current confidence (superseded by drift)"));
     }
 
     #[test]

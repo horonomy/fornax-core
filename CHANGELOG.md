@@ -9,6 +9,30 @@ Jira epic FORNX-20.
 
 ### Added
 
+- `fornax_verify::calibration` + `GET /api/calibration` + `fornax
+  calibration` (FORNX-348, Stage 8): a non-relaxing calibration floor on
+  `/api/decision`'s `Recommendation`. `CalibrationProvenance` snapshots
+  every genuinely observable environment dimension (adapter version,
+  capability fingerprint, fusion/decision policy identity, disabled
+  sensors, active policy revision digest) -- `model_version`/`model_family`
+  stay `Option`, populated only when a caller explicitly supplies them,
+  since no adapter or sensor in this codebase observes a model release.
+  `assess_calibration` compares live provenance against the most recently
+  recorded `calibration_revisions` row (new insert-only store table) and
+  reports one of five states (`NoActiveCalibration`/`Valid`/`Stale`/
+  `Suspect`/`InsufficientSupport`); `apply_calibration_floor` steps a
+  `Proceed` recommendation down to `Review` under any non-`Valid`,
+  non-`NoActiveCalibration` state, strictly downstream of `fuse()` --
+  frozen fusion output and replay-stability are untouched.
+  `fornax-bench::qualifying` refuses to let a benchmark run with any
+  synthetic label, or a dataset whose content hash no longer matches a
+  frozen baseline, count toward a calibration decision. See
+  `docs/adr/0018-calibration-validity-lifecycle.md` for why the drift-derived
+  half (`Suspect`) is unreachable on live traffic today (no
+  `ReliabilityObservation` writer exists anywhere yet), why the floor is
+  provably non-regressive today (`Corroborated`/`Proceed` requires a shared
+  `correlation_group` no shipped sensor stamps, per ADR 0017), and the
+  full honest AC-coverage table.
 - `fornax_verify::independence` + `FusionRule::CommonSourceCollapsed` +
   `Independence::PartiallyCorrelated` (FORNX-347, Stage 8): a read-side
   `SourceFamilyMap` catches the real, live common-source amplification that

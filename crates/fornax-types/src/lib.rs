@@ -15,6 +15,7 @@ use uuid::Uuid;
 pub mod adapter;
 pub mod audit;
 pub mod audit_checkpoint;
+pub mod calibration;
 pub mod capabilities;
 pub mod causal;
 pub mod experiment;

@@ -414,6 +414,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/evidence-plan", get(api_evidence_plan))
         .route("/api/acquire-evidence", post(api_acquire_evidence))
         .route("/api/reliability", get(api_reliability))
+        .route("/api/calibration", get(api_calibration))
         .route("/api/policy", get(api_policy))
         .route("/dashboard", get(dashboard))
         .layer(middleware::from_fn_with_state(
@@ -1338,6 +1339,19 @@ async fn api_decision(
         })),
         FusionOutcome::Found(found) => {
             let recommendation = DefaultRiskPolicy.decide(&found.fused, risk);
+            // FORNX-348: apply the non-relaxing calibration floor strictly
+            // downstream of decide() -- never touches `found.fused` (the
+            // frozen fusion output) itself. `None` (no announced
+            // capabilities for this session) applies no floor at all;
+            // there is nothing to have gone stale or drifted relative to.
+            let recommendation = match calibration_assessment_for_session(&state, &q.session).await
+            {
+                Some(assessment) => fornax_verify::decision::apply_calibration_floor(
+                    recommendation,
+                    &assessment.state,
+                ),
+                None => recommendation,
+            };
             Json(serde_json::json!({
                 "claim": q.claim,
                 "session": q.session,
@@ -1976,6 +1990,171 @@ async fn reliability_response(
             })
         }
     }
+}
+
+/// Stable wire tag for a [`fornax_types::Provider`], reusing its own serde
+/// representation rather than hand-maintaining a second mapping --
+/// mirrors `fornax_types::reliability_context::capability_fingerprint`'s
+/// own documented technique of sorting by "their serde wire representation"
+/// instead of adding ad-hoc `Display` impls.
+fn provider_wire_tag(provider: fornax_types::Provider) -> String {
+    serde_json::to_value(provider)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// The active policy bundle's revision digest(s), if any are currently
+/// loaded (FORNX-348). `state.policy`'s active generation can carry more
+/// than one bundle member; every member's digest is included, sorted, so
+/// this can never silently under-report a multi-bundle activation the way
+/// picking just `.first()` would. `None` when nothing is active yet.
+async fn active_policy_revision_digests(state: &AppState) -> Option<String> {
+    let snapshot = state.policy.read().await;
+    let active = snapshot.state.active.as_ref()?;
+    if active.members.is_empty() {
+        return None;
+    }
+    let mut digests: Vec<String> = active
+        .members
+        .iter()
+        .map(|m| m.revision_digest.as_str().to_string())
+        .collect();
+    digests.sort();
+    digests.dedup();
+    Some(digests.join(","))
+}
+
+/// Build the live [`fornax_types::calibration::CalibrationProvenance`] this
+/// deployment observes right now, for one session's already-resolved
+/// [`RuntimeCapabilities`] (FORNX-348). Reuses every existing identity
+/// source verbatim -- `BaselineFusionPolicy`/`DefaultRiskPolicy`'s own
+/// `name()`/`policy_version()`, `RELIABILITY_POLICY_VERSION`,
+/// `capability_fingerprint`, `state.sensor_disable` -- never re-derives or
+/// hardcodes any of them a second time. `model_version`/`model_family` are
+/// only ever the caller-supplied values passed in; nothing here infers or
+/// defaults them (see `CalibrationProvenance`'s own docs).
+async fn build_calibration_provenance(
+    state: &AppState,
+    capabilities: &RuntimeCapabilities,
+    model_version: Option<String>,
+    model_family: Option<String>,
+) -> fornax_types::calibration::CalibrationProvenance {
+    use fornax_types::reliability_context::capability_fingerprint;
+    use fornax_verify::decision::{DecisionPolicy, DefaultRiskPolicy};
+
+    let fusion_policy = BaselineFusionPolicy;
+    let decision_policy = DefaultRiskPolicy;
+
+    fornax_types::calibration::CalibrationProvenance {
+        schema_version: fornax_types::calibration::CALIBRATION_SCHEMA_VERSION,
+        provider: provider_wire_tag(capabilities.provider),
+        adapter_version: capabilities.notes.get("adapter_version").cloned(),
+        capability_schema_version: capabilities.schema_version,
+        capability_fingerprint: capability_fingerprint(capabilities),
+        fusion_policy_name: fusion_policy.name().to_string(),
+        fusion_policy_version: fusion_policy.policy_version(),
+        decision_policy_name: decision_policy.name().to_string(),
+        decision_policy_version: decision_policy.policy_version(),
+        reliability_policy_version: fornax_verify::reliability::RELIABILITY_POLICY_VERSION,
+        disabled_sensors: fornax_types::calibration::CalibrationProvenance::disabled_sensors_from(
+            state.sensor_disable.disabled_names(),
+        ),
+        active_policy_revision_digest: active_policy_revision_digests(state).await,
+        model_version,
+        model_family,
+    }
+}
+
+/// The most recently recorded calibration revision's provenance, if one has
+/// ever been recorded -- `None` when `calibration_revisions` is empty or
+/// the stored document fails to parse (an honest "no active calibration",
+/// never a fabricated one).
+async fn active_calibration_provenance(
+    state: &AppState,
+) -> Option<fornax_types::calibration::CalibrationProvenance> {
+    let row = state.store.latest_calibration_revision().await.ok()??;
+    serde_json::from_str(&row.document).ok()
+}
+
+/// Assess calibration for one session (FORNX-348), reusing the exact same
+/// capability-lookup discipline `reliability_response` established: pick
+/// the row matching the session's FIRST announced provider when more than
+/// one has announced, since there is no explicit provider context here the
+/// way `/api/reliability` has via its query. `None` when the session has no
+/// announced capabilities at all -- there is no live provenance to compare
+/// against, so no calibration judgment can be made.
+///
+/// **No `ReliabilityObservation`s are persisted anywhere in this codebase
+/// yet** (see `reliability_response`'s own doc comment) -- `drift` is
+/// therefore always `None` here; only the provenance-mismatch half
+/// (`Stale`) is ever actually reachable on live traffic today. See
+/// ADR-0018.
+async fn calibration_assessment_for_session(
+    state: &AppState,
+    session: &str,
+) -> Option<fornax_verify::calibration::CalibrationAssessment> {
+    use fornax_verify::reliability::ReliabilityAggregationConfig;
+
+    let caps = state.store.capabilities_for_session(session).await.ok()?;
+    let capabilities = caps.into_iter().next()?;
+    let live = build_calibration_provenance(state, &capabilities, None, None).await;
+    let active = active_calibration_provenance(state).await;
+    let config = ReliabilityAggregationConfig::load_default();
+    Some(fornax_verify::calibration::assess_calibration(
+        active.as_ref(),
+        &live,
+        None,
+        config.historical_aggregation_enabled,
+    ))
+}
+
+#[derive(serde::Deserialize)]
+struct CalibrationQuery {
+    session: String,
+}
+
+/// FORNX-348: `GET /api/calibration?session=`. Reports whether the
+/// session's live, observable environment (adapter version, capability
+/// fingerprint, fusion/decision policy identity, disabled sensors) still
+/// matches the most recently recorded calibration revision -- see
+/// `fornax_verify::calibration` module docs for the full state vocabulary.
+/// This is the read half of the same assessment `/api/decision` applies as
+/// a non-relaxing floor on its `Recommendation` (FORNX-348 AC4).
+async fn api_calibration(
+    State(state): State<AppState>,
+    Query(q): Query<CalibrationQuery>,
+) -> Json<serde_json::Value> {
+    let caps = match state.store.capabilities_for_session(&q.session).await {
+        Ok(caps) => caps,
+        Err(e) => return Json(serde_json::json!({ "session": q.session, "error": e.to_string() })),
+    };
+    let Some(capabilities) = caps.into_iter().next() else {
+        return Json(serde_json::json!({
+            "session": q.session,
+            "capabilities_announced": false,
+            "reason": "no capabilities announced for this session -- a live calibration \
+                       provenance read cannot be built without one",
+        }));
+    };
+
+    let live = build_calibration_provenance(&state, &capabilities, None, None).await;
+    let active = active_calibration_provenance(&state).await;
+    let config = fornax_verify::reliability::ReliabilityAggregationConfig::load_default();
+    let assessment = fornax_verify::calibration::assess_calibration(
+        active.as_ref(),
+        &live,
+        None,
+        config.historical_aggregation_enabled,
+    );
+
+    Json(serde_json::json!({
+        "session": q.session,
+        "capabilities_announced": true,
+        "active_provenance": active,
+        "live_provenance": live,
+        "assessment": assessment,
+    }))
 }
 
 #[derive(serde::Deserialize)]
@@ -3659,6 +3838,214 @@ mod tests {
         .await;
         let v = response.0;
         assert!(v.get("error").is_some());
+    }
+
+    // --- FORNX-348: /api/calibration + the decision-layer floor ---------
+
+    #[tokio::test]
+    async fn api_calibration_reports_no_capabilities_announced() {
+        let state = test_state().await;
+        let response = api_calibration(
+            State(state),
+            Query(CalibrationQuery {
+                session: "fornx-348-calibration-no-caps".to_string(),
+            }),
+        )
+        .await;
+        let v = response.0;
+        assert_eq!(v["capabilities_announced"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
+    async fn api_calibration_reports_no_active_calibration_when_none_recorded_yet() {
+        use fornax_types::{CapabilitySignal, Provider, SignalAvailability, SignalClass};
+        let state = test_state().await;
+        let session_id = "fornx-348-calibration-no-active-revision";
+        let caps = RuntimeCapabilities {
+            schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
+            provider: Provider::ClaudeCode,
+            signals: vec![CapabilitySignal {
+                class: SignalClass::ToolTrace,
+                state: SignalAvailability::Available,
+                detail: None,
+            }],
+            notes: [("session_id".to_string(), session_id.to_string())].into(),
+        };
+        let mut hint = None;
+        handle_message(&state, IngestMessage::Capabilities(caps), &mut hint)
+            .await
+            .expect("handle capabilities");
+
+        let response = api_calibration(
+            State(state),
+            Query(CalibrationQuery {
+                session: session_id.to_string(),
+            }),
+        )
+        .await;
+        let v = response.0;
+        assert_eq!(v["capabilities_announced"], serde_json::json!(true));
+        assert_eq!(
+            v["assessment"]["state"],
+            serde_json::json!("no_active_calibration")
+        );
+        assert!(
+            v["live_provenance"]["adapter_version"].is_null()
+                || v["live_provenance"].get("adapter_version").is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn api_calibration_reports_stale_when_a_recorded_revision_disagrees() {
+        use fornax_types::{CapabilitySignal, Provider, SignalAvailability, SignalClass};
+        let state = test_state().await;
+        let session_id = "fornx-348-calibration-stale-revision";
+        let caps = RuntimeCapabilities {
+            schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
+            provider: Provider::ClaudeCode,
+            signals: vec![CapabilitySignal {
+                class: SignalClass::ToolTrace,
+                state: SignalAvailability::Available,
+                detail: None,
+            }],
+            notes: [
+                ("session_id".to_string(), session_id.to_string()),
+                (
+                    "adapter_version".to_string(),
+                    "claude-adapter-0.3.0".to_string(),
+                ),
+            ]
+            .into(),
+        };
+        let mut hint = None;
+        handle_message(&state, IngestMessage::Capabilities(caps.clone()), &mut hint)
+            .await
+            .expect("handle capabilities");
+
+        // Record a revision whose provenance matches everything about the
+        // live environment except `adapter_version` -- built the same way
+        // `build_calibration_provenance` would, but with a different
+        // adapter version, so this is a genuine mismatch on exactly one
+        // dimension, not a fabricated one.
+        let mut stale = build_calibration_provenance(&state, &caps, None, None).await;
+        stale.adapter_version = Some("claude-adapter-0.2.0".to_string());
+        state
+            .store
+            .insert_calibration_revision(
+                "rev-1",
+                "2026-01-01T00:00:00Z",
+                &serde_json::to_string(&stale).expect("serialize provenance"),
+            )
+            .await
+            .expect("insert revision");
+
+        let response = api_calibration(
+            State(state),
+            Query(CalibrationQuery {
+                session: session_id.to_string(),
+            }),
+        )
+        .await;
+        let v = response.0;
+        assert_eq!(
+            v["assessment"]["state"]["stale"]["changed_dimensions"],
+            serde_json::json!(["adapter_version"])
+        );
+    }
+
+    #[tokio::test]
+    async fn api_calibration_reports_valid_when_a_recorded_revision_matches_live_provenance() {
+        use fornax_types::{CapabilitySignal, Provider, SignalAvailability, SignalClass};
+        let state = test_state().await;
+        let session_id = "fornx-348-calibration-valid-revision";
+        let caps = RuntimeCapabilities {
+            schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
+            provider: Provider::ClaudeCode,
+            signals: vec![CapabilitySignal {
+                class: SignalClass::ToolTrace,
+                state: SignalAvailability::Available,
+                detail: None,
+            }],
+            notes: [("session_id".to_string(), session_id.to_string())].into(),
+        };
+        let mut hint = None;
+        handle_message(&state, IngestMessage::Capabilities(caps.clone()), &mut hint)
+            .await
+            .expect("handle capabilities");
+
+        let matching = build_calibration_provenance(&state, &caps, None, None).await;
+        state
+            .store
+            .insert_calibration_revision(
+                "rev-1",
+                "2026-01-01T00:00:00Z",
+                &serde_json::to_string(&matching).expect("serialize provenance"),
+            )
+            .await
+            .expect("insert revision");
+
+        let response = api_calibration(
+            State(state),
+            Query(CalibrationQuery {
+                session: session_id.to_string(),
+            }),
+        )
+        .await;
+        let v = response.0;
+        assert_eq!(v["assessment"]["state"], serde_json::json!("valid"));
+    }
+
+    /// `/api/decision` calls `calibration_assessment_for_session` for every
+    /// request -- confirmed here by checking that a session with no
+    /// announced capabilities still returns a normal recommendation (the
+    /// `None` branch applies no floor and never errors), matching
+    /// `api_decision_returns_recommendation_and_full_fused_finding_together`'s
+    /// existing baseline (single `Supports` link, no correlation group ->
+    /// `Verified`/`Qualified` -> `Review`, already at the floor regardless
+    /// of calibration state).
+    #[tokio::test]
+    async fn api_decision_applies_calibration_assessment_without_erroring() {
+        let state = test_state().await;
+        let session_id = "fornx-348-decision-calibration-wiring";
+        let event_id = test_event(&state, session_id).await;
+        let claim = test_claim(session_id, event_id);
+        let evidence = test_evidence(session_id, event_id);
+        state
+            .store
+            .insert_claim(&claim)
+            .await
+            .expect("insert claim");
+        state
+            .store
+            .insert_evidence(&evidence)
+            .await
+            .expect("insert evidence");
+        let link = fornax_types::EvidenceLink {
+            id: Uuid::new_v4(),
+            session_id: session_id.to_string(),
+            claim_id: claim.id,
+            evidence_id: evidence.id,
+            relation: fornax_types::EvidenceRelation::Supports,
+            linked_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        state
+            .store
+            .insert_evidence_link(&link)
+            .await
+            .expect("insert evidence link");
+
+        let response = api_decision(
+            State(state),
+            Query(DecisionQuery {
+                claim: claim.id.to_string(),
+                session: session_id.to_string(),
+                risk: None,
+            }),
+        )
+        .await;
+        let v = response.0;
+        assert_eq!(v["found"], serde_json::json!(true));
+        assert_eq!(v["recommendation"]["action"], serde_json::json!("review"));
     }
 
     // --- FORNX-345: /api/evidence-plan -----------------------------------

@@ -16,6 +16,7 @@ pub mod acquisition;
 pub mod adjudication;
 pub mod audit_checkpoint;
 pub mod audit_ledger;
+pub mod calibration;
 pub mod compliance_report;
 pub mod corpus;
 pub mod policy_cache;
