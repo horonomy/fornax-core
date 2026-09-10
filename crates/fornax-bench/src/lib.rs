@@ -38,6 +38,8 @@
 //!   mechanism, comparing predictions with vs. without a contextual
 //!   reliability signal applied. Mechanism-verification only, over
 //!   synthetic data — see that module's docs.
+//! - [`slice`] — FORNX-344: breaks down metrics by the only trajectory
+//!   dimensions this codebase can actually observe (sensor, provider).
 
 pub mod ablation;
 pub mod dataset;
@@ -46,3 +48,4 @@ pub mod manifest;
 pub mod metrics;
 pub mod qualifying;
 pub mod reliability_eval;
+pub mod slice;
