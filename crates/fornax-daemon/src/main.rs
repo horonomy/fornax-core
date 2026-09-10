@@ -596,23 +596,7 @@ async fn handle_message(
                 );
             }
             let evidence = evidence_read.evidence;
-
-            // FORNX-14: registry stays a flat Vec, per the ticket's own
-            // maintainability requirement ("verifier registry/dispatch only
-            // as complex as the first real verifier set requires") — five
-            // verifiers dispatched by `applies_to` doesn't yet justify more.
-            let verifiers: Vec<Box<dyn Verifier + Send + Sync>> = vec![
-                Box::new(TestResultVerifier),
-                Box::new(CommandExecutedVerifier),
-                Box::new(CommandSuccessVerifier),
-                Box::new(FileModifiedVerifier),
-                Box::new(GitOperationVerifier),
-            ];
-            for verifier in verifiers.iter().filter(|v| v.applies_to(&claim)) {
-                let finding = verifier.verify(&claim, &evidence, &caps);
-                tracing::info!(verdict = ?finding.verdict, claim = %claim.text, "finding computed");
-                state.store.insert_finding(&finding).await?;
-            }
+            run_verifiers_and_persist_findings(state, &claim, &evidence, &caps).await?;
         }
     }
     Ok(())
@@ -1051,6 +1035,37 @@ fn finding_row_to_finding(row: &fornax_store::FindingRow) -> anyhow::Result<Find
         rationale: row.rationale.clone(),
         computed_at: row.computed_at.clone(),
     })
+}
+
+/// Runs the fixed verifier registry against `claim`/`evidence`/`caps` and
+/// persists every resulting `Finding` -- extracted (FORNX-346) from the
+/// `IngestMessage::Claim` handler so `/api/acquire-evidence` can re-run the
+/// exact same real re-verification after newly acquired evidence lands,
+/// rather than duplicating this dispatch loop or inventing a second one.
+///
+/// FORNX-14: registry stays a flat Vec, per the ticket's own
+/// maintainability requirement ("verifier registry/dispatch only as complex
+/// as the first real verifier set requires") — five verifiers dispatched by
+/// `applies_to` doesn't yet justify more.
+async fn run_verifiers_and_persist_findings(
+    state: &AppState,
+    claim: &fornax_types::Claim,
+    evidence: &[fornax_types::Evidence],
+    caps: &RuntimeCapabilities,
+) -> anyhow::Result<()> {
+    let verifiers: Vec<Box<dyn Verifier + Send + Sync>> = vec![
+        Box::new(TestResultVerifier),
+        Box::new(CommandExecutedVerifier),
+        Box::new(CommandSuccessVerifier),
+        Box::new(FileModifiedVerifier),
+        Box::new(GitOperationVerifier),
+    ];
+    for verifier in verifiers.iter().filter(|v| v.applies_to(claim)) {
+        let finding = verifier.verify(claim, evidence, caps);
+        tracing::info!(verdict = ?finding.verdict, claim = %claim.text, "finding computed");
+        state.store.insert_finding(&finding).await?;
+    }
+    Ok(())
 }
 
 /// Outcome of [`compute_fusion`] — the shared claim-lookup/graph-resolution/
