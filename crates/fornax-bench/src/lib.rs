@@ -41,7 +41,9 @@
 //! - [`slice`] — FORNX-344: breaks down metrics by the only trajectory
 //!   dimensions this codebase can actually observe (sensor, provider).
 //! - [`baseline`] — FORNX-344: freezes a `BaselineReport` for a dataset +
-//!   config, the frozen artifact a later comparison diffs against.
+//!   config, the frozen artifact [`regression::compare`] diffs against.
+//! - [`regression`] — FORNX-344: case-level comparison between a frozen
+//!   baseline and a fresh run over the same dataset.
 
 pub mod ablation;
 pub mod baseline;
@@ -50,5 +52,6 @@ pub mod harness;
 pub mod manifest;
 pub mod metrics;
 pub mod qualifying;
+pub mod regression;
 pub mod reliability_eval;
 pub mod slice;
