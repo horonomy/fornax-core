@@ -174,6 +174,14 @@ pub enum FusionRule {
     /// R5: two or more counted links shared a correlation group and the
     /// same relation — collapsed to one effective vote.
     CorrelationCollapsed,
+    /// R5b (FORNX-347): two or more counted links, uncollapsed by
+    /// `CorrelationCollapsed` (no shared `correlation_group`), share the
+    /// same relation AND the same `independence::SourceFamily` (e.g. two
+    /// `AgentAdjacent` sensors reading the same `source_event_id`) —
+    /// collapsed to one effective vote, same as `CorrelationCollapsed`.
+    /// This is the rule that actually fires on real traffic, since no
+    /// shipped sensor stamps `correlation_group` yet.
+    CommonSourceCollapsed,
     /// R5: a counted link's evidence carries no recorded correlation group.
     /// `None` means "no correlation recorded", not "proven independent".
     IndependenceUnverified,
@@ -483,12 +491,19 @@ impl FusionPolicy for BaselineFusionPolicy {
             }
         }
 
-        let mut final_counted: Vec<Candidate<'_>> = Vec::new();
+        // Phase 1 survivors: one representative per exact-`correlation_group`
+        // bucket (already collapsed below), plus every originally-ungrouped
+        // link, each tagged with whether it ever carried an explicit
+        // correlation_group -- that tag decides, after phase 2, whether the
+        // final survivor still needs an `IndependenceUnverified` caveat
+        // (only a link that never had *any* recorded group needs one; a
+        // link whose own group was a singleton already has an explicit,
+        // if unshared, record).
+        let mut phase1_survivors: Vec<(Candidate<'_>, bool)> = Vec::new();
         for ((_, group), mut bucket) in grouped {
             bucket.sort_by_key(|c| c.link.id);
-            let representative_idx = 0;
             if bucket.len() > 1 {
-                let representative_id = bucket[representative_idx].link.id;
+                let representative_id = bucket[0].link.id;
                 let sibling_ids: Vec<Uuid> = bucket[1..].iter().map(|c| c.link.id).collect();
                 for sibling in bucket.iter().skip(1) {
                     discounted_link_ids.push(sibling.link.id);
@@ -513,22 +528,91 @@ impl FusionPolicy for BaselineFusionPolicy {
                     ),
                 });
             }
-            final_counted.push(bucket.into_iter().next().unwrap());
+            phase1_survivors.push((bucket.into_iter().next().unwrap(), true));
         }
         for c in ungrouped {
-            rationale.push(RationaleEntry {
-                rule: FusionRule::IndependenceUnverified,
-                effect: RuleEffect::Caveat,
-                link_ids: vec![c.link.id],
-                missing_evidence_ids: vec![],
-                evidence_ids: vec![c.link.evidence_id],
-                detail: format!(
-                    "link {}'s evidence carries no recorded correlation group; counted as an \
-                     independent vote, but 'no group recorded' is not the same as 'proven \
-                     independent'",
-                    c.link.id
-                ),
-            });
+            phase1_survivors.push((c, false));
+        }
+
+        // --- R5b (FORNX-347): common-source-family collapse -----------------
+        // Applied to EVERY phase-1 survivor, not only the originally-
+        // ungrouped links: an explicit `correlation_group` must never
+        // *prevent* a structural same-source-family collapse (unions are
+        // purely additive) -- two links recorded under two DIFFERENT
+        // explicit groups, but sharing the same real `source_event_id` on
+        // the agent-reported channel, are still the same underlying source
+        // and must still collapse here. `independence::SourceFamilyMap`
+        // already accounts for `correlation_group` as one of its own union
+        // rules, so this is the single source of truth for "same source"
+        // beyond exact-group equality -- the rule that actually fires on
+        // real traffic, since no shipped sensor stamps `correlation_group`
+        // yet. Keyed by the family's minimum evidence id (stable and
+        // deterministic, unlike a union-find root) rather than an index.
+        let family_map = crate::independence::SourceFamilyMap::build(input.evidence);
+        let mut by_family: BTreeMap<(u8, Uuid), Vec<(Candidate<'_>, bool)>> = BTreeMap::new();
+        let mut solo: Vec<(Candidate<'_>, bool)> = Vec::new();
+        for (c, had_group) in phase1_survivors {
+            match family_map.family_of(c.link.evidence_id) {
+                Some(family) if family.evidence_ids.len() > 1 => {
+                    let family_key = family.evidence_ids[0];
+                    by_family
+                        .entry((relation_key(c.link.relation), family_key))
+                        .or_default()
+                        .push((c, had_group));
+                }
+                _ => solo.push((c, had_group)),
+            }
+        }
+
+        let mut final_counted: Vec<Candidate<'_>> = Vec::new();
+        for ((_, family_key), mut bucket) in by_family {
+            bucket.sort_by_key(|(c, _)| c.link.id);
+            if bucket.len() > 1 {
+                let representative_id = bucket[0].0.link.id;
+                let sibling_ids: Vec<Uuid> = bucket[1..].iter().map(|(c, _)| c.link.id).collect();
+                for (sibling, _) in bucket.iter().skip(1) {
+                    discounted_link_ids.push(sibling.link.id);
+                }
+                let mut entry_link_ids = sibling_ids.clone();
+                entry_link_ids.push(representative_id);
+                entry_link_ids.sort();
+                // The representative falls through to `solo` below, same as
+                // any other uncollapsed link -- discounted siblings never
+                // reach that loop, so only the representative can still get
+                // an `IndependenceUnverified` caveat (and only if it never
+                // had its own recorded group either).
+                rationale.push(RationaleEntry {
+                    rule: FusionRule::CommonSourceCollapsed,
+                    effect: RuleEffect::Discounted,
+                    link_ids: entry_link_ids,
+                    missing_evidence_ids: vec![],
+                    evidence_ids: bucket.iter().map(|(c, _)| c.link.evidence_id).collect(),
+                    detail: format!(
+                        "links {sibling_ids:?} share source family {family_key} (independent of \
+                         any per-link correlation_group value) and relation with link \
+                         {representative_id}; collapsed to one effective vote (representative: \
+                         link {representative_id})"
+                    ),
+                });
+            }
+            solo.push(bucket.into_iter().next().unwrap());
+        }
+        for (c, had_group) in solo {
+            if !had_group {
+                rationale.push(RationaleEntry {
+                    rule: FusionRule::IndependenceUnverified,
+                    effect: RuleEffect::Caveat,
+                    link_ids: vec![c.link.id],
+                    missing_evidence_ids: vec![],
+                    evidence_ids: vec![c.link.evidence_id],
+                    detail: format!(
+                        "link {}'s evidence carries no recorded correlation group; counted as \
+                         an independent vote, but 'no group recorded' is not the same as \
+                         'proven independent'",
+                        c.link.id
+                    ),
+                });
+            }
             final_counted.push(c);
         }
 
@@ -872,6 +956,44 @@ mod fusion_tests {
         }
     }
 
+    /// FORNX-347: evidence carrying a real `EvidenceSource` with an
+    /// explicit `trust_class` and `source_event_id`, no `correlation_group`
+    /// -- the shape a `CommonSourceCollapsed` test needs, since that rule
+    /// fires on `ungrouped` (no recorded correlation group) links.
+    fn evidence_with_trust(
+        kind: EvidenceKind,
+        observed_at: &str,
+        trust: TrustClass,
+        source_event_id: Uuid,
+    ) -> Evidence {
+        Evidence {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            source_event_id,
+            kind,
+            observed_at: observed_at.into(),
+            payload: serde_json::json!({}),
+            provenance: "test".into(),
+            source: Some(EvidenceSource {
+                sensor_name: "test_sensor".into(),
+                trust_class: trust,
+                collected_at: "2026-01-01T00:00:00Z".into(),
+                provider: None,
+                collection_method: CollectionMethod::HookCallback,
+                collector_version: None,
+                freshness: fornax_types::Freshness {
+                    clock_source: ClockSource::HostClock,
+                    caveat: None,
+                },
+                tamper_boundary: Default::default(),
+                correlation_group: None,
+                derived_from: vec![],
+            }),
+            extension: None,
+            evidence_purged: false,
+        }
+    }
+
     fn source_with_group(group: Uuid) -> EvidenceSource {
         EvidenceSource {
             sensor_name: "test_sensor".into(),
@@ -1094,6 +1216,196 @@ mod fusion_tests {
         assert_eq!(out.verdict, Verdict::Review);
         assert!(out.unresolved_conflict);
         assert_eq!(out.counted_link_ids.len(), 2);
+    }
+
+    // --- 5b. Common-source-family collapse (FORNX-347) ---------------------
+
+    /// The live, real case this rule exists for: two `AgentAdjacent`
+    /// sensors reading the same `source_event_id` (e.g.
+    /// `ClaudeBashExitCodeSensor` + `ClaudeGitOutcomeSensor` on one Bash
+    /// `PostToolUse`), neither carrying a `correlation_group` (true of
+    /// every shipped sensor today) -- must collapse to one effective vote.
+    #[test]
+    fn two_agent_adjacent_sensors_on_the_same_event_collapse_to_one_vote() {
+        let c = claim();
+        let event = Uuid::new_v4();
+        let ev_a = evidence_with_trust(
+            EvidenceKind::ExitCode,
+            "2026-01-01T00:00:00Z",
+            TrustClass::AgentAdjacent,
+            event,
+        );
+        let ev_b = evidence_with_trust(
+            EvidenceKind::ProcessObservation,
+            "2026-01-01T00:00:00Z",
+            TrustClass::AgentAdjacent,
+            event,
+        );
+        let links = vec![
+            link(c.id, ev_a.id, EvidenceRelation::Supports),
+            link(c.id, ev_b.id, EvidenceRelation::Supports),
+        ];
+        let graph = EvidenceGraph {
+            links,
+            missing: vec![],
+        };
+        let evs = vec![ev_a, ev_b];
+        let policy = BaselineFusionPolicy;
+        let input = FusionInput {
+            claim: &c,
+            graph: &graph,
+            evidence: &evs,
+        };
+        let out = policy.fuse(&input, "2026-01-02T00:00:00Z");
+        assert_eq!(out.counted_link_ids.len(), 1);
+        assert_eq!(out.discounted_link_ids.len(), 1);
+        assert!(out
+            .rationale
+            .iter()
+            .any(|r| r.rule == FusionRule::CommonSourceCollapsed));
+        // The surviving representative still gets the IndependenceUnverified
+        // caveat -- CommonSourceCollapsed doesn't replace it, it's an
+        // additional entry (no recorded correlation_group either way).
+        assert!(out
+            .rationale
+            .iter()
+            .any(|r| r.rule == FusionRule::IndependenceUnverified));
+    }
+
+    /// The load-bearing safety property, at the fusion level: a
+    /// `HostObserved` sensor on the SAME event as an `AgentAdjacent` sensor
+    /// must NOT collapse with it -- genuinely independent corroboration
+    /// must never be under-counted.
+    #[test]
+    fn a_host_observed_sibling_on_the_same_event_still_counts_independently() {
+        let c = claim();
+        let event = Uuid::new_v4();
+        let ev_agent = evidence_with_trust(
+            EvidenceKind::ExitCode,
+            "2026-01-01T00:00:00Z",
+            TrustClass::AgentAdjacent,
+            event,
+        );
+        let ev_host = evidence_with_trust(
+            EvidenceKind::ProcessObservation,
+            "2026-01-01T00:00:00Z",
+            TrustClass::HostObserved,
+            event,
+        );
+        let links = vec![
+            link(c.id, ev_agent.id, EvidenceRelation::Supports),
+            link(c.id, ev_host.id, EvidenceRelation::Supports),
+        ];
+        let graph = EvidenceGraph {
+            links,
+            missing: vec![],
+        };
+        let evs = vec![ev_agent, ev_host];
+        let policy = BaselineFusionPolicy;
+        let input = FusionInput {
+            claim: &c,
+            graph: &graph,
+            evidence: &evs,
+        };
+        let out = policy.fuse(&input, "2026-01-02T00:00:00Z");
+        assert_eq!(out.counted_link_ids.len(), 2);
+        assert!(out.discounted_link_ids.is_empty());
+        assert!(!out
+            .rationale
+            .iter()
+            .any(|r| r.rule == FusionRule::CommonSourceCollapsed));
+    }
+
+    /// Collapse can only ever suppress corroboration-count inflation -- it
+    /// must never flip a verdict, and it must never let the SAME-family
+    /// votes be mistaken for `Corroborated` confidence. Three same-family
+    /// Supports links collapse to one counted vote, still `Verified`
+    /// (Fornax already had one supporting vote's worth of evidence), but
+    /// `Qualified`, never `Corroborated` -- multiplicity from one source
+    /// buys nothing.
+    #[test]
+    fn common_source_collapse_stays_qualified_never_corroborated() {
+        let c = claim();
+        let event = Uuid::new_v4();
+        let evs: Vec<Evidence> = (0..3)
+            .map(|_| {
+                evidence_with_trust(
+                    EvidenceKind::ExitCode,
+                    "2026-01-01T00:00:00Z",
+                    TrustClass::AgentAdjacent,
+                    event,
+                )
+            })
+            .collect();
+        let links: Vec<EvidenceLink> = evs
+            .iter()
+            .map(|e| link(c.id, e.id, EvidenceRelation::Supports))
+            .collect();
+        let graph = EvidenceGraph {
+            links,
+            missing: vec![],
+        };
+        let policy = BaselineFusionPolicy;
+        let input = FusionInput {
+            claim: &c,
+            graph: &graph,
+            evidence: &evs,
+        };
+        let out = policy.fuse(&input, "2026-01-02T00:00:00Z");
+        assert_eq!(out.counted_link_ids.len(), 1);
+        assert_eq!(out.discounted_link_ids.len(), 2);
+        assert_eq!(out.verdict, Verdict::Verified);
+        // Corroborated would require the surviving vote to carry a
+        // recorded correlation_group -- it doesn't, so this stays Qualified
+        // even after collapse, never silently upgraded.
+        assert_eq!(out.uncertainty, UncertaintyBand::Qualified);
+    }
+
+    /// An explicit `correlation_group` can never PREVENT an event-based
+    /// collapse either -- unions are purely additive (mirrors
+    /// `independence::explicit_correlation_group_never_prevents_an_event_union`
+    /// at the fusion level). Two AgentAdjacent, same event, but recorded
+    /// under two DIFFERENT explicit correlation groups still collapse via
+    /// R5b, since R5 (CorrelationCollapsed) never groups them together.
+    #[test]
+    fn distinct_correlation_groups_do_not_prevent_a_same_event_collapse() {
+        let c = claim();
+        let event = Uuid::new_v4();
+        let mut ev_a = evidence_with_trust(
+            EvidenceKind::ExitCode,
+            "2026-01-01T00:00:00Z",
+            TrustClass::AgentAdjacent,
+            event,
+        );
+        ev_a.source.as_mut().unwrap().correlation_group = Some(Uuid::new_v4());
+        let mut ev_b = evidence_with_trust(
+            EvidenceKind::ProcessObservation,
+            "2026-01-01T00:00:00Z",
+            TrustClass::AgentAdjacent,
+            event,
+        );
+        ev_b.source.as_mut().unwrap().correlation_group = Some(Uuid::new_v4());
+        let links = vec![
+            link(c.id, ev_a.id, EvidenceRelation::Supports),
+            link(c.id, ev_b.id, EvidenceRelation::Supports),
+        ];
+        let graph = EvidenceGraph {
+            links,
+            missing: vec![],
+        };
+        let evs = vec![ev_a, ev_b];
+        let policy = BaselineFusionPolicy;
+        let input = FusionInput {
+            claim: &c,
+            graph: &graph,
+            evidence: &evs,
+        };
+        let out = policy.fuse(&input, "2026-01-02T00:00:00Z");
+        assert_eq!(out.counted_link_ids.len(), 1);
+        assert!(out
+            .rationale
+            .iter()
+            .any(|r| r.rule == FusionRule::CommonSourceCollapsed));
     }
 
     // --- 6. Uncorrelated supports each count independently -----------------
