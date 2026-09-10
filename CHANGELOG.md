@@ -9,6 +9,20 @@ Jira epic FORNX-20.
 
 ### Added
 
+- `fornax evidence-plan` + `GET /api/evidence-plan` (FORNX-345, Stage 8):
+  ranks concrete evidence-acquisition candidates (rerun a test, inspect VCS
+  state, query CI status, verify an artifact hash, a bounded replay
+  experiment, human review) that would close a claim's real evidence gaps —
+  derived from fusion's own rationale, the evidence graph's missing-evidence
+  notes, and this runtime's unobservable capability signals. Candidates are
+  gated against the real `SideEffectAllowList`/`GlobalExperimentPolicy`/
+  `SensorDisableConfig` primitives (no fabricated `AUTO_SAFE`/
+  `REQUIRE_APPROVAL`/`FORBIDDEN` model); correlated evidence is never scored
+  as independent corroboration; a candidate that needs an ungranted side
+  effect or is administratively forbidden is always listed, never silently
+  dropped. This planner only ranks candidates for acquisition — it decides
+  and executes nothing; see `docs/adr/0015-voi-evidence-planner.md` for the
+  ranking boundary and the items that cannot be verified without FORNX-346.
 - `fornax adjudicate` (FORNX-342, Stage 8): blind-review workflow converting
   sanitized candidate cases into a human-adjudicated gold corpus — reviewer
   registration with a required human-attestation gate, blinded/unblinded
