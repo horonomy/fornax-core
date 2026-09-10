@@ -292,4 +292,49 @@ mod tests {
         let json = serde_json::to_value(&fb.author).unwrap();
         assert_eq!(json["kind"], serde_json::json!("automated_agent"));
     }
+
+    /// FORNX-349 structural guard: this module must never reference
+    /// `crate::adjudication`'s label/outcome/gold types, and no function
+    /// here may convert a `FeedbackDisposition`/`ReviewFeedback` toward
+    /// one. A source scan, not just a doc comment -- if a future edit adds
+    /// such a reference, this test fails immediately rather than relying
+    /// on a reviewer noticing. Mirrors this workspace's other
+    /// source-scanning invariant tests (e.g.
+    /// `fornax-daemon/tests/adversarial_daemon_input.rs::
+    /// subprocess_surface_is_still_zero_in_production_code`).
+    #[test]
+    fn feedback_module_never_references_adjudication_label_or_gold_types() {
+        let source = include_str!("feedback.rs");
+        // Comments (`//`/`///`) may name these types to explain the
+        // boundary in prose -- only real, non-comment code must not. Strip
+        // every comment line before scanning, and stop before this test
+        // function's own body so its forbidden-substring literals (and
+        // this very explanation) can't trip themselves.
+        let code_end = source
+            .find("fn feedback_module_never_references_adjudication_label_or_gold_types")
+            .expect("this test's own name must still be findable in its own source");
+        let code: String = source[..code_end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for forbidden in [
+            "CaseLabel",
+            "ReviewOutcome",
+            "ReviewerRef",
+            "ReviewerKind",
+            "promote_gold_label",
+            "GoldLabelRevision",
+            "adjudication::review::",
+            "adjudication::gold::",
+            "adjudication::state::",
+            "adjudication::blind::",
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "feedback.rs's real code (not a comment) must never reference `{forbidden}` \
+                 -- feedback must never become adjudication, see module docs"
+            );
+        }
+    }
 }
