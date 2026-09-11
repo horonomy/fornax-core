@@ -951,6 +951,93 @@ fn subprocess_surface_is_still_zero_in_production_code() {
     );
 }
 
+/// FORNX-346 Part 2 / ADR 0022 (founder-decided Option B): the one
+/// deliberate subprocess-spawn exception in this entire workspace --
+/// `exec/fornax-acquire-exec`'s `RerunTest` probe -- must live *only* under
+/// `exec/fornax-acquire-exec/src/`, nowhere else (not `crates/`, already
+/// covered above; not anywhere else under `exec/`; not the workspace root).
+/// `exec/fornax-acquire-exec` is deliberately outside `crates/` so that it
+/// falls outside `subprocess_surface_is_still_zero_in_production_code`'s
+/// scan above -- this test is the other half of that design: proving the
+/// resulting gap is confined to exactly the one directory that's supposed
+/// to have it, not a blank check nobody verifies.
+///
+/// The `!offenders.is_empty()` assertion is load-bearing: without it,
+/// renaming or removing the exec crate would make this test vacuously pass
+/// while proving nothing about where the one real exception actually lives.
+#[test]
+fn subprocess_spawn_exception_is_confined_to_the_exec_crate() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("crates/<name> is two levels below the workspace root");
+
+    let mut offenders: Vec<(PathBuf, String)> = Vec::new();
+    visit_rs_files_workspace_wide(workspace_root, &mut |path| {
+        if path.components().any(|c| c.as_os_str() == "tests") {
+            return;
+        }
+        let contents = std::fs::read_to_string(path).unwrap_or_default();
+        for (i, line) in contents.lines().enumerate() {
+            if line.contains("process::Command")
+                || line.contains("Command::new")
+                || line.contains("sh -c")
+            {
+                offenders.push((
+                    path.to_path_buf(),
+                    format!("{}:{}: {}", path.display(), i + 1, line.trim()),
+                ));
+            }
+        }
+    });
+
+    assert!(
+        !offenders.is_empty(),
+        "expected to find the deliberate exec/fornax-acquire-exec/src/ subprocess-spawn \
+         exception (RerunTest's Command::new), but found none at all anywhere in the \
+         workspace -- this assertion is load-bearing: without it, renaming or removing the \
+         exec crate would make this test vacuously pass without proving anything"
+    );
+
+    let allowed_prefix = workspace_root
+        .join("exec")
+        .join("fornax-acquire-exec")
+        .join("src");
+    let outside_allowed_dir: Vec<&str> = offenders
+        .iter()
+        .filter(|(path, _)| !path.starts_with(&allowed_prefix))
+        .map(|(_, msg)| msg.as_str())
+        .collect();
+    assert!(
+        outside_allowed_dir.is_empty(),
+        "found subprocess-spawn surface outside exec/fornax-acquire-exec/src/:\n{}",
+        outside_allowed_dir.join("\n")
+    );
+}
+
+/// Like `visit_rs_files` but walks the *whole* workspace root rather than
+/// just `crates/`, skipping `target/`, `.git/`, and `crates/` itself
+/// (already covered by `subprocess_surface_is_still_zero_in_production_code`
+/// above) -- used only by
+/// `subprocess_spawn_exception_is_confined_to_the_exec_crate`.
+fn visit_rs_files_workspace_wide(dir: &Path, f: &mut impl FnMut(&Path)) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name == "target" || name == ".git" || name == "crates" {
+                continue;
+            }
+            visit_rs_files_workspace_wide(&path, f);
+        } else if path.extension().map(|e| e == "rs").unwrap_or(false) {
+            f(&path);
+        }
+    }
+}
+
 fn visit_rs_files(dir: &Path, f: &mut impl FnMut(&Path)) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
