@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/fornax-types", "crates/fornax-store", "crates/fornax-verify", "crates/fornax-vcs", "crates/fornax-ci", "crates/fornax-daemon", "crates/fornax-adapter-claude", "crates/fornax-adapter-codex", "crates/fornax-adapter-opencode", "crates/fornax-adapter-conformance", "crates/fornax-cli", "crates/fornax-bench", "crates/fornax-replay", "crates/fornax-experiment-runner", "crates/fornax-corpus", "crates/fornax-acquire", "crates/fornax-receipt"]
+members = ["crates/fornax-types", "crates/fornax-store", "crates/fornax-verify", "crates/fornax-vcs", "crates/fornax-ci", "crates/fornax-daemon", "crates/fornax-adapter-claude", "crates/fornax-adapter-codex", "crates/fornax-adapter-opencode", "crates/fornax-adapter-conformance", "crates/fornax-cli", "crates/fornax-bench", "crates/fornax-replay", "crates/fornax-experiment-runner", "crates/fornax-corpus", "crates/fornax-acquire", "crates/fornax-receipt", "exec/fornax-acquire-exec"]
 
 [workspace.package]
 version = "0.0.1"

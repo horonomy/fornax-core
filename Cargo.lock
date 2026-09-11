@@ -828,6 +828,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "fornax-acquire-exec"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "fornax-acquire",
+ "fornax-ci",
+ "fornax-experiment-runner",
+ "fornax-store",
+ "fornax-types",
+ "fornax-verify",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "toml_edit",
+ "uuid",
+]
+
+[[package]]
 name = "fornax-adapter-claude"
 version = "0.0.1"
 dependencies = [
