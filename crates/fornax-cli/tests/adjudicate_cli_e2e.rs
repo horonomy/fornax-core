@@ -588,3 +588,105 @@ async fn feedback_disagreement_surfaces_in_sample_and_is_enqueued_once() {
 
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// `worksheet-export` should auto-enqueue and auto-issue views for a whole
+/// batch in one command, and `worksheet-import` should submit every filled
+/// entry in one command -- the FORNX-343 batch-prep ergonomics: no
+/// per-case `next`/`submit` round trips.
+#[tokio::test]
+async fn worksheet_export_then_import_submits_every_filled_entry_in_one_command() {
+    let home = temp_home("worksheet");
+    let case_ids = seed_contradiction_sessions(&home, 2).await;
+
+    run(
+        &home,
+        &[
+            "adjudicate",
+            "reviewer-add",
+            "--id",
+            "fixture-ws",
+            "--role",
+            "primary",
+            "--kind",
+            "mechanism-test",
+        ],
+    );
+
+    let worksheet_path = home.join("worksheet.json");
+    let export_out = run(
+        &home,
+        &[
+            "adjudicate",
+            "worksheet-export",
+            "--reviewer",
+            "fixture-ws",
+            "--case",
+            &case_ids.join(","),
+            "--out",
+            worksheet_path.to_str().unwrap(),
+        ],
+    );
+    assert!(export_out.contains("wrote 2 entries"), "{export_out}");
+
+    let mut worksheet: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&worksheet_path).unwrap()).unwrap();
+    assert!(
+        worksheet["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("reliable"),
+        "worksheet must embed the rubric, not just point at a doc"
+    );
+    let entries = worksheet["entries"].as_array_mut().unwrap();
+    assert_eq!(entries.len(), 2);
+    for e in entries.iter() {
+        assert!(
+            !e["claim_text"].as_str().unwrap().is_empty(),
+            "blinded view must still carry the claim text"
+        );
+        assert!(e["label"].is_null(), "must start unfilled");
+    }
+
+    // Fill in only the first entry -- the second stays blank, simulating a
+    // reviewer who stopped partway through the batch.
+    entries[0]["label"] = serde_json::json!("contradicted");
+    entries[0]["critical_failure"] = serde_json::json!(true);
+    entries[0]["failure_class"] = serde_json::json!("claim_contradicted_by_evidence");
+    entries[0]["confidence"] = serde_json::json!("high");
+    entries[0]["rationale"] = serde_json::json!("evidence pool directly contradicts the claim");
+    std::fs::write(
+        &worksheet_path,
+        serde_json::to_vec_pretty(&worksheet).unwrap(),
+    )
+    .unwrap();
+
+    let import_out = run(
+        &home,
+        &[
+            "adjudicate",
+            "worksheet-import",
+            "--file",
+            worksheet_path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        import_out.contains("1 submitted, 1 skipped, 0 failed"),
+        "{import_out}"
+    );
+
+    let queue_out = run(&home, &["adjudicate", "queue"]);
+    assert!(
+        queue_out.contains("Resolved"),
+        "the filled case must reach Resolved: {queue_out}"
+    );
+    assert!(
+        !queue_out.contains(&format!("{} state=Resolved", case_ids[1])),
+        "the unfilled case must not have been submitted: {queue_out}"
+    );
+    assert!(
+        queue_out.contains(&format!("{} state=AwaitingPrimary", case_ids[1])),
+        "the unfilled case must still be waiting on its first review: {queue_out}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}

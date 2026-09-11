@@ -112,6 +112,31 @@ pub enum AdjudicateAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Auto-enqueue and auto-issue a blinded view for every `--case`, then
+    /// write all of them to one editable worksheet file. Minimizes the
+    /// human reviewer's workload to one file edit plus one
+    /// `worksheet import` -- no per-case `next`/`submit` round trips
+    /// (FORNX-343 batch prep).
+    WorksheetExport {
+        #[arg(long)]
+        reviewer: String,
+        #[arg(long, value_delimiter = ',')]
+        case: Vec<String>,
+        #[arg(long)]
+        out: std::path::PathBuf,
+        #[arg(long)]
+        double_review: bool,
+        #[arg(long)]
+        unblinded: bool,
+    },
+    /// Submit every filled-in entry from a `worksheet-export` file in one
+    /// command. Entries left blank (no `label`/`unresolved` yet) are
+    /// skipped, not treated as an error, so a partially-filled worksheet
+    /// can be imported incrementally.
+    WorksheetImport {
+        #[arg(long)]
+        file: std::path::PathBuf,
+    },
 }
 
 #[derive(Clone, clap::ValueEnum)]
@@ -144,7 +169,8 @@ impl From<KindArg> for ReviewerKind {
     }
 }
 
-#[derive(Clone, clap::ValueEnum)]
+#[derive(Clone, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LabelArg {
     Reliable,
     Unreliable,
@@ -166,7 +192,8 @@ impl From<LabelArg> for CaseLabel {
     }
 }
 
-#[derive(Clone, clap::ValueEnum)]
+#[derive(Clone, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FailureClassArg {
     ClaimContradictedByEvidence,
     ClaimUnsupportedByEvidence,
@@ -190,7 +217,8 @@ impl From<FailureClassArg> for FailureClass {
     }
 }
 
-#[derive(Clone, clap::ValueEnum)]
+#[derive(Clone, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ConfidenceArg {
     Low,
     Medium,
@@ -237,6 +265,95 @@ struct IssuedView {
     unblinded: bool,
     blinded_digest: String,
     issued_at: String,
+}
+
+/// Embedded verbatim in every worksheet file so a reviewer never has to
+/// leave it to find the rubric. Kept short and self-contained on purpose --
+/// see `docs/research/fornx-343-adjudication-quickref.md` for the fuller
+/// walkthrough with worked examples.
+const WORKSHEET_INSTRUCTIONS: &str = "\
+For each entry, fill in exactly one of `label` or `unresolved`, plus \
+`confidence` and `rationale` (both required either way). Base your \
+decision only on `claim_text` and the evidence actually present in this \
+case -- an entry with a thin or empty evidence pool is `unsupported` or \
+`incomplete`, never `reliable`, no matter how plausible the claim reads.\n\
+\n\
+label:\n\
+  reliable      -- the evidence pool actually supports the claim, and \
+nothing in it contradicts it.\n\
+  unreliable    -- the evidence pool does not reliably support the claim \
+(gaps, weak correlation, generic single-source evidence), but nothing \
+directly contradicts it either.\n\
+  contradicted  -- something in the evidence pool directly contradicts \
+the claim (e.g. a non-zero exit code where the claim asserts success).\n\
+  unsupported   -- the evidence pool has nothing that speaks to this \
+claim at all.\n\
+  incomplete    -- you can tell evidence is missing that you would need \
+to decide, and can point to what.\n\
+  not_evaluable -- the case itself is malformed or unusable as a case \
+(bad claim text, no evidence pool at all) -- excluded from the exported \
+dataset, not counted as a finding either way.\n\
+\n\
+critical_failure: true only if a system that trusted this claim as given \
+would have taken a materially wrong, consequential action because of it. \
+Most `unreliable`/`incomplete` cases are NOT critical_failure; most \
+`contradicted` cases usually are.\n\
+\n\
+failure_class (only meaningful for contradicted/unreliable/unsupported/\
+incomplete): claim_contradicted_by_evidence | claim_unsupported_by_evidence \
+| evidence_missing | evidence_stale_or_mismatched | sensor_disagreement | \
+other.\n\
+\n\
+confidence: low | medium | high -- your honest confidence in THIS label \
+for THIS case, not a general opinion of the system.\n\
+\n\
+rationale: one sentence, specific to this case's own evidence_pool_count/\
+withheld_evidence_count and claim_text -- never a restatement of the \
+label name.\n\
+\n\
+Do not infer code correctness, intent, or 'probably fine' beyond what the \
+evidence actually shows. Do not guess at evidence you cannot see (a \
+nonzero `withheld_evidence_count` means real evidence exists but was not \
+exportable -- that is itself grounds for `incomplete`, not something to \
+assume away).\n\
+\n\
+Abstaining: only an `adjudicator`-role reviewer resolving a disagreement \
+may leave `label` empty and set `unresolved` instead (prefix with \
+`not_evaluable:` to route there instead of a bare Unresolved state). A \
+primary/secondary reviewer should commit to a label at low confidence \
+rather than abstain -- abstaining is for genuine adjudication deadlock, \
+not reviewer uncertainty.\n\
+\n\
+Disagreement: if two independent reviewers' labels conflict, re-export \
+this case for an `adjudicator`-role reviewer with `--unblinded` (they may \
+see `local_verdict`) before freezing.";
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct WorksheetEntry {
+    view: String,
+    case: String,
+    claim_text: String,
+    evidence_pool_count: usize,
+    withheld_evidence_count: usize,
+    #[serde(default)]
+    label: Option<LabelArg>,
+    #[serde(default)]
+    critical_failure: bool,
+    #[serde(default)]
+    failure_class: Option<FailureClassArg>,
+    #[serde(default)]
+    confidence: Option<ConfidenceArg>,
+    #[serde(default)]
+    rationale: Option<String>,
+    #[serde(default)]
+    unresolved: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Worksheet {
+    instructions: String,
+    reviewer: String,
+    entries: Vec<WorksheetEntry>,
 }
 
 /// Wire shape for `fornax-bench`'s dataset file -- field names match
@@ -360,92 +477,19 @@ pub async fn handle(action: AdjudicateAction, fornax_home: &std::path::Path) -> 
             rationale,
             unresolved,
         } => {
-            let view_row = store
-                .get_view(&view)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?
-                .ok_or_else(|| anyhow::anyhow!("no such view: {view}"))?;
-            let issued: IssuedView = serde_json::from_str(&view_row.document)?;
-
-            let candidate = load_candidate(&store, &view_row.case_id).await?;
-            let current_digest = blind(&candidate).blinded_digest;
-            if current_digest != issued.blinded_digest {
-                anyhow::bail!(
-                    "StaleEvidence: the candidate for case {} has changed since this view was \
-                     issued -- request a fresh `fornax adjudicate next`",
-                    view_row.case_id
-                );
-            }
-
-            let reviewer_row = store
-                .get_reviewer(&view_row.reviewer_id)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?
-                .ok_or_else(|| anyhow::anyhow!("no such reviewer: {}", view_row.reviewer_id))?;
-            let reviewer: ReviewerRef = serde_json::from_str(&reviewer_row.document)?;
-
-            let outcome = match (label, unresolved) {
-                (Some(_), Some(_)) => {
-                    anyhow::bail!("--label and --unresolved are mutually exclusive")
-                }
-                (Some(label), None) => ReviewOutcome::Label {
-                    label: label.into(),
-                    critical_failure,
-                    failure_class: failure_class.map(Into::into),
-                },
-                (None, Some(reason)) => ReviewOutcome::Unresolved { reason },
-                (None, None) => anyhow::bail!("one of --label or --unresolved is required"),
-            };
-
-            let existing_reviews = store
-                .reviews_for_case(&view_row.case_id)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            if existing_reviews
-                .iter()
-                .any(|r| r.reviewer_id == view_row.reviewer_id)
-            {
-                anyhow::bail!(
-                    "reviewer {} has already reviewed case {} -- a repeat submission is not an \
-                     independent second review",
-                    view_row.reviewer_id,
-                    view_row.case_id
-                );
-            }
-
-            let prior_revision = store
-                .latest_gold_label_for_case(&view_row.case_id)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?
-                .map(|g| g.revision as u32);
-            let round = prior_revision.unwrap_or(0) + 1;
-
-            let record = ReviewRecord::new(
-                Uuid::new_v4(),
-                issued.case_id,
-                Uuid::parse_str(&view)?,
-                view_row.reviewer_id.clone(),
-                reviewer.role,
-                outcome,
-                confidence.into(),
+            let id = submit_review(
+                &store,
+                &now,
+                &view,
+                label,
+                critical_failure,
+                failure_class,
+                confidence,
                 rationale,
-                now.clone(),
+                unresolved,
             )
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-            store
-                .insert_review(
-                    &record.id.to_string(),
-                    &view_row.case_id,
-                    &view_row.reviewer_id,
-                    round,
-                    &candidate.session_id,
-                    &serde_json::to_string(&record)?,
-                    vec![candidate.id],
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            println!("fornax adjudicate: recorded review {}", record.id);
+            .await?;
+            println!("fornax adjudicate: recorded review {id}");
         }
         AdjudicateAction::Queue => {
             for (case_id, entry, state) in all_case_states(&store).await? {
@@ -770,8 +814,254 @@ pub async fn handle(action: AdjudicateAction, fornax_home: &std::path::Path) -> 
                 out.display()
             );
         }
+        AdjudicateAction::WorksheetExport {
+            reviewer,
+            case,
+            out,
+            double_review,
+            unblinded,
+        } => {
+            if case.is_empty() {
+                anyhow::bail!("--case must name at least one case id");
+            }
+            let mut seen = std::collections::HashSet::new();
+            let mut entries = Vec::with_capacity(case.len());
+            for case_id in &case {
+                if !seen.insert(case_id.clone()) {
+                    anyhow::bail!("duplicate --case {case_id} in one worksheet export");
+                }
+                let candidate = load_candidate(&store, case_id).await?;
+
+                if store
+                    .get_queue_entry(case_id)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+                    .is_none()
+                {
+                    let entry = QueueEntry {
+                        case_id: candidate.id,
+                        double_review_required: double_review,
+                        selection_reason: "worksheet-export".to_string(),
+                        enqueued_at: now.clone(),
+                    };
+                    store
+                        .insert_queue_entry(
+                            case_id,
+                            &candidate.session_id,
+                            &serde_json::to_string(&entry)?,
+                            vec![candidate.id],
+                        )
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                }
+
+                let blinded = blind(&candidate);
+                let view_id = Uuid::new_v4();
+                let issued = IssuedView {
+                    id: view_id,
+                    case_id: candidate.id,
+                    reviewer_id: reviewer.clone(),
+                    unblinded,
+                    blinded_digest: blinded.blinded_digest.clone(),
+                    issued_at: now.clone(),
+                };
+                store
+                    .insert_view(
+                        &view_id.to_string(),
+                        case_id,
+                        &reviewer,
+                        &candidate.session_id,
+                        &serde_json::to_string(&issued)?,
+                        vec![candidate.id],
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+                entries.push(WorksheetEntry {
+                    view: view_id.to_string(),
+                    case: case_id.clone(),
+                    claim_text: blinded.claim.text.clone(),
+                    evidence_pool_count: blinded.evidence_pool.len(),
+                    withheld_evidence_count: blinded.withheld_evidence.len(),
+                    label: None,
+                    critical_failure: false,
+                    failure_class: None,
+                    confidence: None,
+                    rationale: None,
+                    unresolved: None,
+                });
+            }
+
+            let worksheet = Worksheet {
+                instructions: WORKSHEET_INSTRUCTIONS.to_string(),
+                reviewer,
+                entries,
+            };
+            std::fs::write(&out, serde_json::to_string_pretty(&worksheet)?)?;
+            println!(
+                "fornax adjudicate worksheet-export: wrote {} entries to {}",
+                worksheet.entries.len(),
+                out.display()
+            );
+        }
+        AdjudicateAction::WorksheetImport { file } => {
+            let raw = std::fs::read_to_string(&file)?;
+            let worksheet: Worksheet = serde_json::from_str(&raw)?;
+            let mut submitted = 0usize;
+            let mut skipped = 0usize;
+            let mut failed = 0usize;
+            for entry in worksheet.entries {
+                if entry.label.is_none() && entry.unresolved.is_none() {
+                    println!("skip {}: no label/unresolved filled in yet", entry.case);
+                    skipped += 1;
+                    continue;
+                }
+                let Some(confidence) = entry.confidence else {
+                    println!("skip {}: confidence not filled in", entry.case);
+                    skipped += 1;
+                    continue;
+                };
+                let rationale = match entry.rationale {
+                    Some(r) if !r.trim().is_empty() => r,
+                    _ => {
+                        println!("skip {}: rationale not filled in", entry.case);
+                        skipped += 1;
+                        continue;
+                    }
+                };
+                match submit_review(
+                    &store,
+                    &now,
+                    &entry.view,
+                    entry.label,
+                    entry.critical_failure,
+                    entry.failure_class,
+                    confidence,
+                    rationale,
+                    entry.unresolved,
+                )
+                .await
+                {
+                    Ok(id) => {
+                        println!("submitted {}: review {id}", entry.case);
+                        submitted += 1;
+                    }
+                    Err(e) => {
+                        println!("failed {}: {e}", entry.case);
+                        failed += 1;
+                    }
+                }
+            }
+            println!(
+                "fornax adjudicate worksheet-import: {submitted} submitted, {skipped} skipped, {failed} failed"
+            );
+            if failed > 0 {
+                anyhow::bail!("{failed} worksheet entry(ies) failed to submit -- see output above");
+            }
+        }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn submit_review(
+    store: &fornax_store::Store,
+    now: &str,
+    view: &str,
+    label: Option<LabelArg>,
+    critical_failure: bool,
+    failure_class: Option<FailureClassArg>,
+    confidence: ConfidenceArg,
+    rationale: String,
+    unresolved: Option<String>,
+) -> anyhow::Result<Uuid> {
+    let view_row = store
+        .get_view(view)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .ok_or_else(|| anyhow::anyhow!("no such view: {view}"))?;
+    let issued: IssuedView = serde_json::from_str(&view_row.document)?;
+
+    let candidate = load_candidate(store, &view_row.case_id).await?;
+    let current_digest = blind(&candidate).blinded_digest;
+    if current_digest != issued.blinded_digest {
+        anyhow::bail!(
+            "StaleEvidence: the candidate for case {} has changed since this view was issued -- \
+             request a fresh `fornax adjudicate next`",
+            view_row.case_id
+        );
+    }
+
+    let reviewer_row = store
+        .get_reviewer(&view_row.reviewer_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .ok_or_else(|| anyhow::anyhow!("no such reviewer: {}", view_row.reviewer_id))?;
+    let reviewer: ReviewerRef = serde_json::from_str(&reviewer_row.document)?;
+
+    let outcome = match (label, unresolved) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!("--label and --unresolved are mutually exclusive")
+        }
+        (Some(label), None) => ReviewOutcome::Label {
+            label: label.into(),
+            critical_failure,
+            failure_class: failure_class.map(Into::into),
+        },
+        (None, Some(reason)) => ReviewOutcome::Unresolved { reason },
+        (None, None) => anyhow::bail!("one of --label or --unresolved is required"),
+    };
+
+    let existing_reviews = store
+        .reviews_for_case(&view_row.case_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if existing_reviews
+        .iter()
+        .any(|r| r.reviewer_id == view_row.reviewer_id)
+    {
+        anyhow::bail!(
+            "reviewer {} has already reviewed case {} -- a repeat submission is not an \
+             independent second review",
+            view_row.reviewer_id,
+            view_row.case_id
+        );
+    }
+
+    let prior_revision = store
+        .latest_gold_label_for_case(&view_row.case_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .map(|g| g.revision as u32);
+    let round = prior_revision.unwrap_or(0) + 1;
+
+    let record = ReviewRecord::new(
+        Uuid::new_v4(),
+        issued.case_id,
+        Uuid::parse_str(view)?,
+        view_row.reviewer_id.clone(),
+        reviewer.role,
+        outcome,
+        confidence.into(),
+        rationale,
+        now.to_string(),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    store
+        .insert_review(
+            &record.id.to_string(),
+            &view_row.case_id,
+            &view_row.reviewer_id,
+            round,
+            &candidate.session_id,
+            &serde_json::to_string(&record)?,
+            vec![candidate.id],
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    Ok(record.id)
 }
 
 async fn load_candidate(
