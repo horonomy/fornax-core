@@ -12,8 +12,15 @@
 //! provider adapter's per-hook `translate()`, so a CI query never adds
 //! network latency to the local hook-invocation critical path
 //! (`docs/adr/0001-architecture-invariants.md`'s "no cloud dependency on the
-//! local critical path" — this crate's own query is the one deliberate,
-//! opt-in exception, invoked out-of-band from a CLI command, not from a hook).
+//! local critical path" — this crate's own query is *a* deliberate, opt-in
+//! exception, invoked out-of-band from a CLI command, not from a hook).
+//! **Not the only one anymore**: FORNX-346 Part 2 (`docs/adr/0022-privileged-acquisition-executor.md`)
+//! added a second, physically separate out-of-band network-capable
+//! component, `exec/fornax-acquire-exec`'s `QueryCiStatus` probe — which
+//! calls straight back into this crate's own `GitHubCheckRunSource` rather
+//! than duplicating an HTTP client, so there remains exactly one GitHub API
+//! client implementation in this workspace even though there are now two
+//! places that may invoke it out-of-band.
 //!
 //! # Design: CI provider is GitHub Actions, credential is env-var-only
 //!

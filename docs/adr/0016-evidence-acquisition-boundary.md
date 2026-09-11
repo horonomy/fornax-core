@@ -93,7 +93,16 @@ own precedent comments). `InspectVcsState` reuses the *existing*
 `ClaudeGitWorkingTreeSensor` already produces today, rather than inventing a
 parallel one.
 
-## Escalated, not built: `RerunTest` and `QueryCiStatus`
+## Escalated, not built (Part 1): `RerunTest` and `QueryCiStatus`
+
+**Update (FORNX-346 Part 2, ADR 0022):** the founder decided Option B --
+these two probes live outside `crates/`, as a physically separate,
+explicitly opt-in binary (`exec/fornax-acquire-exec`), gated by two
+independent deny-by-default checks. They are no longer merely escalated;
+see `docs/adr/0022-privileged-acquisition-executor.md` for the full design,
+the injection-surface/SSRF rules, and why `exec/` (not `crates/`) is
+structural enforcement rather than evasion. The rest of this section is
+preserved as the original Part 1 record of the escalation itself.
 
 These two `ProbeKind` variants require `ProcessSpawn`/`NetworkCall`
 respectively. Building them would mean amending the workspace-wide
@@ -107,17 +116,23 @@ FORNX-346's Jira thread rather than decided unilaterally. Until answered:
   rejected as a third path: without spawning anything, a caller-supplied
   `InterventionObserver` can only read files inside a staged copy it just
   wrote, producing no new information about external reality — a tautology,
-  not a real acquisition.
-- `AC7`'s command-injection/SSRF/credential-bearing-probe coverage is
-  **not applicable**, not covered — there is no command execution and no
-  network client in the delivered surface. What *is* a real, covered
-  security surface for the two implemented probes — path traversal, an
-  absolute-path escape, and a symlink escape against
-  `AcquisitionRoots::resolve_contained` — has negative tests.
+  not a real acquisition. **Part 2 update:** `AC1` is now met by three (plus
+  a fourth) real paths — see ADR 0022's AC-by-AC table.
+- `AC7`'s command-injection/SSRF/credential-bearing-probe coverage was
+  **not applicable**, not covered, in Part 1 — there was no command
+  execution and no network client in the Part-1-delivered surface. What
+  *is* a real, covered security surface for the two Part-1 probes — path
+  traversal, an absolute-path escape, and a symlink escape against
+  `AcquisitionRoots::resolve_contained` — has negative tests. **Part 2
+  update:** `AC7` is now applicable (Part 2 ships both a command executor
+  and a network client) and closed — see ADR 0022's own injection-surface
+  test coverage (`exec/fornax-acquire-exec/tests/injection_surface.rs`).
 
 ## Cannot be verified without further work
 
-1. **AC1 is two-of-three**, pending the escalated decision above.
+1. **AC1 was two-of-three in Part 1**, pending the escalated decision
+   above. **Closed in Part 2**: see ADR 0022's AC-by-AC table -- `RerunTest`
+   and `QueryCiStatus` now execute end-to-end via `exec/fornax-acquire-exec`.
 2. ~~**AC2 ("a representative uncertain finding changes or remains uncertain
    based on newly acquired evidence") is achievable only for claims whose
    evidence carries a resolvable `FileDiff` path.**~~ **Closed** in a
@@ -134,6 +149,20 @@ FORNX-346's Jira thread rather than decided unilaterally. Until answered:
    `WorkingTreeStatusObserved`); a freshly acquired hash currently has no
    consumer that turns it into a `Supports`/`Contradicts` verdict — that is
    real verifier-authoring work, out of scope for this ticket.
+   **Part 2 update, checked against the real verifier source (not
+   assumed):** `RerunTest` produces `EvidenceKind::ExitCode` /
+   `ExitCodePayload` evidence — the exact shape
+   `TestResultVerifier`/`CommandExecutedVerifier`/`CommandSuccessVerifier`
+   (`crates/fornax-verify/src/lib.rs`) already read via
+   `evidence.payload.get("exit_code")` and `command_text(&evidence.payload)`,
+   with no filter on how that evidence was produced. **This closes "no
+   consumer" for `RerunTest` specifically** — a freshly reran test's real
+   exit code is picked up by the same existing verifier registry with no
+   new code. `QueryCiStatus` produces `ProcessObservationDetail::CiCheckStatus`
+   evidence, and **this remains open for `QueryCiStatus`**: no verifier in
+   `crates/fornax-verify` reads that variant today, confirmed by inspection
+   (`grep`-checked, not assumed) — a `CiCheckStatus` result currently has no
+   consumer that turns it into a verdict either.
 4. ~~**AC5 (cost/latency/resource budgets, cancellable)** is not
    implemented in this scope~~ **Closed** in a follow-up commit:
    `fornax_acquire::budget::AcquisitionBudget::run` executes a probe on its

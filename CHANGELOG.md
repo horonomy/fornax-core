@@ -9,6 +9,31 @@ Jira epic FORNX-20.
 
 ### Added
 
+- `fornax-acquire-exec` (FORNX-346 Part 2, Stage 8): a physically separate,
+  explicitly opt-in binary at `exec/fornax-acquire-exec` (founder-decided
+  Option B) implementing the two `fornax_verify::voi::ProbeKind` variants
+  ADR 0016 escalated rather than built -- `RerunTest` (real subprocess
+  spawn) and `QueryCiStatus` (real GitHub check-runs query, reusing
+  `fornax-ci`'s existing client). Lives outside `crates/` on purpose:
+  `crates/fornax-daemon/tests/adversarial_daemon_input.rs`'s
+  zero-subprocess-spawn scan only walks `crates/`, and nothing under
+  `crates/` gained any dependency on this binary. Two independent
+  deny-by-default gates guard every attempt: `GlobalExperimentPolicy`
+  (host-wide `ProcessSpawn`/`NetworkCall` grant) and a new `ExecutorGrants`
+  type (`$FORNAX_HOME/config.toml`'s `[acquisition_exec]` table -- which
+  literal commands, which literal CI repo; absent/empty means deny-all).
+  `RerunTest` accepts a command only as a structured `serde_json::Value::Array`
+  of strings (never a shell string), never invokes a shell, requires
+  `argv[0]` on the allowlist and `current_dir` inside a configured
+  acquisition root, strips `GITHUB_TOKEN`/`GH_TOKEN` from the child, and
+  actually kills+reaps the child on timeout rather than abandoning it.
+  `QueryCiStatus` reads its repo slug only from `ExecutorGrants` (never from
+  evidence, closing an SSRF path structurally) and validates `commit_sha`
+  against `^[0-9a-f]{7,40}$` before any network call. A new daemon endpoint,
+  `POST /api/reverify?claim=&session=`, re-runs the existing verifier
+  registry and fusion over whatever evidence is already persisted -- it
+  accepts no client-supplied `Evidence`, matching `docs/adr/0016-evidence-acquisition-boundary.md`'s
+  existing rejection of that shape. See `docs/adr/0022-privileged-acquisition-executor.md`.
 - `fornax receipt issue/verify` (FORNX-350, Stage 8): portable, offline-
   inspectable integrity receipts. `receipt issue` re-fuses a claim's real
   evidence graph and projects it into a deterministic, reference-only
