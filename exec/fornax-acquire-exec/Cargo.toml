@@ -1,0 +1,38 @@
+[package]
+name = "fornax-acquire-exec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "fornax_acquire_exec"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fornax-acquire-exec"
+path = "src/main.rs"
+
+# FORNX-346 Part 2 / ADR 0022: this crate lives outside `crates/` on
+# purpose -- it is the one place in this workspace allowed to spawn a
+# subprocess (`RerunTest`) or make an outbound network call
+# (`QueryCiStatus`). See `docs/adr/0022-privileged-acquisition-executor.md`.
+[dependencies]
+fornax-types = { path = "../../crates/fornax-types" }
+fornax-store = { path = "../../crates/fornax-store" }
+fornax-verify = { path = "../../crates/fornax-verify" }
+fornax-acquire = { path = "../../crates/fornax-acquire" }
+fornax-experiment-runner = { path = "../../crates/fornax-experiment-runner" }
+fornax-ci = { path = "../../crates/fornax-ci" }
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+uuid.workspace = true
+toml_edit.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]

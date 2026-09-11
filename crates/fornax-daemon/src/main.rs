@@ -413,6 +413,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/judge", get(api_judge))
         .route("/api/evidence-plan", get(api_evidence_plan))
         .route("/api/acquire-evidence", post(api_acquire_evidence))
+        .route("/api/reverify", post(api_reverify))
         .route("/api/reliability", get(api_reliability))
         .route("/api/calibration", get(api_calibration))
         .route("/api/policy", get(api_policy))
@@ -1818,6 +1819,100 @@ async fn api_acquire_evidence(
         "rank": q.rank,
         "outcome": outcome_kind,
         "detail": outcome_json,
+        "fused_before": fused_before,
+        "fused_after": fused_after,
+    }))
+}
+
+#[derive(serde::Deserialize)]
+struct ReverifyQuery {
+    claim: String,
+    session: String,
+}
+
+/// FORNX-346 Part 2: `POST /api/reverify?claim=&session=`.
+///
+/// Deliberately **not** an endpoint that accepts client-supplied `Evidence`
+/// -- see `docs/adr/0016-evidence-acquisition-boundary.md` for why
+/// `/api/acquire-evidence` already refuses a client-supplied
+/// `EvidenceRequest`, and accepting a client-supplied `Evidence` directly
+/// would be strictly worse (no gate at all on what "evidence" claims to be).
+/// This endpoint accepts only identifiers the caller can already read (a
+/// claim id, a session id) and re-runs verification against whatever
+/// evidence is **already persisted** in the store -- the privileged
+/// `fornax-acquire-exec` binary (`exec/fornax-acquire-exec`, ADR 0022) is
+/// expected to call `Store::insert_evidence` directly *before* calling this
+/// endpoint, exactly the same order `/api/acquire-evidence` itself already
+/// uses internally.
+///
+/// Reuses the exact same `compute_fusion` / `run_verifiers_and_persist_findings`
+/// dispatch `/api/acquire-evidence` uses -- no new interpretation logic.
+/// This handler contains no acquisition logic, no subprocess spawn, and no
+/// network call of its own; it purely re-runs verification over
+/// already-persisted state.
+async fn api_reverify(
+    State(state): State<AppState>,
+    Query(q): Query<ReverifyQuery>,
+) -> Json<serde_json::Value> {
+    let found = match compute_fusion(&state, &q.claim, &q.session).await {
+        FusionOutcome::Error { message } => {
+            return Json(
+                serde_json::json!({ "claim": q.claim, "session": q.session, "error": message }),
+            )
+        }
+        FusionOutcome::NotFound { reason } => {
+            return Json(serde_json::json!({
+                "claim": q.claim,
+                "session": q.session,
+                "found": false,
+                "reason": reason,
+            }))
+        }
+        FusionOutcome::Found(found) => found,
+    };
+    let fused_before = found.fused.clone();
+
+    let evidence = match state.store.evidence_for_session(&q.session).await {
+        Ok(read) => read.evidence,
+        Err(e) => {
+            return Json(serde_json::json!({
+                "claim": q.claim,
+                "session": q.session,
+                "found": true,
+                "error": format!("failed to read evidence: {e}"),
+                "fused_before": fused_before,
+            }))
+        }
+    };
+
+    let caps = state
+        .caps
+        .lock()
+        .await
+        .get(&q.session)
+        .cloned()
+        .unwrap_or_else(default_unknown_caps);
+
+    if let Err(e) = run_verifiers_and_persist_findings(&state, &found.claim, &evidence, &caps).await
+    {
+        return Json(serde_json::json!({
+            "claim": q.claim,
+            "session": q.session,
+            "found": true,
+            "error": format!("failed to re-verify: {e}"),
+            "fused_before": fused_before,
+        }));
+    }
+
+    let fused_after = match compute_fusion(&state, &q.claim, &q.session).await {
+        FusionOutcome::Found(after) => Some(after.fused),
+        _ => None,
+    };
+
+    Json(serde_json::json!({
+        "claim": q.claim,
+        "session": q.session,
+        "found": true,
         "fused_before": fused_before,
         "fused_after": fused_after,
     }))
