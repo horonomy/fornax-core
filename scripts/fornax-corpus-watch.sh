@@ -57,8 +57,8 @@ done <<< "$sessions"
 dry_run_out=$(fornax adjudicate sample --budget "$MIN_BATCH" --dry-run 2>&1)
 echo "$dry_run_out"
 
-selected=$(echo "$dry_run_out" | grep -oE '^[0-9]+ selected' | grep -oE '^[0-9]+' || echo 0)
-patterns=$(echo "$dry_run_out" | grep -oE '[0-9]+ distinct patterns available' | grep -oE '^[0-9]+' || echo 0)
+selected=$(echo "$dry_run_out" | grep -oE '[0-9]+ selected' | grep -oE '[0-9]+' || echo 0)
+patterns=$(echo "$dry_run_out" | grep -oE '[0-9]+ distinct patterns' | grep -oE '[0-9]+' || echo 0)
 
 if [ "${selected:-0}" -lt "$MIN_BATCH" ] || [ "${patterns:-0}" -lt "$MIN_PATTERNS" ]; then
   echo "fornax-corpus-watch: not enough real data yet for a methodologically valid batch (selected=$selected/$MIN_BATCH, distinct_patterns=$patterns/$MIN_PATTERNS). Not enqueueing or exporting. Waiting for more real sessions."
