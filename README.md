@@ -143,7 +143,8 @@ Nothing leaves your machine unless you explicitly turn on cloud sync
 (`FORNAX_CLOUD_SYNC_ENABLED`, see below) — there is no telemetry and no
 hosted Beta/production service to opt out of, because none exists at this
 version. `$FORNAX_HOME`'s on-disk schema is not yet guaranteed stable across
-releases.
+releases. See [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) for the full, discoverable
+list of current limitations.
 
 Claude Code and Codex CLI support is not symmetric: Codex's hook surface is
 opt-in and can be admin-disabled, so its adapter relies primarily on tailing

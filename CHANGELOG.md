@@ -14,6 +14,12 @@ Jira epic FORNX-20.
   currently-available channel (GitHub Issues) honestly, with no invented
   SLA. Linked from `README.md`. Independent of final pricing/SLA/Dodo-live
   decisions, which remain tracked separately under FORNX-367.
+- `KNOWN_ISSUES.md` (FORNX-363, GA prep): a discoverable, honest list of
+  currently-true limitations (schema stability, pre-1.0 security-fix
+  support window, Claude/Codex/opencode adapter asymmetry), grounded in
+  existing docs/SECURITY.md rather than invented. Linked from `README.md`.
+  Explicitly not a real-time status/uptime page. Independent of final
+  pricing/SLA/Dodo-live decisions, tracked separately under FORNX-367.
 - `fornax-acquire-exec` (FORNX-346 Part 2, Stage 8): a physically separate,
   explicitly opt-in binary at `exec/fornax-acquire-exec` (founder-decided
   Option B) implementing the two `fornax_verify::voi::ProbeKind` variants
