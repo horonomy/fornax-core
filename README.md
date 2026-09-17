@@ -120,7 +120,9 @@ foreign `notify` value), leaving every other key/table/comment untouched:
 The dashboard at `/dashboard` on the daemon's HTTP port works the same way
 across every adapter.
 
-opencode monitoring uses a third, distinct mechanism: an in-process
+opencode monitoring uses a third, distinct mechanism, and — unlike the
+`install-claude`/`install-codex` commands above — has no `install-opencode`
+command yet: it requires manually placing a plugin file. It is an in-process
 `@opencode-ai/plugin` (`crates/fornax-adapter-opencode/plugin/fornax-capture.js`)
 that opencode's own runtime invokes synchronously, forwarding each hook
 event to the long-lived `fornax-hook-opencode` binary over stdin. Enable it
@@ -158,7 +160,8 @@ Codex side.
 `fornax export-spool` reads `$FORNAX_HOME/fornax.db` directly (no daemon
 dependency) and writes one wire-compatible envelope JSON file per
 event/claim/evidence/capability into `<out>/pending/`, in the layout
-`horonomy/fornax-cloud`'s `fornax-uploader` spool expects:
+[`horonomy/fornax-cloud`](https://github.com/horonomy/fornax-cloud)'s
+`fornax-uploader` spool expects:
 
 ```bash
 ./target/debug/fornax export-spool --session "$SESSION" --out /tmp/fornax-uploader-spool
@@ -166,11 +169,14 @@ event/claim/evidence/capability into `<out>/pending/`, in the layout
 
 Point `fornax-uploader`'s `FORNAX_UPLOADER_SPOOL_DIR` at that same directory
 to sync the exported session to a running fornax-cloud stack — see
-`horonomy/fornax-infra`'s README for standing up that stack locally, and
-`horonomy/fornax-cloud`'s README for running `fornax-uploader` itself. Cloud
-sync is opt-in and off by default (`FORNAX_CLOUD_SYNC_ENABLED`) — nothing
-above requires it, and the local daemon/CLI path works fully with cloud
-access disabled.
+[`horonomy/fornax-infra`](https://github.com/horonomy/fornax-infra)'s README
+for standing up that stack locally, and
+[`horonomy/fornax-cloud`](https://github.com/horonomy/fornax-cloud)'s README
+for running `fornax-uploader` itself. Both are private Horonomy repos (the
+hosted cloud-sync stack is not yet a public self-serve product) — cloud sync
+is opt-in and off by default (`FORNAX_CLOUD_SYNC_ENABLED`), and nothing above
+requires it: the local daemon/CLI path works fully with cloud access
+disabled.
 
 ## Support
 
