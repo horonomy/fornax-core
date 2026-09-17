@@ -171,6 +171,12 @@ sync is opt-in and off by default (`FORNAX_CLOUD_SYNC_ENABLED`) — nothing
 above requires it, and the local daemon/CLI path works fully with cloud
 access disabled.
 
+## Support
+
+Found a bug or have a feature request? See [`SUPPORT.md`](SUPPORT.md). For
+security vulnerabilities, see [`SECURITY.md`](SECURITY.md) instead — do not
+open a public issue for those.
+
 ## License
 
 MIT.
