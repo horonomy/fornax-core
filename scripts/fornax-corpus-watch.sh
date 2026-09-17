@@ -54,7 +54,30 @@ while IFS= read -r sid; do
 done <<< "$sessions"
 
 # 3. Dry-run sample to see what's actually minable before touching the queue.
-dry_run_out=$(fornax adjudicate sample --budget "$MIN_BATCH" --dry-run 2>&1)
+#
+# FORNX-361: `adjudicate sample --dry-run` has been observed to hang
+# indefinitely once the corpus grows large enough (32k+ agent_events) --
+# a real perf bug, tracked separately. A cron-fired caller of this script
+# must never let that hang accumulate an unbounded pile of orphaned
+# 100%-CPU processes across ticks, so this step is time-boxed. A timeout
+# here means "couldn't tell this tick" -- exactly like "not enough real
+# data yet" from this watcher's own honesty contract -- never a fabricated
+# readiness signal.
+DRY_RUN_TIMEOUT_SECONDS="${FORNAX_CORPUS_WATCH_DRY_RUN_TIMEOUT:-60}"
+# `|| status=$?` (not `if ! ...; then status=$?`) so `$status` holds the
+# command's REAL exit code -- `!` on the `if` line negates `$?` itself, not
+# just branch selection, which would make a 124 (timeout) indistinguishable
+# from any other failure.
+status=0
+dry_run_out=$(timeout "$DRY_RUN_TIMEOUT_SECONDS" fornax adjudicate sample --budget "$MIN_BATCH" --dry-run 2>&1) || status=$?
+if [ "$status" -eq 124 ]; then
+  echo "fornax-corpus-watch: adjudicate sample --dry-run did not finish within ${DRY_RUN_TIMEOUT_SECONDS}s (FORNX-361) -- treating this tick as inconclusive, not as threshold-not-met. Not enqueueing or exporting."
+  exit 0
+elif [ "$status" -ne 0 ]; then
+  echo "$dry_run_out"
+  echo "fornax-corpus-watch: adjudicate sample --dry-run failed (exit $status)."
+  exit "$status"
+fi
 echo "$dry_run_out"
 
 selected=$(echo "$dry_run_out" | grep -oE '[0-9]+ selected' | grep -oE '[0-9]+' || echo 0)
