@@ -27,6 +27,12 @@ Jira epic FORNX-20.
   CLI/config/on-disk data, distinct from ADR 0003 (dependency versions) and
   ADR 0005 (internal wire-schema evolution). Feeds FORNX-227's GA release
   docs; independent of pricing/SLA/Dodo-live decisions.
+- `docs/adr/0024-telemetry-and-usage-analytics-stance.md` (FORNX-366, GA
+  prep): consolidates the already-implemented "no product-usage telemetry
+  by default" stance (`crates/fornax-types/src/privacy.rs`'s three opt-in
+  gates, `docs/privacy-redaction-policy.md`) into one canonical, GA-facing
+  document. Introduces no new data collection. Explicitly distinguishes
+  itself from FORNX-327's website-only GA4 analytics.
 - `fornax-acquire-exec` (FORNX-346 Part 2, Stage 8): a physically separate,
   explicitly opt-in binary at `exec/fornax-acquire-exec` (founder-decided
   Option B) implementing the two `fornax_verify::voi::ProbeKind` variants
