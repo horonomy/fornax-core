@@ -187,6 +187,11 @@ Jira epic FORNX-20.
   daemon on a shared port fails closed (`UNAVAILABLE`) instead of
   silently reading another session's data.
 
+### Security
+
+- HORO-1226: bumped `rustls` 0.23.43 -> 0.23.45 (lockfile-only) for
+  RUSTSEC-2026-0285. No API or business-logic impact.
+
 ### Fixed
 
 - FORNX-346 AC2/AC5 gaps: `InspectVcsState` no longer requires a `FileDiff`
