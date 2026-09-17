@@ -4371,6 +4371,206 @@ mod tests {
         std::fs::remove_file(&target).ok();
     }
 
+    /// FORNX-346 AC6: `session_id` is threaded through `/api/acquire-evidence`
+    /// as an explicit parameter, not ambient/thread-local state -- but no
+    /// prior test exercised two DIFFERENT sessions concurrently against the
+    /// same daemon to prove that threading actually keeps their evidence and
+    /// `acquisition_log` rows apart under real concurrency (the existing
+    /// end-to-end test above only ever runs one session at a time). Two real
+    /// probes, two distinct temp files, run via `tokio::join!` against the
+    /// same shared `AppState`/store; each session's own acquired evidence
+    /// must carry ONLY its own file's content hash, and each session's
+    /// `acquisition_log` must contain exactly its own attempt -- never the
+    /// other session's.
+    #[tokio::test]
+    async fn api_acquire_evidence_keeps_concurrent_sessions_isolated() {
+        use fornax_types::graph::MissingEvidence;
+        use fornax_types::SignalAvailability;
+        use fornax_types::SignalClass;
+        use sha2::Digest;
+
+        async fn seed_and_acquire(
+            state: AppState,
+            session_id: &'static str,
+            content: &'static [u8],
+        ) -> (String, serde_json::Value) {
+            let target = std::env::temp_dir()
+                .join(format!("fornax-acquire-concurrent-{}.txt", Uuid::new_v4()));
+            std::fs::write(&target, content).unwrap();
+
+            let event_id = test_event(&state, session_id).await;
+            let claim = test_claim(session_id, event_id);
+            state
+                .store
+                .insert_claim(&claim)
+                .await
+                .expect("insert claim");
+            state
+                .store
+                .insert_missing_evidence(&MissingEvidence {
+                    id: Uuid::new_v4(),
+                    session_id: session_id.to_string(),
+                    claim_id: claim.id,
+                    signal_class: SignalClass::ToolResultPayload,
+                    availability: SignalAvailability::Unavailable,
+                    detail: None,
+                    noted_at: "2026-01-01T00:00:00Z".to_string(),
+                })
+                .await
+                .expect("insert missing evidence");
+            let file_diff = fornax_types::Evidence {
+                id: Uuid::new_v4(),
+                session_id: session_id.to_string(),
+                source_event_id: event_id,
+                kind: fornax_types::EvidenceKind::FileDiff,
+                observed_at: "2026-01-01T00:00:00Z".to_string(),
+                payload: serde_json::json!({ "path": target.to_string_lossy(), "diff": "" }),
+                provenance: "test".to_string(),
+                source: None,
+                extension: None,
+                evidence_purged: false,
+            };
+            state
+                .store
+                .insert_evidence(&file_diff)
+                .await
+                .expect("insert file diff evidence");
+
+            let plan_response = api_evidence_plan(
+                State(state.clone()),
+                Query(EvidencePlanQuery {
+                    claim: claim.id.to_string(),
+                    session: session_id.to_string(),
+                    risk: None,
+                }),
+            )
+            .await;
+            let candidates = plan_response.0["plan"]["candidates"]
+                .as_array()
+                .cloned()
+                .expect("candidates array");
+            let rank = candidates
+                .iter()
+                .find(|c| c["request"]["kind"] == serde_json::json!("verify_artifact_hash"))
+                .and_then(|c| c["rank"].as_u64())
+                .expect("VerifyArtifactHash must be ranked") as u32;
+
+            let response = api_acquire_evidence(
+                State(state.clone()),
+                Query(AcquireEvidenceQuery {
+                    claim: claim.id.to_string(),
+                    session: session_id.to_string(),
+                    rank,
+                    risk: None,
+                }),
+            )
+            .await;
+
+            std::fs::remove_file(&target).ok();
+            (claim.id.to_string(), response.0)
+        }
+
+        // Same acquisition_roots covers both temp files -- they share
+        // std::env::temp_dir() as their parent.
+        let root = std::env::temp_dir();
+        let db_path = std::env::temp_dir().join(format!("fornax-test-{}.db", Uuid::new_v4()));
+        let store = fornax_store::Store::open(&db_path)
+            .await
+            .expect("open test store");
+        let state = AppState {
+            store,
+            caps: Arc::new(Mutex::new(HashMap::new())),
+            processing: Arc::new(Mutex::new(())),
+            home_id: Arc::from(format!("test-home-{}", Uuid::new_v4()).as_str()),
+            trust: Arc::new(None),
+            policy: Arc::new(RwLock::new(PolicyCacheSnapshot::empty())),
+            experiment_policy: Arc::new(GlobalExperimentPolicy::new(std::iter::empty())),
+            sensor_disable: Arc::new(SensorDisableConfig::empty()),
+            acquisition_roots: Arc::new(fornax_acquire::AcquisitionRoots::new([root])),
+        };
+
+        let session_a = "fornx-346-concurrent-session-a";
+        let session_b = "fornx-346-concurrent-session-b";
+        let ((claim_a, resp_a), (claim_b, resp_b)) = tokio::join!(
+            seed_and_acquire(state.clone(), session_a, b"session A content"),
+            seed_and_acquire(state.clone(), session_b, b"session B content"),
+        );
+
+        assert_eq!(resp_a["outcome"], serde_json::json!("acquired"));
+        assert_eq!(resp_b["outcome"], serde_json::json!("acquired"));
+
+        // Each session's acquired evidence carries ONLY its own content hash.
+        let sha_a = resp_a["detail"]["evidence"]["payload"]["observation"]["sha256_hex"]
+            .as_str()
+            .expect("session A sha256_hex present");
+        let sha_b = resp_b["detail"]["evidence"]["payload"]["observation"]["sha256_hex"]
+            .as_str()
+            .expect("session B sha256_hex present");
+        assert_eq!(
+            sha_a,
+            hex::encode(sha2::Sha256::digest(b"session A content"))
+        );
+        assert_eq!(
+            sha_b,
+            hex::encode(sha2::Sha256::digest(b"session B content"))
+        );
+        assert_ne!(sha_a, sha_b);
+
+        // Each session's own evidence pool contains only ITS acquired
+        // observation, never the other session's.
+        let evidence_a = state
+            .store
+            .evidence_for_session(session_a)
+            .await
+            .expect("read session A evidence")
+            .evidence;
+        let evidence_b = state
+            .store
+            .evidence_for_session(session_b)
+            .await
+            .expect("read session B evidence")
+            .evidence;
+        assert!(evidence_a
+            .iter()
+            .any(|e| e.kind == fornax_types::EvidenceKind::ProcessObservation
+                && e.payload["observation"]["sha256_hex"] == serde_json::json!(sha_a)));
+        assert!(!evidence_a
+            .iter()
+            .any(|e| e.payload["observation"]["sha256_hex"] == serde_json::json!(sha_b)));
+        assert!(evidence_b
+            .iter()
+            .any(|e| e.kind == fornax_types::EvidenceKind::ProcessObservation
+                && e.payload["observation"]["sha256_hex"] == serde_json::json!(sha_b)));
+        assert!(!evidence_b
+            .iter()
+            .any(|e| e.payload["observation"]["sha256_hex"] == serde_json::json!(sha_a)));
+
+        // Each session's acquisition_log contains exactly its own attempt.
+        let log_a = state
+            .store
+            .acquisition_log_for_claim(session_a, &claim_a)
+            .await
+            .expect("read session A acquisition log");
+        let log_b = state
+            .store
+            .acquisition_log_for_claim(session_b, &claim_b)
+            .await
+            .expect("read session B acquisition log");
+        assert_eq!(log_a.len(), 1);
+        assert_eq!(log_b.len(), 1);
+        assert_eq!(log_a[0].outcome_kind, "acquired");
+        assert_eq!(log_b[0].outcome_kind, "acquired");
+
+        // Cross-session log lookup returns nothing -- confirms attribution
+        // is scoped by session_id, not merely by claim_id coincidence.
+        let cross_log = state
+            .store
+            .acquisition_log_for_claim(session_b, &claim_a)
+            .await
+            .expect("cross-session log lookup");
+        assert!(cross_log.is_empty());
+    }
+
     /// A candidate that needs an ungranted side effect must be refused, not
     /// silently executed -- the actual enforcement of "approval-required
     /// and forbidden probes cannot silently execute" (FORNX-346 AC3).
