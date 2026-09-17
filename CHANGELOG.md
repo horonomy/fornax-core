@@ -9,6 +9,11 @@ Jira epic FORNX-20.
 
 ### Added
 
+- Real support/feedback pathway (FORNX-362, GA prep): `.github/ISSUE_TEMPLATE/`
+  (bug report + feature request) and a top-level `SUPPORT.md` describing the
+  currently-available channel (GitHub Issues) honestly, with no invented
+  SLA. Linked from `README.md`. Independent of final pricing/SLA/Dodo-live
+  decisions, which remain tracked separately under FORNX-367.
 - `fornax-acquire-exec` (FORNX-346 Part 2, Stage 8): a physically separate,
   explicitly opt-in binary at `exec/fornax-acquire-exec` (founder-decided
   Option B) implementing the two `fornax_verify::voi::ProbeKind` variants
