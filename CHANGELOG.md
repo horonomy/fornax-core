@@ -189,6 +189,11 @@ Jira epic FORNX-20.
 
 ### Fixed
 
+- README onboarding gaps (FORNX-365, GA prep): the cloud-sync section now
+  links `horonomy/fornax-infra`/`horonomy/fornax-cloud` instead of naming
+  them as bare repo names, and notes they are private repos; the opencode
+  section now calls out that it has no `install-opencode` command and
+  requires manual plugin setup, unlike the Claude/Codex integrations.
 - FORNX-346 AC2/AC5 gaps: `InspectVcsState` no longer requires a `FileDiff`
   target -- it falls back to the first configured `AcquisitionRoots` entry
   (a repo-level check, not a per-file one) when a claim carries no such
