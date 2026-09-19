@@ -11,7 +11,7 @@
     {
       "name": "fornax-cloud",
       "owner": "horonomy",
-      "sha": "00d2ef75057226cdd9f0817def20927c644f9c5b",
+      "sha": "f4dea415dd4d0d7e3ea4d630a948ad6ea95cb24d",
       "publishes_artifact": true
     },
     {
@@ -23,13 +23,13 @@
     {
       "name": "fornax-docs",
       "owner": "horonomy",
-      "sha": "623f551b3b55fd9af564b51104d011346e8600a5",
+      "sha": "912421a22de8c8234554c769acc80ef92543d58c",
       "publishes_artifact": false
     },
     {
       "name": "fornax-website",
       "owner": "horonomy",
-      "sha": "9d5ef315b19e43cdaed7ae489dd7b40b454d0dae",
+      "sha": "a26f19fcb486014e831cf55ffca23f9ad69436a2",
       "publishes_artifact": false
     }
   ],
