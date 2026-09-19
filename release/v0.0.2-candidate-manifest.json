@@ -1,6 +1,13 @@
 {
   "version": "v0.0.2",
   "release_notes_path": "CHANGELOG.md",
+  "risk_class": "TRUST_BOUNDARY",
+  "release_tag": {
+    "fornax-cloud": {
+      "tag": "v0.0.2+corrected.fd5a543",
+      "note": "fornax-cloud already had a 'v0.0.2' git tag (created 2026-09-18, commit 0f3f19112cef173ab2234390d8c8ca52fc530448 — the pre-frontend-deployment PR #41 boundary) before this candidate's frontend deployment, TLS work and QA sign-off existed. Per FORNX-235 ('existing public version tags are immutable, never force-move a published release tag'), that tag is left untouched and treated as a historical premature/retroactive marker, NOT the completed coordinated release (its own annotation says exactly this). The completed v0.0.2 release for fornax-cloud is authoritatively marked by 'v0.0.2+corrected.fd5a543' (SemVer 2.0 build-metadata form; does not redefine or move 'v0.0.2', does not alter version precedence, safe for every consumer in this repo since no tooling here parses git tags for version resolution — Cargo.toml/package.json versions are independent and unbumped)."
+    }
+  },
   "repos": [
     {
       "name": "fornax-core",
@@ -11,7 +18,7 @@
     {
       "name": "fornax-cloud",
       "owner": "horonomy",
-      "sha": "f4dea415dd4d0d7e3ea4d630a948ad6ea95cb24d",
+      "sha": "fd5a543ae417f11531c9573b8372900aa18940c6",
       "publishes_artifact": true
     },
     {
