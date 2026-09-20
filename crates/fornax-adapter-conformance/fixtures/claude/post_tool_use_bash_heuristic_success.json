@@ -1,0 +1,22 @@
+{
+  "provider": "claude_code",
+  "provider_runtime_version": "2.1.238",
+  "description": "Real confirmed Claude Code v2.1.238 Bash tool_response shape: no exit_code/exitCode/returncode/status key at all — only {stdout, stderr, interrupted, isImage, noOutputExpected}. Adapter must fall back to the documented stderr-empty heuristic, not fabricate a literal exit code.",
+  "sanitized": true,
+  "historical_schema_drift_ticket": null,
+  "native_events": [
+    {
+      "hook_event_name": "PostToolUse",
+      "session_id": "fixture-claude-session-002",
+      "tool_name": "Bash",
+      "tool_input": { "command": "echo hi" },
+      "tool_response": {
+        "stdout": "hi\n",
+        "stderr": "",
+        "interrupted": false,
+        "isImage": false,
+        "noOutputExpected": false
+      }
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "provider": "codex",
+  "provider_runtime_version": "codex-cli-0.147.0",
+  "description": "session_meta rollout bookkeeping line — recognized shape, deliberately Ignored (not Unrecognized), and used by the adapter to discover the session id for later lines.",
+  "sanitized": true,
+  "historical_schema_drift_ticket": null,
+  "native_events": [
+    {
+      "type": "session_meta",
+      "payload": { "session_id": "fixture-codex-session-001" }
+    }
+  ]
+}

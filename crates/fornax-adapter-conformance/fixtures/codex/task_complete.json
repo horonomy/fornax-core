@@ -1,0 +1,16 @@
+{
+  "provider": "codex",
+  "provider_runtime_version": "codex-cli-0.147.0",
+  "description": "task_complete rollout event with a last_agent_message that trips the test-result claim pre-filter.",
+  "sanitized": true,
+  "historical_schema_drift_ticket": null,
+  "native_events": [
+    {
+      "type": "event_msg",
+      "payload": {
+        "type": "task_complete",
+        "last_agent_message": "All tests passed."
+      }
+    }
+  ]
+}

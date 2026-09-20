@@ -1,0 +1,31 @@
+{
+  "provider": "codex",
+  "provider_runtime_version": "codex-cli-0.147.0",
+  "description": "FORNX-16 real failure-marker capture: `codex exec --disable unified_exec` routes shell exec through the stateless `tools.shell_command` tool (instead of the default persistent `tools.exec_command` / unified_exec shell), whose `custom_tool_call_output` embeds a genuine, parseable `Exit code: <n>` in the output text for both outcomes — `Script failed` / `Script error:\nExit code: <n>` on failure. This fixture pins a real failing `pytest -q` run (live-captured 2026-08-31, one deliberately failing assertion, `1 failed in 0.02s`) through this exact tool, so a future adapter change cannot silently regress to the old zero-guess heuristic for a case that carries a real nonzero code, and so `fornax-verify`'s `TestResultVerifier` has genuine test-runner evidence to contradict a false claim against.",
+  "sanitized": true,
+  "native_events": [
+    {
+      "type": "response_item",
+      "payload": {
+        "type": "custom_tool_call",
+        "call_id": "fixture-call-fail-001",
+        "name": "exec",
+        "input": "const r = await tools.shell_command({command:\"pytest -q\",workdir:\"/workspace\",timeout_ms:120000}); text(r)\n"
+      }
+    },
+    {
+      "type": "response_item",
+      "payload": {
+        "type": "custom_tool_call_output",
+        "call_id": "fixture-call-fail-001",
+        "output": [
+          { "type": "input_text", "text": "Script failed\nWall time 0.5 seconds\nOutput:\n" },
+          {
+            "type": "input_text",
+            "text": "Script error:\nExit code: 1\nWall time: 0.4 seconds\nOutput:\nF                                                                        [100%]\n=================================== FAILURES ===================================\n__________________________________ test_fail ___________________________________\n\n    def test_fail():\n>       assert 1 == 2\nE       assert 1 == 2\n\ntest_sample.py:2: AssertionError\n=========================== short test summary info ============================\nFAILED test_sample.py::test_fail - assert 1 == 2\n1 failed in 0.02s\n"
+          }
+        ]
+      }
+    }
+  ]
+}

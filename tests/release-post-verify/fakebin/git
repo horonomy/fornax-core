@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Fake `git` for release-post-verify.sh bats tests. Never touches the
+# network. Controlled via FAKE_CLONE_FAIL, FAKE_CLONE_SHA, FAKE_SOURCE_VERSION,
+# FAKE_GIT_LOG (append-only call log).
+set -euo pipefail
+
+LOG="${FAKE_GIT_LOG:-/dev/null}"
+echo "git $*" >> "$LOG"
+
+if [ "$1" = "clone" ]; then
+  if [ "${FAKE_CLONE_FAIL:-false}" = "true" ]; then
+    echo "fake git: simulated clone failure" >&2
+    exit 1
+  fi
+  # last argument is the destination directory
+  dest="${@: -1}"
+  mkdir -p "$dest"
+  cat > "${dest}/Cargo.toml" <<CARGOEOF
+[workspace.package]
+version = "${FAKE_SOURCE_VERSION:-0.0.1}"
+CARGOEOF
+  exit 0
+elif [ "$1" = "-C" ]; then
+  if [ "$3" = "rev-parse" ] && [ "$4" = "HEAD" ]; then
+    echo "${FAKE_CLONE_SHA:-abcdef1234567890abcdef1234567890abcdef12}"
+    exit 0
+  fi
+  exit 0
+else
+  echo "fake git: unhandled invocation: $*" >&2
+  exit 99
+fi

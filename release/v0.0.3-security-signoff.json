@@ -1,0 +1,44 @@
+{
+  "version": "v0.0.3",
+  "candidate_repos": [
+    { "name": "fornax-core", "owner": "horonomy", "sha": "d9ca81ea4fb6fb1d267afe2e5004d013ac5e9ec0" }
+  ],
+  "risk_class": "TRUST_BOUNDARY",
+  "trust_boundary_delta_ref": "release/v0.0.3-trust-boundary-delta.json",
+  "threat_model_version": 2,
+  "findings": [
+    {
+      "id": "SEC-v0.0.3-0001",
+      "severity": "high",
+      "title": "Evidence.extension (ExtensionEnvelope) fields/unknown were not redacted before storage/export, unlike Evidence.payload",
+      "evidence": "handle_message's IngestMessage::Evidence arm (crates/fornax-daemon/src/main.rs, at the pre-fix analysis SHA cc7ed3f) applied redact_json to ev.payload but never touched ev.extension. opencode's tool.execute.after sensor (crates/fornax-adapter-opencode/src/lib.rs::build_tool_telemetry_extension) is the first real ExtensionEnvelope producer and carries the bash tool's own command string in its title field -- demonstrably as attacker/agent-controlled as tool_input was in FORNX-280, e.g. a command like 'curl --api-key <secret> https://...'. fornax export-spool spools Evidence 'as-is' including extension (crates/fornax-cli/src/main.rs::evidence_envelope_carries_extension_data_through_export), the same egress path FORNX-280 fixed for payload/tool_input. Fixed: redact_json now applied to both extension.fields and extension.unknown at the same daemon ingestion boundary as payload (merged to next/v0.0.3 in PR #79, commit aa93c62; independently re-confirmed present in this candidate). Regression test crates/fornax-daemon/src/main.rs::tests::extension_fields_and_unknown_are_redacted_before_storage passing on real hosted CI.",
+      "disposition": "fixed",
+      "waiver_ref": null
+    },
+    {
+      "id": "SEC-v0.0.3-0002",
+      "severity": "high",
+      "title": "fornax-daemon's in-memory capabilities cache is keyed only on provider-controlled session_id, allowing a cross-provider capability downgrade",
+      "evidence": "state.caps (crates/fornax-daemon/src/main.rs, at the pre-fix analysis SHA cc7ed3f) is a HashMap<session_id, RuntimeCapabilities> with no provider discriminator, but session_id is read straight off each adapter's native payload (e.g. opencode's /input/sessionID, crates/fornax-adapter-opencode/src/lib.rs). A Capabilities announcement naming an already-active session id from a different provider silently overwrote that session's cached snapshot -- the exact slot handle_message's Claim arm reads to gate every verifier via RuntimeCapabilities::is_observable -- a real capability downgrade that could suppress verification and hide evidence. The persisted store is correctly scoped to (session_id, provider) (Store::upsert_capabilities, crates/fornax-store/src/lib.rs) and was never affected; only this in-memory read path was. Fixed: a same-session announcement from a provider different than the one already cached is dropped from the in-memory cache (logged as a warning) rather than overwriting it; the correctly-scoped store row is still written. Regression test crates/fornax-daemon/src/main.rs::tests::cross_provider_capabilities_announcement_does_not_clobber_cached_session passing on real hosted CI (PR #80).",
+      "disposition": "fixed",
+      "waiver_ref": null
+    },
+    {
+      "id": "SEC-v0.0.3-0003",
+      "severity": "informational",
+      "title": "fornax-hook-opencode is resolved by bare name off PATH and spawned inside opencode's own process",
+      "evidence": "plugin/fornax-capture.js: spawn(\"fornax-hook-opencode\", [], ...) with no absolute path. Same trust class as the already-accepted-risk SEC-v0.0.1-0005 (fornax-adapter-claude's unconfirmed transcript_path read): no privilege boundary is crossed, the spawned binary runs as the invoking user, and PATH is under that same user's control. A missing/wrong-PATH binary silently drops opencode evidence collection with no user-visible signal (stdio is [\"pipe\", \"ignore\", \"ignore\"]) -- a silent availability gap, not a confidentiality/integrity one.",
+      "disposition": "accepted_risk",
+      "waiver_ref": null
+    },
+    {
+      "id": "SEC-v0.0.3-0004",
+      "severity": "informational",
+      "title": "FORNX-161's two disclosed opencode adapter failure modes are confirmed fixed in the reviewed code",
+      "evidence": "(1) plugin/fornax-capture.js lines 31-39: child.on('error', ...) and child.stdin.on('error', ...) listeners now swallow a dead/missing fornax-hook-opencode's error, which previously crashed opencode's own process (a fatal uncaught exception in the host process, since the plugin runs in-process). (2) plugin/fornax-capture.js lines 56-70: dispose() now awaits child.stdin.end()'s callback, bounded by a 200ms timeout, closing the previous race that could drop the last queued event on a fast opencode shutdown. Both fixes are present in the exact code reviewed for this candidate (SHA cc7ed3f); crates/fornax-adapter-opencode/tests/live_transport.rs is the automated regression for the transport leg these fixes protect. No Jira Bug filed -- both are data-loss/reliability nits already fixed, not open gaps.",
+      "disposition": "fixed",
+      "waiver_ref": null
+    }
+  ],
+  "verdict": "PASS"
+}

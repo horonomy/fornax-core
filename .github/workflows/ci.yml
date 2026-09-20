@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Lets a human/release process force the full required candidate suite
+  # on demand, regardless of the affected-surface path filter below.
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -13,14 +16,86 @@ permissions:
   contents: read
 
 jobs:
-  rust:
+  # Conservative affected-surface detection (FORNX-237). Doc-only PRs (e.g.
+  # a README/docs/**-only change) currently trigger a full
+  # `cargo build --workspace` + `cargo test --workspace` for no reason —
+  # zero risk in skipping. Anything that could plausibly affect Rust
+  # correctness always runs the full suite: any `.rs` file, `Cargo.toml`/
+  # `Cargo.lock`, the workflow files themselves (`.github/**` — a workflow
+  # change must validate itself), and the contract/schema surfaces
+  # (`crates/fornax-types/**`, `crates/fornax-adapter-conformance/**`,
+  # FORNX-14/230/231) that cross-repo consumers depend on.
+  #
+  # `push` (the release/main lane) and manual `workflow_dispatch` always
+  # resolve to `code=true` here — path filtering only ever narrows the PR
+  # fast lane, never the release lane, satisfying the "release assurance
+  # can still force the complete required candidate suite regardless of
+  # path filters" AC.
+  #
+  # Implemented as a job-level `if` (not a top-level `on.paths-ignore`)
+  # deliberately: `rust` is the required status check on `main` branch
+  # protection, and a workflow that never triggers at all for a given path
+  # pattern leaves that required check stuck "Expected" forever, blocking
+  # merge. A job that runs but skips its steps completes as a normal
+  # (green) required check instead.
+  changes:
     runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          fetch-depth: 0
+      - name: determine affected surface
+        id: filter
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "non-PR event (${{ github.event_name }}): always running full suite"
+            exit 0
+          fi
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          changed="$(git diff --name-only "$base...$head" || true)"
+          echo "changed files in this PR:"
+          echo "$changed"
+          if [ -z "$changed" ]; then
+            # Couldn't resolve a diff — fail safe and run the full suite.
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if echo "$changed" | grep -Eq '\.rs$|(^|/)Cargo\.(toml|lock)$|^\.github/|^crates/fornax-types/|^crates/fornax-adapter-conformance/'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Fast feedback lane: fmt/clippy are cheap and deterministic. Running them
+  # in their own job lets them report red/green in parallel with the slower
+  # build+test job instead of waiting behind a full `cargo build --workspace`.
+  lint:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: t0
+        id: t0
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - name: t1 (post-checkout)
+        id: t1
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: t2 (post-toolchain)
+        id: t2
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3 # v2
+        id: rust_cache
+      - name: t3 (post-cache-restore)
+        id: t3
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
       - name: check workspace has crates
         id: has_crates
         run: |
@@ -30,12 +105,76 @@ jobs:
             echo "present=false" >> "$GITHUB_OUTPUT"
           fi
       - name: fmt
+        id: fmt
         if: steps.has_crates.outputs.present == 'true'
         run: cargo fmt --all -- --check
+      - name: t4 (post-fmt)
+        id: t4
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
       - name: clippy
+        id: clippy
         if: steps.has_crates.outputs.present == 'true'
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: t5 (post-clippy)
+        id: t5
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+      - name: timing summary
+        if: always()
+        run: |
+          {
+            echo "## CI timing telemetry — job \`lint\`"
+            echo ""
+            echo "| phase | seconds |"
+            echo "|---|---|"
+            echo "| checkout | $(( ${{ steps.t1.outputs.epoch }} - ${{ steps.t0.outputs.epoch }} )) |"
+            echo "| toolchain setup | $(( ${{ steps.t2.outputs.epoch }} - ${{ steps.t1.outputs.epoch }} )) |"
+            echo "| cache restore (rust-cache) | $(( ${{ steps.t3.outputs.epoch }} - ${{ steps.t2.outputs.epoch }} )) |"
+            echo "| fmt --check | $(( ${{ steps.t4.outputs.epoch }} - ${{ steps.t3.outputs.epoch }} )) |"
+            echo "| clippy | $(( ${{ steps.t5.outputs.epoch }} - ${{ steps.t4.outputs.epoch }} )) |"
+            echo "| **total (checkout→clippy)** | **$(( ${{ steps.t5.outputs.epoch }} - ${{ steps.t0.outputs.epoch }} ))** |"
+            echo ""
+            echo "rust-cache cache-hit: \`${{ steps.rust_cache.outputs.cache-hit }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Kept as job name `rust` — this is the required status check name on
+  # `main` branch protection; renaming it would strand that required check.
+  # build and test stay in the same job (not split further): fornax-daemon's
+  # integration tests invoke sibling workspace binaries by their conventional
+  # target/<profile>/<bin> path, so `cargo build --workspace` must run in the
+  # same job, on the same runner filesystem, immediately before `cargo test`.
+  rust:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: t0
+        id: t0
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - name: t1 (post-checkout)
+        id: t1
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: t2 (post-toolchain)
+        id: t2
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+      - uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3 # v2
+        id: rust_cache
+      - name: t3 (post-cache-restore)
+        id: t3
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+      - name: check workspace has crates
+        id: has_crates
+        run: |
+          if [ -n "$(find . -mindepth 3 -maxdepth 3 -name Cargo.toml)" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: build workspace binaries
+        id: build
         if: steps.has_crates.outputs.present == 'true'
         # Some integration tests (e.g. fornax-daemon's) invoke sibling
         # workspace binaries by their conventional target/<profile>/<bin>
@@ -43,6 +182,60 @@ jobs:
         # bins in the *same* crate as the test) — those binaries must exist
         # on disk before `cargo test` runs, same as local dev convention.
         run: cargo build --workspace
+      - name: t4 (post-build)
+        id: t4
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
       - name: test
+        id: test
         if: steps.has_crates.outputs.present == 'true'
         run: cargo test --workspace
+      - name: t5 (post-test)
+        id: t5
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+      - name: timing summary
+        if: always()
+        run: |
+          {
+            echo "## CI timing telemetry — job \`rust\`"
+            echo ""
+            echo "| phase | seconds |"
+            echo "|---|---|"
+            echo "| checkout | $(( ${{ steps.t1.outputs.epoch }} - ${{ steps.t0.outputs.epoch }} )) |"
+            echo "| toolchain setup | $(( ${{ steps.t2.outputs.epoch }} - ${{ steps.t1.outputs.epoch }} )) |"
+            echo "| cache restore (rust-cache) | $(( ${{ steps.t3.outputs.epoch }} - ${{ steps.t2.outputs.epoch }} )) |"
+            echo "| cargo build --workspace | $(( ${{ steps.t4.outputs.epoch }} - ${{ steps.t3.outputs.epoch }} )) |"
+            echo "| cargo test --workspace | $(( ${{ steps.t5.outputs.epoch }} - ${{ steps.t4.outputs.epoch }} )) |"
+            echo "| **total (checkout→test)** | **$(( ${{ steps.t5.outputs.epoch }} - ${{ steps.t0.outputs.epoch }} ))** |"
+            echo ""
+            echo "rust-cache cache-hit: \`${{ steps.rust_cache.outputs.cache-hit }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Baseline PATCH_LOW_RISK-tier security check every higher risk tier also
+  # inherits (docs/release-security-gate.md, FORNX-233). Installed via
+  # `cargo install` from crates.io rather than a third-party GitHub Action,
+  # so no new action SHA needs pinning (docs/adr/0002-repo-and-ci-conventions.md).
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3 # v2
+      - name: check workspace has crates
+        id: has_crates
+        run: |
+          if [ -n "$(find . -mindepth 3 -maxdepth 3 -name Cargo.toml)" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: install cargo-audit
+        if: steps.has_crates.outputs.present == 'true'
+        # Pinned to the exact version this job's local-equivalent
+        # verification pass ran against (docs/release-security-gate.md,
+        # "Validation") — cargo-audit's audit.toml config-path resolution
+        # is version-sensitive, so an unpinned "latest" could silently
+        # change which .cargo/audit.toml ignores are honored.
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: cargo audit
+        if: steps.has_crates.outputs.present == 'true'
+        run: cargo audit

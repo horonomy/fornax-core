@@ -1,0 +1,50 @@
+{
+  "provider": "open_code",
+  "provider_runtime_version": "1.18.25",
+  "description": "Real, sanitized capture from a live opencode v1.18.25 session (FORNX-161, 2026-08-30): the tool.execute.before/tool.execute.after hook pair for a real bash tool call, captured via the @opencode-ai/plugin in-process Hooks API. The tool invocation, the real `ls -la .` process opencode spawned, its real stdout, and every field in this payload are produced entirely by opencode's own real code paths — see the fitness report for why the driving LLM turn was a deterministic stub (every locally available Ollama tool-calling model degraded real tool_calls into plain text once wrapped in opencode's actual production system prompt; reproduced directly against Ollama's HTTP API, independent of opencode). output.metadata.exit is a literal integer exit code opencode's plugin API genuinely exposes — no heuristic inference needed, unlike Claude Code (no exit code at all) or Codex (text-match heuristic).",
+  "sanitized": true,
+  "historical_schema_drift_ticket": null,
+  "native_events": [
+    {
+      "hook": "tool.execute.before",
+      "at": "2026-08-30T11:56:52.611Z",
+      "payload": {
+        "input": {
+          "tool": "bash",
+          "sessionID": "fixture-opencode-session-001",
+          "callID": "call_fixture_1"
+        },
+        "output": {
+          "args": {
+            "command": "ls -la .",
+            "description": "List files in the current directory"
+          }
+        }
+      }
+    },
+    {
+      "hook": "tool.execute.after",
+      "at": "2026-08-30T11:56:52.659Z",
+      "payload": {
+        "input": {
+          "tool": "bash",
+          "sessionID": "fixture-opencode-session-001",
+          "callID": "call_fixture_1",
+          "args": {
+            "command": "ls -la .",
+            "description": "List files in the current directory"
+          }
+        },
+        "output": {
+          "title": "ls -la .",
+          "metadata": {
+            "output": "total 40\ndrwxr-xr-x@  8 user  staff   256 30 Aug 19:54 .\n-rw-r--r--@  1 user  staff    31 30 Aug 19:32 notes.txt\n",
+            "exit": 0,
+            "truncated": false
+          },
+          "output": "total 40\ndrwxr-xr-x@  8 user  staff   256 30 Aug 19:54 .\n-rw-r--r--@  1 user  staff    31 30 Aug 19:32 notes.txt\n"
+        }
+      }
+    }
+  ]
+}

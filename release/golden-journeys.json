@@ -1,0 +1,76 @@
+{
+  "_comment": "Durable, repo-level golden-journey catalog. Schema and field meanings are defined in docs/release-candidate-evidence.md (FORNX-231). This file is NOT per-candidate — it is the standing catalog that QA coverage reconciliation checks each release candidate's feature-delta items against. IDs are stable and never reused; a retired journey gets status:\"retired\", never deletion.",
+  "schema_version": 1,
+  "journeys": [
+    {
+      "id": "GJ-0001",
+      "status": "active",
+      "priority": "P0",
+      "title": "Daemon observes a hook-reported agent action and returns a verdict",
+      "persona": "operator",
+      "surfaces": ["daemon_socket", "adapter_provider_input"],
+      "setup": "fornax-daemon running locally; fornax-hook-claude installed and registered for a Claude Code session.",
+      "expected_result": "The daemon receives the hook's event over the local socket, computes one of the five product verdicts (VERIFIED/UNVERIFIED/CONTRADICTED/REVIEW/UNAVAILABLE per ADR-0001 D4), and the hook exits 0 without blocking the agent when the verdict does not require blocking.",
+      "evidence_requirements": [
+        "daemon log line recording the received event and the computed verdict",
+        "hook process exit code"
+      ]
+    },
+    {
+      "id": "GJ-0002",
+      "status": "active",
+      "priority": "P0",
+      "title": "Operator queries fornax CLI for current daemon/session status",
+      "persona": "operator",
+      "surfaces": ["cli"],
+      "setup": "fornax-daemon running locally with at least one prior observed event.",
+      "expected_result": "`fornax status` (or equivalent CLI entry point) exits 0 and prints the daemon's current state and the most recent verdict, sourced from the daemon rather than re-derived by the CLI itself.",
+      "evidence_requirements": [
+        "CLI stdout capture",
+        "CLI process exit code"
+      ]
+    },
+    {
+      "id": "GJ-0003",
+      "status": "active",
+      "priority": "P1",
+      "title": "Codex hook reports an agent action equivalently to the Claude hook",
+      "persona": "operator",
+      "surfaces": ["adapter_provider_input"],
+      "setup": "fornax-daemon running locally; fornax-hook-codex installed and registered for a Codex CLI session.",
+      "expected_result": "The daemon accepts fornax-hook-codex's event payload and produces a verdict through the same computation path as GJ-0001, confirming the adapter boundary is thin and provider-agnostic per ADR-0001.",
+      "evidence_requirements": [
+        "daemon log line recording the received event and the computed verdict",
+        "hook process exit code"
+      ]
+    },
+    {
+      "id": "GJ-0004",
+      "status": "active",
+      "priority": "P2",
+      "title": "Daemon fails closed when a hook payload is malformed or from an unrecognized adapter version",
+      "persona": "security_reviewer",
+      "surfaces": ["adapter_provider_input", "evidence_provenance"],
+      "setup": "fornax-daemon running locally; a hand-crafted malformed or version-mismatched event payload sent over the local socket.",
+      "expected_result": "The daemon rejects or marks the observation UNAVAILABLE rather than silently accepting it as VERIFIED, and the rejection is itself recorded as evidence — no silent drop.",
+      "evidence_requirements": [
+        "daemon log line recording the rejection/UNAVAILABLE verdict and the reason",
+        "confirmation no downstream state treats the malformed payload as a normal VERIFIED/UNVERIFIED/CONTRADICTED/REVIEW observation"
+      ]
+    },
+    {
+      "id": "GJ-0005",
+      "status": "active",
+      "priority": "P1",
+      "title": "opencode plugin reports an agent action through the plugin-hosted transport pattern",
+      "persona": "operator",
+      "surfaces": ["adapter_provider_input"],
+      "setup": "fornax-daemon running locally; the fornax-capture.js plugin loaded in-process by an opencode session (or, where opencode itself is not installed, driven directly via its exported Hooks with real captured opencode payload shapes) spawning fornax-hook-opencode once as a long-lived child process.",
+      "expected_result": "The daemon accepts fornax-hook-opencode's NDJSON-framed event stream forwarded from the in-process plugin and produces a verdict through the same computation path as GJ-0001/GJ-0003, confirming the adapter boundary stays thin and provider-agnostic even for the third, structurally distinct transport pattern (in-process plugin spawning a long-lived child, rather than a per-invocation hook process or a tailed transcript file) per ADR-0001 and docs/contributing/adding-an-adapter.md's step 5.",
+      "evidence_requirements": [
+        "daemon log line recording the received event and the computed verdict",
+        "on-disk store rows for the session showing SessionStart, PreToolUse and PostToolUse events plus derived Evidence (matches crates/fornax-adapter-opencode/tests/live_transport.rs's assertions)"
+      ]
+    }
+  ]
+}

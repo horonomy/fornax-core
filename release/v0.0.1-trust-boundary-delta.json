@@ -1,0 +1,32 @@
+{
+  "version": "v0.0.1",
+  "generated_at": "2026-09-01T00:00:00Z",
+  "threat_model_version": 1,
+  "full_review": false,
+  "boundaries_touched": [
+    {
+      "surface": "adapter_provider_input",
+      "feature_delta_ids": ["FD-v0.0.1-retro-0001"],
+      "review": "Adversarial daemon/adapter input corpus (malformed JSON, missing/null/wrong-type fields, unknown fields, 60-3000-level nesting, 5MB strings, control characters, path-traversal-looking strings, shell metacharacters, replayed event IDs, 100KB identifiers) run against a real fornax-daemon + fornax-hook-claude. Zero crashes, zero panics, zero subprocess spawns, zero filesystem escapes, no state corruption.",
+      "adversarial_coverage": "crates/fornax-daemon/tests/adversarial_daemon_input.rs (fornax-core#30, merge commit fb03f4f7ee9e7bcd5c3bde1c98bbe18d1c9d7fe4)"
+    },
+    {
+      "surface": "evidence_provenance",
+      "feature_delta_ids": ["FD-v0.0.1-retro-0002"],
+      "review": "Message processing serialized behind a single AppState.processing lock after an intermittent real-CI race (FORNX-281) computed a wrong verdict when an evidence read on one connection's task ran before an earlier write on another connection's task finished, despite the two hooks being invoked strictly sequentially by the same user.",
+      "adversarial_coverage": "cargo test --workspace clean, adversarial corpus run 15x locally post-fix (15/15), next real CI run on the fix PR passed (fornax-core#32, docs/release/v0.0.1-qa-security-signoff.md section 7.6)"
+    },
+    {
+      "surface": "egress_redaction",
+      "feature_delta_ids": ["FD-v0.0.1-retro-0003"],
+      "review": "redact_json/redact_text applied at the daemon's ingestion boundary to tool_input and Claim.text after a full-stack secret-egress canary found both fields reaching the daemon log, SQLite store, and fornax export-spool output unredacted (FORNX-280, Critical).",
+      "adversarial_coverage": "tool_input_and_claim_text_are_redacted_before_storage regression test (fornax-core#29, merge commit f309bc21caad2bf8b994b7f366ba2a42eea27c63); verified by temporarily reverting the fix lines and confirming the test failed with the exact reported leak, then restoring the fix and confirming it passed again; re-verified end-to-end with a fresh canary marker after the fix (zero raw hits in daemon log, SQLite store, export-spool output)"
+    },
+    {
+      "surface": "browser_rendering_injection",
+      "feature_delta_ids": ["FD-v0.0.1-retro-0004"],
+      "review": "Static sink enumeration (dangerouslySetInnerHTML, innerHTML, insertAdjacentHTML, document.write, new Function, raw-HTML markdown renderer, javascript: URI construction) found zero hits in the fornax-cloud React frontend; claim/rationale text renders as plain JSX text-child expressions, which React escapes by default.",
+      "adversarial_coverage": "Real Playwright session against the frozen v0.0.1 candidate's /dashboard, four payloads (<script>, <img onerror>, attribute-breakout \">, javascript: URI) injected into claim text via fornax-hook-claude; window.__FORNAX_XSS_EXECUTED stayed undefined in every case (docs/release/0001-fornx-238-dashboard-xss-check.md, fornax-core#28, merge commit cfc1a70648e099447565bfc4502001b7f6b3243e)"
+    }
+  ]
+}

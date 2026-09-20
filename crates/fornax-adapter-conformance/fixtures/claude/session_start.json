@@ -1,0 +1,14 @@
+{
+  "provider": "claude_code",
+  "provider_runtime_version": "2.1.238",
+  "description": "SessionStart hook payload — session lifecycle only, no tool evidence (docs/research/adapter-capability-matrix.md).",
+  "sanitized": true,
+  "historical_schema_drift_ticket": null,
+  "native_events": [
+    {
+      "hook_event_name": "SessionStart",
+      "session_id": "fixture-claude-session-001",
+      "source": "startup"
+    }
+  ]
+}

@@ -151,6 +151,51 @@ mod tests {
         assert_eq!(out, "7 failed, 1 passed in 3.21s");
     }
 
+    /// FORNX-19: confirms a documented gap rather than adding speculative
+    /// detection — a path containing a real username is short, lowercase,
+    /// and path-separator-heavy enough that it does not trip the
+    /// high-entropy shape (no digit, or too short once split on `/`).
+    #[test]
+    fn does_not_redact_a_path_containing_a_username() {
+        let out = redact_text("reading /Users/alice/.ssh/id_rsa for the demo");
+        assert!(out.contains("/Users/alice/.ssh/id_rsa"));
+    }
+
+    /// FORNX-19: confirms a documented gap — a short, human-chosen password
+    /// passed as a literal CLI argument is under the 20-character floor for
+    /// the high-entropy detector and isn't an env-assignment line, so it is
+    /// not redacted today.
+    #[test]
+    fn does_not_redact_a_short_password_shaped_cli_argument() {
+        let out = redact_text("mysql -u root --password hunter2 -e 'select 1'");
+        assert!(out.contains("hunter2"));
+    }
+
+    /// FORNX-19: a long, high-entropy value passed as a literal shell
+    /// argument (not a `NAME=value` assignment) IS caught, because
+    /// `high_entropy_token` tests the token itself, independent of the flag
+    /// name preceding it — no new detector needed for this shape.
+    #[test]
+    fn redacts_a_high_entropy_secret_passed_as_a_shell_argument() {
+        let out = redact_text(
+            "curl --api-key zqT9v2Lk8pXwR4nHc7bEaMdJ1sYuF6oQ3iZgN0tKrV5 https://example.com",
+        );
+        assert!(!out.contains("zqT9v2Lk8pXwR4nHc7bEaMdJ1sYuF6oQ3iZgN0tKrV5"));
+        assert!(out.contains("[REDACTED]"));
+        assert!(out.contains("--api-key"));
+    }
+
+    /// FORNX-19: `redact_text` is not a pure "replace the matched substring
+    /// in place" transform — it rebuilds each line via
+    /// `split_whitespace().join(" ")`, which normalizes (and can lossily
+    /// collapse) whitespace even on lines with nothing to redact. Documented
+    /// as a fidelity caveat, not a detection gap.
+    #[test]
+    fn normalizes_whitespace_even_when_nothing_is_redacted() {
+        let out = redact_text("  indented\ttext  with   gaps");
+        assert_eq!(out, "indented text with gaps");
+    }
+
     #[test]
     fn redacts_nested_json_values_not_keys() {
         let v = serde_json::json!({

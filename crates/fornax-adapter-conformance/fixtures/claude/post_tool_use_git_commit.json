@@ -1,0 +1,20 @@
+{
+  "provider": "claude_code",
+  "provider_runtime_version": "2.1.238",
+  "description": "Synthetic (not a real captured transcript) Claude Code Bash PostToolUse tool_response for a successful `git commit`, shaped to match git's real stdout summary line format. Exercises ClaudeGitOutcomeSensor's authoritative (#tool_response, not #heuristic) ProcessObservation/vcs_operation evidence path against the conformance harness's canonical-payload validation.",
+  "sanitized": true,
+  "historical_schema_drift_ticket": null,
+  "native_events": [
+    {
+      "hook_event_name": "PostToolUse",
+      "session_id": "fixture-claude-session-014",
+      "tool_name": "Bash",
+      "tool_input": { "command": "git commit -m 'add feature'" },
+      "tool_response": {
+        "stdout": "[main 0e2fbd4] add feature\n 1 file changed, 3 insertions(+)\n",
+        "stderr": "",
+        "interrupted": false
+      }
+    }
+  ]
+}

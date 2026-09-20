@@ -3,7 +3,9 @@
 //! verifiers (FORNX-49) from this store alone, with no network/adapter
 //! dependency.
 
-use fornax_types::{AgentEvent, Claim, Evidence, Finding, RuntimeCapabilities};
+use fornax_types::{
+    AgentEvent, Claim, Evidence, Finding, LegacyCapabilitiesWire, RuntimeCapabilities,
+};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use std::path::Path;
@@ -141,9 +143,15 @@ impl Store {
     }
 
     pub async fn insert_evidence(&self, ev: &Evidence) -> Result<()> {
+        let source = ev.source.as_ref().map(serde_json::to_string).transpose()?;
+        let extension = ev
+            .extension
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         sqlx::query(
-            "INSERT INTO evidence (id, session_id, source_event_id, kind, observed_at, payload, provenance)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO evidence (id, session_id, source_event_id, kind, observed_at, payload, provenance, source, extension)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )
         .bind(ev.id.to_string())
         .bind(&ev.session_id)
@@ -152,6 +160,8 @@ impl Store {
         .bind(&ev.observed_at)
         .bind(ev.payload.to_string())
         .bind(&ev.provenance)
+        .bind(source)
+        .bind(extension)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -176,15 +186,38 @@ impl Store {
 
     /// All evidence rows for a session, oldest first — the input a verifier
     /// needs alongside a claim.
-    pub async fn evidence_for_session(&self, session_id: &str) -> Result<Vec<Evidence>> {
+    ///
+    /// FORNX-289: one row that fails to deserialize (e.g. an `extension`
+    /// blob stamped with a `schema_version` this binary no longer/doesn't
+    /// yet support, see `ExtensionEnvelope`'s `TryFrom`) must not take down
+    /// the whole session's evidence read — a verifier still needs the N-1
+    /// good rows. The failure is not silently dropped either: it comes back
+    /// in `failed`, named by row id, so the caller can decide what "N of M
+    /// evidence rows for this session failed to deserialize" means for it
+    /// (log, surface to an operator, etc). This is deliberately scoped to
+    /// *this* session-wide query — a direct single-row read/version-check
+    /// elsewhere still fails loudly per FORNX-158's original design.
+    pub async fn evidence_for_session(&self, session_id: &str) -> Result<EvidenceReadOutcome> {
         let rows = sqlx::query_as::<_, EvidenceRow>(
-            "SELECT id, session_id, source_event_id, kind, observed_at, payload, provenance
+            "SELECT id, session_id, source_event_id, kind, observed_at, payload, provenance, source, extension
              FROM evidence WHERE session_id = ?1 ORDER BY observed_at ASC",
         )
         .bind(session_id)
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter().map(TryInto::try_into).collect()
+        let mut evidence = Vec::with_capacity(rows.len());
+        let mut failed = Vec::new();
+        for row in rows {
+            let id = row.id.clone();
+            match Evidence::try_from(row) {
+                Ok(ev) => evidence.push(ev),
+                Err(e) => failed.push(EvidenceReadFailure {
+                    id,
+                    error: e.to_string(),
+                }),
+            }
+        }
+        Ok(EvidenceReadOutcome { evidence, failed })
     }
 
     /// All events for a session, oldest first (FORNX-60: needed alongside
@@ -205,17 +238,24 @@ impl Store {
     /// for `session_id` (FORNX-62). Unlike `insert_*`, this is an upsert on
     /// `(session_id, provider)` — see `migrations/0002_runtime_capabilities.sql`
     /// for why capabilities don't follow the insert-only convention.
+    ///
+    /// Writes both the formalized `signals`/`schema_version` columns
+    /// (FORNX-155, source of truth) and the six legacy `supports_*` bool
+    /// columns (write-only compatibility mirror, derived via
+    /// `LegacyCapabilitiesWire` — see `migrations/0003_capability_signals.sql`).
     pub async fn upsert_capabilities(
         &self,
         session_id: &str,
         caps: &RuntimeCapabilities,
     ) -> Result<()> {
+        let legacy = LegacyCapabilitiesWire::from(caps);
         sqlx::query(
             "INSERT INTO runtime_capabilities
                 (session_id, provider, supports_pre_tool_use, supports_post_tool_use,
                  supports_tool_response_capture, supports_session_stop_event,
-                 supports_transcript_tail, supports_subagent_lifecycle, notes, observed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                 supports_transcript_tail, supports_subagent_lifecycle, notes,
+                 schema_version, signals, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
              ON CONFLICT(session_id, provider) DO UPDATE SET
                 supports_pre_tool_use = excluded.supports_pre_tool_use,
                 supports_post_tool_use = excluded.supports_post_tool_use,
@@ -224,17 +264,21 @@ impl Store {
                 supports_transcript_tail = excluded.supports_transcript_tail,
                 supports_subagent_lifecycle = excluded.supports_subagent_lifecycle,
                 notes = excluded.notes,
+                schema_version = excluded.schema_version,
+                signals = excluded.signals,
                 observed_at = excluded.observed_at",
         )
         .bind(session_id)
         .bind(tag(&caps.provider)?)
-        .bind(caps.supports_pre_tool_use)
-        .bind(caps.supports_post_tool_use)
-        .bind(caps.supports_tool_response_capture)
-        .bind(caps.supports_session_stop_event)
-        .bind(caps.supports_transcript_tail)
-        .bind(caps.supports_subagent_lifecycle)
+        .bind(legacy.supports_pre_tool_use)
+        .bind(legacy.supports_post_tool_use)
+        .bind(legacy.supports_tool_response_capture)
+        .bind(legacy.supports_session_stop_event)
+        .bind(legacy.supports_transcript_tail)
+        .bind(legacy.supports_subagent_lifecycle)
         .bind(serde_json::to_string(&caps.notes)?)
+        .bind(caps.schema_version as i64)
+        .bind(serde_json::to_string(&caps.signals)?)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -250,7 +294,8 @@ impl Store {
         let rows = sqlx::query_as::<_, CapabilitiesRow>(
             "SELECT provider, supports_pre_tool_use, supports_post_tool_use,
                     supports_tool_response_capture, supports_session_stop_event,
-                    supports_transcript_tail, supports_subagent_lifecycle, notes
+                    supports_transcript_tail, supports_subagent_lifecycle, notes,
+                    schema_version, signals
              FROM runtime_capabilities WHERE session_id = ?1 ORDER BY provider ASC",
         )
         .bind(session_id)
@@ -285,6 +330,99 @@ impl Store {
         .await?;
         Ok(rows)
     }
+
+    /// One finding row by id, joined with its claim (FORNX-18: the
+    /// dashboard's finding-detail page). `None` if no such finding exists.
+    pub async fn finding_by_id(&self, id: &str) -> Result<Option<FindingRow>> {
+        let row = sqlx::query_as::<_, FindingRow>(
+            "SELECT f.id, f.claim_id, f.verdict, f.evidence_ids, f.verifier_name, f.rationale, f.computed_at,
+                    c.text as claim_text, c.session_id as session_id
+             FROM findings f JOIN claims c ON c.id = f.claim_id
+             WHERE f.id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// One overview row per session that has at least one event, newest
+    /// activity first (FORNX-18: the dashboard's session-list page). The
+    /// `provider` column comes straight from `agent_events` — a session's
+    /// events are always normalized by the one adapter connection that
+    /// produced them, so this needs no capability-table lookup and stays
+    /// correct even for a session that never explicitly announced
+    /// `RuntimeCapabilities`.
+    pub async fn sessions_overview(&self) -> Result<Vec<SessionSummary>> {
+        let rows = sqlx::query_as::<_, SessionSummary>(
+            "SELECT e.session_id as session_id,
+                    e.provider as provider,
+                    COUNT(DISTINCT e.id) as event_count,
+                    COUNT(DISTINCT c.id) as claim_count,
+                    COUNT(DISTINCT f.id) as finding_count,
+                    MAX(e.observed_at) as last_activity
+             FROM agent_events e
+             LEFT JOIN claims c ON c.session_id = e.session_id
+             LEFT JOIN findings f ON f.claim_id = c.id
+             GROUP BY e.session_id, e.provider
+             ORDER BY last_activity DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// All findings for one session, newest first (FORNX-18: the
+    /// dashboard's session-detail page — distinct from `recent_findings`,
+    /// which is cross-session).
+    pub async fn findings_for_session(&self, session_id: &str) -> Result<Vec<FindingRow>> {
+        let rows = sqlx::query_as::<_, FindingRow>(
+            "SELECT f.id, f.claim_id, f.verdict, f.evidence_ids, f.verifier_name, f.rationale, f.computed_at,
+                    c.text as claim_text, c.session_id as session_id
+             FROM findings f JOIN claims c ON c.id = f.claim_id
+             WHERE c.session_id = ?1
+             ORDER BY f.computed_at DESC",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+}
+
+/// One row of `Store::sessions_overview` — a session's activity summary for
+/// the dashboard's session-list page (FORNX-18). Not the canonical session
+/// concept (there is no `sessions` table; a session is implicitly whatever
+/// `session_id` its events/claims/findings share) — purely a read-side
+/// aggregate.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct SessionSummary {
+    pub session_id: String,
+    pub provider: String,
+    pub event_count: i64,
+    pub claim_count: i64,
+    pub finding_count: i64,
+    pub last_activity: String,
+}
+
+/// Result of `Store::evidence_for_session`: the rows that deserialized
+/// successfully, plus an explicit account of the ones that didn't (M minus
+/// `evidence.len()` gives the failed count; see `evidence_for_session`'s
+/// doc comment for why a bad row is reported rather than either silently
+/// dropped or failing the whole query).
+#[derive(Debug, Clone, Default)]
+pub struct EvidenceReadOutcome {
+    pub evidence: Vec<Evidence>,
+    pub failed: Vec<EvidenceReadFailure>,
+}
+
+/// One evidence row that could not be deserialized, named by its (opaque,
+/// unparsed — a bad row is not a place to introduce a second failure mode)
+/// id, with the deserialization error that was reported.
+#[derive(Debug, Clone)]
+pub struct EvidenceReadFailure {
+    pub id: String,
+    pub error: String,
 }
 
 #[derive(sqlx::FromRow)]
@@ -296,6 +434,16 @@ struct EvidenceRow {
     observed_at: String,
     payload: String,
     provenance: String,
+    /// `NULL` for any row written before FORNX-157's 0004 migration, or by
+    /// code not yet migrated onto the `EvidenceSensor` contract — reads
+    /// back as `Evidence::source == None`, not a fabricated value (see
+    /// `migrations/0004_evidence_source.sql`).
+    source: Option<String>,
+    /// `NULL` for any row with no provider-extension data (the common
+    /// case) or written before FORNX-158's 0005 migration — reads back as
+    /// `Evidence::extension == None` (see
+    /// `migrations/0005_evidence_extension.sql`).
+    extension: Option<String>,
 }
 
 impl TryFrom<EvidenceRow> for Evidence {
@@ -309,6 +457,8 @@ impl TryFrom<EvidenceRow> for Evidence {
             observed_at: r.observed_at,
             payload: serde_json::from_str(&r.payload)?,
             provenance: r.provenance,
+            source: r.source.map(|s| serde_json::from_str(&s)).transpose()?,
+            extension: r.extension.map(|s| serde_json::from_str(&s)).transpose()?,
         })
     }
 }
@@ -380,21 +530,43 @@ struct CapabilitiesRow {
     supports_transcript_tail: bool,
     supports_subagent_lifecycle: bool,
     notes: String,
+    /// `NULL` for any row written before FORNX-155's 0003 migration.
+    schema_version: Option<i64>,
+    /// `NULL` for any row written before FORNX-155's 0003 migration —
+    /// reconstruct from the six bool columns above in that case. Non-NULL
+    /// rows are authoritative and complete; the bool columns are then only a
+    /// write-only compatibility mirror (see 0003's migration comment).
+    signals: Option<String>,
 }
 
 impl TryFrom<CapabilitiesRow> for RuntimeCapabilities {
     type Error = StoreError;
     fn try_from(r: CapabilitiesRow) -> Result<Self> {
-        Ok(RuntimeCapabilities {
-            provider: from_tag(&r.provider)?,
-            supports_pre_tool_use: r.supports_pre_tool_use,
-            supports_post_tool_use: r.supports_post_tool_use,
-            supports_tool_response_capture: r.supports_tool_response_capture,
-            supports_session_stop_event: r.supports_session_stop_event,
-            supports_transcript_tail: r.supports_transcript_tail,
-            supports_subagent_lifecycle: r.supports_subagent_lifecycle,
-            notes: serde_json::from_str(&r.notes)?,
-        })
+        // Route both the pre-0003 (bools only) and post-0003 (signals JSON)
+        // row shapes through `RuntimeCapabilities`'s own tolerant
+        // `Deserialize` impl (`fornax_types::capabilities`), rather than
+        // duplicating its legacy-bool-reconstruction rule here — one
+        // reconstruction rule, exercised by both the wire path and this
+        // store path, cannot drift apart.
+        let mut value = serde_json::json!({});
+        value["provider"] = serde_json::Value::String(r.provider.clone());
+        value["supports_pre_tool_use"] = serde_json::Value::Bool(r.supports_pre_tool_use);
+        value["supports_post_tool_use"] = serde_json::Value::Bool(r.supports_post_tool_use);
+        value["supports_tool_response_capture"] =
+            serde_json::Value::Bool(r.supports_tool_response_capture);
+        value["supports_session_stop_event"] =
+            serde_json::Value::Bool(r.supports_session_stop_event);
+        value["supports_transcript_tail"] = serde_json::Value::Bool(r.supports_transcript_tail);
+        value["supports_subagent_lifecycle"] =
+            serde_json::Value::Bool(r.supports_subagent_lifecycle);
+        value["notes"] = serde_json::from_str(&r.notes)?;
+        if let Some(schema_version) = r.schema_version {
+            value["schema_version"] = serde_json::Value::Number(schema_version.into());
+        }
+        if let Some(signals) = &r.signals {
+            value["signals"] = serde_json::from_str(signals)?;
+        }
+        Ok(serde_json::from_value(value)?)
     }
 }
 
@@ -509,6 +681,23 @@ mod tests {
             observed_at: "2026-01-01T00:00:01Z".into(),
             payload: serde_json::json!({"command": ["pytest"], "exit_code": 1}),
             provenance: "test".into(),
+            source: Some(fornax_types::EvidenceSource {
+                sensor_name: "test_sensor_v1".into(),
+                trust_class: fornax_types::TrustClass::HostObserved,
+                collected_at: "2026-01-01T00:00:01Z".into(),
+                provider: Some(Provider::Codex),
+                collection_method: fornax_types::CollectionMethod::ProcessObservation,
+                collector_version: Some("test-sensor-0.1.0".into()),
+                freshness: fornax_types::Freshness {
+                    clock_source: fornax_types::ClockSource::HostClock,
+                    caveat: None,
+                },
+                tamper_boundary: fornax_types::TamperBoundary::for_trust_class(
+                    &fornax_types::TrustClass::HostObserved,
+                    &fornax_types::CollectionMethod::ProcessObservation,
+                ),
+            }),
+            extension: None,
         };
         store
             .insert_evidence(&evidence)
@@ -542,10 +731,14 @@ mod tests {
         let fetched_evidence = store
             .evidence_for_session("s1")
             .await
-            .expect("query evidence");
+            .expect("query evidence")
+            .evidence;
         assert_eq!(fetched_evidence.len(), 1);
         assert_eq!(fetched_evidence[0].id, evidence.id);
         assert_eq!(fetched_evidence[0].payload["exit_code"], 1);
+        // FORNX-157: structured EvidenceSource/trust-class metadata must
+        // survive the local persistence round trip byte-for-byte.
+        assert_eq!(fetched_evidence[0].source, evidence.source);
 
         let recent = store.recent_findings(10).await.expect("query findings");
         assert_eq!(recent.len(), 1);
@@ -578,7 +771,8 @@ mod tests {
         let evidence = store
             .evidence_for_session("s2")
             .await
-            .expect("query after restart");
+            .expect("query after restart")
+            .evidence;
         assert!(
             evidence.is_empty(),
             "no evidence was inserted, only an event"
@@ -588,14 +782,42 @@ mod tests {
     }
 
     fn sample_capabilities() -> RuntimeCapabilities {
+        use fornax_types::{CapabilitySignal, SignalAvailability, SignalClass};
         RuntimeCapabilities {
+            schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
             provider: Provider::ClaudeCode,
-            supports_pre_tool_use: true,
-            supports_post_tool_use: true,
-            supports_tool_response_capture: true,
-            supports_session_stop_event: false,
-            supports_transcript_tail: true,
-            supports_subagent_lifecycle: false,
+            signals: vec![
+                CapabilitySignal {
+                    class: SignalClass::ToolInvocation,
+                    state: SignalAvailability::Available,
+                    detail: None,
+                },
+                CapabilitySignal {
+                    class: SignalClass::ToolTrace,
+                    state: SignalAvailability::Available,
+                    detail: None,
+                },
+                CapabilitySignal {
+                    class: SignalClass::ToolResultPayload,
+                    state: SignalAvailability::Available,
+                    detail: None,
+                },
+                CapabilitySignal {
+                    class: SignalClass::SessionLifecycle,
+                    state: SignalAvailability::Unknown,
+                    detail: None,
+                },
+                CapabilitySignal {
+                    class: SignalClass::FinalResponse,
+                    state: SignalAvailability::Available,
+                    detail: None,
+                },
+                CapabilitySignal {
+                    class: SignalClass::SubagentLifecycle,
+                    state: SignalAvailability::Unknown,
+                    detail: None,
+                },
+            ],
             notes: [("session_id".to_string(), "s3".to_string())].into(),
         }
     }
@@ -622,8 +844,8 @@ mod tests {
             .expect("query capabilities after restart");
         assert_eq!(fetched.len(), 1);
         assert_eq!(fetched[0].provider, Provider::ClaudeCode);
-        assert!(fetched[0].supports_pre_tool_use);
-        assert!(!fetched[0].supports_session_stop_event);
+        assert!(fetched[0].is_observable(&fornax_types::SignalClass::ToolInvocation));
+        assert!(!fetched[0].is_observable(&fornax_types::SignalClass::SessionLifecycle));
         assert_eq!(fetched[0].notes.get("session_id").unwrap(), "s3");
 
         std::fs::remove_file(&path).ok();
@@ -644,7 +866,13 @@ mod tests {
             .expect("first announcement");
 
         let mut updated = sample_capabilities();
-        updated.supports_session_stop_event = true;
+        if let Some(s) = updated
+            .signals
+            .iter_mut()
+            .find(|s| s.class == fornax_types::SignalClass::SessionLifecycle)
+        {
+            s.state = fornax_types::SignalAvailability::Available;
+        }
         store
             .upsert_capabilities("s4", &updated)
             .await
@@ -659,7 +887,7 @@ mod tests {
             1,
             "re-announcement must overwrite, not add a row"
         );
-        assert!(fetched[0].supports_session_stop_event);
+        assert!(fetched[0].is_observable(&fornax_types::SignalClass::SessionLifecycle));
 
         std::fs::remove_file(&path).ok();
     }
@@ -674,6 +902,420 @@ mod tests {
             .await
             .expect("query capabilities");
         assert!(fetched.is_empty());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// FORNX-155: a row written before the 0003 migration (bool columns
+    /// populated, `schema_version`/`signals` both NULL) must still read back
+    /// correctly, reconstructed via the exact same legacy rule the wire path
+    /// uses. Simulates that shape by hand-inserting directly rather than via
+    /// `upsert_capabilities` (which always writes the new columns).
+    #[tokio::test]
+    async fn pre_migration_row_with_null_signals_reconstructs_from_legacy_bools() {
+        let path = tmp_db_path("caps-pre-migration");
+        let store = Store::open(&path).await.expect("open db");
+
+        sqlx::query(
+            "INSERT INTO runtime_capabilities
+                (session_id, provider, supports_pre_tool_use, supports_post_tool_use,
+                 supports_tool_response_capture, supports_session_stop_event,
+                 supports_transcript_tail, supports_subagent_lifecycle, notes)
+             VALUES ('s5', 'codex', 0, 1, 1, 1, 1, 0, '{}')",
+        )
+        .execute(&store.pool)
+        .await
+        .expect("hand-insert pre-migration row");
+
+        let fetched = store
+            .capabilities_for_session("s5")
+            .await
+            .expect("query capabilities");
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(
+            fetched[0].schema_version,
+            fornax_types::CAPABILITY_SCHEMA_VERSION
+        );
+        assert!(!fetched[0].is_observable(&fornax_types::SignalClass::ToolInvocation));
+        assert!(fetched[0].is_observable(&fornax_types::SignalClass::ToolTrace));
+        assert!(fetched[0].is_observable(&fornax_types::SignalClass::SessionLifecycle));
+        assert!(!fetched[0].is_observable(&fornax_types::SignalClass::SubagentLifecycle));
+        // A class the old bools never covered is ordinary absence, not a
+        // fabricated Unsupported/Unavailable claim.
+        assert_eq!(
+            fetched[0].state_of(&fornax_types::SignalClass::ProcessResult),
+            fornax_types::SignalAvailability::Unknown
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// FORNX-157: a row written before the 0004 migration (or by code not
+    /// yet migrated onto `EvidenceSensor`) has `source IS NULL`. It must
+    /// still read back cleanly, with `Evidence::source == None` — not a
+    /// fabricated value and not a query error. Mirrors
+    /// `pre_migration_row_with_null_signals_reconstructs_from_legacy_bools`'s
+    /// hand-insert pattern for `runtime_capabilities`.
+    #[tokio::test]
+    async fn pre_migration_evidence_row_with_null_source_reads_back_as_none() {
+        let path = tmp_db_path("evidence-pre-migration");
+        let store = Store::open(&path).await.expect("open db");
+
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "s6".into(),
+            provider: Provider::Codex,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("exec_command".into()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        store.insert_event(&event).await.expect("insert event");
+
+        sqlx::query(
+            "INSERT INTO evidence (id, session_id, source_event_id, kind, observed_at, payload, provenance)
+             VALUES (?1, 's6', ?2, 'exit_code', '2026-01-01T00:00:01Z', '{\"exit_code\":0}', 'legacy')",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(event.id.to_string())
+        .execute(&store.pool)
+        .await
+        .expect("hand-insert pre-migration evidence row with no source column value");
+
+        let fetched = store
+            .evidence_for_session("s6")
+            .await
+            .expect("query evidence")
+            .evidence;
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].source, None);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// FORNX-159 AC: "Existing Stage 1/2 evidence is migrated with honest
+    /// defaults/unknowns where history lacks detail." Distinct from
+    /// `pre_migration_evidence_row_with_null_source_reads_back_as_none`
+    /// above: this row's `source` column is *not* NULL — it holds a
+    /// genuine FORNX-157-era `EvidenceSource` JSON blob (trust_class,
+    /// sensor_name, collected_at, provider all known and real), written
+    /// before FORNX-159's `collection_method`/`collector_version`/
+    /// `freshness`/`tamper_boundary` fields existed at all. No new
+    /// `fornax-store` column is added for these fields — they live inside
+    /// the same JSON blob (see `fornax_types::sensor`'s module docs' "no new
+    /// fornax-store column" design note) — so the honesty guarantee lives
+    /// entirely in `EvidenceSource`'s `#[serde(default)]`s, proven here
+    /// through the full store round trip (not just an in-memory serde
+    /// round trip, matching `evidence_extension_unknown_field_survives_store_round_trip`'s
+    /// precedent below).
+    #[tokio::test]
+    async fn pre_migration_evidence_source_reads_back_new_fields_as_honest_unknown() {
+        let path = tmp_db_path("evidence-source-pre-fornx-159");
+        let store = Store::open(&path).await.expect("open db");
+
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "s6b".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("Bash".into()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        store.insert_event(&event).await.expect("insert event");
+
+        // The exact shape FORNX-157 persisted: sensor_name, trust_class,
+        // collected_at, provider — nothing more.
+        let legacy_source_json = serde_json::json!({
+            "sensor_name": "claude_bash_exit_code_sensor_v1",
+            "trust_class": "agent_adjacent",
+            "collected_at": "2026-01-01T00:00:01Z",
+            "provider": "claude_code",
+        })
+        .to_string();
+
+        sqlx::query(
+            "INSERT INTO evidence (id, session_id, source_event_id, kind, observed_at, payload, provenance, source)
+             VALUES (?1, 's6b', ?2, 'exit_code', '2026-01-01T00:00:01Z', '{\"exit_code\":0}', 'legacy', ?3)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(event.id.to_string())
+        .bind(&legacy_source_json)
+        .execute(&store.pool)
+        .await
+        .expect("hand-insert pre-FORNX-159 evidence row with a FORNX-157-shaped source blob");
+
+        let fetched = store
+            .evidence_for_session("s6b")
+            .await
+            .expect("query evidence")
+            .evidence;
+        assert_eq!(fetched.len(), 1);
+        let source = fetched[0]
+            .source
+            .as_ref()
+            .expect("legacy source blob must still deserialize, not become None");
+
+        // Known fields from FORNX-157 stay known — not touched by this
+        // migration.
+        assert_eq!(source.sensor_name, "claude_bash_exit_code_sensor_v1");
+        assert_eq!(source.trust_class, fornax_types::TrustClass::AgentAdjacent);
+        assert_eq!(source.provider, Some(Provider::ClaudeCode));
+
+        // New fields must read as an explicit pre-provenance/unknown
+        // marker, never a fabricated specific-sounding value (e.g. must not
+        // silently become `CollectionMethod::HookCallback`, even though
+        // that happens to be the real answer for this sensor — the point is
+        // this binary cannot know that from the persisted row alone).
+        assert_eq!(
+            source.collection_method,
+            fornax_types::CollectionMethod::PreProvenance,
+            "missing collection_method must not be fabricated"
+        );
+        assert_eq!(source.collector_version, None);
+        assert_eq!(
+            source.freshness.clock_source,
+            fornax_types::ClockSource::PreProvenance
+        );
+        assert_eq!(source.freshness.caveat, None);
+        assert_eq!(
+            source.tamper_boundary.description,
+            "unknown (record predates tamper-boundary tracking)",
+            "tamper boundary must not be reconstructed from trust_class alone"
+        );
+
+        // Read-modify-write stability: re-persisting the deserialized
+        // Evidence (as a replay/migration pass would) must keep emitting
+        // the honest markers explicitly, not silently drop back to an
+        // absent key or acquire a real-looking value on the round trip.
+        let mut migrated = fetched[0].clone();
+        migrated.id = Uuid::new_v4();
+        store
+            .insert_evidence(&migrated)
+            .await
+            .expect("re-insert migrated evidence");
+        let refetched = store
+            .evidence_for_session("s6b")
+            .await
+            .expect("query evidence after re-insert")
+            .evidence;
+        let rewritten_source = refetched
+            .iter()
+            .find(|e| e.id == migrated.id)
+            .and_then(|e| e.source.as_ref())
+            .expect("re-persisted row must still carry a source");
+        assert_eq!(
+            rewritten_source.collection_method,
+            fornax_types::CollectionMethod::PreProvenance
+        );
+        assert_eq!(
+            rewritten_source.tamper_boundary.description,
+            "unknown (record predates tamper-boundary tracking)"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// FORNX-158: a row written before the 0005 migration (or with no
+    /// provider-extension data at all, the common case) has `extension IS
+    /// NULL`. It must read back cleanly as `Evidence::extension == None`,
+    /// not a fabricated value or a query error. Mirrors
+    /// `pre_migration_evidence_row_with_null_source_reads_back_as_none`.
+    #[tokio::test]
+    async fn pre_migration_evidence_row_with_null_extension_reads_back_as_none() {
+        let path = tmp_db_path("evidence-extension-pre-migration");
+        let store = Store::open(&path).await.expect("open db");
+
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "s7".into(),
+            provider: Provider::Codex,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("exec_command".into()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        store.insert_event(&event).await.expect("insert event");
+
+        sqlx::query(
+            "INSERT INTO evidence (id, session_id, source_event_id, kind, observed_at, payload, provenance)
+             VALUES (?1, 's7', ?2, 'exit_code', '2026-01-01T00:00:01Z', '{\"exit_code\":0}', 'legacy')",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(event.id.to_string())
+        .execute(&store.pool)
+        .await
+        .expect("hand-insert pre-migration evidence row with no extension column value");
+
+        let fetched = store
+            .evidence_for_session("s7")
+            .await
+            .expect("query evidence")
+            .evidence;
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].extension, None);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// FORNX-158 required test: an unknown top-level field on an
+    /// `ExtensionEnvelope`, within a compatible `schema_version`, must
+    /// survive the SQLite store round trip (insert -> read back ->
+    /// re-serialize), not just an in-memory serde round trip — this is
+    /// where a naive "deserialize into a fixed struct" implementation would
+    /// actually drop it.
+    #[tokio::test]
+    async fn evidence_extension_unknown_field_survives_store_round_trip() {
+        let path = tmp_db_path("evidence-extension-unknown-field");
+        let store = Store::open(&path).await.expect("open db");
+
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "s8".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("Bash".into()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        store.insert_event(&event).await.expect("insert event");
+
+        let mut extension = fornax_types::ExtensionEnvelope::new(
+            Provider::ClaudeCode,
+            "claude-adapter-0.3.0",
+            fornax_types::ContentClass::ToolTelemetry,
+            serde_json::json!({"cache_read_tokens": 7}),
+        );
+        extension
+            .unknown
+            .insert("future_field".into(), serde_json::json!("keep me"));
+
+        let evidence = Evidence {
+            id: Uuid::new_v4(),
+            session_id: "s8".into(),
+            source_event_id: event.id,
+            kind: EvidenceKind::ExitCode,
+            observed_at: "2026-01-01T00:00:01Z".into(),
+            payload: serde_json::json!({"command": [], "exit_code": 0}),
+            provenance: "test".into(),
+            source: None,
+            extension: Some(extension),
+        };
+        store
+            .insert_evidence(&evidence)
+            .await
+            .expect("insert evidence");
+
+        let fetched = store
+            .evidence_for_session("s8")
+            .await
+            .expect("query evidence")
+            .evidence;
+        assert_eq!(fetched.len(), 1);
+        let got = fetched[0].extension.as_ref().expect("extension present");
+        assert_eq!(
+            got.unknown.get("future_field"),
+            Some(&serde_json::json!("keep me")),
+            "unknown extension field must not be dropped across the store round trip"
+        );
+        assert_eq!(got.fields["cache_read_tokens"], serde_json::json!(7));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// FORNX-289: a session with one good evidence row and one row whose
+    /// `extension` blob carries an incompatible `schema_version` (per
+    /// `ExtensionEnvelope`'s `TryFrom`, see `extension.rs`) must not fail
+    /// the whole session read — the caller still needs the good row, plus
+    /// an explicit account of the bad one (not a silent drop, and not a
+    /// fabricated success).
+    #[tokio::test]
+    async fn one_bad_extension_row_does_not_fail_the_whole_session_read() {
+        let path = tmp_db_path("evidence-partial-failure");
+        let store = Store::open(&path).await.expect("open db");
+
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "s9".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("Bash".into()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        store.insert_event(&event).await.expect("insert event");
+
+        // Good row, inserted via the normal API.
+        let good = Evidence {
+            id: Uuid::new_v4(),
+            session_id: "s9".into(),
+            source_event_id: event.id,
+            kind: EvidenceKind::ExitCode,
+            observed_at: "2026-01-01T00:00:01Z".into(),
+            payload: serde_json::json!({"command": [], "exit_code": 0}),
+            provenance: "test".into(),
+            source: None,
+            extension: None,
+        };
+        store.insert_evidence(&good).await.expect("insert good row");
+
+        // Bad row: hand-inserted directly (bypassing `insert_evidence`,
+        // which would require a valid `ExtensionEnvelope` to serialize in
+        // the first place) with an `extension` blob whose `schema_version`
+        // is outside `SUPPORTED_EXTENSION_SCHEMA_VERSIONS`.
+        let bad_id = Uuid::new_v4();
+        let bad_extension = serde_json::json!({
+            "schema_version": 999,
+            "provider": "claude_code",
+            "adapter_version": "claude-adapter-0.3.0",
+            "content_class": "tool_telemetry",
+            "fields": {}
+        })
+        .to_string();
+        sqlx::query(
+            "INSERT INTO evidence (id, session_id, source_event_id, kind, observed_at, payload, provenance, extension)
+             VALUES (?1, 's9', ?2, 'exit_code', '2026-01-01T00:00:02Z', '{\"exit_code\":0}', 'legacy', ?3)",
+        )
+        .bind(bad_id.to_string())
+        .bind(event.id.to_string())
+        .bind(&bad_extension)
+        .execute(&store.pool)
+        .await
+        .expect("hand-insert row with an incompatible extension schema_version");
+
+        let outcome = store
+            .evidence_for_session("s9")
+            .await
+            .expect("session read must succeed despite one bad row");
+
+        assert_eq!(
+            outcome.evidence.len(),
+            1,
+            "the good row must still come back"
+        );
+        assert_eq!(outcome.evidence[0].id, good.id);
+
+        assert_eq!(
+            outcome.failed.len(),
+            1,
+            "the bad row must be reported, not silently dropped"
+        );
+        assert_eq!(outcome.failed[0].id, bad_id.to_string());
+        assert!(
+            outcome.failed[0].error.contains("incompatible"),
+            "failure reason must name the FORNX-158 incompatibility, got: {}",
+            outcome.failed[0].error
+        );
 
         std::fs::remove_file(&path).ok();
     }

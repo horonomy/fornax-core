@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Fake `gh` for release-post-verify.sh bats tests. Never touches the network.
+# Controlled via FAKE_RELEASE_EXISTS, FAKE_GH_LOG (append-only call log).
+set -euo pipefail
+
+LOG="${FAKE_GH_LOG:-/dev/null}"
+echo "gh $*" >> "$LOG"
+
+if [ "$1" = "release" ] && [ "$2" = "view" ]; then
+  [ "${FAKE_RELEASE_EXISTS:-false}" = "true" ] && exit 0
+  exit 1
+fi
+
+echo "fake gh: unhandled invocation: $*" >&2
+exit 99

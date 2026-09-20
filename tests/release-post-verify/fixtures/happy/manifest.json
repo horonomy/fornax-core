@@ -1,0 +1,18 @@
+{
+  "version": "v0.0.1",
+  "repos": [
+    {
+      "name": "fornax-core",
+      "owner": "horonomy",
+      "sha": "abcdef1234567890abcdef1234567890abcdef12",
+      "publishes_artifact": true
+    }
+  ],
+  "evidence": [
+    { "gate": "qa", "jira_key": "PROJ-1", "jira_url": "https://example.atlassian.net/browse/PROJ-1", "applies_to_repos": ["fornax-core"] },
+    { "gate": "security", "jira_key": "PROJ-2", "jira_url": "https://example.atlassian.net/browse/PROJ-2", "applies_to_repos": ["fornax-core"] },
+    { "gate": "docs", "jira_key": "PROJ-3", "jira_url": "https://example.atlassian.net/browse/PROJ-3", "applies_to_repos": ["fornax-core"] },
+    { "gate": "stage", "jira_key": "PROJ-4", "jira_url": "https://example.atlassian.net/browse/PROJ-4", "applies_to_repos": [] }
+  ],
+  "release_notes_ticket": "PROJ-1"
+}

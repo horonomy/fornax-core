@@ -1,0 +1,20 @@
+{
+  "mode": "execute",
+  "overall": "PASS",
+  "timestamp": "2026-08-30T00:00:00Z",
+  "steps": [
+    {"name": "readiness.gate", "status": "pass", "detail": "release-readiness.sh returned ready:true for version v0.0.1"},
+    {"name": "tag.horonomy/fornax-core.immutability", "status": "pass", "detail": "tag does not yet exist — safe to create"},
+    {"name": "tag.horonomy/fornax-core.create_push", "status": "pass", "detail": "created and pushed annotated tag v0.0.1"},
+    {"name": "build.fornax-core", "status": "pass", "detail": "cargo build --release --workspace succeeded"},
+    {
+      "name": "checksum.compute",
+      "status": "pass",
+      "detail": "sha256 computed for: fornax fornax-daemon fornax-hook-claude fornax-hook-codex",
+      "extra": {
+        "checksums": "1111111111111111111111111111111111111111111111111111111111111111  /repo/target/release/fornax\n2222222222222222222222222222222222222222222222222222222222222222  /repo/target/release/fornax-daemon\n3333333333333333333333333333333333333333333333333333333333333333  /repo/target/release/fornax-hook-claude\n4444444444444444444444444444444444444444444444444444444444444444  /repo/target/release/fornax-hook-codex"
+      }
+    },
+    {"name": "release.create", "status": "pass", "detail": "created GitHub Release v0.0.1 on horonomy/fornax-core with checksum attachment"}
+  ]
+}

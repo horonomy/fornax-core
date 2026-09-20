@@ -20,6 +20,11 @@
       "type": "string",
       "description": "Optional. Repo-relative path to a committed CHANGELOG/release-notes file (e.g. \"CHANGELOG.md\") whose content for this version is the approved release notes source, per FORNX-235."
     },
+    "risk_class": {
+      "type": "string",
+      "enum": ["PATCH_LOW_RISK", "FEATURE", "TRUST_BOUNDARY", "MAJOR_OR_GA"],
+      "description": "Optional. This candidate's overall risk/change class per docs/release-assurance-policy.md's Risk/change classes table (FORNX-229) — the highest class among its feature-delta items. Governs assurance depth (FORNX-230/232/233) and which golden-journey tiers coverage reconciliation requires (docs/release-candidate-evidence.md, FORNX-231). release-readiness.sh does not read or enforce this field today; it is validated and consumed by the FORNX-230 orchestration this schema addition unblocks, not retroactively enforced against already-shipped v0.0.1 evidence."
+    },
     "repos": {
       "type": "array",
       "description": "Every repo this candidate spans. For a single-repo release this array has one entry.",

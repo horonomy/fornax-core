@@ -9,6 +9,12 @@ automation as an enforced gate by `scripts/release-execute.sh` (FORNX-235,
 see `docs/release-execute.md`), which calls this script as a hard
 precondition and refuses to proceed on anything but `ready: true`.
 
+The canonical risk classes, gate-depth requirements, and PASS/BLOCK/
+INCONCLUSIVE/UNTESTED verdict semantics a sign-off ticket must satisfy
+before this checker considers it Done are defined in
+[`docs/release-assurance-policy.md`](release-assurance-policy.md)
+(FORNX-229).
+
 ## The candidate manifest
 
 A release candidate — potentially spanning several repos — is described by

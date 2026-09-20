@@ -1,0 +1,14 @@
+{
+  "provider": "claude_code",
+  "provider_runtime_version": "synthetic",
+  "description": "SYNTHETIC breaking-change probe, never observed live: simulates a hypothetical future Claude Code hook rename/addition the adapter has no mapping for. Proves the conformance suite catches a breaking upstream change as an actionable Unrecognized error, not silent data loss.",
+  "sanitized": true,
+  "historical_schema_drift_ticket": null,
+  "native_events": [
+    {
+      "hook_event_name": "ToolLifecycleCompletedV2",
+      "session_id": "fixture-claude-session-005",
+      "tool_execution": { "id": "abc", "status": "ok" }
+    }
+  ]
+}

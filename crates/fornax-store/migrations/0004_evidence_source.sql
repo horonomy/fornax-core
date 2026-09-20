@@ -1,0 +1,12 @@
+-- Structured evidence provenance (FORNX-157, EvidenceSensor/EvidenceSource
+-- contract, parent epic FORNX-138).
+--
+-- Additive only, matching 0003's precedent: a single nullable column on the
+-- existing `evidence` table, not a new table. `source IS NULL` marks a row
+-- written before this migration, or by code not yet migrated onto the
+-- sensor contract -- `fornax_types::Evidence::source` reads that back as
+-- `None`, honestly representing "no structured provenance recorded", not a
+-- fabricated legacy value (unlike 0003's `signals IS NULL` reconstruction,
+-- which had six legacy bool columns to rebuild from -- there is no legacy
+-- source-identity data to reconstruct here).
+ALTER TABLE evidence ADD COLUMN source TEXT; -- JSON-serialized EvidenceSource, or NULL

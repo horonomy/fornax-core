@@ -1,0 +1,61 @@
+{
+  "version": "v0.0.1",
+  "candidate_repos": [
+    { "name": "fornax-core", "owner": "horonomy", "sha": "9e75d95ea290223b8ca143cb1e4fd9756dc675e8" },
+    { "name": "fornax-cloud", "owner": "horonomy", "sha": "84f02a0c8c0a14ca64176c22799ba9f4b50c1b4f" }
+  ],
+  "risk_class": "TRUST_BOUNDARY",
+  "trust_boundary_delta_ref": "release/v0.0.1-trust-boundary-delta.json",
+  "threat_model_version": 1,
+  "findings": [
+    {
+      "id": "SEC-v0.0.1-0001",
+      "severity": "medium",
+      "title": "RUSTSEC-2023-0071: rsa crate timing side-channel, pulled in via sqlx's optional mysql feature",
+      "evidence": "cargo audit (fornax-core): 1 finding, RUSTSEC-2023-0071",
+      "disposition": "accepted_risk",
+      "waiver_ref": null
+    },
+    {
+      "id": "SEC-v0.0.1-0002",
+      "severity": "low",
+      "title": "npm audit (fornax-docs): 24 findings (18 rated high by npm), transitive through Docusaurus 3.10.2's dev-server dependency chain",
+      "evidence": "npm audit fornax-docs: 24 findings, 18 rated high by npm's own advisory severity; every one of the 18 is reachable only through the local Docusaurus dev server, never through the published static site fornax-docs actually ships (static HTML/JS with no dev-server process running in production); no clean fix without a Docusaurus major bump. Severity here is rated at its effective severity to this candidate (unreachable in the shipped artifact), not npm's upstream advisory rating; the reachability argument that justifies the downgrade is stated here rather than left implicit.",
+      "disposition": "accepted_risk",
+      "waiver_ref": null
+    },
+    {
+      "id": "SEC-v0.0.1-0003",
+      "severity": "critical",
+      "title": "FORNX-280: tool_input and Claim.text reached daemon log, SQLite store, and export-spool output unredacted",
+      "evidence": "Full-stack secret-egress canary (random-hex marker) found raw marker in daemon log, SQLite store, and fornax export-spool output via AgentEvent.tool_input and Claim.text; tool_response/raw.* redaction confirmed still working in the same repro. Fixed in crates/fornax-daemon/src/main.rs's handle_message (fornax-core#29, merge commit f309bc21caad2bf8b994b7f366ba2a42eea27c63). Regression test tool_input_and_claim_text_are_redacted_before_storage added. Re-verified with a fresh canary marker: zero raw hits post-fix.",
+      "disposition": "fixed",
+      "waiver_ref": null
+    },
+    {
+      "id": "SEC-v0.0.1-0004",
+      "severity": "high",
+      "title": "FORNX-281: event/claim ordering race intermittently computed Unverified instead of CONTRADICTED on real CI",
+      "evidence": "Not reproducible on demand locally (15/15 local runs passed both before and after the fix); real GitHub Actions run intermittently hit the race. Fixed by serializing message processing behind a single AppState.processing lock (fornax-core#32). Re-verified: cargo test --workspace clean, adversarial corpus run 15x locally post-fix (15/15), next real CI run on this PR passed.",
+      "disposition": "fixed",
+      "waiver_ref": null
+    },
+    {
+      "id": "SEC-v0.0.1-0005",
+      "severity": "informational",
+      "title": "fornax-adapter-claude's last_assistant_text reads a Stop hook's transcript_path with no confinement to $FORNAX_HOME",
+      "evidence": "Static review during FORNX-238's adversarial pass: content from an arbitrary local path (even via ../../ traversal) can reach the claims table if it parses as expected transcript JSONL. No privilege boundary is crossed (hook runs as the invoking user).",
+      "disposition": "accepted_risk",
+      "waiver_ref": null
+    },
+    {
+      "id": "SEC-v0.0.1-0006",
+      "severity": "informational",
+      "title": "Dashboard html_escape helper does not escape quotes",
+      "evidence": "Static review of frontend/src during FORNX-238's XSS campaign: safe today only because no rendered field is placed inside an HTML attribute.",
+      "disposition": "accepted_risk",
+      "waiver_ref": null
+    }
+  ],
+  "verdict": "PASS"
+}

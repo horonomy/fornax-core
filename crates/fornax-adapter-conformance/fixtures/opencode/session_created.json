@@ -1,0 +1,37 @@
+{
+  "provider": "open_code",
+  "provider_runtime_version": "1.18.25",
+  "description": "Real, sanitized capture from a live opencode v1.18.25 session (FORNX-161, 2026-08-30): the event hook's session.created payload, driven by real local-Ollama inference (mistral-nemo). Confirms opencode's plugin API genuinely exposes session-lifecycle start.",
+  "sanitized": true,
+  "historical_schema_drift_ticket": null,
+  "native_events": [
+    {
+      "hook": "event",
+      "at": "2026-08-30T11:38:17.180Z",
+      "payload": {
+        "id": "evt_fixture_session_created",
+        "type": "session.created",
+        "properties": {
+          "sessionID": "fixture-opencode-session-002",
+          "info": {
+            "id": "fixture-opencode-session-002",
+            "slug": "curious-canyon",
+            "version": "1.18.25",
+            "projectID": "global",
+            "directory": "/workspace/project",
+            "path": "workspace/project",
+            "title": "New session",
+            "permission": [
+              { "permission": "question", "pattern": "*", "action": "deny" },
+              { "permission": "plan_enter", "pattern": "*", "action": "deny" },
+              { "permission": "plan_exit", "pattern": "*", "action": "deny" }
+            ],
+            "cost": 0,
+            "tokens": { "input": 0, "output": 0, "reasoning": 0, "cache": { "read": 0, "write": 0 } },
+            "time": { "created": 1788089897180, "updated": 1788089897180 }
+          }
+        }
+      }
+    }
+  ]
+}

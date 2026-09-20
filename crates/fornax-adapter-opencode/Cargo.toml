@@ -1,0 +1,25 @@
+[package]
+name = "fornax-adapter-opencode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "fornax_adapter_opencode"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fornax-hook-opencode"
+path = "src/main.rs"
+
+[dependencies]
+fornax-types = { path = "../fornax-types" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+fornax-store = { path = "../fornax-store" }

@@ -1,0 +1,18 @@
+# cargo-audit configuration for the `security` CI job
+# (.github/workflows/ci.yml, docs/release-security-gate.md, FORNX-233).
+#
+# An ignored advisory here must have a corresponding "accepted_risk" finding
+# in a security sign-off artifact (release/security-signoff.schema.json) —
+# this file is not a place to silently suppress a finding that hasn't been
+# reviewed and dispositioned.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071: rsa crate timing side-channel (Marvin Attack).
+    # Pulled in transitively only via sqlx's optional `mysql` feature, which
+    # this workspace does not enable — no exploitable path exists in this
+    # build. No fixed upgrade is available upstream.
+    # Disposition: accepted_risk. See release/v0.0.1-security-signoff.json
+    # (SEC-v0.0.1-0001) and docs/release/v0.0.1-qa-security-signoff.md §3.1.
+    "RUSTSEC-2023-0071",
+]

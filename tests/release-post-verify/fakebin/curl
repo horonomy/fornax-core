@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Fake `curl` for release-post-verify.sh bats tests — a single canary probe.
+# Controlled via FAKE_CANARY_HTTP_CODE (default 200), FAKE_CURL_LOG.
+set -euo pipefail
+
+LOG="${FAKE_CURL_LOG:-/dev/null}"
+echo "curl $*" >> "$LOG"
+
+printf '%s' "${FAKE_CANARY_HTTP_CODE:-200}"
+exit 0

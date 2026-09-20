@@ -1,0 +1,14 @@
+{
+  "provider": "claude_code",
+  "provider_runtime_version": "2.1.238",
+  "description": "UserPromptSubmit hook payload — confirms the raw-prompt event kind produces a canonical event with no evidence attached.",
+  "sanitized": true,
+  "historical_schema_drift_ticket": null,
+  "native_events": [
+    {
+      "hook_event_name": "UserPromptSubmit",
+      "session_id": "fixture-claude-session-004",
+      "prompt": "run the test suite"
+    }
+  ]
+}

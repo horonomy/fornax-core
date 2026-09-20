@@ -1,0 +1,11 @@
+-- Versioned provider-extension envelope column (FORNX-158, parent epic
+-- FORNX-138).
+--
+-- Additive only, matching 0003/0004's precedent: a single nullable column on
+-- the existing `evidence` table, not a new table. `extension IS NULL` marks
+-- a row with no provider-specific extension data -- the common case, since
+-- most evidence needs none -- and reads back as `Evidence::extension ==
+-- None`, exactly as `source IS NULL` reads back as `Evidence::source ==
+-- None` (0004). There is no legacy extension data to reconstruct, same
+-- reasoning as 0004's `source` column.
+ALTER TABLE evidence ADD COLUMN extension TEXT; -- JSON-serialized ExtensionEnvelope, or NULL

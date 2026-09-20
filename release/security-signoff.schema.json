@@ -1,0 +1,120 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/horonomy/fornax-core/release/security-signoff.schema.json",
+  "title": "Fornax Release Security Sign-off",
+  "description": "The security gate sign-off artifact (docs/release-security-gate.md, FORNX-233). Bound to an exact release candidate's repos/SHAs. Carried by the Jira ticket a candidate manifest's evidence[] entry with gate=\"security\" points at (release/candidate-manifest.schema.json, FORNX-234), or committed to the repo and linked from that ticket. Independent of, and never merged with, the QA sign-off artifact (FORNX-232).",
+  "type": "object",
+  "required": ["version", "candidate_repos", "risk_class", "trust_boundary_delta_ref", "findings", "verdict"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "string",
+      "description": "The candidate release version this sign-off attests to, e.g. \"v0.0.1\". Must match the candidate manifest's version field.",
+      "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+"
+    },
+    "candidate_repos": {
+      "type": "array",
+      "description": "The exact repo/SHA pairs this sign-off attests to. Must be a subset of the candidate manifest's repos[] consistent with the same SHAs; this is what makes the sign-off exact-candidate-bound rather than merely version-bound.",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name", "owner", "sha"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string" },
+          "owner": { "type": "string" },
+          "sha": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{7,40}$"
+          }
+        }
+      }
+    },
+    "risk_class": {
+      "type": "string",
+      "enum": ["PATCH_LOW_RISK", "FEATURE", "TRUST_BOUNDARY", "MAJOR_OR_GA"],
+      "description": "This candidate's overall risk/change class per docs/release-assurance-policy.md (FORNX-229). Must match the candidate manifest's risk_class when that field is set."
+    },
+    "trust_boundary_delta_ref": {
+      "type": ["string", "null"],
+      "description": "Repo-relative path to this candidate's trust-boundary delta record (release/trust-boundary-delta.schema.json). Required (non-null) when risk_class is TRUST_BOUNDARY or MAJOR_OR_GA; must be null for PATCH_LOW_RISK or FEATURE, since no trust boundary was touched at those tiers."
+    },
+    "threat_model_version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "The docs/security/threat-model.md version this sign-off was reviewed against. Required (via this schema's risk_class-conditional allOf) whenever risk_class is TRUST_BOUNDARY or MAJOR_OR_GA; optional for PATCH_LOW_RISK/FEATURE, which never touch a trust boundary."
+    },
+    "findings": {
+      "type": "array",
+      "description": "Every security finding identified while producing this sign-off, including accepted-risk and already-fixed ones — omission is not permitted; a clean run still ships \"findings\": [].",
+      "items": {
+        "type": "object",
+        "required": ["id", "severity", "title", "evidence", "disposition", "waiver_ref"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Stable within this candidate's sign-off, e.g. \"SEC-v0.0.1-0001\". Not reused across candidates.",
+            "pattern": "^SEC-v[0-9]+\\.[0-9]+\\.[0-9]+-[0-9]{4}$"
+          },
+          "severity": {
+            "type": "string",
+            "enum": ["critical", "high", "medium", "low", "informational"]
+          },
+          "title": { "type": "string" },
+          "evidence": {
+            "type": "string",
+            "description": "Concrete: the command run, the log line observed, the test name and result. Never a bare narrative like \"reviewed and looks fine.\""
+          },
+          "disposition": {
+            "type": "string",
+            "enum": ["fixed", "accepted_risk", "waived", "open"]
+          },
+          "waiver_ref": {
+            "type": ["string", "null"],
+            "description": "URL of the Jira comment recording a policy-compliant owner disposition per docs/release-assurance-policy.md's Residual-risk and waiver policy. Required (non-null) when disposition is \"waived\"; must be null otherwise."
+          }
+        },
+        "allOf": [
+          {
+            "if": { "properties": { "disposition": { "const": "waived" } } },
+            "then": { "properties": { "waiver_ref": { "type": "string", "minLength": 1 } } }
+          },
+          {
+            "if": { "properties": { "disposition": { "const": "fixed" } } },
+            "then": { "properties": { "waiver_ref": { "type": "null" } } }
+          },
+          {
+            "if": { "properties": { "disposition": { "const": "accepted_risk" } } },
+            "then": { "properties": { "waiver_ref": { "type": "null" } } }
+          },
+          {
+            "if": { "properties": { "disposition": { "const": "open" } } },
+            "then": { "properties": { "waiver_ref": { "type": "null" } } }
+          }
+        ]
+      }
+    },
+    "verdict": {
+      "type": "string",
+      "enum": ["PASS", "BLOCK", "INCONCLUSIVE", "UNTESTED"],
+      "description": "Per docs/release-assurance-policy.md's verdict semantics (FORNX-229). Must be the worst of findings[]: any critical/high finding whose disposition is not \"fixed\" or a fully policy-compliant \"waived\" forces BLOCK. This schema cannot itself execute that cross-field rule (JSON Schema has no severity-ordering arithmetic); a conforming producer/consumer must enforce it, and docs/release-security-gate.md documents it as a required invariant, not a suggestion."
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "risk_class": { "enum": ["TRUST_BOUNDARY", "MAJOR_OR_GA"] } } },
+      "then": {
+        "properties": {
+          "trust_boundary_delta_ref": { "type": "string", "minLength": 1 },
+          "threat_model_version": { "type": "integer", "minimum": 1 }
+        },
+        "required": ["threat_model_version"]
+      }
+    },
+    {
+      "if": { "properties": { "risk_class": { "enum": ["PATCH_LOW_RISK", "FEATURE"] } } },
+      "then": { "properties": { "trust_boundary_delta_ref": { "type": "null" } } }
+    }
+  ]
+}

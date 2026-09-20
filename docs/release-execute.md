@@ -4,6 +4,11 @@ Jira: FORNX-235. Builds ON `scripts/release-readiness.sh` (FORNX-234,
 `docs/release-readiness.md`) — that script is called as a hard precondition
 gate and is never reimplemented here.
 
+The canonical release relay this tool's `Release` step fits into, plus the
+rollback/yank/deprecate policy `--yank` implements, are defined in
+[`docs/release-assurance-policy.md`](release-assurance-policy.md)
+(FORNX-229).
+
 > **DO NOT run `scripts/release-execute.sh --execute` without explicit owner
 > authorization for a real release.** `--execute` creates and pushes real
 > immutable Git tags and a real public GitHub Release on `horonomy/fornax-core`.

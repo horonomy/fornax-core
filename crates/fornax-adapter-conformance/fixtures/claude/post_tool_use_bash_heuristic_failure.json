@@ -1,0 +1,20 @@
+{
+  "provider": "claude_code",
+  "provider_runtime_version": "2.1.238",
+  "description": "Real confirmed Claude Code v2.1.238 Bash tool_response shape with non-empty stderr — heuristic must classify this as a failure (exit_code 1), still marked heuristic in payload/provenance.",
+  "sanitized": true,
+  "historical_schema_drift_ticket": null,
+  "native_events": [
+    {
+      "hook_event_name": "PostToolUse",
+      "session_id": "fixture-claude-session-003",
+      "tool_name": "Bash",
+      "tool_input": { "command": "false" },
+      "tool_response": {
+        "stdout": "",
+        "stderr": "boom",
+        "interrupted": false
+      }
+    }
+  ]
+}

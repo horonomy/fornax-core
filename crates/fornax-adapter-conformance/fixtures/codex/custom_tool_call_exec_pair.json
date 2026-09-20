@@ -1,0 +1,29 @@
+{
+  "provider": "codex",
+  "provider_runtime_version": "codex-cli-0.147.0",
+  "description": "HISTORICAL SCHEMA-DRIFT REGRESSION (FORNX-55): the adapter originally assumed shell exec always arrives as event_msg{type:exec_command_end}. A real codex-cli 0.147.0 exec turn never emits that shape at all — shell exec is instead wrapped as a response_item pair, custom_tool_call (invocation, command embedded in a JS snippet string) followed by custom_tool_call_output (free-text result, no exit code), matched by call_id. This fixture pins that real pair down so a future adapter change cannot silently regress to assuming only the exec_command_end shape exists.",
+  "sanitized": true,
+  "historical_schema_drift_ticket": "FORNX-55",
+  "native_events": [
+    {
+      "type": "response_item",
+      "payload": {
+        "type": "custom_tool_call",
+        "call_id": "fixture-call-002",
+        "name": "exec",
+        "input": "const r = await tools.exec_command({cmd:\"echo hi\",workdir:\"/workspace\"}); text(r.output);\n"
+      }
+    },
+    {
+      "type": "response_item",
+      "payload": {
+        "type": "custom_tool_call_output",
+        "call_id": "fixture-call-002",
+        "output": [
+          { "type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n" },
+          { "type": "input_text", "text": "hi\n" }
+        ]
+      }
+    }
+  ]
+}

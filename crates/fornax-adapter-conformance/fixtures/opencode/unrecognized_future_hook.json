@@ -1,0 +1,17 @@
+{
+  "provider": "open_code",
+  "provider_runtime_version": "synthetic",
+  "description": "SYNTHETIC breaking-change probe, never observed live: simulates a hypothetical future opencode plugin hook this adapter has no mapping for. Proves the conformance suite catches a breaking upstream Hooks-interface change as an actionable Unrecognized error, not silent data loss.",
+  "sanitized": true,
+  "historical_schema_drift_ticket": null,
+  "native_events": [
+    {
+      "hook": "agent.subtask.spawned",
+      "at": "2026-08-30T00:00:00.000Z",
+      "payload": {
+        "input": { "sessionID": "fixture-opencode-session-003", "subtaskID": "abc" },
+        "output": {}
+      }
+    }
+  ]
+}

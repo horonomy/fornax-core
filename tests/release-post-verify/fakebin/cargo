@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Fake `cargo` for release-post-verify.sh bats tests. Never runs a real
+# build. Writes small executable stub binaries into $CARGO_TARGET_DIR/release
+# so the script's own smoke checks (--version, status) run against real,
+# invokable stand-ins. Controlled via FAKE_CARGO_FAIL, FAKE_BUILT_VERSION,
+# FAKE_STARTUP_FAIL, FAKE_SKIP_DAEMON_BINARY, FAKE_CARGO_LOG.
+set -euo pipefail
+
+LOG="${FAKE_CARGO_LOG:-/dev/null}"
+echo "cargo $* (CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-})" >> "$LOG"
+
+if [ "${FAKE_CARGO_FAIL:-false}" = "true" ]; then
+  echo "fake cargo: simulated build failure" >&2
+  exit 1
+fi
+
+[ -n "${CARGO_TARGET_DIR:-}" ] || { echo "fake cargo: CARGO_TARGET_DIR not set" >&2; exit 1; }
+mkdir -p "${CARGO_TARGET_DIR}/release"
+
+cat > "${CARGO_TARGET_DIR}/release/fornax" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  --version) echo "fornax ${FAKE_BUILT_VERSION:-0.0.1}"; exit 0 ;;
+  status)
+    if [ "${FAKE_STARTUP_FAIL:-false}" = "true" ]; then exit 1; fi
+    echo "fornax status: ok (no daemon running)"
+    exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "${CARGO_TARGET_DIR}/release/fornax"
+
+if [ "${FAKE_SKIP_DAEMON_BINARY:-false}" != "true" ]; then
+  for b in fornax-daemon fornax-hook-claude fornax-hook-codex; do
+    printf 'fake-binary-content-%s' "$b" > "${CARGO_TARGET_DIR}/release/${b}"
+    chmod +x "${CARGO_TARGET_DIR}/release/${b}"
+  done
+fi
+
+if [ "${FAKE_EXTRA_BINARY:-false}" = "true" ]; then
+  printf 'fake-binary-content-extra' > "${CARGO_TARGET_DIR}/release/fornax-extra-tool"
+  chmod +x "${CARGO_TARGET_DIR}/release/fornax-extra-tool"
+fi
+
+exit 0

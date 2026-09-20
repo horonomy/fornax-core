@@ -1,0 +1,24 @@
+{
+  "provider": "open_code",
+  "provider_runtime_version": "1.18.25",
+  "description": "Real, sanitized capture from a live opencode v1.18.25 session (FORNX-161, 2026-08-30): the chat.message hook, fired for the user's own turn. Recognized shape, deliberately Ignored — conversational content has no canonical signal class in this adapter's scope.",
+  "sanitized": true,
+  "historical_schema_drift_ticket": null,
+  "native_events": [
+    {
+      "hook": "chat.message",
+      "at": "2026-08-30T11:38:17.410Z",
+      "payload": {
+        "input": {
+          "sessionID": "fixture-opencode-session-002",
+          "agent": "build",
+          "model": { "providerID": "ollama", "modelID": "mistral-nemo:latest" }
+        },
+        "output": {
+          "message": { "role": "user" },
+          "parts": [{ "type": "text", "text": "List files in the current directory." }]
+        }
+      }
+    }
+  ]
+}

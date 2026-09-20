@@ -1,0 +1,9 @@
+{
+  "mode": "execute",
+  "overall": "FAIL",
+  "timestamp": "2026-08-30T00:00:00Z",
+  "steps": [
+    {"name": "readiness.gate", "status": "pass", "detail": "release-readiness.sh returned ready:true for version v0.0.1"},
+    {"name": "build.fornax-core", "status": "fail", "detail": "cargo build --release --workspace failed"}
+  ]
+}

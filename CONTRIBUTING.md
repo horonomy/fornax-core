@@ -56,6 +56,15 @@ security (secrets/injection/logging leakage/network exposure), and is
 fmt/lint/type/test all green. Fix anything wrong, re-test, re-review. Record
 LGTM/self-review evidence in the PR before merging.
 
+## Changelog and release docs
+
+A PR with user- or operator-visible impact adds an entry to `CHANGELOG.md`'s
+`[Unreleased]` section in the same PR. See
+`docs/release/release-docs-governance.md` for the full policy: which of
+changelog / release notes / docs / website an update needs, required
+metadata for breaking/security changes, and sequencing across
+`fornax-core`/`fornax-docs`/`fornax-website`.
+
 ## Merge
 
 Merge method: **create a merge commit**. Never squash, never rebase-merge.

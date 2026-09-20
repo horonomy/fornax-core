@@ -10,11 +10,27 @@
 //! `hook_event_name`, plus event-specific `tool_name`/`tool_input`/`tool_response`.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use uuid::Uuid;
 
+pub mod adapter;
+pub mod capabilities;
+pub mod extension;
 pub mod privacy;
 pub mod redact;
+pub mod sensor;
+
+pub use adapter::{AgentAdapter, NormalizationOutcome};
+pub use capabilities::{
+    CapabilityProbe, CapabilitySignal, LegacyCapabilitiesWire, RuntimeCapabilities,
+    SignalAvailability, SignalClass, CAPABILITY_SCHEMA_VERSION,
+};
+pub use extension::{
+    ContentClass, ExtensionEnvelope, EXTENSION_SCHEMA_VERSION, SUPPORTED_EXTENSION_SCHEMA_VERSIONS,
+};
+pub use sensor::{
+    ClockSource, CollectionMethod, EvidenceSensor, EvidenceSource, Freshness, SensorOutcome,
+    TamperBoundary, TrustClass,
+};
 
 /// Which coding-agent runtime an event/capability originated from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -22,6 +38,13 @@ pub mod redact;
 pub enum Provider {
     ClaudeCode,
     Codex,
+    OpenCode,
+    /// No adapter has announced itself for this session yet. This is a
+    /// local, in-process placeholder only (FORNX-288) — it must never be
+    /// persisted via `upsert_capabilities` or exported to `fornax-cloud`'s
+    /// separate, closed ingest enum, which does not know this variant.
+    /// `default_unknown_caps()` is the only producer of this value.
+    Unknown,
 }
 
 /// Normalized lifecycle event kind. One variant per canonical concept a
@@ -77,6 +100,16 @@ pub struct Claim {
 }
 
 /// Evidence kind — what was directly observed, independent of any claim.
+///
+/// **Closed on purpose — do not add a variant.** `fornax-cloud` (a separate
+/// repo) mirrors this enum as a closed enum with no catch-all in
+/// `crates/fornax-uploader/src/types.rs` and `crates/fornax-ingest/src/types.rs`.
+/// Adding a new variant here would silently break cloud ingestion for it (a
+/// coordinated two-repo change). A new evidence shape must instead widen an
+/// existing variant's canonical payload struct (see e.g.
+/// [`ProcessObservationPayload`]'s `observation` field, added FORNX-14) —
+/// payload is opaque `serde_json::Value` on the cloud side, so widening a
+/// payload struct's fields is safe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceKind {
@@ -99,6 +132,159 @@ pub struct Evidence {
     pub payload: serde_json::Value,
     /// Human-readable provenance, e.g. "claude_code:PostToolUse:Bash#tool_response".
     pub provenance: String,
+    /// Structured sensor/trust provenance (FORNX-157). `None` means this
+    /// evidence predates the sensor contract or was produced by code not
+    /// yet migrated onto it — see `sensor::EvidenceSource`'s doc comment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<sensor::EvidenceSource>,
+    /// Versioned provider-extension data (FORNX-158) that doesn't fit
+    /// `payload`'s canonical shape for `kind`. `None` is the common case —
+    /// most evidence needs no extension at all. See
+    /// `extension::ExtensionEnvelope`'s doc comment for the full
+    /// canonical-vs-extension boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension: Option<extension::ExtensionEnvelope>,
+}
+
+/// Strongly-typed canonical payload shapes, one per [`EvidenceKind`] variant
+/// (FORNX-158 AC: "canonical fields remain strongly typed and validated").
+///
+/// `Evidence::payload` itself stays `serde_json::Value` — every producer of
+/// canonical evidence already builds a `serde_json::Value` directly (see
+/// `fornax-adapter-claude`/`fornax-adapter-codex`'s `ExitCode` sensors), and
+/// changing that field's storage type is out of scope for this ticket. This
+/// enum instead gives that JSON a typed contract to be checked against via
+/// [`validate_canonical_payload`] — a producer or a conformance test can
+/// confirm a given `(kind, payload)` pair actually matches the canonical
+/// shape for `kind`, rather than accepting anything.
+///
+/// Only [`EvidenceKind::ExitCode`] has a real producer today (both adapters'
+/// exit-code sensors). The remaining variants are typed ahead of any
+/// producer existing, the same way FORNX-157's `ReasoningSummarySensor`
+/// worked example types a signal class before any provider exposes it —
+/// giving a future sensor a canonical shape to target from day one rather
+/// than inventing one ad hoc when it lands.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExitCodePayload {
+    /// The command invoked. Kept as `Value` because providers report it in
+    /// different shapes (Claude Code: array from `tool_input.command`;
+    /// Codex: whatever `resp["command"]` already is) — typing this further
+    /// would require picking one provider's shape as canonical, which
+    /// FORNX-158 does not ask for.
+    pub command: serde_json::Value,
+    pub exit_code: i64,
+    /// True when `exit_code` was inferred from a heuristic (e.g. "stderr is
+    /// empty") rather than a literal exit-code field the provider reported.
+    #[serde(default)]
+    pub heuristic: bool,
+}
+
+/// Not yet produced by any sensor — see [`ExitCodePayload`]'s doc comment
+/// for why these are typed ahead of a producer existing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolResultPayload {
+    pub summary: String,
+}
+
+/// Not yet produced by any sensor — see [`ExitCodePayload`]'s doc comment
+/// for why these are typed ahead of a producer existing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileDiffPayload {
+    pub path: String,
+    pub diff: String,
+}
+
+/// `description` predates any producer (see [`ExitCodePayload`]'s doc
+/// comment for why canonical payloads are typed ahead of a producer
+/// existing). `observation` (FORNX-14) is this payload's first real producer
+/// field: `fornax-adapter-claude`'s `ClaudeGitOutcomeSensor` populates it for
+/// a git commit/push outcome observed in a Bash `tool_response`. Widening
+/// this struct's fields — rather than adding a new [`EvidenceKind`] variant —
+/// is the deliberate way to add a new evidence shape; see that enum's doc
+/// comment.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessObservationPayload {
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<ProcessObservationDetail>,
+}
+
+/// Structured detail for a [`ProcessObservationPayload`] (FORNX-14). Only
+/// `VcsOperation` exists today — an `HttpProbe` variant is planned for a
+/// follow-up PR (FORNX-14's HTTP-health work) but deliberately not added
+/// here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "observation_kind",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum ProcessObservationDetail {
+    VcsOperation {
+        operation: VcsOperation,
+        outcome: VcsOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        commit_sha: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remote: Option<String>,
+    },
+}
+
+/// Which git operation a [`ProcessObservationDetail::VcsOperation`] observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VcsOperation {
+    Commit,
+    Push,
+}
+
+/// What git reported for a [`ProcessObservationDetail::VcsOperation`],
+/// parsed from the real `git` stdout/stderr text Claude Code's `tool_response`
+/// carries for a `git commit`/`git push` Bash invocation — never fabricated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VcsOutcome {
+    Created,
+    NothingToCommit,
+    RefUpdated,
+    UpToDate,
+    Rejected,
+}
+
+/// Not yet produced by any sensor — see [`ExitCodePayload`]'s doc comment
+/// for why these are typed ahead of a producer existing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TranscriptExcerptPayload {
+    pub text: String,
+}
+
+/// Validate that `payload` matches the canonical typed shape for `kind`
+/// (FORNX-158 required test: canonical fields reject wrong types, not just
+/// accept anything). Returns the specific `serde_json` type mismatch on
+/// failure; never panics.
+pub fn validate_canonical_payload(
+    kind: EvidenceKind,
+    payload: &serde_json::Value,
+) -> Result<(), String> {
+    fn check<T: for<'de> Deserialize<'de>>(payload: &serde_json::Value) -> Result<(), String> {
+        serde_json::from_value::<T>(payload.clone())
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    match kind {
+        EvidenceKind::ExitCode => check::<ExitCodePayload>(payload),
+        EvidenceKind::ToolResult => check::<ToolResultPayload>(payload),
+        EvidenceKind::FileDiff => check::<FileDiffPayload>(payload),
+        EvidenceKind::ProcessObservation => check::<ProcessObservationPayload>(payload),
+        EvidenceKind::TranscriptExcerpt => check::<TranscriptExcerptPayload>(payload),
+    }
 }
 
 /// The five-state verdict vocabulary (HVDL-15 / FORNX-20). Never collapsed
@@ -131,6 +317,13 @@ pub struct Finding {
 /// extraction/verification happens daemon-side.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+// `Evidence` (via `EvidenceSource`'s FORNX-159 provenance fields) is now
+// meaningfully larger than the other variants. Boxing it would touch ~13
+// construction/match sites across both adapter crates and the daemon for a
+// stack-size optimization with no behavior change; `IngestMessage` values
+// are short-lived (constructed, sent over one UDS message, dropped), so the
+// extra stack space per unused-variant slot is not worth that churn.
+#[allow(clippy::large_enum_variant)]
 pub enum IngestMessage {
     Event(AgentEvent),
     Claim(Claim),
@@ -139,19 +332,339 @@ pub enum IngestMessage {
     Capabilities(RuntimeCapabilities),
 }
 
-/// What a given provider integration can actually observe. Verifiers consult
-/// this before deciding `Unavailable` vs. attempting verification — a missing
-/// capability must never be silently treated as a pass.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RuntimeCapabilities {
-    pub provider: Provider,
-    pub supports_pre_tool_use: bool,
-    pub supports_post_tool_use: bool,
-    pub supports_tool_response_capture: bool,
-    pub supports_session_stop_event: bool,
-    pub supports_transcript_tail: bool,
-    pub supports_subagent_lifecycle: bool,
-    /// Free-form notes on partial/uncertain support, for the capability
-    /// matrix doc — not machine-consumed, kept for provenance in Findings.
-    pub notes: HashMap<String, String>,
+// `RuntimeCapabilities` and its supporting taxonomy (`SignalClass`,
+// `SignalAvailability`, `CapabilitySignal`, `CapabilityProbe`) live in
+// `capabilities.rs` (FORNX-155) and are re-exported above.
+
+#[cfg(test)]
+mod evidence_schema_tests {
+    use super::*;
+
+    fn evidence_with(kind: EvidenceKind, payload: serde_json::Value) -> Evidence {
+        Evidence {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            source_event_id: Uuid::new_v4(),
+            kind,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            payload,
+            provenance: "test".into(),
+            source: None,
+            extension: None,
+        }
+    }
+
+    // --- Required test: canonical fields reject wrong types (test #4) ----
+
+    #[test]
+    fn exit_code_payload_with_wrong_type_is_rejected() {
+        let bad = serde_json::json!({"command": [], "exit_code": "zero"});
+        let err = validate_canonical_payload(EvidenceKind::ExitCode, &bad).unwrap_err();
+        assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn exit_code_payload_missing_required_field_is_rejected() {
+        let bad = serde_json::json!({"command": []});
+        assert!(validate_canonical_payload(EvidenceKind::ExitCode, &bad).is_err());
+    }
+
+    #[test]
+    fn exit_code_payload_with_unknown_extra_field_is_rejected() {
+        // Canonical payloads are strongly typed and closed (`deny_unknown_fields`)
+        // — unlike the extension envelope's flatten/tolerate behavior, an
+        // unrecognized field on a *canonical* shape is a validation failure,
+        // not something to preserve-and-ignore. Tolerance is reserved for the
+        // extension envelope (see `extension` module docs).
+        let bad = serde_json::json!({"command": [], "exit_code": 0, "surprise": true});
+        assert!(validate_canonical_payload(EvidenceKind::ExitCode, &bad).is_err());
+    }
+
+    #[test]
+    fn well_typed_exit_code_payload_validates() {
+        let good = serde_json::json!({"command": ["pytest"], "exit_code": 0, "heuristic": false});
+        assert!(validate_canonical_payload(EvidenceKind::ExitCode, &good).is_ok());
+    }
+
+    #[test]
+    fn well_typed_exit_code_payload_without_optional_heuristic_field_validates() {
+        let good = serde_json::json!({"command": ["pytest"], "exit_code": 1});
+        assert!(validate_canonical_payload(EvidenceKind::ExitCode, &good).is_ok());
+    }
+
+    #[test]
+    fn not_yet_produced_kinds_still_validate_their_typed_shape() {
+        assert!(validate_canonical_payload(
+            EvidenceKind::ToolResult,
+            &serde_json::json!({"summary": "ok"})
+        )
+        .is_ok());
+        assert!(validate_canonical_payload(
+            EvidenceKind::ToolResult,
+            &serde_json::json!({"summary": 1})
+        )
+        .is_err());
+        assert!(validate_canonical_payload(
+            EvidenceKind::FileDiff,
+            &serde_json::json!({"path": "a.rs", "diff": "+x"})
+        )
+        .is_ok());
+        assert!(validate_canonical_payload(
+            EvidenceKind::ProcessObservation,
+            &serde_json::json!({"description": "ran"})
+        )
+        .is_ok());
+        assert!(validate_canonical_payload(
+            EvidenceKind::TranscriptExcerpt,
+            &serde_json::json!({"text": "hello"})
+        )
+        .is_ok());
+    }
+
+    // --- FORNX-14: ProcessObservationPayload.observation widening ---------
+
+    #[test]
+    fn process_observation_payload_with_vcs_operation_observation_validates() {
+        let good = serde_json::json!({
+            "description": "git commit created",
+            "observation": {
+                "observation_kind": "vcs_operation",
+                "operation": "commit",
+                "outcome": "created",
+                "commit_sha": "abc1234",
+                "branch": "main"
+            }
+        });
+        assert!(validate_canonical_payload(EvidenceKind::ProcessObservation, &good).is_ok());
+    }
+
+    #[test]
+    fn process_observation_payload_observation_with_unknown_field_is_rejected() {
+        let bad = serde_json::json!({
+            "description": "git commit created",
+            "observation": {
+                "observation_kind": "vcs_operation",
+                "operation": "commit",
+                "outcome": "created",
+                "surprise": true
+            }
+        });
+        assert!(validate_canonical_payload(EvidenceKind::ProcessObservation, &bad).is_err());
+    }
+
+    // --- Evidence::extension is optional and independent of `payload` ----
+
+    #[test]
+    fn evidence_extension_defaults_to_none_and_round_trips_when_absent() {
+        let json = r#"{
+            "id": "00000000-0000-0000-0000-000000000001",
+            "session_id": "s1",
+            "source_event_id": "00000000-0000-0000-0000-000000000002",
+            "kind": "exit_code",
+            "observed_at": "2026-01-01T00:00:00Z",
+            "payload": {"command": [], "exit_code": 0},
+            "provenance": "test"
+        }"#;
+        let ev: Evidence = serde_json::from_str(json).unwrap();
+        assert!(ev.extension.is_none());
+        let reser = serde_json::to_value(&ev).unwrap();
+        assert!(reser.get("extension").is_none());
+    }
+
+    #[test]
+    fn evidence_with_extension_round_trips() {
+        let mut ev = evidence_with(
+            EvidenceKind::ExitCode,
+            serde_json::json!({"command": [], "exit_code": 0}),
+        );
+        ev.extension = Some(extension::ExtensionEnvelope::new(
+            Provider::Codex,
+            "codex-adapter-0.1.0",
+            extension::ContentClass::ToolTelemetry,
+            serde_json::json!({"extra": "detail"}),
+        ));
+        let json = serde_json::to_string(&ev).unwrap();
+        let back: Evidence = serde_json::from_str(&json).unwrap();
+        assert_eq!(ev.extension, back.extension);
+    }
+}
+
+/// Direct unit coverage for the core domain types (FORNX-11): construction
+/// and serde round-trip for `AgentEvent`/`Claim`/`Evidence`/`Finding`/
+/// `IngestMessage`, plus the five-state `Verdict` vocabulary. Schema
+/// versioning/evolution itself is FORNX-158's `extension` module (see
+/// `docs/adr/0005-schema-evolution.md`) — this module only closes the gap
+/// that `fornax-types`' other domain types had no direct tests of their own.
+#[cfg(test)]
+mod domain_type_tests {
+    use super::*;
+
+    fn sample_event() -> AgentEvent {
+        AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("Bash".into()),
+            tool_input: Some(serde_json::json!({"command": "pytest"})),
+            tool_response: Some(serde_json::json!({"exit_code": 0})),
+            raw: serde_json::json!({"hook_event_name": "PostToolUse"}),
+        }
+    }
+
+    fn sample_claim() -> Claim {
+        Claim {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            source_event_id: Uuid::new_v4(),
+            text: "All tests passed".into(),
+            subject: "test_result".into(),
+            claimed_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    fn sample_finding(verdict: Verdict) -> Finding {
+        Finding {
+            id: Uuid::new_v4(),
+            claim_id: Uuid::new_v4(),
+            verdict,
+            evidence_ids: vec![Uuid::new_v4()],
+            verifier_name: "exit_code_verifier".into(),
+            rationale: "exit code was 0".into(),
+            computed_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    // --- AgentEvent ---------------------------------------------------
+
+    #[test]
+    fn agent_event_round_trips_through_json() {
+        let event = sample_event();
+        let json = serde_json::to_string(&event).unwrap();
+        let back: AgentEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event.id, back.id);
+        assert_eq!(event.session_id, back.session_id);
+        assert_eq!(event.provider, back.provider);
+        assert_eq!(event.kind, back.kind);
+        assert_eq!(event.tool_name, back.tool_name);
+        assert_eq!(event.tool_input, back.tool_input);
+        assert_eq!(event.tool_response, back.tool_response);
+        assert_eq!(event.raw, back.raw);
+    }
+
+    #[test]
+    fn agent_event_allows_absent_tool_fields() {
+        let mut event = sample_event();
+        event.tool_name = None;
+        event.tool_input = None;
+        event.tool_response = None;
+        let json = serde_json::to_string(&event).unwrap();
+        let back: AgentEvent = serde_json::from_str(&json).unwrap();
+        assert!(back.tool_name.is_none());
+        assert!(back.tool_input.is_none());
+        assert!(back.tool_response.is_none());
+    }
+
+    // --- Claim ----------------------------------------------------------
+
+    #[test]
+    fn claim_round_trips_through_json() {
+        let claim = sample_claim();
+        let json = serde_json::to_string(&claim).unwrap();
+        let back: Claim = serde_json::from_str(&json).unwrap();
+        assert_eq!(claim.id, back.id);
+        assert_eq!(claim.session_id, back.session_id);
+        assert_eq!(claim.source_event_id, back.source_event_id);
+        assert_eq!(claim.text, back.text);
+        assert_eq!(claim.subject, back.subject);
+        assert_eq!(claim.claimed_at, back.claimed_at);
+    }
+
+    // --- Finding ----------------------------------------------------------
+
+    #[test]
+    fn finding_round_trips_through_json() {
+        let finding = sample_finding(Verdict::Verified);
+        let json = serde_json::to_string(&finding).unwrap();
+        let back: Finding = serde_json::from_str(&json).unwrap();
+        assert_eq!(finding.id, back.id);
+        assert_eq!(finding.claim_id, back.claim_id);
+        assert_eq!(finding.verdict, back.verdict);
+        assert_eq!(finding.evidence_ids, back.evidence_ids);
+        assert_eq!(finding.verifier_name, back.verifier_name);
+        assert_eq!(finding.rationale, back.rationale);
+        assert_eq!(finding.computed_at, back.computed_at);
+    }
+
+    // --- Verdict: the five-state vocabulary must never collapse ----------
+
+    /// Exhaustive match with no wildcard arm: if a `Verdict` variant is ever
+    /// added, removed, or renamed, this fails to compile rather than
+    /// silently passing (HVDL-15 / FORNX-20: "never collapsed to a boolean
+    /// or a score").
+    #[test]
+    fn verdict_has_exactly_five_states_with_stable_wire_names() {
+        let cases = [
+            (Verdict::Verified, "verified"),
+            (Verdict::Unverified, "unverified"),
+            (Verdict::Contradicted, "contradicted"),
+            (Verdict::Review, "review"),
+            (Verdict::Unavailable, "unavailable"),
+        ];
+        for (verdict, expected_wire_name) in cases {
+            // Exhaustiveness check: every variant must be named here.
+            match verdict {
+                Verdict::Verified
+                | Verdict::Unverified
+                | Verdict::Contradicted
+                | Verdict::Review
+                | Verdict::Unavailable => {}
+            }
+            let json = serde_json::to_value(verdict).unwrap();
+            assert_eq!(json, serde_json::json!(expected_wire_name));
+            let back: Verdict = serde_json::from_value(json).unwrap();
+            assert_eq!(verdict, back);
+        }
+    }
+
+    // --- IngestMessage ----------------------------------------------------
+
+    #[test]
+    fn ingest_message_event_variant_round_trips_and_tags_type() {
+        let msg = IngestMessage::Event(sample_event());
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json.get("type").and_then(|v| v.as_str()), Some("event"));
+        let back: IngestMessage = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, IngestMessage::Event(_)));
+    }
+
+    #[test]
+    fn ingest_message_claim_variant_round_trips_and_tags_type() {
+        let msg = IngestMessage::Claim(sample_claim());
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json.get("type").and_then(|v| v.as_str()), Some("claim"));
+        let back: IngestMessage = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, IngestMessage::Claim(_)));
+    }
+
+    #[test]
+    fn ingest_message_evidence_variant_round_trips_and_tags_type() {
+        let evidence = Evidence {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            source_event_id: Uuid::new_v4(),
+            kind: EvidenceKind::ExitCode,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            payload: serde_json::json!({"command": [], "exit_code": 0}),
+            provenance: "test".into(),
+            source: None,
+            extension: None,
+        };
+        let msg = IngestMessage::Evidence(evidence);
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json.get("type").and_then(|v| v.as_str()), Some("evidence"));
+        let back: IngestMessage = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, IngestMessage::Evidence(_)));
+    }
 }

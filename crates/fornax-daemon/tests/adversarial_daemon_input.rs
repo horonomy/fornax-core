@@ -246,6 +246,7 @@ async fn assert_no_data_for_session(store: &Store, session_id: &str) {
             .evidence_for_session(session_id)
             .await
             .expect("query evidence")
+            .evidence
             .is_empty(),
         "expected no evidence persisted for session {session_id}"
     );
@@ -432,7 +433,11 @@ async fn adversarial_corpus_against_live_daemon() {
         );
         // exit_code "one" is not an i64 and the heuristic fallback also finds
         // no usable shape (no stdout/stderr/interrupted keys) -> no Evidence.
-        let evidence = store.evidence_for_session(session).await.expect("evidence");
+        let evidence = store
+            .evidence_for_session(session)
+            .await
+            .expect("evidence")
+            .evidence;
         assert!(
             evidence.is_empty(),
             "a non-numeric exit_code and no heuristic fields must not fabricate Evidence"
@@ -464,10 +469,15 @@ async fn adversarial_corpus_against_live_daemon() {
                 .evidence_for_session(session)
                 .await
                 .expect("evidence")
+                .evidence
                 .is_empty()
         })
         .await;
-        let evidence = store.evidence_for_session(session).await.expect("evidence");
+        let evidence = store
+            .evidence_for_session(session)
+            .await
+            .expect("evidence")
+            .evidence;
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].payload["exit_code"], 1);
         assert_valid_processing_still_works(&daemon, "probe-05").await;
@@ -498,6 +508,7 @@ async fn adversarial_corpus_against_live_daemon() {
                 .evidence_for_session(session)
                 .await
                 .expect("evidence")
+                .evidence
                 .is_empty()
         })
         .await;
@@ -554,6 +565,7 @@ async fn adversarial_corpus_against_live_daemon() {
                 .evidence_for_session(session)
                 .await
                 .expect("evidence")
+                .evidence
                 .is_empty()
         })
         .await;
@@ -586,10 +598,15 @@ async fn adversarial_corpus_against_live_daemon() {
                 .evidence_for_session(session)
                 .await
                 .expect("evidence")
+                .evidence
                 .is_empty()
         })
         .await;
-        let evidence = store.evidence_for_session(session).await.expect("evidence");
+        let evidence = store
+            .evidence_for_session(session)
+            .await
+            .expect("evidence")
+            .evidence;
         assert_eq!(evidence.len(), 1);
         // stderr is non-empty -> heuristic exit_code=1, regardless of its
         // exact (redacted or not) content: proves the control characters
@@ -628,6 +645,7 @@ async fn adversarial_corpus_against_live_daemon() {
                 .evidence_for_session(traversal_session)
                 .await
                 .expect("evidence")
+                .evidence
                 .is_empty()
         })
         .await;
@@ -870,13 +888,15 @@ async fn adversarial_corpus_against_live_daemon() {
                 .evidence_for_session(&huge_session)
                 .await
                 .expect("evidence")
+                .evidence
                 .is_empty()
         })
         .await;
         let evidence = store
             .evidence_for_session(&huge_session)
             .await
-            .expect("evidence");
+            .expect("evidence")
+            .evidence;
         assert_eq!(evidence.len(), 1);
         assert_valid_processing_still_works(&daemon, "probe-12").await;
     }

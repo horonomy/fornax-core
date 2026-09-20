@@ -1,0 +1,71 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/horonomy/fornax-core/release/trust-boundary-delta.schema.json",
+  "title": "Fornax Release Trust-Boundary Delta",
+  "description": "Per-candidate record of every trust boundary a release candidate's feature-delta items touch (docs/release-security-gate.md, FORNX-233). Required whenever a candidate's risk_class is TRUST_BOUNDARY or MAJOR_OR_GA (docs/release-assurance-policy.md, FORNX-229). Reviewed against, and may update, docs/security/threat-model.md.",
+  "type": "object",
+  "required": ["version", "generated_at", "threat_model_version", "boundaries_touched"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "string",
+      "description": "The candidate release version this delta record is for, e.g. \"v0.0.1\".",
+      "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+"
+    },
+    "generated_at": {
+      "type": "string",
+      "description": "ISO 8601 UTC timestamp, e.g. \"2026-09-01T00:00:00Z\"."
+    },
+    "threat_model_version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "The docs/security/threat-model.md version this delta was reviewed against."
+    },
+    "full_review": {
+      "type": "boolean",
+      "default": false,
+      "description": "True when every boundary in the threat model was re-reviewed in this pass (required for a MAJOR_OR_GA candidate), not only the touched ones."
+    },
+    "boundaries_touched": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["surface", "feature_delta_ids", "review", "adversarial_coverage"],
+        "additionalProperties": false,
+        "properties": {
+          "surface": {
+            "type": "string",
+            "enum": [
+              "daemon_socket",
+              "adapter_provider_input",
+              "evidence_provenance",
+              "egress_redaction",
+              "cloud_identity_tenant",
+              "browser_rendering_injection",
+              "event_transport",
+              "judge_replay_execution",
+              "enterprise_policy_deployment",
+              "sdk_plugin_trust"
+            ],
+            "description": "Must be one of the trust-boundary=yes values from docs/release-candidate-evidence.md's Shared surface vocabulary. The four non-boundary surfaces (public_api_schema_migration, infra_config, cli, ui_docs) never appear here — a feature-delta item tagged only with those does not require a trust-boundary delta entry."
+          },
+          "feature_delta_ids": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string" },
+            "description": "Feature-delta item IDs (FORNX-231's FD-<version>-<seq> format) whose surfaces include this boundary."
+          },
+          "review": {
+            "type": "string",
+            "description": "What changed at this boundary and why it does/doesn't introduce new risk. Concrete, never a bare \"looks fine.\""
+          },
+          "adversarial_coverage": {
+            "type": "string",
+            "description": "The actual falsification/negative test exercised proving the control at this boundary still rejects a bad input, named concretely (test path, or NOT_RUN plus the reason and the residual-risk implication) — never \"manual review only\" as a bare string."
+          }
+        }
+      }
+    }
+  }
+}

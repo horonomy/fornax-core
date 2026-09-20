@@ -1,0 +1,16 @@
+{
+  "provider": "codex",
+  "provider_runtime_version": "synthetic",
+  "description": "SYNTHETIC breaking-change probe, never observed live: simulates a hypothetical future Codex event_msg subtype the adapter has no mapping for. Proves the conformance suite catches a breaking upstream change as an actionable Unrecognized error, not silent data loss.",
+  "sanitized": true,
+  "historical_schema_drift_ticket": null,
+  "native_events": [
+    {
+      "type": "event_msg",
+      "payload": {
+        "type": "agent_handoff_v3",
+        "target_agent": "fixture-subagent"
+      }
+    }
+  ]
+}

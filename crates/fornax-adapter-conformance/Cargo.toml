@@ -1,0 +1,25 @@
+[package]
+name = "fornax-adapter-conformance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Test-only harness (FORNX-156): proves Claude and Codex adapters both
+# satisfy the same `fornax_types::AgentAdapter` contract. Depends on both
+# concrete adapter crates as [dev-dependencies] only — nothing shipped
+# depends on both adapters at once, and this crate produces no library or
+# binary of its own that anything else links against.
+
+[dependencies]
+fornax-types = { path = "../fornax-types" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+fornax-adapter-claude = { path = "../fornax-adapter-claude" }
+fornax-adapter-codex = { path = "../fornax-adapter-codex" }
+fornax-adapter-opencode = { path = "../fornax-adapter-opencode" }
+fornax-verify = { path = "../fornax-verify" }
+uuid.workspace = true
+chrono.workspace = true
