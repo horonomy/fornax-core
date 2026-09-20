@@ -265,15 +265,26 @@ async fn independent_sessions_submitted_concurrently_are_not_lost_or_mixed_up() 
     }
 
     for session in &sessions {
+        // FORNX-372: wait on the Finding, not on the Claim. `handle_message`
+        // persists the Claim (main.rs:327) and only then runs the verifiers,
+        // inserting each Finding as a separate write (main.rs:361), with no
+        // transaction around the pair — so a visible Claim does not imply its
+        // Finding exists yet. Waiting on the Claim left the finding assertion
+        // below racing exactly that gap. The Finding is the last artefact this
+        // session's Stop submission produces, and the daemon's global
+        // `processing` mutex preserves arrival order, so its presence also
+        // implies the earlier Event and Claim writes are durable. This is the
+        // same barrier the sibling test below already uses.
         wait_for(Duration::from_secs(15), || {
             let store = &store;
             let session = session.clone();
             async move {
-                !store
-                    .claims_for_session(&session)
+                store
+                    .recent_findings(500)
                     .await
-                    .expect("claims")
-                    .is_empty()
+                    .expect("recent findings")
+                    .iter()
+                    .any(|f| f.session_id == session)
             }
         })
         .await;
