@@ -91,7 +91,7 @@ jobs:
       - name: t2 (post-toolchain)
         id: t2
         run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
-      - uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         id: rust_cache
       - name: t3 (post-cache-restore)
         id: t3
@@ -160,7 +160,7 @@ jobs:
       - name: t2 (post-toolchain)
         id: t2
         run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
-      - uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         id: rust_cache
       - name: t3 (post-cache-restore)
         id: t3
@@ -219,7 +219,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: check workspace has crates
         id: has_crates
         run: |
