@@ -195,9 +195,9 @@ impl Store {
 
     /// Every stored checkpoint receipt, oldest (`checkpoint_seq`) first.
     pub async fn audit_checkpoint_receipts(&self) -> Result<Vec<AuditCheckpointReceipt>> {
-        let rows = sqlx::query_as::<_, AuditCheckpointRow>(&format!(
+        let rows = sqlx::query_as::<_, AuditCheckpointRow>(sqlx::AssertSqlSafe(format!(
             "SELECT {RECEIPT_COLUMNS} FROM audit_checkpoints ORDER BY checkpoint_seq ASC"
-        ))
+        )))
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(AuditCheckpointReceipt::from).collect())
@@ -207,9 +207,9 @@ impl Store {
     /// anchor a later receipt's `device_id` is cross-checked against (see
     /// [`Self::store_audit_checkpoint_receipt`]'s doc comment).
     pub async fn first_audit_checkpoint_receipt(&self) -> Result<Option<AuditCheckpointReceipt>> {
-        let row = sqlx::query_as::<_, AuditCheckpointRow>(&format!(
+        let row = sqlx::query_as::<_, AuditCheckpointRow>(sqlx::AssertSqlSafe(format!(
             "SELECT {RECEIPT_COLUMNS} FROM audit_checkpoints ORDER BY checkpoint_seq ASC LIMIT 1"
-        ))
+        )))
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(AuditCheckpointReceipt::from))
@@ -217,9 +217,9 @@ impl Store {
 
     /// The highest-`checkpoint_seq` stored receipt, if any.
     pub async fn latest_audit_checkpoint_receipt(&self) -> Result<Option<AuditCheckpointReceipt>> {
-        let row = sqlx::query_as::<_, AuditCheckpointRow>(&format!(
+        let row = sqlx::query_as::<_, AuditCheckpointRow>(sqlx::AssertSqlSafe(format!(
             "SELECT {RECEIPT_COLUMNS} FROM audit_checkpoints ORDER BY checkpoint_seq DESC LIMIT 1"
-        ))
+        )))
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(AuditCheckpointReceipt::from))

@@ -1255,12 +1255,12 @@ mod tests {
         // insert path added later that forgets to tag — walk each table
         // with a LEFT JOIN against dataset_lineage_tags instead.
         for table in ["agent_events", "claims", "evidence", "findings"] {
-            let untagged: (i64,) = sqlx::query_as(&format!(
+            let untagged: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
                 "SELECT COUNT(*) FROM {table} t \
                  LEFT JOIN dataset_lineage_tags d \
                  ON d.record_table = '{table}' AND d.record_id = t.id \
                  WHERE d.record_id IS NULL"
-            ))
+            )))
             .fetch_one(&store.pool)
             .await
             .unwrap_or_else(|e| panic!("count untagged rows in {table}: {e}"));
@@ -1635,11 +1635,12 @@ mod tests {
         let store = Store::open(&path).await.expect("open db");
 
         for table in KNOWN_RECORD_TABLES {
-            let columns: Vec<(String,)> =
-                sqlx::query_as(&format!("SELECT name FROM pragma_table_info('{table}')"))
-                    .fetch_all(&store.pool)
-                    .await
-                    .unwrap_or_else(|e| panic!("read table_info for {table}: {e}"));
+            let columns: Vec<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT name FROM pragma_table_info('{table}')"
+            )))
+            .fetch_all(&store.pool)
+            .await
+            .unwrap_or_else(|e| panic!("read table_info for {table}: {e}"));
             assert!(
                 !columns.iter().any(|(name,)| name == "tenant_id"),
                 "{table} must not have a tenant_id column — TenantRef stays schema-only \
