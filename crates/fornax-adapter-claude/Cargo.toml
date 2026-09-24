@@ -14,9 +14,19 @@ path = "src/main.rs"
 
 [dependencies]
 fornax-types = { path = "../fornax-types" }
+# Narrow, named exception to "adapters depend on fornax-types only" — see
+# docs/adr/0004-adapter-contract.md's "Allowed core dependencies" (FORNX-302).
+fornax-vcs = { path = "../fornax-vcs" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+# Test-fixture-only: builds a real temp git repo for
+# `ClaudeGitWorkingTreeSensor`'s tests without shelling out to `git` (FORNX-238).
+# Not a new production dependency — `fornax-vcs` (declared above) already
+# carries `gix` in the actual sensor code path.
+gix = { version = "0.87", features = ["max-performance-safe"] }

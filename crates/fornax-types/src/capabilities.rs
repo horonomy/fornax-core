@@ -77,6 +77,15 @@ pub enum SignalAvailability {
     /// Ordinary absence: no adapter has declared an opinion about this
     /// signal class. The default when a class is missing from `signals`.
     Unknown,
+    /// The producing sensor was turned off by local configuration
+    /// (`fornax_types::sensor_config::SensorDisableConfig`, FORNX-302) — the
+    /// sensor never ran this call, as opposed to running and finding nothing
+    /// (`Unavailable`) or being incapable in principle (`Unsupported`).
+    /// Reused on [`crate::SensorOutcome::disabled`] rather than a sensor
+    /// silently producing no evidence and no explanation, matching this
+    /// enum's own governing rule: a missing signal must always be an
+    /// explicit, distinct state, never silent omission.
+    Disabled,
     /// Forward-compatibility catch-all: a state tag this binary doesn't
     /// recognize (e.g. persisted by a newer binary). Carries the original
     /// string so a tolerant reader that re-serializes the value does not
@@ -102,6 +111,7 @@ impl SignalAvailability {
             "redacted" => Self::Redacted,
             "collection_failed" => Self::CollectionFailed,
             "unknown" => Self::Unknown,
+            "disabled" => Self::Disabled,
             other => Self::Unrecognized(other.to_string()),
         }
     }
@@ -188,10 +198,13 @@ pub struct RuntimeCapabilities {
     /// transport field — `fornax-daemon` reads it to key the
     /// `(session_id, provider)` capabilities upsert for a `Capabilities`
     /// message that arrives before any `Event` sets the session hint (see
-    /// `fornax-daemon/src/main.rs::handle_message`). It is not promoted to a
-    /// real field because the capabilities spool envelope (`fornax-cli`'s
-    /// `export_spool`) must never carry a session id — `fornax-cloud` keys
-    /// capabilities on `(device_id, provider)`, never an envelope id.
+    /// `fornax-daemon/src/main.rs::handle_message`). That informal
+    /// `notes["session_id"]` convention predates FORNX-301: `session_id` is
+    /// now also promoted to a real field on `LegacyCapabilitiesWire`
+    /// (`fornax-cli`'s `export_spool` boundary), because `fornax-cloud` has
+    /// grown a `session_capabilities` table keyed on `(session_id,
+    /// provider)` and needs the id on the wire to populate it — see
+    /// `LegacyCapabilitiesWire`'s doc comment for the export-side rationale.
     pub notes: HashMap<String, String>,
 }
 
@@ -338,13 +351,22 @@ pub trait CapabilityProbe {
 
 /// The flat six-bool shape the pre-FORNX-155 `RuntimeCapabilities` wire type
 /// had. Used only at the `fornax-cli` `export-spool` boundary: the spool
-/// envelope sent onward to `fornax-cloud` must stay byte-for-byte
-/// wire-compatible with that (out-of-scope, separately owned) repo's
-/// `fornax-uploader::types::RuntimeCapabilities`, which has not been taught
-/// about `signals`/`schema_version`/`detail`. This is a one-way projection
-/// (`From<&RuntimeCapabilities>`), never the other direction, and is never
-/// itself persisted — the domain type's `signals` list is the single source
-/// of truth; this is computed on demand at the moment of export.
+/// envelope sent onward to `fornax-cloud` must stay backward-compatible with
+/// that (out-of-scope, separately owned) repo's original
+/// `fornax-uploader::types::RuntimeCapabilities` nine-key shape. This is a
+/// one-way projection (`From<&RuntimeCapabilities>`), never the other
+/// direction, and is never itself persisted — the domain type's `signals`
+/// list is the single source of truth; this is computed on demand at the
+/// moment of export.
+///
+/// FORNX-301 additively extends this shape with `session_id`,
+/// `schema_version`, and `signals`, so fornax-cloud can key a
+/// `session_capabilities` table on `(session_id, provider)` and receive the
+/// rich per-signal taxonomy instead of only the down-projected bools. All
+/// three are `#[serde(skip_serializing_if = ...)]`-guarded: when unset, the
+/// serialized JSON is byte-identical to the original nine-key shape, so an
+/// older `fornax-uploader` that has not been taught about the new fields
+/// still parses this envelope unchanged.
 #[derive(Debug, Clone, Serialize)]
 pub struct LegacyCapabilitiesWire {
     pub provider: Provider,
@@ -355,6 +377,12 @@ pub struct LegacyCapabilitiesWire {
     pub supports_transcript_tail: bool,
     pub supports_subagent_lifecycle: bool,
     pub notes: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signals: Vec<CapabilitySignal>,
 }
 
 impl From<&RuntimeCapabilities> for LegacyCapabilitiesWire {
@@ -368,6 +396,9 @@ impl From<&RuntimeCapabilities> for LegacyCapabilitiesWire {
             supports_transcript_tail: c.is_observable(&SignalClass::FinalResponse),
             supports_subagent_lifecycle: c.is_observable(&SignalClass::SubagentLifecycle),
             notes: c.notes.clone(),
+            session_id: None,
+            schema_version: Some(c.schema_version),
+            signals: c.signals.clone(),
         }
     }
 }
@@ -420,6 +451,7 @@ mod tests {
                 SignalAvailability::CollectionFailed,
             ),
             ("\"unknown\"", SignalAvailability::Unknown),
+            ("\"disabled\"", SignalAvailability::Disabled),
         ];
         for (json, expected) in cases {
             let v: SignalAvailability = serde_json::from_str(json).unwrap();
@@ -587,6 +619,7 @@ mod tests {
             SignalAvailability::Redacted,
             SignalAvailability::CollectionFailed,
             SignalAvailability::Unknown,
+            SignalAvailability::Disabled,
             SignalAvailability::Unrecognized("future_state".to_string()),
         ];
         for state in states {
@@ -617,7 +650,7 @@ mod tests {
     // --- Legacy projection (spool wire-compat) ---------------------------
 
     #[test]
-    fn legacy_projection_reproduces_the_exact_frozen_key_set() {
+    fn legacy_projection_reproduces_the_frozen_key_set_as_a_superset() {
         let c = caps_with(vec![
             CapabilitySignal {
                 class: SignalClass::ToolInvocation,
@@ -656,22 +689,41 @@ mod tests {
             "type".to_string(),
             serde_json::Value::String("capabilities".to_string()),
         );
-        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
-        keys.sort_unstable();
-        assert_eq!(
-            keys,
-            vec![
-                "notes",
-                "provider",
-                "supports_post_tool_use",
-                "supports_pre_tool_use",
-                "supports_session_stop_event",
-                "supports_subagent_lifecycle",
-                "supports_tool_response_capture",
-                "supports_transcript_tail",
-                "type",
-            ]
-        );
+        let keys: std::collections::HashSet<&str> =
+            v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+
+        // The nine original legacy keys must always still be present, with
+        // unchanged values — this is the frozen contract fornax-cloud's
+        // worker-gate consumer reads.
+        let frozen = [
+            "notes",
+            "provider",
+            "supports_post_tool_use",
+            "supports_pre_tool_use",
+            "supports_session_stop_event",
+            "supports_subagent_lifecycle",
+            "supports_tool_response_capture",
+            "supports_transcript_tail",
+            "type",
+        ];
+        for key in frozen {
+            assert!(keys.contains(key), "frozen legacy key {key} missing");
+        }
+        assert_eq!(v["supports_pre_tool_use"], false);
+        assert_eq!(v["supports_post_tool_use"], true);
+        assert_eq!(v["supports_tool_response_capture"], true);
+        assert_eq!(v["supports_session_stop_event"], true);
+        assert_eq!(v["supports_transcript_tail"], true);
+        assert_eq!(v["supports_subagent_lifecycle"], false);
+
+        // Plus the new additive keys: `From<&RuntimeCapabilities>` always
+        // populates `schema_version`/`signals` (session_id is left to the
+        // caller, so it's absent here).
+        assert!(keys.contains("schema_version"));
+        assert!(keys.contains("signals"));
+        assert!(!keys.contains("session_id"));
+        assert_eq!(v["schema_version"], CAPABILITY_SCHEMA_VERSION);
+        assert_eq!(v["signals"].as_array().unwrap().len(), 6);
     }
 
     #[test]
@@ -703,5 +755,137 @@ mod tests {
                 "bool {k} drifted through legacy->domain->legacy"
             );
         }
+    }
+
+    // --- FORNX-301: additive session_id/schema_version/signals ----------
+
+    /// The backward-compatibility guarantee the whole design rests on: when
+    /// `signals` is empty and `session_id` is `None`, the serialized JSON
+    /// has exactly the original nine legacy keys — no new keys appear, so
+    /// an unmodified `fornax-uploader` on the other end still parses this
+    /// envelope exactly as it did before FORNX-301.
+    #[test]
+    fn empty_signals_and_absent_session_id_serialize_to_exactly_the_original_nine_keys() {
+        let dto = LegacyCapabilitiesWire {
+            provider: Provider::Codex,
+            supports_pre_tool_use: false,
+            supports_post_tool_use: true,
+            supports_tool_response_capture: true,
+            supports_session_stop_event: true,
+            supports_transcript_tail: true,
+            supports_subagent_lifecycle: false,
+            notes: HashMap::new(),
+            session_id: None,
+            schema_version: None,
+            signals: vec![],
+        };
+        let mut v = serde_json::to_value(&dto).unwrap();
+        v.as_object_mut().unwrap().insert(
+            "type".to_string(),
+            serde_json::Value::String("capabilities".to_string()),
+        );
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "notes",
+                "provider",
+                "supports_post_tool_use",
+                "supports_pre_tool_use",
+                "supports_session_stop_event",
+                "supports_subagent_lifecycle",
+                "supports_tool_response_capture",
+                "supports_transcript_tail",
+                "type",
+            ],
+            "no new keys should appear when session_id/schema_version/signals are unset"
+        );
+    }
+
+    /// A rich `RuntimeCapabilities` with a full `signals` vec — including an
+    /// `Unrecognized` class/state pair, to prove the taxonomy's forward-compat
+    /// path survives export — round-trips through the export projection with
+    /// every field intact, matching the shared JSON contract with
+    /// fornax-cloud.
+    #[test]
+    fn full_signals_and_session_id_survive_the_export_projection_round_trip() {
+        let c = RuntimeCapabilities {
+            schema_version: 1,
+            provider: Provider::Codex,
+            signals: vec![
+                CapabilitySignal {
+                    class: SignalClass::ToolInvocation,
+                    state: SignalAvailability::Unsupported,
+                    detail: Some("rollout tail cannot intercept pre-execution".to_string()),
+                },
+                CapabilitySignal {
+                    class: SignalClass::ToolTrace,
+                    state: SignalAvailability::Available,
+                    detail: None,
+                },
+                CapabilitySignal {
+                    class: SignalClass::ProcessResult,
+                    state: SignalAvailability::CollectionFailed,
+                    detail: Some("no literal exit code in tool_response".to_string()),
+                },
+                CapabilitySignal {
+                    class: SignalClass::ReasoningSummary,
+                    state: SignalAvailability::Redacted,
+                    detail: None,
+                },
+                CapabilitySignal {
+                    class: SignalClass::InternalModelSignals,
+                    state: SignalAvailability::Unknown,
+                    detail: None,
+                },
+                CapabilitySignal {
+                    class: SignalClass::Unrecognized("neural_trace".to_string()),
+                    state: SignalAvailability::Unrecognized("quantum_entangled".to_string()),
+                    detail: None,
+                },
+            ],
+            notes: [("session_id".to_string(), "s-1".to_string())].into(),
+        };
+
+        let mut dto = LegacyCapabilitiesWire::from(&c);
+        dto.session_id = Some("s-1".to_string());
+
+        let mut v = serde_json::to_value(&dto).unwrap();
+        v.as_object_mut().unwrap().insert(
+            "type".to_string(),
+            serde_json::Value::String("capabilities".to_string()),
+        );
+
+        assert_eq!(v["type"], "capabilities");
+        assert_eq!(v["provider"], "codex");
+        assert_eq!(v["supports_pre_tool_use"], false);
+        assert_eq!(v["supports_post_tool_use"], true);
+        assert_eq!(v["supports_tool_response_capture"], false);
+        assert_eq!(v["supports_session_stop_event"], false);
+        assert_eq!(v["supports_transcript_tail"], false);
+        assert_eq!(v["supports_subagent_lifecycle"], false);
+        assert_eq!(v["notes"]["session_id"], "s-1");
+        assert_eq!(v["session_id"], "s-1");
+        assert_eq!(v["schema_version"], 1);
+
+        let signals = v["signals"].as_array().unwrap();
+        assert_eq!(signals.len(), 6);
+        assert_eq!(signals[0]["class"], "tool_invocation");
+        assert_eq!(signals[0]["state"], "unsupported");
+        assert_eq!(
+            signals[0]["detail"],
+            "rollout tail cannot intercept pre-execution"
+        );
+        assert_eq!(signals[1]["class"], "tool_trace");
+        assert_eq!(signals[1]["state"], "available");
+        assert_eq!(signals[2]["class"], "process_result");
+        assert_eq!(signals[2]["state"], "collection_failed");
+        assert_eq!(signals[3]["class"], "reasoning_summary");
+        assert_eq!(signals[3]["state"], "redacted");
+        assert_eq!(signals[4]["class"], "internal_model_signals");
+        assert_eq!(signals[4]["state"], "unknown");
+        assert_eq!(signals[5]["class"], "neural_trace");
+        assert_eq!(signals[5]["state"], "quantum_entangled");
     }
 }

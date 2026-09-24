@@ -72,6 +72,41 @@
 //!   `detail` string, not freeform text a sensor author invents each time —
 //!   see the type's own doc comment.
 //!
+//! # Evidence quality metadata (FORNX-92, parent epic FORNX-66)
+//!
+//! FORNX-92 adds two more fields to the same struct, for the same "extend
+//! `EvidenceSource`, not a new envelope" reason as FORNX-159's fields above:
+//!
+//! - `correlation_group`: marks that this evidence shares an underlying
+//!   actor/source with other evidence carrying the same group id (e.g. two
+//!   model-authored signals both derived from the same LLM completion) —
+//!   AC: "Two model-authored signals can be marked correlated rather than
+//!   counted as independent." This module only makes correlated evidence
+//!   *identifiable*; discounting correlated signals during fusion is
+//!   FORNX-93's job.
+//! - `derived_from`: the evidence this record was computed from, when it
+//!   wasn't observed directly (e.g. a computed duration derived from two
+//!   raw timestamps — hence a `Vec`, not a single id). [`EvidenceSource::derived`]
+//!   is the intended constructor: it copies the origin's `trust_class`
+//!   verbatim, so a derived record cannot silently claim independence from
+//!   or higher trust than what it was derived from — an upgrade past the
+//!   origin's trust class is only possible via an explicit later assignment
+//!   to the returned value's `trust_class` field, never automatic.
+//!
+//! Both fields live on `EvidenceSource`, so a piece of `Evidence` whose
+//! `source` is `None` (predates FORNX-157 entirely) cannot be marked
+//! correlated/derived — the same limitation FORNX-159's fields already
+//! carry, accepted for the same reason: there is no structured provenance
+//! home to attach it to.
+//!
+//! `TrustClass` already distinguishes host/agent/human/external origin
+//! (below) — FORNX-92's "external independent vs. same-process/self-reported"
+//! AC is satisfied by that pre-existing taxonomy; nothing new is added for
+//! it here. Freshness *expiry* (as opposed to this struct's `Freshness`,
+//! which is about clock provenance, not staleness) and conflict-surfacing
+//! live in `crate::graph` instead, alongside the rest of FORNX-89/92's
+//! per-claim evidence-quality types.
+//!
 //! ## Design note: extend `EvidenceSource`, not a new envelope
 //!
 //! FORNX-159's AC requires *every* evidence record to carry enough
@@ -200,6 +235,13 @@ pub enum CollectionMethod {
     /// future CI webhook sensor). Not implemented by any sensor yet — typed
     /// ahead of a producer, same as `SignalClass::ReasoningSummary`.
     HttpWebhook,
+    /// An outbound HTTP request Fornax itself issued against an external
+    /// API to *query* current state (e.g. GitHub's check-runs API for a
+    /// given commit SHA) — distinct from [`Self::HttpWebhook`], which is an
+    /// *inbound* request delivered to Fornax on the external system's own
+    /// schedule. `fornax-ci`'s `GitHubCiStatusSensor` (FORNX-302) is the
+    /// first producer.
+    HttpQuery,
     /// Fornax's own host-side process invocation (e.g. a literal `git`
     /// command Fornax ran itself), as opposed to reading something a
     /// provider produced.
@@ -427,6 +469,21 @@ pub struct EvidenceSource {
     /// [`TamperBoundary`].
     #[serde(default)]
     pub tamper_boundary: TamperBoundary,
+    /// Marks this evidence as sharing an underlying actor/source with any
+    /// other evidence carrying the same group id (FORNX-92) — e.g. two
+    /// model-authored signals both derived from the same LLM completion.
+    /// `None` (the default, and what a pre-FORNX-92 blob deserializes to)
+    /// means no correlation has been recorded, not "known independent" —
+    /// see the module docs' "Evidence quality metadata" section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_group: Option<uuid::Uuid>,
+    /// Evidence ids this record was computed from, when it wasn't observed
+    /// directly (FORNX-92) — e.g. a computed duration derived from two raw
+    /// timestamps. Empty (the default) means this evidence was observed
+    /// directly, not derived. See [`EvidenceSource::derived`] for the
+    /// intended way to populate this without silently upgrading trust.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub derived_from: Vec<uuid::Uuid>,
 }
 
 impl EvidenceSource {
@@ -454,7 +511,54 @@ impl EvidenceSource {
                 caveat: None,
             },
             tamper_boundary,
+            correlation_group: None,
+            derived_from: Vec::new(),
         }
+    }
+
+    /// Build an `EvidenceSource` for evidence *computed* from one or more
+    /// already-collected evidence records, e.g. a duration derived from two
+    /// raw timestamps (FORNX-92). `origin_trust_class` is copied verbatim
+    /// into the returned value's `trust_class` — the derived record cannot
+    /// silently claim independence from or higher trust than what it was
+    /// derived from; a caller wanting a different trust class must assign
+    /// `trust_class` explicitly afterward. `collection_method` is forced to
+    /// [`CollectionMethod::Reconstructed`] and `freshness.clock_source` to
+    /// [`ClockSource::Reconstructed`], since a derived value is by
+    /// definition not a direct sensor observation of anything.
+    pub fn derived(
+        sensor_name: &'static str,
+        origin_trust_class: TrustClass,
+        provider: Option<Provider>,
+        collector_version: Option<String>,
+        derived_from: Vec<uuid::Uuid>,
+    ) -> Self {
+        let collection_method = CollectionMethod::Reconstructed;
+        let tamper_boundary =
+            TamperBoundary::for_trust_class(&origin_trust_class, &collection_method);
+        Self {
+            sensor_name: sensor_name.to_string(),
+            trust_class: origin_trust_class,
+            collected_at: chrono::Utc::now().to_rfc3339(),
+            provider,
+            collection_method,
+            collector_version,
+            freshness: Freshness {
+                clock_source: ClockSource::Reconstructed,
+                caveat: None,
+            },
+            tamper_boundary,
+            correlation_group: None,
+            derived_from,
+        }
+    }
+
+    /// Mark this evidence as correlated with any other evidence carrying
+    /// the same `group` id (FORNX-92) — see the module docs' "Evidence
+    /// quality metadata" section.
+    pub fn with_correlation_group(mut self, group: uuid::Uuid) -> Self {
+        self.correlation_group = Some(group);
+        self
     }
 }
 
@@ -529,6 +633,21 @@ impl SensorOutcome {
     pub fn has_evidence(&self) -> bool {
         !self.evidence.is_empty()
     }
+
+    /// A sensor configured off (`crate::SensorDisableConfig`, FORNX-302)
+    /// never ran this call — reported explicitly via
+    /// [`crate::SignalAvailability::Disabled`], not by silently returning
+    /// [`SensorOutcome::nothing_to_report`] or omitting the sensor's output
+    /// altogether. `sensor_name` is folded into `detail` so the reason a
+    /// caller sees no evidence from this sensor is legible without
+    /// cross-referencing the config file.
+    pub fn disabled(sensor_name: &str) -> Self {
+        Self {
+            evidence: vec![],
+            state: SignalAvailability::Disabled,
+            detail: Some(format!("sensor '{sensor_name}' disabled via local config")),
+        }
+    }
 }
 
 /// Contract for a component that observes something and turns it into
@@ -592,6 +711,23 @@ pub trait EvidenceSensor {
             .iter()
             .all(|c| caps.is_observable(c))
     }
+}
+
+/// Runs `sensor.collect(event, caps)` unless `disable_config` names this
+/// sensor as disabled, in which case it reports
+/// [`SensorOutcome::disabled`] without calling `collect` at all — the one
+/// call site adapters route every sensor invocation through so the
+/// disable check can't be forgotten at a new call site (FORNX-302).
+pub fn collect_with_disable_check(
+    sensor: &dyn EvidenceSensor,
+    event: &AgentEvent,
+    caps: &RuntimeCapabilities,
+    disable_config: &crate::SensorDisableConfig,
+) -> SensorOutcome {
+    if disable_config.is_disabled(sensor.name()) {
+        return SensorOutcome::disabled(sensor.name());
+    }
+    sensor.collect(event, caps)
 }
 
 #[cfg(test)]
@@ -715,6 +851,7 @@ mod tests {
             ("\"hook_callback\"", CollectionMethod::HookCallback),
             ("\"file_poll\"", CollectionMethod::FilePoll),
             ("\"http_webhook\"", CollectionMethod::HttpWebhook),
+            ("\"http_query\"", CollectionMethod::HttpQuery),
             (
                 "\"process_observation\"",
                 CollectionMethod::ProcessObservation,
@@ -915,5 +1052,143 @@ mod tests {
             detail: None,
         }]);
         assert!(sensor.is_ready(&future_caps));
+    }
+
+    // --- FORNX-92: correlation groups --------------------------------------
+
+    #[test]
+    fn correlation_group_round_trips_through_json() {
+        let group = Uuid::new_v4();
+        let src = EvidenceSource::now(
+            "reasoning_summary_sensor_v1",
+            TrustClass::ModelInternal,
+            Some(Provider::ClaudeCode),
+            CollectionMethod::HookCallback,
+            None,
+        )
+        .with_correlation_group(group);
+        assert_eq!(src.correlation_group, Some(group));
+
+        let json = serde_json::to_string(&src).unwrap();
+        let back: EvidenceSource = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.correlation_group, Some(group));
+        assert_eq!(src, back);
+    }
+
+    #[test]
+    fn two_evidence_sources_can_be_marked_correlated() {
+        // AC: "Two model-authored signals can be marked correlated rather
+        // than counted as independent."
+        let group = Uuid::new_v4();
+        let a = EvidenceSource::now(
+            "reasoning_summary_sensor_v1",
+            TrustClass::ModelInternal,
+            None,
+            CollectionMethod::HookCallback,
+            None,
+        )
+        .with_correlation_group(group);
+        let b = EvidenceSource::now(
+            "token_logprobs_sensor_v1",
+            TrustClass::ModelInternal,
+            None,
+            CollectionMethod::HookCallback,
+            None,
+        )
+        .with_correlation_group(group);
+        assert_eq!(a.correlation_group, b.correlation_group);
+    }
+
+    #[test]
+    fn correlation_group_defaults_to_none_when_absent_from_legacy_json() {
+        let json = r#"{
+            "sensor_name": "claude_bash_exit_code_sensor_v1",
+            "trust_class": "agent_adjacent",
+            "collected_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let src: EvidenceSource = serde_json::from_str(json).unwrap();
+        assert_eq!(src.correlation_group, None);
+        assert!(src.derived_from.is_empty());
+    }
+
+    // --- FORNX-92: derived-evidence trust inheritance ----------------------
+
+    #[test]
+    fn derived_evidence_inherits_origin_trust_class_verbatim() {
+        // A computed duration derived from two raw, AgentAdjacent
+        // timestamps must not silently claim a higher/independent trust
+        // class than its origin.
+        let origin_a = Uuid::new_v4();
+        let origin_b = Uuid::new_v4();
+        let derived = EvidenceSource::derived(
+            "duration_computation_sensor_v1",
+            TrustClass::AgentAdjacent,
+            None,
+            None,
+            vec![origin_a, origin_b],
+        );
+        assert_eq!(derived.trust_class, TrustClass::AgentAdjacent);
+        assert_eq!(derived.derived_from, vec![origin_a, origin_b]);
+        assert_eq!(derived.collection_method, CollectionMethod::Reconstructed);
+        assert_eq!(derived.freshness.clock_source, ClockSource::Reconstructed);
+    }
+
+    #[test]
+    fn derived_evidence_trust_class_only_changes_via_explicit_assignment() {
+        // Upgrading past the origin's trust class is possible, but only by
+        // an explicit later assignment -- never automatic from calling
+        // `derived` alone.
+        let mut derived = EvidenceSource::derived(
+            "duration_computation_sensor_v1",
+            TrustClass::AgentAdjacent,
+            None,
+            None,
+            vec![Uuid::new_v4()],
+        );
+        assert_eq!(derived.trust_class, TrustClass::AgentAdjacent);
+        derived.trust_class = TrustClass::HumanReviewed;
+        assert_eq!(derived.trust_class, TrustClass::HumanReviewed);
+    }
+
+    // --- FORNX-302: per-sensor disable configuration ----------------------
+
+    #[test]
+    fn collect_with_disable_check_reports_disabled_without_running_the_sensor() {
+        let sensor = ReasoningSummarySensor;
+        let caps = caps_with(vec![CapabilitySignal {
+            class: SignalClass::ReasoningSummary,
+            state: SignalAvailability::Available,
+            detail: None,
+        }]);
+        // Ready per `is_ready`, so an un-checked `collect` call would run
+        // (returning `nothing_to_report`, i.e. `Available`) — the disable
+        // check must intercept before that happens.
+        assert!(sensor.is_ready(&caps));
+
+        let disable_config = crate::SensorDisableConfig::from_toml_str(
+            "[sensors]\ndisabled = [\"reasoning_summary_sensor_v1\"]\n",
+        )
+        .unwrap();
+        let outcome = collect_with_disable_check(&sensor, &dummy_event(), &caps, &disable_config);
+        assert!(!outcome.has_evidence());
+        assert_eq!(outcome.state, SignalAvailability::Disabled);
+        assert!(outcome
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("reasoning_summary_sensor_v1"));
+    }
+
+    #[test]
+    fn collect_with_disable_check_runs_the_sensor_normally_when_not_disabled() {
+        let sensor = ReasoningSummarySensor;
+        let caps = caps_with(vec![]);
+        let disable_config = crate::SensorDisableConfig::empty();
+        let outcome = collect_with_disable_check(&sensor, &dummy_event(), &caps, &disable_config);
+        // Unaffected by the disable check: same result as calling
+        // `collect` directly (see `future_reasoning_summary_sensor_...`
+        // above) — not ready, so `Unsupported`.
+        assert!(!outcome.has_evidence());
+        assert_eq!(outcome.state, SignalAvailability::Unsupported);
     }
 }

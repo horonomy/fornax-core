@@ -30,10 +30,11 @@
 //! canonical signal class mapped to it yet, not a parse failure.
 
 use fornax_types::{
-    AgentAdapter, AgentEvent, CapabilityProbe, CollectionMethod, ContentClass, EventKind, Evidence,
-    EvidenceKind, EvidenceSensor, EvidenceSource, ExtensionEnvelope, IngestMessage,
-    NormalizationOutcome, Provider, RuntimeCapabilities, SensorOutcome, SignalAvailability,
-    TrustClass,
+    collect_with_disable_check, AgentAdapter, AgentEvent, CapabilityProbe, CollectionMethod,
+    ContentClass, EventKind, Evidence, EvidenceKind, EvidenceSensor, EvidenceSource,
+    ExtensionEnvelope, IngestMessage, NormalizationOutcome, ProcessObservationDetail,
+    ProcessObservationPayload, Provider, RuntimeCapabilities, SensorDisableConfig, SensorOutcome,
+    SignalAvailability, TrustClass,
 };
 use uuid::Uuid;
 
@@ -308,6 +309,129 @@ impl EvidenceSensor for OpenCodeExitCodeSensor {
     }
 }
 
+/// FORNX-91 "process evidence" sensor: promotes opencode's own
+/// `output.time.start`/`output.time.end` timestamps — already reaching this
+/// adapter today, previously only carried forward opaquely inside
+/// [`build_tool_telemetry_extension`]'s `ExtensionEnvelope` — into canonical
+/// `ProcessObservation` evidence with a computed wall-clock duration.
+///
+/// This is **not** a new OS-level process-monitoring subsystem: it reads
+/// fields already present on the same `tool.execute.after` payload
+/// [`OpenCodeExitCodeSensor`] reads, and does nothing if they are absent —
+/// see the caveat below. `TrustClass::AgentAdjacent`, same class as
+/// `OpenCodeExitCodeSensor`: both are opencode's own account of what
+/// happened, not something Fornax measured independently.
+///
+/// **What it can observe**: `duration_ms = time.end - time.start`, and — as
+/// a genuine, if narrow, verification contribution — whether those two
+/// timestamps are even internally consistent (`end < start` is reported as
+/// `SignalAvailability::CollectionFailed`, not a fabricated negative
+/// duration).
+/// **What it cannot observe**: wall-clock time independent of what opencode
+/// itself reported, or anything for a tool call whose payload omits `time`
+/// entirely.
+///
+/// **Caveat**: unlike `output.metadata.exit` (empirically confirmed real
+/// against opencode v1.18.25 — see `OpenCodeExitCodeSensor`'s doc comment),
+/// `output.time.{start,end}`'s presence has not been independently
+/// reconfirmed against a live capture as part of this ticket — it was
+/// already referenced by `build_tool_telemetry_extension`'s doc comment
+/// before this sensor existed. If a future live capture shows the field is
+/// absent or shaped differently, this sensor's honest `Unavailable`
+/// response (never a fabricated duration) is exactly the behavior that
+/// makes that discovery safe rather than silently wrong — re-verify before
+/// trusting this sensor's `Available` case in production, same standing
+/// caution as the rest of `docs/research/adapter-capability-matrix.md`.
+/// The unit is likewise assumed, not confirmed: `duration_ms` treats
+/// `time.start`/`time.end` as epoch milliseconds (the field's name
+/// suggests it, nothing captured so far confirms it) — re-verify the unit
+/// alongside the field's existence.
+struct OpenCodeCommandDurationSensor {
+    adapter_version: &'static str,
+}
+
+impl EvidenceSensor for OpenCodeCommandDurationSensor {
+    fn name(&self) -> &'static str {
+        "opencode_command_duration_sensor_v1"
+    }
+
+    fn required_capabilities(&self) -> &'static [fornax_types::SignalClass] {
+        // Duration is a companion metric to the literal exit code this
+        // capability already gates — see `OpenCodeExitCodeSensor`.
+        &[fornax_types::SignalClass::ProcessResult]
+    }
+
+    fn trust_class(&self) -> TrustClass {
+        TrustClass::AgentAdjacent
+    }
+
+    fn collection_method(&self) -> CollectionMethod {
+        CollectionMethod::HookCallback
+    }
+
+    fn collector_version(&self) -> Option<String> {
+        Some(self.adapter_version.to_string())
+    }
+
+    fn collect(&self, event: &AgentEvent, _caps: &RuntimeCapabilities) -> SensorOutcome {
+        if event.kind != EventKind::PostToolUse {
+            return SensorOutcome::not_collected(
+                SignalAvailability::Unknown,
+                Some("not a PostToolUse event".to_string()),
+            );
+        }
+        let Some(resp) = &event.tool_response else {
+            return SensorOutcome::not_collected(
+                SignalAvailability::Unavailable,
+                Some("no tool_response present on this event".to_string()),
+            );
+        };
+        let start = resp.pointer("/time/start").and_then(|v| v.as_i64());
+        let end = resp.pointer("/time/end").and_then(|v| v.as_i64());
+        let (Some(start), Some(end)) = (start, end) else {
+            return SensorOutcome::not_collected(
+                SignalAvailability::Unavailable,
+                Some("no time.start/time.end fields on this tool_response".to_string()),
+            );
+        };
+
+        if end < start {
+            return SensorOutcome::not_collected(
+                SignalAvailability::CollectionFailed,
+                Some(format!(
+                    "time.end ({end}) is before time.start ({start}) — inconsistent timing data"
+                )),
+            );
+        }
+        let duration_ms = end - start;
+
+        SensorOutcome::collected(vec![Evidence {
+            id: Uuid::new_v4(),
+            session_id: event.session_id.clone(),
+            source_event_id: event.id,
+            kind: EvidenceKind::ProcessObservation,
+            observed_at: event.observed_at.clone(),
+            payload: serde_json::to_value(ProcessObservationPayload {
+                description: format!("tool call completed in {duration_ms}ms"),
+                observation: Some(ProcessObservationDetail::CommandDuration { duration_ms }),
+            })
+            .expect("ProcessObservationPayload always serializes"),
+            provenance: format!(
+                "opencode:{v}:tool.execute.after#time",
+                v = self.adapter_version
+            ),
+            source: Some(EvidenceSource::now(
+                self.name(),
+                self.trust_class(),
+                Some(Provider::OpenCode),
+                self.collection_method(),
+                self.collector_version(),
+            )),
+            extension: None,
+        }])
+    }
+}
+
 /// FORNX-158: the first real adapter usage of `ExtensionEnvelope` (neither
 /// Claude nor Codex populates it — see the fitness report). opencode's
 /// `tool.execute.after` payload carries fields with no home in
@@ -428,6 +552,11 @@ fn translate(
                 raw: native.clone(),
             };
             let caps = stamped_capabilities(adapter, &session_id);
+            // FORNX-302: loaded once per event; every sensor call below
+            // routes through `collect_with_disable_check` so a sensor named
+            // in `$FORNAX_HOME/config.toml`'s `[sensors].disabled` reports
+            // `SignalAvailability::Disabled` instead of running.
+            let sensor_config = SensorDisableConfig::load_default();
             let mut out = vec![
                 IngestMessage::Capabilities(caps.clone()),
                 IngestMessage::Event(event.clone()),
@@ -435,8 +564,23 @@ fn translate(
             let sensor = OpenCodeExitCodeSensor {
                 adapter_version: adapter.adapter_version(),
             };
-            let outcome = sensor.collect(&event, &caps);
+            let outcome = collect_with_disable_check(&sensor, &event, &caps, &sensor_config);
             out.extend(outcome.evidence.into_iter().map(IngestMessage::Evidence));
+
+            // FORNX-91: promote time.start/time.end (already reaching this
+            // adapter, previously only carried into the extension envelope)
+            // into canonical duration evidence.
+            let duration_sensor = OpenCodeCommandDurationSensor {
+                adapter_version: adapter.adapter_version(),
+            };
+            let duration_outcome =
+                collect_with_disable_check(&duration_sensor, &event, &caps, &sensor_config);
+            out.extend(
+                duration_outcome
+                    .evidence
+                    .into_iter()
+                    .map(IngestMessage::Evidence),
+            );
             NormalizationOutcome::Messages(out)
         }
         "event" => {
@@ -691,5 +835,102 @@ mod tests {
             }
             other => panic!("expected Capabilities, got {other:?}"),
         }
+    }
+
+    // --- FORNX-91: OpenCodeCommandDurationSensor ---------------------------
+
+    fn duration_event(tool_response: serde_json::Value) -> AgentEvent {
+        AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "ses-1".into(),
+            provider: Provider::OpenCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("bash".into()),
+            tool_input: Some(serde_json::json!({"command": "ls"})),
+            tool_response: Some(tool_response),
+            raw: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn duration_sensor_computes_duration_from_time_start_and_end() {
+        let event = duration_event(serde_json::json!({
+            "metadata": {"exit": 0},
+            "time": {"start": 1000, "end": 1250}
+        }));
+        let sensor = OpenCodeCommandDurationSensor {
+            adapter_version: ADAPTER_VERSION,
+        };
+        let outcome = sensor.collect(&event, &OpenCodeAdapter::new().probe());
+        assert!(outcome.has_evidence());
+        assert_eq!(outcome.state, SignalAvailability::Available);
+        let ev = &outcome.evidence[0];
+        assert_eq!(ev.kind, EvidenceKind::ProcessObservation);
+        assert_eq!(ev.payload["observation"]["duration_ms"], 250);
+        let source = ev.source.as_ref().expect("evidence must carry source");
+        assert_eq!(source.trust_class, TrustClass::AgentAdjacent);
+    }
+
+    #[test]
+    fn duration_sensor_reports_unavailable_when_time_fields_are_absent() {
+        // The real, empirically-captured `tool_execute_before_after_pair`
+        // fixture shape (FORNX-161) — no `time` field at all.
+        let event = duration_event(serde_json::json!({
+            "metadata": {"exit": 0},
+            "output": "total 0\n"
+        }));
+        let sensor = OpenCodeCommandDurationSensor {
+            adapter_version: ADAPTER_VERSION,
+        };
+        let outcome = sensor.collect(&event, &OpenCodeAdapter::new().probe());
+        assert!(!outcome.has_evidence());
+        assert_eq!(outcome.state, SignalAvailability::Unavailable);
+    }
+
+    #[test]
+    fn duration_sensor_reports_collection_failed_when_end_precedes_start() {
+        let event = duration_event(serde_json::json!({
+            "time": {"start": 2000, "end": 1000}
+        }));
+        let sensor = OpenCodeCommandDurationSensor {
+            adapter_version: ADAPTER_VERSION,
+        };
+        let outcome = sensor.collect(&event, &OpenCodeAdapter::new().probe());
+        assert!(!outcome.has_evidence());
+        assert_eq!(outcome.state, SignalAvailability::CollectionFailed);
+    }
+
+    #[test]
+    fn duration_sensor_reports_unavailable_with_no_tool_response() {
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "ses-1".into(),
+            provider: Provider::OpenCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("bash".into()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        let sensor = OpenCodeCommandDurationSensor {
+            adapter_version: ADAPTER_VERSION,
+        };
+        let outcome = sensor.collect(&event, &OpenCodeAdapter::new().probe());
+        assert!(!outcome.has_evidence());
+        assert_eq!(outcome.state, SignalAvailability::Unavailable);
+    }
+
+    #[test]
+    fn duration_sensor_ignores_non_post_tool_use_events() {
+        let mut event = duration_event(serde_json::json!({"time": {"start": 0, "end": 1}}));
+        event.kind = EventKind::PreToolUse;
+        let sensor = OpenCodeCommandDurationSensor {
+            adapter_version: ADAPTER_VERSION,
+        };
+        let outcome = sensor.collect(&event, &OpenCodeAdapter::new().probe());
+        assert!(!outcome.has_evidence());
+        assert_eq!(outcome.state, SignalAvailability::Unknown);
     }
 }

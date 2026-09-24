@@ -1,0 +1,22 @@
+[package]
+name = "fornax-ci"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fornax-types = { path = "../fornax-types" }
+serde.workspace = true
+serde_json.workspace = true
+# Blocking client: `EvidenceSensor::collect` (fornax-types) is a synchronous
+# trait method, matching every other sensor in this workspace — see this
+# crate's module docs for why the HTTP call is blocking rather than async.
+# The workspace `reqwest` dependency already exists (used by fornax-cli);
+# this crate additionally enables its "blocking" feature.
+reqwest = { workspace = true, features = ["blocking"] }
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]

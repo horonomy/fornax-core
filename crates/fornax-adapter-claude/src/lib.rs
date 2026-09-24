@@ -4,11 +4,13 @@
 //! JSON into canonical `fornax_types::IngestMessage`s.
 
 use fornax_types::{
-    AgentAdapter, AgentEvent, CapabilityProbe, Claim, CollectionMethod, EventKind, Evidence,
-    EvidenceKind, EvidenceSensor, EvidenceSource, IngestMessage, NormalizationOutcome,
-    ProcessObservationDetail, Provider, RuntimeCapabilities, SensorOutcome, SignalAvailability,
-    SignalClass, TrustClass, VcsOperation, VcsOutcome,
+    collect_with_disable_check, AgentAdapter, AgentEvent, CapabilityProbe, Claim, CollectionMethod,
+    EventKind, Evidence, EvidenceKind, EvidenceSensor, EvidenceSource, IngestMessage,
+    NormalizationOutcome, ProcessObservationDetail, Provider, RuntimeCapabilities,
+    SensorDisableConfig, SensorOutcome, SignalAvailability, SignalClass, TrustClass, VcsOperation,
+    VcsOutcome,
 };
+use std::path::PathBuf;
 use uuid::Uuid;
 
 /// This adapter implementation's own version — independent of the Claude
@@ -487,6 +489,261 @@ impl EvidenceSensor for ClaudeEditWriteDiffSensor {
     }
 }
 
+/// FORNX-91 "independent filesystem evidence" sensor: cross-checks a claimed
+/// Edit/Write/MultiEdit against the *actual* file on disk, independent of
+/// anything Claude Code itself reported.
+///
+/// Unlike [`ClaudeEditWriteDiffSensor`] (which reconstructs a diff-*shaped*
+/// string purely from `tool_input` — Claude's own account of what it wrote,
+/// `TrustClass::AgentAdjacent`), this sensor calls `std::fs::metadata` on the
+/// claimed path itself, on the same host the Fornax daemon and the Claude
+/// Code process both run on (`docs/adr/0001-architecture-invariants.md`'s
+/// "no cloud dependency on the local critical path") — `TrustClass::
+/// HostObserved`.
+///
+/// **Deliberately not a `git`-based sensor.** A working-tree `git status`/
+/// `git diff` observation was the original design for this ticket, but it
+/// is blocked by two independent constraints: `crates/fornax-daemon/tests/
+/// adversarial_daemon_input.rs::subprocess_surface_is_still_zero_in_production_code`
+/// (FORNX-238) asserts a zero subprocess-spawn surface (no `std` process-
+/// spawning API, no shell `-c` invocation) across every production module
+/// in this workspace, and
+/// `docs/contributing/adding-an-adapter.md`'s "Allowed core dependencies"
+/// restricts an adapter crate to depending on `fornax-types` only, which
+/// rules out a pure-Rust git library (`gix`/`git2`) as an in-process
+/// alternative. A real git-backed sensor therefore needs either a new
+/// non-adapter crate carrying that dependency or an ADR amendment — noted
+/// as follow-up scope for FORNX-91, not silently worked around here.
+///
+/// `EvidenceSource::provider` is `Some(ClaudeCode)` here — accurate, since
+/// this sensor runs under that adapter connection — even though what it
+/// measures (the real filesystem) is independent of what Claude Code
+/// reported.
+///
+/// **What it can observe**: whether the claimed path exists at all, and
+/// (from the same `std::fs::Metadata` call, no second syscall) whether its
+/// modification time is recent enough to be consistent with this specific
+/// tool call having just run, using a generous tolerance window — this
+/// sensor cannot know the exact moment the write syscall completed, only
+/// that it should be close to `AgentEvent::observed_at`.
+/// **What it cannot observe**: file *content* correctness (only
+/// existence/mtime), a change later reverted before this sensor runs (looks
+/// identical to "never happened" from mtime alone once enough time passes),
+/// or anything when the host clock and the claimed-observation clock are
+/// skewed by more than the tolerance window.
+struct ClaudeFileWriteConfirmedSensor {
+    adapter_version: &'static str,
+    /// How far a file's mtime may lag (or lead, under clock skew)
+    /// `AgentEvent::observed_at` and still count as consistent with the
+    /// claim. A named field, not a magic number inlined at the comparison
+    /// site — see [`Self::with_default_tolerance`] for the value this
+    /// sensor is actually constructed with.
+    tolerance: chrono::Duration,
+}
+
+impl ClaudeFileWriteConfirmedSensor {
+    fn with_default_tolerance(adapter_version: &'static str) -> Self {
+        Self {
+            adapter_version,
+            // Generous on purpose: this sensor only needs to catch "this
+            // path was never touched" or "this path was last touched days
+            // ago", not to measure precise latency.
+            tolerance: chrono::Duration::seconds(300),
+        }
+    }
+
+    /// Same precedence as [`ClaudeEditWriteDiffSensor::collect`]'s path
+    /// extraction: `tool_response`'s `filePath`/`file_path`, falling back to
+    /// `tool_input.file_path`. `pub(crate)` so [`ClaudeGitWorkingTreeSensor`]
+    /// (FORNX-302) can reuse the exact same extraction rather than
+    /// duplicating it a third time.
+    pub(crate) fn claimed_path(event: &AgentEvent) -> Option<&str> {
+        let resp = event.tool_response.as_ref()?;
+        resp.get("filePath")
+            .and_then(|v| v.as_str())
+            .or_else(|| resp.get("file_path").and_then(|v| v.as_str()))
+            .or_else(|| {
+                event
+                    .tool_input
+                    .as_ref()
+                    .and_then(|ti| ti.get("file_path"))
+                    .and_then(|v| v.as_str())
+            })
+    }
+
+    fn build_evidence(
+        &self,
+        event: &AgentEvent,
+        path: &str,
+        exists: bool,
+        modified_at: Option<String>,
+        consistent_with_claim: bool,
+    ) -> Evidence {
+        let description = if !exists {
+            format!("host filesystem shows no file at claimed path {path}")
+        } else if consistent_with_claim {
+            format!("host filesystem confirms {path} was written consistent with the claim")
+        } else {
+            format!(
+                "host filesystem shows {path} exists but its modification time is not \
+                 consistent with this claim"
+            )
+        };
+
+        Evidence {
+            id: Uuid::new_v4(),
+            session_id: event.session_id.clone(),
+            source_event_id: event.id,
+            kind: EvidenceKind::ProcessObservation,
+            observed_at: event.observed_at.clone(),
+            payload: serde_json::to_value(fornax_types::ProcessObservationPayload {
+                description,
+                observation: Some(ProcessObservationDetail::FileWriteObserved {
+                    claimed_path: path.to_string(),
+                    exists,
+                    modified_at,
+                    consistent_with_claim,
+                }),
+            })
+            .expect("ProcessObservationPayload always serializes"),
+            provenance: format!(
+                "claude_code:{v}:PostToolUse:{tool}#host_observed:fs_metadata",
+                v = self.adapter_version,
+                tool = event.tool_name.as_deref().unwrap_or("")
+            ),
+            source: Some(EvidenceSource::now(
+                self.name(),
+                self.trust_class(),
+                Some(Provider::ClaudeCode),
+                self.collection_method(),
+                self.collector_version(),
+            )),
+            extension: None,
+        }
+    }
+}
+
+impl EvidenceSensor for ClaudeFileWriteConfirmedSensor {
+    fn name(&self) -> &'static str {
+        "claude_file_write_confirmed_sensor_v1"
+    }
+
+    fn required_capabilities(&self) -> &'static [SignalClass] {
+        // Needed to learn *what was claimed* (the file path), not to read
+        // the filesystem — the `std::fs::metadata` call below needs no
+        // provider capability at all.
+        &[SignalClass::ToolResultPayload]
+    }
+
+    fn trust_class(&self) -> TrustClass {
+        TrustClass::HostObserved
+    }
+
+    fn collection_method(&self) -> CollectionMethod {
+        // `ProcessObservation`'s doc names a literal `git` invocation as its
+        // example, but its defining contrast is "Fornax's own host-side
+        // [...] as opposed to reading something a provider produced" — a
+        // direct filesystem read fits that same contrast exactly, and no
+        // other variant does (same kind of reasonable broadening
+        // `OpenCodeExitCodeSensor::collection_method` already documents for
+        // `HookCallback`).
+        CollectionMethod::ProcessObservation
+    }
+
+    fn collector_version(&self) -> Option<String> {
+        Some(self.adapter_version.to_string())
+    }
+
+    fn collect(&self, event: &AgentEvent, _caps: &RuntimeCapabilities) -> SensorOutcome {
+        let is_target_tool = matches!(
+            event.tool_name.as_deref(),
+            Some("Edit") | Some("Write") | Some("MultiEdit")
+        );
+        if event.kind != EventKind::PostToolUse || !is_target_tool {
+            return SensorOutcome::not_collected(
+                SignalAvailability::Unknown,
+                Some("not an Edit/Write/MultiEdit PostToolUse event".to_string()),
+            );
+        }
+
+        if event.tool_response.is_none() {
+            return SensorOutcome::not_collected(
+                SignalAvailability::Unavailable,
+                Some("no tool_response present on this event".to_string()),
+            );
+        }
+
+        let Some(path) = Self::claimed_path(event) else {
+            return SensorOutcome::not_collected(
+                SignalAvailability::Unavailable,
+                Some("no file path found in tool_response or tool_input".to_string()),
+            );
+        };
+
+        let meta = match std::fs::metadata(path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // A genuine, useful negative: the claimed path does not
+                // exist on disk at all — collected, not discarded, per
+                // `SensorOutcome`'s "partial/negative collection is still
+                // collection" contract.
+                return SensorOutcome::collected(vec![
+                    self.build_evidence(event, path, false, None, false)
+                ]);
+            }
+            Err(e) => {
+                return SensorOutcome::not_collected(
+                    SignalAvailability::CollectionFailed,
+                    Some(format!("failed to stat {path}: {e}")),
+                );
+            }
+        };
+
+        let Ok(modified) = meta.modified() else {
+            return SensorOutcome::not_collected(
+                SignalAvailability::CollectionFailed,
+                Some(format!(
+                    "filesystem/platform does not report a modification time for {path}"
+                )),
+            );
+        };
+        let modified_at: chrono::DateTime<chrono::Utc> = modified.into();
+
+        let consistent = match chrono::DateTime::parse_from_rfc3339(&event.observed_at) {
+            Ok(observed_at) => {
+                let observed_at = observed_at.with_timezone(&chrono::Utc);
+                let delta = observed_at - modified_at;
+                // The file may have been written slightly before the hook
+                // fired (delta > 0, bounded by `tolerance`) or, under clock
+                // skew, appear to land slightly after it (delta < 0,
+                // likewise bounded) — both directions are tolerated
+                // symmetrically rather than assuming which clock is ahead.
+                delta <= self.tolerance && delta >= -self.tolerance
+            }
+            Err(e) => {
+                // `translate()` always stamps a parseable RFC3339
+                // `observed_at`, so this is unreachable in production —
+                // still handled honestly rather than fabricating a timing
+                // verdict, matching the sibling `meta.modified()` failure
+                // branch above: a check that couldn't run is a collection
+                // failure, not a silent pass.
+                return SensorOutcome::not_collected(
+                    SignalAvailability::CollectionFailed,
+                    Some(format!("event.observed_at is not valid RFC3339: {e}")),
+                );
+            }
+        };
+
+        SensorOutcome::collected(vec![self.build_evidence(
+            event,
+            path,
+            true,
+            Some(modified_at.to_rfc3339()),
+            consistent,
+        )])
+    }
+}
+
 /// FORNX-14 "git commit/push claim" class: parses `git commit`/`git push`
 /// output from a Bash `tool_response` into structured `VcsOperation`
 /// evidence.
@@ -772,6 +1029,164 @@ impl EvidenceSensor for ClaudeGitOutcomeSensor {
     }
 }
 
+/// FORNX-302 "git-native working-tree cross-check" sensor: cross-checks a
+/// claimed Edit/Write/MultiEdit against the *real git working tree*,
+/// queried in-process via `fornax-vcs` (no subprocess spawn — see that
+/// crate's module docs for why it exists as a standalone crate).
+///
+/// Genuinely new signal, not a restatement of either existing sensor for
+/// the same event class:
+/// - [`ClaudeFileWriteConfirmedSensor`] (FORNX-91) only calls
+///   `std::fs::metadata` — it has no notion of git at all, so it cannot
+///   tell "written and already committed" apart from "written and still
+///   dirty".
+/// - [`ClaudeGitOutcomeSensor`] (FORNX-14) parses Claude Code's own reported
+///   `git commit`/`git push` stdout for a *separate* Bash tool call — it
+///   never queries the actual working tree, and produces no evidence at all
+///   unless the agent happened to run one of those two commands.
+///
+/// This sensor instead asks git itself, independent of both: is the
+/// claimed path currently dirty (uncommitted, unstaged, or untracked)
+/// relative to `HEAD`, and what is `HEAD` right now? `TrustClass::
+/// HostObserved`, matching `ClaudeFileWriteConfirmedSensor`'s reasoning —
+/// measured directly by Fornax's own local tooling, independent of what the
+/// agent claims happened.
+struct ClaudeGitWorkingTreeSensor {
+    adapter_version: &'static str,
+}
+
+impl ClaudeGitWorkingTreeSensor {
+    fn build_evidence(
+        &self,
+        event: &AgentEvent,
+        path: &str,
+        status: &fornax_vcs::PathStatus,
+        path_is_dirty: bool,
+    ) -> Evidence {
+        // Deliberately not phrased as "clean" — `path_is_dirty: false` also
+        // covers "never written" and "gitignored", not only "committed and
+        // unmodified"; see `fornax_vcs::PathStatus::is_dirty`'s doc for the
+        // exact boundary this sensor inherits.
+        let description = if path_is_dirty {
+            format!("git working tree shows {path} as dirty (uncommitted, unstaged, or untracked)")
+        } else {
+            format!("git's status walk reports no pending change for {path}")
+        };
+
+        Evidence {
+            id: Uuid::new_v4(),
+            session_id: event.session_id.clone(),
+            source_event_id: event.id,
+            kind: EvidenceKind::ProcessObservation,
+            observed_at: event.observed_at.clone(),
+            payload: serde_json::to_value(fornax_types::ProcessObservationPayload {
+                description,
+                observation: Some(ProcessObservationDetail::WorkingTreeStatusObserved {
+                    claimed_path: path.to_string(),
+                    is_repo: status.is_repo,
+                    head_commit: status.head_commit.clone(),
+                    path_is_dirty,
+                }),
+            })
+            .expect("ProcessObservationPayload always serializes"),
+            provenance: format!(
+                "claude_code:{v}:PostToolUse:{tool}#host_observed:git_working_tree",
+                v = self.adapter_version,
+                tool = event.tool_name.as_deref().unwrap_or("")
+            ),
+            source: Some(EvidenceSource::now(
+                self.name(),
+                self.trust_class(),
+                Some(Provider::ClaudeCode),
+                self.collection_method(),
+                self.collector_version(),
+            )),
+            extension: None,
+        }
+    }
+}
+
+impl EvidenceSensor for ClaudeGitWorkingTreeSensor {
+    fn name(&self) -> &'static str {
+        "claude_git_working_tree_sensor_v1"
+    }
+
+    fn required_capabilities(&self) -> &'static [SignalClass] {
+        // Same reasoning as `ClaudeFileWriteConfirmedSensor`: needed to
+        // learn the claimed path, not to query git — the `fornax_vcs` call
+        // below needs no provider capability at all.
+        &[SignalClass::ToolResultPayload]
+    }
+
+    fn trust_class(&self) -> TrustClass {
+        TrustClass::HostObserved
+    }
+
+    fn collection_method(&self) -> CollectionMethod {
+        CollectionMethod::ProcessObservation
+    }
+
+    fn collector_version(&self) -> Option<String> {
+        Some(self.adapter_version.to_string())
+    }
+
+    fn collect(&self, event: &AgentEvent, _caps: &RuntimeCapabilities) -> SensorOutcome {
+        let is_target_tool = matches!(
+            event.tool_name.as_deref(),
+            Some("Edit") | Some("Write") | Some("MultiEdit")
+        );
+        if event.kind != EventKind::PostToolUse || !is_target_tool {
+            return SensorOutcome::not_collected(
+                SignalAvailability::Unknown,
+                Some("not an Edit/Write/MultiEdit PostToolUse event".to_string()),
+            );
+        }
+
+        if event.tool_response.is_none() {
+            return SensorOutcome::not_collected(
+                SignalAvailability::Unavailable,
+                Some("no tool_response present on this event".to_string()),
+            );
+        }
+
+        let Some(path) = ClaudeFileWriteConfirmedSensor::claimed_path(event) else {
+            return SensorOutcome::not_collected(
+                SignalAvailability::Unavailable,
+                Some("no file path found in tool_response or tool_input".to_string()),
+            );
+        };
+
+        let path_buf = PathBuf::from(path);
+        // `fornax_vcs::path_status` restricts the underlying git status
+        // walk to this one path (a pathspec) rather than the whole working
+        // tree — see that function's doc for why that matters on a hook
+        // that fires on every single Edit/Write/MultiEdit.
+        let status = match fornax_vcs::path_status(&path_buf) {
+            Ok(status) => status,
+            Err(e) => {
+                return SensorOutcome::not_collected(
+                    SignalAvailability::CollectionFailed,
+                    Some(format!("git working-tree query failed for {path}: {e}")),
+                );
+            }
+        };
+
+        if !status.is_repo {
+            return SensorOutcome::not_collected(
+                SignalAvailability::Unavailable,
+                Some(format!("{path} is not inside a git working tree")),
+            );
+        }
+
+        SensorOutcome::collected(vec![self.build_evidence(
+            event,
+            path,
+            &status,
+            status.is_dirty,
+        )])
+    }
+}
+
 fn translate(
     adapter: &ClaudeAdapter,
     session_hint: &str,
@@ -842,6 +1257,11 @@ fn translate(
     // the daemon never learns this session can expose exit-code evidence,
     // and every claim resolves Unavailable regardless of Evidence present.
     let caps = stamped_capabilities(adapter, &session_id);
+    // FORNX-302: loaded once per event, not once per sensor — every sensor
+    // call below routes through `collect_with_disable_check` so a sensor
+    // named in `$FORNAX_HOME/config.toml`'s `[sensors].disabled` reports
+    // `SignalAvailability::Disabled` instead of running.
+    let sensor_config = SensorDisableConfig::load_default();
     let mut out = vec![
         IngestMessage::Capabilities(caps.clone()),
         IngestMessage::Event(event.clone()),
@@ -857,7 +1277,7 @@ fn translate(
         let sensor = ClaudeBashExitCodeSensor {
             adapter_version: adapter.adapter_version(),
         };
-        let outcome = sensor.collect(&event, &caps);
+        let outcome = collect_with_disable_check(&sensor, &event, &caps, &sensor_config);
         out.extend(outcome.evidence.into_iter().map(IngestMessage::Evidence));
     }
 
@@ -873,8 +1293,38 @@ fn translate(
         let sensor = ClaudeEditWriteDiffSensor {
             adapter_version: adapter.adapter_version(),
         };
-        let outcome = sensor.collect(&event, &caps);
+        let outcome = collect_with_disable_check(&sensor, &event, &caps, &sensor_config);
         out.extend(outcome.evidence.into_iter().map(IngestMessage::Evidence));
+
+        // FORNX-91: independent host-filesystem corroboration/contradiction
+        // for the same Edit/Write/MultiEdit claim — see
+        // `ClaudeFileWriteConfirmedSensor` for why this is `TrustClass::
+        // HostObserved` rather than a second heuristic reading of
+        // `tool_input`.
+        let host_sensor =
+            ClaudeFileWriteConfirmedSensor::with_default_tolerance(adapter.adapter_version());
+        let host_outcome = collect_with_disable_check(&host_sensor, &event, &caps, &sensor_config);
+        out.extend(
+            host_outcome
+                .evidence
+                .into_iter()
+                .map(IngestMessage::Evidence),
+        );
+
+        // FORNX-302: git-native working-tree cross-check for the same
+        // claim — see `ClaudeGitWorkingTreeSensor` for why this is genuinely
+        // new signal, not a restatement of the host-filesystem sensor above
+        // or `ClaudeGitOutcomeSensor` below.
+        let vcs_sensor = ClaudeGitWorkingTreeSensor {
+            adapter_version: adapter.adapter_version(),
+        };
+        let vcs_outcome = collect_with_disable_check(&vcs_sensor, &event, &caps, &sensor_config);
+        out.extend(
+            vcs_outcome
+                .evidence
+                .into_iter()
+                .map(IngestMessage::Evidence),
+        );
     }
 
     // PostToolUse for a Bash call whose command looks like `git commit`/
@@ -886,7 +1336,7 @@ fn translate(
         let sensor = ClaudeGitOutcomeSensor {
             adapter_version: adapter.adapter_version(),
         };
-        let outcome = sensor.collect(&event, &caps);
+        let outcome = collect_with_disable_check(&sensor, &event, &caps, &sensor_config);
         out.extend(outcome.evidence.into_iter().map(IngestMessage::Evidence));
     }
 
@@ -1229,6 +1679,24 @@ mod tests {
 
     // --- FORNX-14: ClaudeEditWriteDiffSensor -------------------------------
 
+    /// Finds the first `FileDiff` evidence message — used instead of a fixed
+    /// `msgs[2]` index because FORNX-91's `ClaudeFileWriteConfirmedSensor`
+    /// now also fires on every Edit/Write/MultiEdit event with a
+    /// `tool_response`, adding a second (`ProcessObservation`) evidence
+    /// message after this one. These fixtures' paths (`/repo/...`) don't
+    /// exist on the real filesystem the test runs on, so that second
+    /// message is an honest `exists: false` observation — itself proof the
+    /// new sensor is independent of `tool_input`/`tool_response` content —
+    /// not a regression in this sensor's own behavior.
+    fn file_diff_evidence(msgs: &[IngestMessage]) -> &Evidence {
+        msgs.iter()
+            .find_map(|m| match m {
+                IngestMessage::Evidence(ev) if ev.kind == EvidenceKind::FileDiff => Some(ev),
+                _ => None,
+            })
+            .expect("expected a FileDiff Evidence message")
+    }
+
     #[test]
     fn post_tool_use_edit_produces_file_diff_evidence() {
         let raw = serde_json::json!({
@@ -1243,18 +1711,13 @@ mod tests {
             "tool_response": {"filePath": "/repo/src/lib.rs"}
         });
         let msgs = normalize(&raw).into_messages();
-        assert_eq!(msgs.len(), 3);
-        match &msgs[2] {
-            IngestMessage::Evidence(ev) => {
-                assert_eq!(ev.kind, EvidenceKind::FileDiff);
-                assert_eq!(ev.payload["path"], "/repo/src/lib.rs");
-                let diff = ev.payload["diff"].as_str().unwrap();
-                assert!(diff.contains("-fn old() {}"));
-                assert!(diff.contains("+fn new() {}"));
-                assert!(ev.provenance.ends_with("#heuristic:tool_input"));
-            }
-            other => panic!("expected Evidence, got {other:?}"),
-        }
+        assert_eq!(msgs.len(), 4);
+        let ev = file_diff_evidence(&msgs);
+        assert_eq!(ev.payload["path"], "/repo/src/lib.rs");
+        let diff = ev.payload["diff"].as_str().unwrap();
+        assert!(diff.contains("-fn old() {}"));
+        assert!(diff.contains("+fn new() {}"));
+        assert!(ev.provenance.ends_with("#heuristic:tool_input"));
     }
 
     #[test]
@@ -1270,18 +1733,13 @@ mod tests {
             "tool_response": {"filePath": "/repo/src/new_file.rs"}
         });
         let msgs = normalize(&raw).into_messages();
-        assert_eq!(msgs.len(), 3);
-        match &msgs[2] {
-            IngestMessage::Evidence(ev) => {
-                assert_eq!(ev.kind, EvidenceKind::FileDiff);
-                let diff = ev.payload["diff"].as_str().unwrap();
-                assert!(diff.contains("+line one"));
-                assert!(diff.contains("+line two"));
-                assert!(!diff.contains('-'));
-                assert!(ev.provenance.ends_with("#heuristic:tool_input"));
-            }
-            other => panic!("expected Evidence, got {other:?}"),
-        }
+        assert_eq!(msgs.len(), 4);
+        let ev = file_diff_evidence(&msgs);
+        let diff = ev.payload["diff"].as_str().unwrap();
+        assert!(diff.contains("+line one"));
+        assert!(diff.contains("+line two"));
+        assert!(!diff.contains('-'));
+        assert!(ev.provenance.ends_with("#heuristic:tool_input"));
     }
 
     #[test]
@@ -1300,20 +1758,15 @@ mod tests {
             "tool_response": {"filePath": "/repo/src/lib.rs"}
         });
         let msgs = normalize(&raw).into_messages();
-        assert_eq!(msgs.len(), 3);
-        match &msgs[2] {
-            IngestMessage::Evidence(ev) => {
-                assert_eq!(ev.kind, EvidenceKind::FileDiff);
-                let diff = ev.payload["diff"].as_str().unwrap();
-                assert!(diff.contains("-a1"));
-                assert!(diff.contains("+a2"));
-                assert!(diff.contains("-b1"));
-                assert!(diff.contains("+b2"));
-            }
-            other => panic!("expected Evidence, got {other:?}"),
-        }
-        // Single evidence entry, not one per edit.
-        assert_eq!(msgs.len(), 3);
+        let ev = file_diff_evidence(&msgs);
+        let diff = ev.payload["diff"].as_str().unwrap();
+        assert!(diff.contains("-a1"));
+        assert!(diff.contains("+a2"));
+        assert!(diff.contains("-b1"));
+        assert!(diff.contains("+b2"));
+        // Single FileDiff evidence entry, not one per edit (plus FORNX-91's
+        // independent filesystem observation alongside it).
+        assert_eq!(msgs.len(), 4);
     }
 
     #[test]
@@ -1380,6 +1833,364 @@ mod tests {
             IngestMessage::Evidence(ev) => assert_eq!(ev.kind, EvidenceKind::ExitCode),
             other => panic!("expected Evidence, got {other:?}"),
         }
+    }
+
+    // --- FORNX-91: ClaudeFileWriteConfirmedSensor --------------------------
+    //
+    // No subprocess spawning anywhere in this module: FORNX-238's
+    // `subprocess_surface_is_still_zero_in_production_code` invariant
+    // (`crates/fornax-daemon/tests/adversarial_daemon_input.rs`) scans every
+    // production `.rs` file in the workspace, including files under `src/`
+    // that only contain `#[cfg(test)]` code — so these fixtures use
+    // `std::fs` only, matching the sensor under test.
+
+    /// Creates a fresh temp file (named with a `Uuid` for uniqueness,
+    /// matching how the rest of this crate already depends on `uuid` — no
+    /// new test-only dependency needed) and returns its absolute path.
+    /// Callers must remove it when done.
+    fn temp_file(contents: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("fornax-fornx91-{}.txt", Uuid::new_v4()));
+        std::fs::write(&path, contents).expect("write temp file");
+        path
+    }
+
+    fn file_write_event(tool_name: &str, file_path: &str, observed_at: &str) -> AgentEvent {
+        AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "sess-1".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: observed_at.into(),
+            tool_name: Some(tool_name.into()),
+            tool_input: Some(serde_json::json!({"file_path": file_path})),
+            tool_response: Some(serde_json::json!({"filePath": file_path})),
+            raw: serde_json::json!({}),
+        }
+    }
+
+    /// Real success case: the claimed path genuinely exists and was just
+    /// modified — `exists: true`, `consistent_with_claim: true`,
+    /// `TrustClass::HostObserved`, independent of any provider-reported
+    /// claim content.
+    #[test]
+    fn file_write_confirmed_sensor_confirms_a_genuinely_written_file() {
+        let file = temp_file("changed\n");
+        let observed_at = chrono::Utc::now().to_rfc3339();
+        let event = file_write_event("Write", file.to_str().unwrap(), &observed_at);
+        let sensor = ClaudeFileWriteConfirmedSensor::with_default_tolerance(ADAPTER_VERSION);
+        let outcome = sensor.collect(&event, &ClaudeAdapter.probe());
+
+        std::fs::remove_file(&file).ok();
+
+        assert!(outcome.has_evidence());
+        assert_eq!(outcome.state, SignalAvailability::Available);
+        let ev = &outcome.evidence[0];
+        assert_eq!(ev.kind, EvidenceKind::ProcessObservation);
+        let source = ev.source.as_ref().expect("evidence must carry source");
+        assert_eq!(source.trust_class, fornax_types::TrustClass::HostObserved);
+        assert_eq!(
+            source.collection_method,
+            fornax_types::CollectionMethod::ProcessObservation
+        );
+        assert_eq!(ev.payload["observation"]["exists"], true);
+        assert_eq!(ev.payload["observation"]["consistent_with_claim"], true);
+    }
+
+    /// Honest negative: the claimed path does not exist at all on disk —
+    /// the sensor must say so, never silently omit evidence just because
+    /// the claim didn't pan out.
+    #[test]
+    fn file_write_confirmed_sensor_reports_exists_false_for_a_missing_path() {
+        let observed_at = chrono::Utc::now().to_rfc3339();
+        let event = file_write_event(
+            "Edit",
+            "/nonexistent/fornax-fornx91-missing-path.txt",
+            &observed_at,
+        );
+        let sensor = ClaudeFileWriteConfirmedSensor::with_default_tolerance(ADAPTER_VERSION);
+        let outcome = sensor.collect(&event, &ClaudeAdapter.probe());
+
+        assert!(outcome.has_evidence());
+        assert_eq!(outcome.state, SignalAvailability::Available);
+        let ev = &outcome.evidence[0];
+        assert_eq!(ev.payload["observation"]["exists"], false);
+        assert_eq!(ev.payload["observation"]["consistent_with_claim"], false);
+        assert!(ev.payload["observation"]["modified_at"].is_null());
+    }
+
+    /// A stat error that is *not* "path doesn't exist" (e.g. treating a
+    /// plain file as if it were a directory, which yields `ENOTDIR`, not
+    /// `NotFound`) must be reported as `CollectionFailed`, distinct from
+    /// the honest `exists: false` negative above — a failed attempt is not
+    /// the same claim as a confirmed absence.
+    #[test]
+    fn file_write_confirmed_sensor_reports_collection_failed_on_a_non_not_found_stat_error() {
+        let file = temp_file("not a directory\n");
+        let bogus_child = file.join("child");
+        let observed_at = chrono::Utc::now().to_rfc3339();
+        let event = file_write_event("Write", bogus_child.to_str().unwrap(), &observed_at);
+        let sensor = ClaudeFileWriteConfirmedSensor::with_default_tolerance(ADAPTER_VERSION);
+        let outcome = sensor.collect(&event, &ClaudeAdapter.probe());
+
+        std::fs::remove_file(&file).ok();
+
+        assert!(!outcome.has_evidence());
+        assert_eq!(outcome.state, SignalAvailability::CollectionFailed);
+    }
+
+    /// The file exists but was last modified far outside the tolerance
+    /// window around `observed_at` — a stale file must not be reported as
+    /// consistent with a claim that it was *just* written.
+    #[test]
+    fn file_write_confirmed_sensor_reports_inconsistent_for_a_stale_file() {
+        let file = temp_file("stale\n");
+        let sensor = ClaudeFileWriteConfirmedSensor::with_default_tolerance(ADAPTER_VERSION);
+        // Well outside the sensor's own tolerance window in either
+        // direction, relative to the file's real mtime (now) — derived from
+        // `sensor.tolerance` rather than a hardcoded duration, so this test
+        // stays correct if the default tolerance is ever retuned.
+        let observed_at = (chrono::Utc::now() + sensor.tolerance * 2).to_rfc3339();
+        let event = file_write_event("Write", file.to_str().unwrap(), &observed_at);
+        let outcome = sensor.collect(&event, &ClaudeAdapter.probe());
+
+        std::fs::remove_file(&file).ok();
+
+        assert!(outcome.has_evidence());
+        let ev = &outcome.evidence[0];
+        assert_eq!(ev.payload["observation"]["exists"], true);
+        assert_eq!(ev.payload["observation"]["consistent_with_claim"], false);
+    }
+
+    #[test]
+    fn file_write_confirmed_sensor_reports_unavailable_with_no_tool_response() {
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "sess-1".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("Edit".into()),
+            tool_input: Some(serde_json::json!({"file_path": "/tmp/x"})),
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        let sensor = ClaudeFileWriteConfirmedSensor::with_default_tolerance(ADAPTER_VERSION);
+        let outcome = sensor.collect(&event, &ClaudeAdapter.probe());
+        assert!(!outcome.has_evidence());
+        assert_eq!(outcome.state, SignalAvailability::Unavailable);
+    }
+
+    #[test]
+    fn file_write_confirmed_sensor_ignores_non_edit_write_events() {
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "sess-1".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("Bash".into()),
+            tool_input: Some(serde_json::json!({"command": "pytest"})),
+            tool_response: Some(serde_json::json!({"exit_code": 0})),
+            raw: serde_json::json!({}),
+        };
+        let sensor = ClaudeFileWriteConfirmedSensor::with_default_tolerance(ADAPTER_VERSION);
+        let outcome = sensor.collect(&event, &ClaudeAdapter.probe());
+        assert!(!outcome.has_evidence());
+        assert_eq!(outcome.state, SignalAvailability::Unknown);
+    }
+
+    // --- FORNX-302: ClaudeGitWorkingTreeSensor -----------------------------
+    //
+    // No subprocess spawning anywhere in this module — same invariant noted
+    // above `ClaudeFileWriteConfirmedSensor`'s fixtures: `fornax-vcs` is a
+    // pure in-process git implementation (`gix`), never a `git` binary.
+
+    /// A fresh temp directory (named with a `Uuid` for uniqueness, matching
+    /// `ClaudeFileWriteConfirmedSensor::temp_file`'s existing precedent —
+    /// no new test-only dependency needed). Callers must remove it when
+    /// done.
+    fn temp_repo_dir() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("fornax-fornx302-{}", Uuid::new_v4()))
+    }
+
+    #[test]
+    fn git_working_tree_sensor_reports_a_dirty_untracked_file() {
+        let dir = temp_repo_dir();
+        std::fs::create_dir_all(&dir).expect("create temp repo dir");
+        gix::init(&dir).expect("gix::init");
+        let file = dir.join("claimed.txt");
+        std::fs::write(&file, "hello\n").expect("write claimed file");
+
+        let observed_at = chrono::Utc::now().to_rfc3339();
+        let event = file_write_event("Write", file.to_str().unwrap(), &observed_at);
+        let sensor = ClaudeGitWorkingTreeSensor {
+            adapter_version: ADAPTER_VERSION,
+        };
+        let outcome = sensor.collect(&event, &ClaudeAdapter.probe());
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(outcome.has_evidence());
+        assert_eq!(outcome.state, SignalAvailability::Available);
+        let ev = &outcome.evidence[0];
+        assert_eq!(ev.kind, EvidenceKind::ProcessObservation);
+        let source = ev.source.as_ref().expect("evidence must carry source");
+        assert_eq!(source.trust_class, fornax_types::TrustClass::HostObserved);
+        assert_eq!(
+            source.collection_method,
+            fornax_types::CollectionMethod::ProcessObservation
+        );
+        assert_eq!(ev.payload["observation"]["is_repo"], true);
+        assert_eq!(ev.payload["observation"]["path_is_dirty"], true);
+        assert!(ev.payload["observation"]["head_commit"].is_null());
+    }
+
+    /// Real matching "clean" case: a freshly initialized repo with no
+    /// commits and no working-tree changes at all is genuinely clean — the
+    /// sensor must not fabricate dirtiness just because the claimed path
+    /// happens to sit inside a repo.
+    #[test]
+    fn git_working_tree_sensor_reports_clean_for_a_committed_unmodified_file() {
+        // Real "clean" per the task brief: committed, indexed, and the
+        // working-tree copy is byte-identical — not merely "a repo with
+        // nothing in it yet" (which is trivially "clean" only because
+        // there is nothing to compare against).
+        let dir = temp_repo_dir();
+        std::fs::create_dir_all(&dir).expect("create temp repo dir");
+        std::env::set_var("GIT_AUTHOR_NAME", "Fornax Test");
+        std::env::set_var("GIT_AUTHOR_EMAIL", "fornax-test@example.invalid");
+        std::env::set_var("GIT_COMMITTER_NAME", "Fornax Test");
+        std::env::set_var("GIT_COMMITTER_EMAIL", "fornax-test@example.invalid");
+
+        let repo = gix::init(&dir).expect("gix::init");
+        let file = dir.join("claimed.txt");
+        std::fs::write(&file, "hello\n").expect("write working-tree file");
+        let blob_id = repo
+            .write_blob(b"hello\n".as_slice())
+            .expect("write blob")
+            .detach();
+        let tree = gix::objs::Tree {
+            entries: vec![gix::objs::tree::Entry {
+                mode: gix::objs::tree::EntryKind::Blob.into(),
+                filename: "claimed.txt".into(),
+                oid: blob_id,
+            }],
+        };
+        let tree_id = repo.write_object(&tree).expect("write tree").detach();
+        repo.commit(
+            "HEAD",
+            "initial commit",
+            tree_id,
+            std::iter::empty::<gix::ObjectId>(),
+        )
+        .expect("commit");
+        let index_state = gix::index::State::from_tree(&tree_id, &repo.objects, Default::default())
+            .expect("build index state from tree");
+        let mut index_file =
+            gix::index::File::from_state(index_state, repo.git_dir().join("index"));
+        index_file
+            .write(gix::index::write::Options::default())
+            .expect("persist index");
+
+        let observed_at = chrono::Utc::now().to_rfc3339();
+        let event = file_write_event("Write", file.to_str().unwrap(), &observed_at);
+        let sensor = ClaudeGitWorkingTreeSensor {
+            adapter_version: ADAPTER_VERSION,
+        };
+        let outcome = sensor.collect(&event, &ClaudeAdapter.probe());
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(outcome.has_evidence());
+        let ev = &outcome.evidence[0];
+        assert_eq!(ev.payload["observation"]["is_repo"], true);
+        assert_eq!(ev.payload["observation"]["path_is_dirty"], false);
+        assert!(ev.payload["observation"]["head_commit"].is_string());
+    }
+
+    #[test]
+    fn git_working_tree_sensor_reports_unavailable_outside_any_git_repo() {
+        let dir = temp_repo_dir();
+        std::fs::create_dir_all(&dir).expect("create temp non-repo dir");
+        let file = dir.join("claimed.txt");
+        std::fs::write(&file, "hello\n").expect("write claimed file");
+
+        let observed_at = chrono::Utc::now().to_rfc3339();
+        let event = file_write_event("Write", file.to_str().unwrap(), &observed_at);
+        let sensor = ClaudeGitWorkingTreeSensor {
+            adapter_version: ADAPTER_VERSION,
+        };
+        let outcome = sensor.collect(&event, &ClaudeAdapter.probe());
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(!outcome.has_evidence());
+        assert_eq!(outcome.state, SignalAvailability::Unavailable);
+    }
+
+    #[test]
+    fn git_working_tree_sensor_reports_collection_failed_when_the_query_errors() {
+        // A path that does not exist as a directory at all makes
+        // `fornax_vcs::path_status`'s discovery step fail outright
+        // (a genuine access failure, not "no repo found here") — see
+        // `fornax-vcs`'s own
+        // `reports_open_failure_for_a_path_discovery_cannot_even_access`
+        // test for why this specific shape is the one that reliably
+        // exercises that path.
+        let bogus_dir = temp_repo_dir();
+        let file = bogus_dir.join("claimed.txt");
+
+        let observed_at = chrono::Utc::now().to_rfc3339();
+        let event = file_write_event("Write", file.to_str().unwrap(), &observed_at);
+        let sensor = ClaudeGitWorkingTreeSensor {
+            adapter_version: ADAPTER_VERSION,
+        };
+        let outcome = sensor.collect(&event, &ClaudeAdapter.probe());
+
+        assert!(!outcome.has_evidence());
+        assert_eq!(outcome.state, SignalAvailability::CollectionFailed);
+    }
+
+    #[test]
+    fn git_working_tree_sensor_reports_unavailable_with_no_tool_response() {
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "sess-1".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("Edit".into()),
+            tool_input: Some(serde_json::json!({"file_path": "/tmp/x"})),
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        let sensor = ClaudeGitWorkingTreeSensor {
+            adapter_version: ADAPTER_VERSION,
+        };
+        let outcome = sensor.collect(&event, &ClaudeAdapter.probe());
+        assert!(!outcome.has_evidence());
+        assert_eq!(outcome.state, SignalAvailability::Unavailable);
+    }
+
+    #[test]
+    fn git_working_tree_sensor_ignores_non_edit_write_events() {
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "sess-1".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("Bash".into()),
+            tool_input: Some(serde_json::json!({"command": "pytest"})),
+            tool_response: Some(serde_json::json!({"exit_code": 0})),
+            raw: serde_json::json!({}),
+        };
+        let sensor = ClaudeGitWorkingTreeSensor {
+            adapter_version: ADAPTER_VERSION,
+        };
+        let outcome = sensor.collect(&event, &ClaudeAdapter.probe());
+        assert!(!outcome.has_evidence());
+        assert_eq!(outcome.state, SignalAvailability::Unknown);
     }
 
     // --- FORNX-14: ClaudeGitOutcomeSensor ----------------------------------

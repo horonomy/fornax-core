@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/fornax-types", "crates/fornax-store", "crates/fornax-verify", "crates/fornax-daemon", "crates/fornax-adapter-claude", "crates/fornax-adapter-codex", "crates/fornax-adapter-opencode", "crates/fornax-adapter-conformance", "crates/fornax-cli"]
+members = ["crates/fornax-types", "crates/fornax-store", "crates/fornax-verify", "crates/fornax-vcs", "crates/fornax-ci", "crates/fornax-daemon", "crates/fornax-adapter-claude", "crates/fornax-adapter-codex", "crates/fornax-adapter-opencode", "crates/fornax-adapter-conformance", "crates/fornax-cli", "crates/fornax-bench"]
 
 [workspace.package]
 version = "0.0.1"
@@ -20,6 +20,6 @@ reqwest = { version = "0.13", features = ["json"] }
 thiserror = "2"
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 axum = "0.8"
 toml_edit = "0.25"

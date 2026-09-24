@@ -15,9 +15,11 @@ use uuid::Uuid;
 pub mod adapter;
 pub mod capabilities;
 pub mod extension;
+pub mod graph;
 pub mod privacy;
 pub mod redact;
 pub mod sensor;
+pub mod sensor_config;
 
 pub use adapter::{AgentAdapter, NormalizationOutcome};
 pub use capabilities::{
@@ -27,10 +29,16 @@ pub use capabilities::{
 pub use extension::{
     ContentClass, ExtensionEnvelope, EXTENSION_SCHEMA_VERSION, SUPPORTED_EXTENSION_SCHEMA_VERSIONS,
 };
-pub use sensor::{
-    ClockSource, CollectionMethod, EvidenceSensor, EvidenceSource, Freshness, SensorOutcome,
-    TamperBoundary, TrustClass,
+pub use graph::{
+    staleness_of, staleness_of_default, EvidenceConflict, EvidenceGraph, EvidenceLink,
+    EvidenceRelation, FreshnessWindow, MissingEvidence, StalenessAssessment,
+    DEFAULT_EXIT_CODE_FRESHNESS_SECONDS,
 };
+pub use sensor::{
+    collect_with_disable_check, ClockSource, CollectionMethod, EvidenceSensor, EvidenceSource,
+    Freshness, SensorOutcome, TamperBoundary, TrustClass,
+};
+pub use sensor_config::{default_fornax_home, SensorConfigError, SensorDisableConfig};
 
 /// Which coding-agent runtime an event/capability originated from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -213,10 +221,16 @@ pub struct ProcessObservationPayload {
     pub observation: Option<ProcessObservationDetail>,
 }
 
-/// Structured detail for a [`ProcessObservationPayload`] (FORNX-14). Only
-/// `VcsOperation` exists today — an `HttpProbe` variant is planned for a
-/// follow-up PR (FORNX-14's HTTP-health work) but deliberately not added
-/// here.
+/// Structured detail for a [`ProcessObservationPayload`] (FORNX-14). An
+/// `HttpProbe` variant is planned for a follow-up PR (FORNX-14's HTTP-health
+/// work) but deliberately not added here.
+///
+/// `FileWriteObserved` and `CommandDuration` (FORNX-91) are the second and
+/// third real producers, following the same "widen this enum, no new
+/// `EvidenceKind` variant, no new `fornax-store` column" precedent
+/// `VcsOperation` established — see this enum's home module doc
+/// ([`EvidenceKind`]'s "closed on purpose" note) for why a new evidence
+/// shape lands here rather than as a new top-level kind.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "observation_kind",
@@ -234,6 +248,81 @@ pub enum ProcessObservationDetail {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         remote: Option<String>,
     },
+    /// FORNX-91: whether the *actual host filesystem* (independent of
+    /// anything a provider claimed) shows `claimed_path` existing, and
+    /// whether its modification time is consistent with the claim. Produced
+    /// by a `TrustClass::HostObserved` sensor that calls `std::fs::metadata`
+    /// itself, never by parsing a provider's own tool-result text — see
+    /// `fornax-adapter-claude`'s `ClaudeFileWriteConfirmedSensor` for the one
+    /// producer that exists today.
+    FileWriteObserved {
+        claimed_path: String,
+        exists: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        modified_at: Option<String>,
+        consistent_with_claim: bool,
+    },
+    /// FORNX-91: a command's actual wall-clock duration, computed from
+    /// provider-reported start/end timestamps already present on a tool
+    /// result payload (not a new OS-level process-monitoring mechanism —
+    /// see `fornax-adapter-opencode`'s `OpenCodeCommandDurationSensor`, the
+    /// one producer that exists today, for the exact fields it reads).
+    CommandDuration { duration_ms: i64 },
+    /// FORNX-302: whether the *real git working tree* (queried in-process
+    /// via `fornax-vcs`, independent of anything a provider claimed)
+    /// considers `claimed_path` dirty (uncommitted/unstaged/untracked),
+    /// cross-checking a claimed Edit/Write/MultiEdit or `git commit`/`git
+    /// push` against actual working-tree/HEAD state. Distinct from
+    /// [`Self::FileWriteObserved`] (plain `std::fs::metadata`, no git
+    /// awareness) and from [`Self::VcsOperation`] (parses a provider's own
+    /// reported `git` stdout/stderr, `TrustClass::AgentAdjacent`) — this
+    /// variant is produced by a `TrustClass::HostObserved` sensor that
+    /// queries git itself. Produced today only by
+    /// `fornax-adapter-claude`'s `ClaudeGitWorkingTreeSensor`.
+    WorkingTreeStatusObserved {
+        claimed_path: String,
+        is_repo: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        head_commit: Option<String>,
+        path_is_dirty: bool,
+    },
+    /// FORNX-302: aggregated CI check-run status for one commit SHA, queried
+    /// from the CI provider's own API (GitHub Actions, via the `fornax-ci`
+    /// crate's `GitHubCiStatusSensor` — the one producer today).
+    /// `TrustClass::IndependentExternal` — reported by a system outside both
+    /// the coding agent and the local host, independent of what either
+    /// claims happened.
+    CiCheckStatus {
+        /// `"owner/repo"` slug the check-runs were queried for.
+        repo: String,
+        commit_sha: String,
+        total_count: i64,
+        overall: CiOverallStatus,
+    },
+}
+
+/// Coarse aggregate of a commit's CI check-runs
+/// ([`ProcessObservationDetail::CiCheckStatus`]), derived by the querying
+/// sensor from each individual check-run's `status`/`conclusion` — never a
+/// raw pass-through of GitHub's own per-check vocabulary, so downstream
+/// verifiers have one small, closed vocabulary to match on regardless of how
+/// many individual checks a repository happens to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CiOverallStatus {
+    /// Every check-run completed with a conclusion of `success`, `neutral`,
+    /// or `skipped`.
+    Success,
+    /// At least one check-run completed with `failure`, `timed_out`,
+    /// `cancelled`, or `action_required`.
+    Failure,
+    /// At least one check-run has not yet completed (`queued`/`in_progress`),
+    /// and none have failed.
+    Pending,
+    /// No check-runs were reported for this commit at all (`total_count ==
+    /// 0`), or a check-run reported a conclusion this binary does not
+    /// recognize — an honest "cannot summarize", never guessed as `Success`.
+    Unknown,
 }
 
 /// Which git operation a [`ProcessObservationDetail::VcsOperation`] observed.

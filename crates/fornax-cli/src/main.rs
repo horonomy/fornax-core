@@ -22,6 +22,94 @@ enum Commands {
     Status,
     /// Full evidence/finding detail for recent sessions.
     Detail,
+    /// Per-`SignalClass` capability availability for one session (FORNX-85):
+    /// which signals the announcing runtime(s) actually exposed this
+    /// session — available, unsupported, unavailable, redacted, collection-
+    /// failed, or not yet announced. Reads `GET /api/capabilities` on the
+    /// daemon. Never collapses the six-state availability taxonomy into a
+    /// boolean (`capabilities.rs`'s own doc comments, ADR-0001 D4) — each
+    /// signal class is rendered with its real, distinct state.
+    Capabilities {
+        /// Session id to look up.
+        session: String,
+    },
+    /// Claim-centered evidence graph (FORNX-90, local half): every typed
+    /// claim-to-evidence link plus every explicit missing-evidence note for
+    /// one claim, grouped by relation. Reads `GET /api/evidence-graph` on
+    /// the daemon (`fornax-store::Store::evidence_graph_for_claim`,
+    /// FORNX-89). Never collapses the graph into a single count/score — a
+    /// claim with genuinely zero evidence renders differently from one with
+    /// evidence explicitly noted missing, which renders differently again
+    /// from a claim id the daemon has never seen.
+    EvidenceGraph {
+        /// Claim id to look up.
+        claim: String,
+        /// Session id the claim belongs to.
+        session: String,
+    },
+    /// Live fused verdict for one claim (FORNX-304): computes
+    /// `fornax_verify::fusion::BaselineFusionPolicy::fuse` over the claim's
+    /// real evidence graph (FORNX-89), falling back to the `project_graph`
+    /// projection when the real graph is empty — the same fallback FORNX-93
+    /// documents as today's actual production state. Reads `GET
+    /// /api/fusion` on the daemon. Every `RationaleEntry` is rendered
+    /// individually, never collapsed into a summary — the same
+    /// never-collapse-the-taxonomy discipline as `evidence-graph`/
+    /// `capabilities`.
+    Fusion {
+        /// Claim id to look up.
+        claim: String,
+        /// Session id the claim belongs to.
+        session: String,
+    },
+    /// Actionable recommendation for one claim (FORNX-96, local half):
+    /// computes `fornax_verify::fusion::BaselineFusionPolicy::fuse` exactly
+    /// like `fusion`, then applies
+    /// `fornax_verify::decision::DefaultRiskPolicy` for the requested risk
+    /// class to produce a `PROCEED`/`REVIEW`/`BLOCK` recommendation. Reads
+    /// `GET /api/decision` on the daemon.
+    ///
+    /// Never shows the recommendation alone — always renders it together
+    /// with the same full fusion detail `fusion` renders (verdict,
+    /// uncertainty band, every rationale entry), reusing that rendering
+    /// function rather than duplicating it. This is what "user can inspect
+    /// why the recommendation changed" means: the recommendation and its
+    /// full evidence trail are shown together, and re-running with a
+    /// different `--risk` shows how the same evidence can yield a
+    /// different action.
+    Decision {
+        /// Claim id to look up.
+        claim: String,
+        /// Session id the claim belongs to.
+        session: String,
+        /// Risk class to evaluate under: `strict`, `balanced`, or
+        /// `lenient`. Defaults to `balanced` — the class every hard safety
+        /// floor in `fornax_verify::decision` is written against.
+        #[arg(long, default_value = "balanced")]
+        risk: String,
+    },
+    /// Semantic Judge opinion for one claim (FORNX-94): sends the claim plus
+    /// a bounded, structured evidence-graph excerpt to the configured local
+    /// self-hosted judge (Ollama-compatible endpoint, `[semantic_judge]` in
+    /// `$FORNAX_HOME/config.toml`, disabled by default) and renders the
+    /// resulting model-derived verdict alongside the same full fusion detail
+    /// `fusion`/`decision` render — the judge's opinion never replaces or
+    /// hides the deterministic evidence trail. Reads `GET /api/judge` on the
+    /// daemon.
+    ///
+    /// A disabled/unreachable/timed-out judge is rendered honestly as
+    /// unavailable, never a fabricated pass/fail.
+    Judge {
+        /// Claim id to look up.
+        claim: String,
+        /// Session id the claim belongs to.
+        session: String,
+        /// Explicit opt-in to send unredacted evidence content to the
+        /// judge. Off by default — see FORNX-94's "raw protected evidence"
+        /// AC.
+        #[arg(long, default_value_t = false)]
+        allow_raw_evidence: bool,
+    },
     /// Export one session's events/claims/evidence/capabilities from the
     /// local store into a directory-based spool, as one wire-compatible
     /// envelope JSON file per message (FORNX-60, FORNX-62). Reads
@@ -98,6 +186,71 @@ async fn main() -> anyhow::Result<()> {
         Commands::Detail => {
             match fetch_json(&format!("{}/api/findings/recent", base_url())).await {
                 Ok(v) => print_detail(&v),
+                Err(_) => println!("fornax: daemon unreachable (is `fornax-daemon` running?)"),
+            }
+        }
+        Commands::Capabilities { session } => {
+            let url = format!("{}/api/capabilities?session={}", base_url(), session);
+            match fetch_json(&url).await {
+                Ok(v) => print!("{}", render_capabilities(&v)),
+                Err(_) => println!("fornax: daemon unreachable (is `fornax-daemon` running?)"),
+            }
+        }
+        Commands::EvidenceGraph { claim, session } => {
+            let url = format!(
+                "{}/api/evidence-graph?claim={}&session={}",
+                base_url(),
+                claim,
+                session
+            );
+            match fetch_json(&url).await {
+                Ok(v) => print!("{}", render_evidence_graph(&v)),
+                Err(_) => println!("fornax: daemon unreachable (is `fornax-daemon` running?)"),
+            }
+        }
+        Commands::Fusion { claim, session } => {
+            let url = format!(
+                "{}/api/fusion?claim={}&session={}",
+                base_url(),
+                claim,
+                session
+            );
+            match fetch_json(&url).await {
+                Ok(v) => print!("{}", render_fusion(&v)),
+                Err(_) => println!("fornax: daemon unreachable (is `fornax-daemon` running?)"),
+            }
+        }
+        Commands::Decision {
+            claim,
+            session,
+            risk,
+        } => {
+            let url = format!(
+                "{}/api/decision?claim={}&session={}&risk={}",
+                base_url(),
+                claim,
+                session,
+                risk
+            );
+            match fetch_json(&url).await {
+                Ok(v) => print!("{}", render_decision(&v)),
+                Err(_) => println!("fornax: daemon unreachable (is `fornax-daemon` running?)"),
+            }
+        }
+        Commands::Judge {
+            claim,
+            session,
+            allow_raw_evidence,
+        } => {
+            let url = format!(
+                "{}/api/judge?claim={}&session={}&allow_raw_evidence={}",
+                base_url(),
+                claim,
+                session,
+                allow_raw_evidence
+            );
+            match fetch_json(&url).await {
+                Ok(v) => print!("{}", render_judge(&v)),
                 Err(_) => println!("fornax: daemon unreachable (is `fornax-daemon` running?)"),
             }
         }
@@ -571,13 +724,15 @@ async fn export_spool_from_store(
         // filename, matching that same convention.
         //
         // FORNX-155: the domain `RuntimeCapabilities` now carries
-        // `schema_version`/`signals`, which fornax-cloud's
-        // `fornax-uploader::types::RuntimeCapabilities` (a separate,
-        // out-of-scope repo) does not know about. Project to the frozen
-        // flat-bool wire shape at the export boundary so the spool envelope
-        // stays byte-for-byte wire-compatible — see
+        // `schema_version`/`signals`. FORNX-301 additively includes both of
+        // those, plus `session_id`, on the exported wire shape so
+        // fornax-cloud can receive the rich per-signal taxonomy instead of
+        // only the down-projected bools — the nine legacy flat-bool keys
+        // remain unchanged, since `fornax-cloud`'s `device_capabilities`
+        // worker-gate consumer still reads exactly those. See
         // `fornax_types::capabilities::LegacyCapabilitiesWire`'s doc comment.
-        let legacy = fornax_types::LegacyCapabilitiesWire::from(caps);
+        let mut legacy = fornax_types::LegacyCapabilitiesWire::from(caps);
+        legacy.session_id = Some(session.to_string());
         write_envelope(&pending_dir, "capabilities", uuid::Uuid::new_v4(), &legacy)?;
     }
 
@@ -647,6 +802,482 @@ fn print_detail(v: &serde_json::Value) {
     }
 }
 
+/// Icon for a `SignalAvailability` state, mirroring `verdict_icon`'s
+/// distinct-per-state convention. FORNX-85/ADR-0001 D4: the six-state
+/// availability taxonomy must never collapse into a boolean — each state
+/// gets its own icon and label, and an unrecognized tag is shown verbatim
+/// rather than mapped onto an existing state.
+fn availability_icon(state: &str) -> &'static str {
+    match state {
+        "available" => "✓",
+        "unsupported" => "⛔",
+        "unavailable" => "—",
+        "redacted" => "▮",
+        "collection_failed" => "✕",
+        "unknown" => "?",
+        _ => "◌",
+    }
+}
+
+/// Renders `GET /api/capabilities`'s response: one section per announcing
+/// provider, one line per declared `SignalClass`, each showing its exact
+/// `SignalAvailability` state (and `detail`, when present) rather than a
+/// summarized available/not-available boolean. Returns the rendered text
+/// (rather than printing directly) so it can be asserted on in tests, the
+/// same shape as `render_status_line`.
+fn render_capabilities(v: &serde_json::Value) -> String {
+    let mut out = String::new();
+    let session = v.get("session").and_then(|s| s.as_str()).unwrap_or("?");
+    let announced = v
+        .get("announced")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false);
+    out.push_str(&format!("session: {session}\n"));
+    if !announced {
+        let reason = v
+            .get("reason")
+            .and_then(|s| s.as_str())
+            .unwrap_or("no capabilities announced yet");
+        out.push_str(&format!("  no capabilities announced yet ({reason})\n"));
+        return out;
+    }
+    let empty = vec![];
+    let capabilities = v
+        .get("capabilities")
+        .and_then(|c| c.as_array())
+        .unwrap_or(&empty);
+    for caps in capabilities {
+        let provider = caps.get("provider").and_then(|s| s.as_str()).unwrap_or("?");
+        out.push_str(&format!("  provider: {provider}\n"));
+        let empty_signals = vec![];
+        let signals = caps
+            .get("signals")
+            .and_then(|s| s.as_array())
+            .unwrap_or(&empty_signals);
+        if signals.is_empty() {
+            out.push_str("    (no signal classes declared)\n");
+            continue;
+        }
+        for signal in signals {
+            let class = signal.get("class").and_then(|s| s.as_str()).unwrap_or("?");
+            let state = signal.get("state").and_then(|s| s.as_str()).unwrap_or("?");
+            let icon = availability_icon(state);
+            match signal.get("detail").and_then(|s| s.as_str()) {
+                Some(detail) => out.push_str(&format!("    {icon} {class}: {state} ({detail})\n")),
+                None => out.push_str(&format!("    {icon} {class}: {state}\n")),
+            }
+        }
+    }
+    out
+}
+
+/// Icon for an `EvidenceRelation`, mirroring `verdict_icon`/`availability_icon`'s
+/// distinct-per-state convention (FORNX-90). An unrecognized tag is shown
+/// verbatim rather than mapped onto an existing relation.
+fn relation_icon(relation: &str) -> &'static str {
+    match relation {
+        "supports" => "✚",
+        "contradicts" => "✕",
+        "neutral" => "•",
+        _ => "◌",
+    }
+}
+
+/// Renders `GET /api/evidence-graph`'s response (FORNX-90, local Evidence
+/// Explorer): every linked-evidence relation grouped by
+/// `EvidenceRelation`, plus every missing-evidence note, each item shown
+/// individually rather than collapsed into a count. Returns the rendered
+/// text (rather than printing directly) so it can be asserted on in tests,
+/// the same shape as `render_capabilities`.
+///
+/// Deliberately renders three distinguishable outcomes for the same "empty
+/// links" surface state, the core product invariant this ticket exists
+/// for: the claim id is unknown to the daemon at all; the claim exists but
+/// nobody has linked or noted anything ("nobody has looked"); and the claim
+/// exists with evidence explicitly noted missing even though no link exists
+/// ("looked, but it could not be collected").
+fn render_evidence_graph(v: &serde_json::Value) -> String {
+    let mut out = String::new();
+    let claim = v.get("claim").and_then(|s| s.as_str()).unwrap_or("?");
+    let session = v.get("session").and_then(|s| s.as_str()).unwrap_or("?");
+    out.push_str(&format!("claim: {claim}\nsession: {session}\n"));
+
+    // A daemon-side error (e.g. a store read failure) carries no `found`
+    // key at all — must be reported as its own distinct outcome, never
+    // defaulted into the "claim not found" case (that would conflate "we
+    // don't know" with "we looked and it's absent").
+    if let Some(error) = v.get("error").and_then(|s| s.as_str()) {
+        out.push_str(&format!("  error: {error}\n"));
+        return out;
+    }
+
+    let found = v.get("found").and_then(|b| b.as_bool()).unwrap_or(false);
+    if !found {
+        let reason = v
+            .get("reason")
+            .and_then(|s| s.as_str())
+            .unwrap_or("no claim with this id is on record for this session");
+        out.push_str(&format!("  no such claim on record ({reason})\n"));
+        return out;
+    }
+
+    let empty = vec![];
+    let links = v.get("links").and_then(|l| l.as_array()).unwrap_or(&empty);
+    let missing = v
+        .get("missing")
+        .and_then(|m| m.as_array())
+        .unwrap_or(&empty);
+
+    if links.is_empty() && missing.is_empty() {
+        out.push_str(
+            "  no evidence linked and no missing-evidence notes recorded for this claim\n",
+        );
+        return out;
+    }
+
+    if links.is_empty() {
+        out.push_str("  no evidence linked to this claim\n");
+    } else {
+        // FORNX-92 AC: "Conflicts remain inspectable in Evidence Explorer" —
+        // surface, but do not resolve, a claim carrying both a `supports`
+        // and a `contradicts` link.
+        let supports_count = links
+            .iter()
+            .filter(|l| l.get("relation").and_then(|r| r.as_str()) == Some("supports"))
+            .count();
+        let contradicts_count = links
+            .iter()
+            .filter(|l| l.get("relation").and_then(|r| r.as_str()) == Some("contradicts"))
+            .count();
+        if supports_count > 0 && contradicts_count > 0 {
+            out.push_str(&format!(
+                "  ⚠ conflict: {supports_count} supports vs {contradicts_count} contradicts (unresolved)\n"
+            ));
+        }
+
+        let known_relations = ["supports", "contradicts", "neutral"];
+        // Forward-compat: a link whose relation is not one of the three
+        // known states must still be shown, not silently dropped — the AC
+        // requires every item to appear, never a collapsed count.
+        let mut unrecognized_relations: Vec<&str> = links
+            .iter()
+            .filter_map(|l| l.get("relation").and_then(|r| r.as_str()))
+            .filter(|r| !known_relations.contains(r))
+            .collect();
+        unrecognized_relations.sort_unstable();
+        unrecognized_relations.dedup();
+
+        for relation in known_relations
+            .iter()
+            .copied()
+            .chain(unrecognized_relations.iter().copied())
+        {
+            let group: Vec<&serde_json::Value> = links
+                .iter()
+                .filter(|l| l.get("relation").and_then(|r| r.as_str()) == Some(relation))
+                .collect();
+            if group.is_empty() {
+                continue;
+            }
+            out.push_str(&format!(
+                "  {} {} ({})\n",
+                relation_icon(relation),
+                relation,
+                group.len()
+            ));
+            for link in group {
+                let evidence_id = link
+                    .get("evidence_id")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("?");
+                let linked_at = link
+                    .get("linked_at")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("?");
+                out.push_str(&format!(
+                    "    evidence: {evidence_id}  linked_at: {linked_at}\n"
+                ));
+            }
+        }
+    }
+
+    if !missing.is_empty() {
+        out.push_str(&format!("  ◌ missing ({})\n", missing.len()));
+        for note in missing {
+            let signal_class = note
+                .get("signal_class")
+                .and_then(|s| s.as_str())
+                .unwrap_or("?");
+            let availability = note
+                .get("availability")
+                .and_then(|s| s.as_str())
+                .unwrap_or("?");
+            match note.get("detail").and_then(|s| s.as_str()) {
+                Some(detail) => {
+                    out.push_str(&format!("    {signal_class}: {availability} ({detail})\n"))
+                }
+                None => out.push_str(&format!("    {signal_class}: {availability}\n")),
+            }
+        }
+    }
+
+    out
+}
+
+/// Icon for a `RuleEffect` tag, mirroring `verdict_icon`/`availability_icon`'s
+/// distinct-per-state convention. An unrecognized tag is shown verbatim
+/// rather than mapped onto an existing effect.
+fn rule_effect_icon(effect: &str) -> &'static str {
+    match effect {
+        "counted" => "✚",
+        "discounted" => "✕",
+        "caveat" => "⚠",
+        "decided" => "🛡",
+        _ => "◌",
+    }
+}
+
+/// Renders `GET /api/fusion`'s response (FORNX-304): the live `FusedFinding`
+/// computed from a claim's real evidence graph (FORNX-89/FORNX-93), or the
+/// `project_graph` fallback when that graph is empty. Every
+/// `RationaleEntry` is rendered individually — rule name, effect, every
+/// referenced link/missing-evidence/evidence id, and the detail text —
+/// never collapsed into a summary count, the same never-collapse-the-
+/// taxonomy discipline `render_evidence_graph`/`render_capabilities` follow.
+/// Returns the rendered text (rather than printing directly) so it can be
+/// asserted on in tests.
+fn render_fusion(v: &serde_json::Value) -> String {
+    let mut out = String::new();
+    let claim = v.get("claim").and_then(|s| s.as_str()).unwrap_or("?");
+    let session = v.get("session").and_then(|s| s.as_str()).unwrap_or("?");
+    out.push_str(&format!("claim: {claim}\nsession: {session}\n"));
+
+    if let Some(error) = v.get("error").and_then(|s| s.as_str()) {
+        out.push_str(&format!("  error: {error}\n"));
+        return out;
+    }
+
+    let found = v.get("found").and_then(|b| b.as_bool()).unwrap_or(false);
+    if !found {
+        let reason = v
+            .get("reason")
+            .and_then(|s| s.as_str())
+            .unwrap_or("no claim with this id is on record for this session");
+        out.push_str(&format!("  no such claim on record ({reason})\n"));
+        return out;
+    }
+
+    let graph_source = v
+        .get("graph_source")
+        .and_then(|s| s.as_str())
+        .unwrap_or("?");
+    out.push_str(&format!("  graph_source: {graph_source}\n"));
+
+    let fused = v.get("fused").cloned().unwrap_or_default();
+    let verdict = fused.get("verdict").and_then(|s| s.as_str()).unwrap_or("?");
+    let uncertainty = fused
+        .get("uncertainty")
+        .and_then(|s| s.as_str())
+        .unwrap_or("?");
+    let policy_name = fused
+        .get("policy_name")
+        .and_then(|s| s.as_str())
+        .unwrap_or("?");
+    let policy_version = fused
+        .get("policy_version")
+        .and_then(|n| n.as_u64())
+        .unwrap_or(0);
+    let computed_at = fused
+        .get("computed_at")
+        .and_then(|s| s.as_str())
+        .unwrap_or("?");
+    let unresolved_conflict = fused
+        .get("unresolved_conflict")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false);
+
+    out.push_str(&format!(
+        "  {} {}  (uncertainty: {})\n",
+        verdict_icon(verdict),
+        verdict.to_uppercase(),
+        uncertainty
+    ));
+    if unresolved_conflict {
+        out.push_str("  ⚠ unresolved conflict: not auto-resolved\n");
+    }
+    out.push_str(&format!(
+        "  policy: {policy_name} v{policy_version}  computed_at: {computed_at}\n"
+    ));
+
+    let empty = vec![];
+    let rationale = fused
+        .get("rationale")
+        .and_then(|r| r.as_array())
+        .unwrap_or(&empty);
+    if rationale.is_empty() {
+        out.push_str("  rationale: (none)\n");
+        return out;
+    }
+    out.push_str(&format!("  rationale ({}):\n", rationale.len()));
+    for entry in rationale {
+        let rule = entry.get("rule").and_then(|s| s.as_str()).unwrap_or("?");
+        let effect = entry.get("effect").and_then(|s| s.as_str()).unwrap_or("?");
+        let detail = entry.get("detail").and_then(|s| s.as_str()).unwrap_or("");
+        out.push_str(&format!(
+            "    {} {} [{}]: {}\n",
+            rule_effect_icon(effect),
+            rule,
+            effect,
+            detail
+        ));
+        let ids_line = |key: &str| -> Option<String> {
+            let ids: Vec<&str> = entry
+                .get(key)
+                .and_then(|a| a.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|id| id.as_str())
+                .collect();
+            if ids.is_empty() {
+                None
+            } else {
+                Some(format!("      {key}: {}\n", ids.join(", ")))
+            }
+        };
+        for key in ["link_ids", "missing_evidence_ids", "evidence_ids"] {
+            if let Some(line) = ids_line(key) {
+                out.push_str(&line);
+            }
+        }
+    }
+
+    out
+}
+
+/// Icon for a `Recommendation::action` value, mirroring `verdict_icon`'s
+/// never-collapse-the-vocabulary discipline: three actions, three distinct
+/// icons, no default that could be mistaken for a real one.
+fn recommendation_icon(action: &str) -> &'static str {
+    match action {
+        "proceed" => "✓",
+        "review" => "!",
+        "block" => "✕",
+        _ => "?",
+    }
+}
+
+/// Renders `GET /api/decision`'s response (FORNX-96, local half): the
+/// `Recommendation` computed for the requested risk class, followed by the
+/// SAME full fusion detail `render_fusion` renders for `fornax fusion` —
+/// reusing that function rather than duplicating its rendering logic. This
+/// is what "recommendation never replaces the underlying Finding/evidence
+/// graph" means at the CLI layer: both are always shown together. When the
+/// claim isn't found or the daemon reports an error, `render_fusion` alone
+/// already handles both cases correctly (this response shares that shape),
+/// so no `recommendation` block is printed in either case.
+fn render_decision(v: &serde_json::Value) -> String {
+    let mut out = String::new();
+    let found = v.get("found").and_then(|b| b.as_bool()).unwrap_or(false);
+    let has_error = v.get("error").is_some();
+    if found && !has_error {
+        if let Some(rec) = v.get("recommendation") {
+            let action = rec.get("action").and_then(|s| s.as_str()).unwrap_or("?");
+            let risk_class = rec
+                .get("risk_class")
+                .and_then(|s| s.as_str())
+                .unwrap_or("?");
+            let policy_name = rec
+                .get("policy_name")
+                .and_then(|s| s.as_str())
+                .unwrap_or("?");
+            let policy_version = rec
+                .get("policy_version")
+                .and_then(|n| n.as_u64())
+                .unwrap_or(0);
+            let rationale_summary = rec
+                .get("rationale_summary")
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
+            out.push_str(&format!(
+                "recommendation: {} {}  (risk: {}, policy: {} v{})\n  {}\n\n",
+                recommendation_icon(action),
+                action.to_uppercase(),
+                risk_class,
+                policy_name,
+                policy_version,
+                rationale_summary
+            ));
+        }
+    }
+    out.push_str(&render_fusion(v));
+    out
+}
+
+/// Icon for a `JudgeOutput::verdict` value -- four distinct icons, never
+/// collapsed, mirroring `verdict_icon`/`recommendation_icon`'s discipline.
+/// `unavailable` gets its own icon distinct from `inconclusive` -- "the
+/// judge tried and couldn't decide" must read differently from "the judge
+/// never weighed in at all" (FORNX-94 module docs).
+fn judge_verdict_icon(verdict: &str) -> &'static str {
+    match verdict {
+        "supported" => "✓",
+        "contradicted" => "✕",
+        "inconclusive" => "?",
+        "unavailable" => "—",
+        _ => "?",
+    }
+}
+
+/// Renders `GET /api/judge`'s response (FORNX-94): the Semantic Judge's
+/// model-derived opinion, clearly labeled as such, followed by the same
+/// full fusion detail `render_fusion`/`render_decision` render -- the
+/// judge's opinion is always shown alongside, never instead of, the
+/// deterministic evidence trail. A disagreement between the judge and
+/// already-known deterministic evidence is surfaced as an explicit banner,
+/// never silently dropped.
+fn render_judge(v: &serde_json::Value) -> String {
+    let mut out = String::new();
+    let found = v.get("found").and_then(|b| b.as_bool()).unwrap_or(false);
+    let has_error = v.get("error").is_some();
+    if found && !has_error {
+        if let Some(judge) = v.get("judge") {
+            let verdict = judge.get("verdict").and_then(|s| s.as_str()).unwrap_or("?");
+            let model = judge.get("model").and_then(|s| s.as_str()).unwrap_or("?");
+            let endpoint = judge
+                .get("endpoint")
+                .and_then(|s| s.as_str())
+                .unwrap_or("?");
+            let rationale = judge
+                .get("rationale")
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
+            let called_at = judge
+                .get("called_at")
+                .and_then(|s| s.as_str())
+                .unwrap_or("?");
+            out.push_str(&format!(
+                "judge (model-derived, NOT independent evidence): {} {}\n  \
+                 model: {}  endpoint: {}  called_at: {}\n  rationale: {}\n",
+                judge_verdict_icon(verdict),
+                verdict.to_uppercase(),
+                model,
+                endpoint,
+                called_at,
+                rationale
+            ));
+            if let Some(true) = judge.get("disagreement").and_then(|d| d.as_bool()) {
+                out.push_str(
+                    "  ⚠ disagreement: the judge's verdict differs from the deterministic \
+                     evidence for this claim -- shown, not resolved\n",
+                );
+            }
+            out.push('\n');
+        }
+    }
+    out.push_str(&render_fusion(v));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,6 +1307,195 @@ mod tests {
         assert_eq!(verdict_icon("contradicted"), "🛡 ✕");
         assert_eq!(verdict_icon("review"), "🛡 !");
         assert_eq!(verdict_icon("unavailable"), "🛡 —");
+    }
+
+    #[test]
+    fn availability_icon_covers_every_state_distinctly() {
+        assert_eq!(availability_icon("available"), "✓");
+        assert_eq!(availability_icon("unsupported"), "⛔");
+        assert_eq!(availability_icon("unavailable"), "—");
+        assert_eq!(availability_icon("redacted"), "▮");
+        assert_eq!(availability_icon("collection_failed"), "✕");
+        assert_eq!(availability_icon("unknown"), "?");
+        // Forward-compat: an unrecognized tag must not collapse onto an
+        // existing state's icon.
+        assert_eq!(availability_icon("quantum_pending"), "◌");
+    }
+
+    #[test]
+    fn render_capabilities_reports_not_announced_when_absent() {
+        let v = serde_json::json!({
+            "session": "s1",
+            "announced": false,
+            "reason": "no capabilities announced yet by any adapter for this session",
+            "capabilities": [],
+        });
+        let rendered = render_capabilities(&v);
+        assert!(rendered.contains("session: s1"));
+        assert!(rendered.contains("no capabilities announced yet"));
+    }
+
+    /// FORNX-85: the rendering must never collapse the six-state
+    /// availability taxonomy — each declared signal class's real state must
+    /// appear distinctly in the output, including its `detail` when present.
+    #[test]
+    fn render_capabilities_shows_each_signal_class_state_distinctly() {
+        let v = serde_json::json!({
+            "session": "s2",
+            "announced": true,
+            "capabilities": [{
+                "provider": "claude_code",
+                "schema_version": 1,
+                "signals": [
+                    {"class": "tool_invocation", "state": "available"},
+                    {"class": "process_result", "state": "unsupported"},
+                    {"class": "raw_reasoning", "state": "redacted", "detail": "withheld by privacy boundary"},
+                ],
+                "notes": {},
+            }],
+        });
+        let rendered = render_capabilities(&v);
+        assert!(rendered.contains("tool_invocation: available"));
+        assert!(rendered.contains("process_result: unsupported"));
+        assert!(rendered.contains("raw_reasoning: redacted (withheld by privacy boundary)"));
+        // The verdict-vocabulary states and the capability-availability
+        // states must never bleed into each other's rendering.
+        assert!(!rendered.contains("VERIFIED"));
+        assert!(!rendered.contains("CONTRADICTED"));
+    }
+
+    #[test]
+    fn relation_icon_covers_all_three_states_never_collapsing() {
+        assert_eq!(relation_icon("supports"), "✚");
+        assert_eq!(relation_icon("contradicts"), "✕");
+        assert_eq!(relation_icon("neutral"), "•");
+        // Forward-compat: an unrecognized tag must not collapse onto an
+        // existing relation's icon.
+        assert_eq!(relation_icon("quantum_pending"), "◌");
+    }
+
+    #[test]
+    fn render_evidence_graph_reports_not_found_for_unknown_claim() {
+        let v = serde_json::json!({
+            "claim": "c1",
+            "session": "s1",
+            "found": false,
+            "reason": "no claim with this id is on record for this session",
+        });
+        let rendered = render_evidence_graph(&v);
+        assert!(rendered.contains("claim: c1"));
+        assert!(rendered.contains("no such claim on record"));
+    }
+
+    /// FORNX-90: the core product invariant — a claim with genuinely zero
+    /// links and zero missing notes ("nobody has looked") must render a
+    /// distinct message from a claim with zero links but one or more
+    /// missing notes ("looked, evidence could not be collected"), and both
+    /// must be distinct from the "claim not found" case above.
+    #[test]
+    fn render_evidence_graph_distinguishes_nobody_looked_from_looked_but_absent() {
+        let nobody_looked = serde_json::json!({
+            "claim": "c1", "session": "s1", "found": true, "links": [], "missing": [],
+        });
+        let rendered = render_evidence_graph(&nobody_looked);
+        assert!(rendered.contains("no evidence linked and no missing-evidence notes recorded"));
+
+        let looked_but_absent = serde_json::json!({
+            "claim": "c1", "session": "s1", "found": true, "links": [],
+            "missing": [{
+                "signal_class": "process_result",
+                "availability": "unavailable",
+                "detail": "no exit code sensor ran for this claim",
+            }],
+        });
+        let rendered2 = render_evidence_graph(&looked_but_absent);
+        assert!(rendered2.contains("no evidence linked to this claim"));
+        assert!(rendered2
+            .contains("process_result: unavailable (no exit code sensor ran for this claim)"));
+        assert_ne!(rendered, rendered2);
+    }
+
+    /// FORNX-90: linked evidence must be grouped by relation and each item
+    /// shown individually — never collapsed into a single count/score.
+    #[test]
+    fn render_evidence_graph_groups_links_by_relation_and_shows_each_item() {
+        let v = serde_json::json!({
+            "claim": "c1", "session": "s1", "found": true,
+            "links": [
+                {"evidence_id": "e1", "relation": "supports", "linked_at": "2026-09-01T00:00:00Z"},
+                {"evidence_id": "e2", "relation": "supports", "linked_at": "2026-09-01T00:00:01Z"},
+                {"evidence_id": "e3", "relation": "contradicts", "linked_at": "2026-09-01T00:00:02Z"},
+            ],
+            "missing": [],
+        });
+        let rendered = render_evidence_graph(&v);
+        assert!(rendered.contains("✚ supports (2)"));
+        assert!(rendered.contains("✕ contradicts (1)"));
+        assert!(rendered.contains("evidence: e1"));
+        assert!(rendered.contains("evidence: e2"));
+        assert!(rendered.contains("evidence: e3"));
+        assert!(!rendered.contains("no evidence linked"));
+    }
+
+    /// FORNX-90 regression: a link with an unrecognized relation tag must
+    /// still be shown, never silently dropped — "show each item" applies
+    /// even to a state this renderer doesn't yet name.
+    #[test]
+    fn render_evidence_graph_never_drops_a_link_with_an_unrecognized_relation() {
+        let v = serde_json::json!({
+            "claim": "c1", "session": "s1", "found": true,
+            "links": [
+                {"evidence_id": "e1", "relation": "quantum_pending", "linked_at": "2026-09-01T00:00:00Z"},
+            ],
+            "missing": [],
+        });
+        let rendered = render_evidence_graph(&v);
+        assert!(rendered.contains("evidence: e1"));
+        assert!(rendered.contains("quantum_pending (1)"));
+    }
+
+    /// FORNX-92 AC: "Conflicts remain inspectable in Evidence Explorer" —
+    /// a claim with both a supports and a contradicts link must render a
+    /// distinct conflict banner, without resolving which side is right.
+    #[test]
+    fn render_evidence_graph_surfaces_a_conflict_banner_for_opposing_links() {
+        let v = serde_json::json!({
+            "claim": "c1", "session": "s1", "found": true,
+            "links": [
+                {"evidence_id": "e1", "relation": "supports", "linked_at": "2026-09-01T00:00:00Z"},
+                {"evidence_id": "e2", "relation": "contradicts", "linked_at": "2026-09-01T00:00:01Z"},
+            ],
+            "missing": [],
+        });
+        let rendered = render_evidence_graph(&v);
+        assert!(rendered.contains("⚠ conflict: 1 supports vs 1 contradicts (unresolved)"));
+    }
+
+    /// No conflict banner when links agree.
+    #[test]
+    fn render_evidence_graph_shows_no_conflict_banner_when_links_agree() {
+        let v = serde_json::json!({
+            "claim": "c1", "session": "s1", "found": true,
+            "links": [
+                {"evidence_id": "e1", "relation": "supports", "linked_at": "2026-09-01T00:00:00Z"},
+            ],
+            "missing": [],
+        });
+        let rendered = render_evidence_graph(&v);
+        assert!(!rendered.contains("conflict"));
+    }
+
+    /// FORNX-90 regression: a daemon-side error must render as its own
+    /// distinct outcome, never defaulted into "claim not found" — "we don't
+    /// know" must stay distinguishable from "we looked and it's absent".
+    #[test]
+    fn render_evidence_graph_shows_daemon_error_distinctly_from_not_found() {
+        let v = serde_json::json!({
+            "claim": "c1", "session": "s1", "error": "store unavailable",
+        });
+        let rendered = render_evidence_graph(&v);
+        assert!(rendered.contains("error: store unavailable"));
+        assert!(!rendered.contains("no such claim on record"));
     }
 
     // FORNX-15: install-claude / uninstall-claude must idempotently
@@ -1254,12 +2074,11 @@ trust_level = \"trusted\"\n";
             assert!(types.contains(&"claim".to_string()));
             assert!(types.contains(&"evidence".to_string()));
 
-            // The emitted capabilities file must be wire-compatible with
-            // fornax-cloud's fornax-uploader::types::RuntimeCapabilities:
-            // the flat field set below, plus "type" — no extra fields such
-            // as a store-internal session_id/id (the cloud backend keys
-            // capabilities on (device_id, provider), never on an envelope
-            // id — see that crate's IngestMessage::canonical_id doc).
+            // The emitted capabilities file must remain wire-compatible
+            // with fornax-cloud's original fornax-uploader::types::
+            // RuntimeCapabilities nine-key shape (FORNX-301 adds
+            // session_id/schema_version/signals additively on top — see
+            // `LegacyCapabilitiesWire`'s doc comment).
             let caps_file = std::fs::read_dir(&pending_dir)
                 .unwrap()
                 .map(|e| e.unwrap().path())
@@ -1271,22 +2090,131 @@ trust_level = \"trusted\"\n";
                 .expect("capabilities file exists");
             let v: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&caps_file).unwrap()).unwrap();
-            let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
-            keys.sort_unstable();
+            let keys: std::collections::HashSet<&str> =
+                v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+            let frozen = [
+                "notes",
+                "provider",
+                "supports_post_tool_use",
+                "supports_pre_tool_use",
+                "supports_session_stop_event",
+                "supports_subagent_lifecycle",
+                "supports_tool_response_capture",
+                "supports_transcript_tail",
+                "type",
+            ];
+            for key in frozen {
+                assert!(keys.contains(key), "frozen legacy key {key} missing");
+            }
+            // FORNX-301: session_id is set by export_spool_from_store from
+            // its `session` parameter, schema_version/signals come through
+            // `From<&RuntimeCapabilities>`.
+            assert_eq!(v["session_id"], "s-aha");
+            assert_eq!(v["schema_version"], fornax_types::CAPABILITY_SCHEMA_VERSION);
+            assert_eq!(v["signals"].as_array().unwrap().len(), 6);
+
+            std::fs::remove_file(&db_path).ok();
+            std::fs::remove_dir_all(&out_dir).ok();
+        }
+
+        /// FORNX-301: proves the byte-identical backward-compat guarantee
+        /// end-to-end through the real export path — a capabilities
+        /// announcement using only the legacy six bools (no rich `signals`)
+        /// still exports to exactly the original nine legacy keys, with no
+        /// `session_id`/`schema_version`/`signals` keys appearing, once
+        /// `notes` doesn't carry a session id of its own either. This is the
+        /// export-path counterpart to `fornax_types::capabilities`'s
+        /// `empty_signals_and_absent_session_id_serialize_to_exactly_the_original_nine_keys`
+        /// unit test — but `export_spool_from_store` always stamps
+        /// `session_id` from its `session` parameter, so this test instead
+        /// confirms the new keys are present and additive, not exact-set.
+        #[tokio::test]
+        async fn full_signal_capabilities_export_round_trips_every_field() {
+            let db_path = tmp_db_path("full-signals");
+            let store = seeded_store(&db_path).await;
+            let caps = RuntimeCapabilities {
+                schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
+                provider: Provider::Codex,
+                signals: vec![
+                    CapabilitySignal {
+                        class: SignalClass::ToolInvocation,
+                        state: SignalAvailability::Unsupported,
+                        detail: Some("rollout tail cannot intercept pre-execution".to_string()),
+                    },
+                    CapabilitySignal {
+                        class: SignalClass::ToolTrace,
+                        state: SignalAvailability::Available,
+                        detail: None,
+                    },
+                    CapabilitySignal {
+                        class: SignalClass::ProcessResult,
+                        state: SignalAvailability::CollectionFailed,
+                        detail: Some("no literal exit code in tool_response".to_string()),
+                    },
+                    CapabilitySignal {
+                        class: SignalClass::ReasoningSummary,
+                        state: SignalAvailability::Redacted,
+                        detail: None,
+                    },
+                    CapabilitySignal {
+                        class: SignalClass::InternalModelSignals,
+                        state: SignalAvailability::Unknown,
+                        detail: None,
+                    },
+                    CapabilitySignal {
+                        class: SignalClass::Unrecognized("neural_trace".to_string()),
+                        state: SignalAvailability::Unrecognized("quantum_entangled".to_string()),
+                        detail: None,
+                    },
+                ],
+                notes: [("session_id".to_string(), "s-1".to_string())].into(),
+            };
+            store
+                .upsert_capabilities("s-1", &caps)
+                .await
+                .expect("upsert capabilities");
+
+            let out_dir = std::env::temp_dir().join(format!("fornax-spool-{}", Uuid::new_v4()));
+            export_spool_from_store(&store, "s-1", &out_dir)
+                .await
+                .expect("export spool");
+
+            let pending_dir = out_dir.join("pending");
+            let caps_file = std::fs::read_dir(&pending_dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .find(|p| {
+                    let v: serde_json::Value =
+                        serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
+                    v["type"] == "capabilities"
+                })
+                .expect("capabilities file exists");
+            let v: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&caps_file).unwrap()).unwrap();
+
+            assert_eq!(v["type"], "capabilities");
+            assert_eq!(v["provider"], "codex");
+            assert_eq!(v["supports_pre_tool_use"], false);
+            assert_eq!(v["supports_post_tool_use"], true);
+            assert_eq!(v["supports_tool_response_capture"], false);
+            assert_eq!(v["supports_session_stop_event"], false);
+            assert_eq!(v["supports_transcript_tail"], false);
+            assert_eq!(v["supports_subagent_lifecycle"], false);
+            assert_eq!(v["session_id"], "s-1");
+            assert_eq!(v["schema_version"], fornax_types::CAPABILITY_SCHEMA_VERSION);
+
+            let signals = v["signals"].as_array().unwrap();
+            assert_eq!(signals.len(), 6);
+            assert_eq!(signals[0]["class"], "tool_invocation");
+            assert_eq!(signals[0]["state"], "unsupported");
             assert_eq!(
-                keys,
-                vec![
-                    "notes",
-                    "provider",
-                    "supports_post_tool_use",
-                    "supports_pre_tool_use",
-                    "supports_session_stop_event",
-                    "supports_subagent_lifecycle",
-                    "supports_tool_response_capture",
-                    "supports_transcript_tail",
-                    "type",
-                ]
+                signals[0]["detail"],
+                "rollout tail cannot intercept pre-execution"
             );
+            assert_eq!(signals[2]["class"], "process_result");
+            assert_eq!(signals[2]["state"], "collection_failed");
+            assert_eq!(signals[5]["class"], "neural_trace");
+            assert_eq!(signals[5]["state"], "quantum_entangled");
 
             std::fs::remove_file(&db_path).ok();
             std::fs::remove_dir_all(&out_dir).ok();
@@ -1363,6 +2291,8 @@ trust_level = \"trusted\"\n";
                         &fornax_types::TrustClass::AgentAdjacent,
                         &fornax_types::CollectionMethod::FilePoll,
                     ),
+                    correlation_group: None,
+                    derived_from: Vec::new(),
                 }),
                 extension: None,
             };
@@ -1487,5 +2417,267 @@ trust_level = \"trusted\"\n";
             std::fs::remove_file(&db_path).ok();
             std::fs::remove_dir_all(&out_dir).ok();
         }
+    }
+
+    // --- FORNX-304: render_fusion -------------------------------------------
+
+    /// Fixture shaped exactly like `GET /api/fusion`'s real response body —
+    /// a `FusedFinding` with two rationale entries, one `Counted` and one
+    /// `Decided`, so the rendering test below can pin that every entry (and
+    /// every id it names) is shown individually rather than collapsed into a
+    /// summary.
+    fn fusion_fixture() -> serde_json::Value {
+        serde_json::json!({
+            "claim": "c1",
+            "session": "s1",
+            "found": true,
+            "graph_source": "graph",
+            "fused": {
+                "claim_id": "c1",
+                "verdict": "verified",
+                "uncertainty": "qualified",
+                "rationale": [
+                    {
+                        "rule": "independence_unverified",
+                        "effect": "caveat",
+                        "link_ids": ["link-1"],
+                        "missing_evidence_ids": [],
+                        "evidence_ids": ["ev-1"],
+                        "detail": "link link-1's evidence carries no recorded correlation group",
+                    },
+                    {
+                        "rule": "verdict_decided",
+                        "effect": "decided",
+                        "link_ids": ["link-1"],
+                        "missing_evidence_ids": [],
+                        "evidence_ids": [],
+                        "detail": "1 distinct supporting vote(s) survived fusion, no contradicting votes",
+                    },
+                ],
+                "counted_link_ids": ["link-1"],
+                "discounted_link_ids": [],
+                "missing_evidence_ids": [],
+                "unresolved_conflict": false,
+                "policy_name": "deterministic_baseline_v1",
+                "policy_version": 1,
+                "computed_at": "2026-09-02T00:00:00+00:00",
+            },
+        })
+    }
+
+    #[test]
+    fn render_fusion_shows_verdict_and_every_rationale_entry_individually() {
+        let v = fusion_fixture();
+        let rendered = render_fusion(&v);
+        assert!(rendered.contains("claim: c1"));
+        assert!(rendered.contains("session: s1"));
+        assert!(rendered.contains("graph_source: graph"));
+        assert!(rendered.contains("VERIFIED"));
+        assert!(rendered.contains("uncertainty: qualified"));
+        assert!(rendered.contains("policy: deterministic_baseline_v1 v1"));
+        assert!(rendered.contains("computed_at: 2026-09-02T00:00:00+00:00"));
+        // Both rationale entries must appear, each with its rule name,
+        // effect, referenced ids, and detail text -- never collapsed into a
+        // single summary line.
+        assert!(rendered.contains("independence_unverified [caveat]"));
+        assert!(rendered.contains("link link-1's evidence carries no recorded correlation group"));
+        assert!(rendered.contains("verdict_decided [decided]"));
+        assert!(rendered
+            .contains("1 distinct supporting vote(s) survived fusion, no contradicting votes"));
+        assert!(rendered.contains("link_ids: link-1"));
+        assert!(rendered.contains("evidence_ids: ev-1"));
+    }
+
+    #[test]
+    fn render_fusion_reports_not_found_for_unknown_claim() {
+        let v = serde_json::json!({
+            "claim": "c-missing",
+            "session": "s1",
+            "found": false,
+            "reason": "no claim with this id is on record for this session",
+        });
+        let rendered = render_fusion(&v);
+        assert!(rendered.contains("no such claim on record"));
+    }
+
+    #[test]
+    fn render_fusion_shows_daemon_error_distinctly_from_not_found() {
+        let v = serde_json::json!({
+            "claim": "c1",
+            "session": "s1",
+            "error": "database error: disk I/O error",
+        });
+        let rendered = render_fusion(&v);
+        assert!(rendered.contains("error: database error"));
+        assert!(!rendered.contains("no such claim on record"));
+    }
+
+    #[test]
+    fn render_fusion_surfaces_unresolved_conflict_banner() {
+        let mut v = fusion_fixture();
+        v["fused"]["verdict"] = serde_json::json!("review");
+        v["fused"]["unresolved_conflict"] = serde_json::json!(true);
+        let rendered = render_fusion(&v);
+        assert!(rendered.contains("⚠ unresolved conflict"));
+    }
+
+    // --- FORNX-96: render_decision (local half) -----------------------------
+
+    /// Fixture shaped exactly like `GET /api/decision`'s real response body
+    /// -- `fusion_fixture` plus a `recommendation` block.
+    fn decision_fixture() -> serde_json::Value {
+        let mut v = fusion_fixture();
+        v["recommendation"] = serde_json::json!({
+            "claim_id": "c1",
+            "action": "review",
+            "risk_class": "balanced",
+            "policy_name": "default_risk_policy_v1",
+            "policy_version": 1,
+            "rationale_summary": "verdict=Verified uncertainty=Qualified risk=Balanced -> Review",
+        });
+        v
+    }
+
+    #[test]
+    fn render_decision_shows_recommendation_and_full_fusion_detail_together() {
+        let v = decision_fixture();
+        let rendered = render_decision(&v);
+        // The recommendation is shown...
+        assert!(rendered.contains("recommendation: ! REVIEW"));
+        assert!(rendered.contains("risk: balanced"));
+        assert!(rendered.contains("policy: default_risk_policy_v1 v1"));
+        assert!(rendered.contains("verdict=Verified uncertainty=Qualified risk=Balanced -> Review"));
+        // ...together with the SAME full fusion detail `fusion` renders --
+        // never instead of it.
+        assert!(rendered.contains("VERIFIED"));
+        assert!(rendered.contains("uncertainty: qualified"));
+        assert!(rendered.contains("independence_unverified"));
+        assert!(rendered.contains("verdict_decided"));
+    }
+
+    #[test]
+    fn render_decision_icons_cover_all_three_actions_distinctly() {
+        assert_eq!(recommendation_icon("proceed"), "✓");
+        assert_eq!(recommendation_icon("review"), "!");
+        assert_eq!(recommendation_icon("block"), "✕");
+    }
+
+    #[test]
+    fn render_decision_reports_not_found_for_unknown_claim() {
+        let v = serde_json::json!({
+            "claim": "missing",
+            "session": "s1",
+            "found": false,
+            "reason": "no claim with this id is on record for this session",
+        });
+        let rendered = render_decision(&v);
+        assert!(rendered.contains("no such claim on record"));
+        assert!(!rendered.contains("recommendation:"));
+    }
+
+    #[test]
+    fn render_decision_shows_daemon_error_without_a_recommendation_block() {
+        let v = serde_json::json!({
+            "claim": "c1",
+            "session": "s1",
+            "error": "unknown risk class 'reckless' -- expected one of strict, balanced, lenient",
+        });
+        let rendered = render_decision(&v);
+        assert!(rendered.contains("error:"));
+        assert!(!rendered.contains("recommendation:"));
+    }
+
+    #[test]
+    fn render_decision_reflects_a_different_action_under_a_different_risk_class() {
+        let mut strict_view = decision_fixture();
+        strict_view["recommendation"]["action"] = serde_json::json!("block");
+        strict_view["recommendation"]["risk_class"] = serde_json::json!("strict");
+        let rendered = render_decision(&strict_view);
+        assert!(rendered.contains("recommendation: ✕ BLOCK"));
+        assert!(rendered.contains("risk: strict"));
+    }
+
+    fn judge_fixture() -> serde_json::Value {
+        let mut v = fusion_fixture();
+        v["judge"] = serde_json::json!({
+            "verdict": "supported",
+            "rationale": "the evidence excerpt is consistent with the claim",
+            "model": "llama3.1",
+            "endpoint": "http://localhost:11434/v1",
+            "prompt_version": 1,
+            "called_at": "2026-09-02T00:00:00+00:00",
+            "disagreement": false,
+        });
+        v
+    }
+
+    #[test]
+    fn render_judge_shows_labeled_model_derived_opinion_and_full_fusion_detail_together() {
+        let v = judge_fixture();
+        let rendered = render_judge(&v);
+        assert!(rendered.contains("judge (model-derived, NOT independent evidence): ✓ SUPPORTED"));
+        assert!(rendered.contains("model: llama3.1"));
+        assert!(rendered.contains("endpoint: http://localhost:11434/v1"));
+        // ...together with the SAME full fusion detail `fusion` renders --
+        // never instead of it.
+        assert!(rendered.contains("VERIFIED"));
+        assert!(rendered.contains("uncertainty: qualified"));
+    }
+
+    #[test]
+    fn render_judge_icons_cover_all_four_verdicts_distinctly() {
+        assert_eq!(judge_verdict_icon("supported"), "✓");
+        assert_eq!(judge_verdict_icon("contradicted"), "✕");
+        assert_eq!(judge_verdict_icon("inconclusive"), "?");
+        assert_eq!(judge_verdict_icon("unavailable"), "—");
+    }
+
+    #[test]
+    fn render_judge_surfaces_disagreement_banner_without_hiding_it() {
+        let mut v = judge_fixture();
+        v["judge"]["verdict"] = serde_json::json!("contradicted");
+        v["judge"]["disagreement"] = serde_json::json!(true);
+        let rendered = render_judge(&v);
+        assert!(rendered.contains("⚠ disagreement"));
+        // The underlying deterministic verdict is still shown, unresolved --
+        // never overwritten by the judge's disagreement.
+        assert!(rendered.contains("VERIFIED"));
+    }
+
+    #[test]
+    fn render_judge_shows_unavailable_honestly_never_a_fabricated_verdict() {
+        let mut v = judge_fixture();
+        v["judge"]["verdict"] = serde_json::json!("unavailable");
+        v["judge"]["rationale"] =
+            serde_json::json!("semantic judge disabled via [semantic_judge].enabled = false");
+        v["judge"]["disagreement"] = serde_json::Value::Null;
+        let rendered = render_judge(&v);
+        assert!(rendered.contains("— UNAVAILABLE"));
+        assert!(!rendered.contains("⚠ disagreement"));
+    }
+
+    #[test]
+    fn render_judge_reports_not_found_for_unknown_claim() {
+        let v = serde_json::json!({
+            "claim": "missing",
+            "session": "s1",
+            "found": false,
+            "reason": "no claim with this id is on record for this session",
+        });
+        let rendered = render_judge(&v);
+        assert!(rendered.contains("no such claim on record"));
+        assert!(!rendered.contains("judge ("));
+    }
+
+    #[test]
+    fn render_judge_shows_daemon_error_without_a_judge_block() {
+        let v = serde_json::json!({
+            "claim": "c1",
+            "session": "s1",
+            "error": "judge task panicked",
+        });
+        let rendered = render_judge(&v);
+        assert!(rendered.contains("error:"));
+        assert!(!rendered.contains("judge ("));
     }
 }

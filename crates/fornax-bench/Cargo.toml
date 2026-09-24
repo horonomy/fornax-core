@@ -1,19 +1,24 @@
 [package]
-name = "fornax-daemon"
+name = "fornax-bench"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "fornax_bench"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fornax-bench"
+path = "src/main.rs"
+
 [dependencies]
 fornax-types = { path = "../fornax-types" }
-fornax-store = { path = "../fornax-store" }
 fornax-verify = { path = "../fornax-verify" }
-tokio.workspace = true
-axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
-anyhow.workspace = true
 uuid.workspace = true
+thiserror.workspace = true
+clap.workspace = true
+anyhow.workspace = true
 chrono.workspace = true

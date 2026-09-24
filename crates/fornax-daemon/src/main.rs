@@ -3,11 +3,12 @@
 //! status line, detail command, and dashboard (FORNX-30/31/32). No cloud
 //! dependency on the critical path (D2, ADR 0001).
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use fornax_types::redact::{redact_json, redact_text};
-use fornax_types::{IngestMessage, RuntimeCapabilities};
+use fornax_types::{Finding, IngestMessage, RuntimeCapabilities};
+use fornax_verify::fusion::{project_graph, BaselineFusionPolicy, FusionInput, FusionPolicy};
 use fornax_verify::{
     CommandExecutedVerifier, CommandSuccessVerifier, FileModifiedVerifier, GitOperationVerifier,
     TestResultVerifier, Verifier,
@@ -159,6 +160,11 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/api/status", get(api_status))
         .route("/api/findings/recent", get(api_findings_recent))
+        .route("/api/capabilities", get(api_capabilities))
+        .route("/api/evidence-graph", get(api_evidence_graph))
+        .route("/api/fusion", get(api_fusion))
+        .route("/api/decision", get(api_decision))
+        .route("/api/judge", get(api_judge))
         .route("/dashboard", get(dashboard))
         .with_state(state);
 
@@ -410,6 +416,486 @@ async fn api_findings_recent(State(state): State<AppState>) -> Json<serde_json::
     match state.store.recent_findings(50).await {
         Ok(rows) => Json(serde_json::json!({ "findings": rows })),
         Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CapabilitiesQuery {
+    session: String,
+}
+
+/// FORNX-85: exposes the persisted `RuntimeCapabilities` announcement(s) for
+/// a session — the daemon-side half of the capability UX surface consumed by
+/// `fornax capabilities <session>`. Reads `store.capabilities_for_session`
+/// (one row per announcing provider, FORNX-62) rather than the in-memory
+/// `state.caps` cache: the cache holds only the single most-recently-cached
+/// provider per session id (see the `AppState::caps` field doc comment) and
+/// exists to serve the claim-verification hot path, not to be a general
+/// read API — a session with more than one announcing provider would be
+/// silently under-reported by reading it here instead.
+async fn api_capabilities(
+    State(state): State<AppState>,
+    Query(q): Query<CapabilitiesQuery>,
+) -> Json<serde_json::Value> {
+    match state.store.capabilities_for_session(&q.session).await {
+        Ok(caps) if caps.is_empty() => Json(serde_json::json!({
+            "session": q.session,
+            "announced": false,
+            "reason": "no capabilities announced yet by any adapter for this session",
+            "capabilities": [],
+        })),
+        Ok(caps) => Json(serde_json::json!({
+            "session": q.session,
+            "announced": true,
+            "capabilities": caps,
+        })),
+        Err(e) => Json(serde_json::json!({ "session": q.session, "error": e.to_string() })),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct EvidenceGraphQuery {
+    claim: String,
+    session: String,
+}
+
+/// FORNX-90: exposes `Store::evidence_graph_for_claim` (FORNX-89) as the
+/// daemon-side half of the local Evidence Explorer — `fornax evidence-graph
+/// <claim> <session>` reads this. This endpoint surfaces only `EvidenceLink`/
+/// `MissingEvidence` rows — evidence ids and relation/availability metadata,
+/// no evidence payload content at all (`EvidenceLink` doesn't carry one) —
+/// so no redaction step applies on this path. A redaction-safe payload
+/// drill-down (this ticket's AC also asks for one) is not built here; were
+/// it added, it would need to read the already-redacted `Evidence` rows
+/// (`handle_message` runs every `Evidence`/`Claim` through
+/// `redact_json`/`redact_text` on ingest, see the `*_redacted_before_storage`
+/// regression tests above), which would already satisfy that boundary
+/// without any further redaction step of its own.
+///
+/// Distinguishes three cases, matching this ticket's core invariant that
+/// "no evidence found" must never be silently conflated with "the claim
+/// itself doesn't exist" or "evidence was expected but is missing":
+/// - the claim id is not on record for this session at all -> `found: false`
+/// - the claim exists but has zero links and zero missing-evidence notes
+///   ("nobody has looked") -> `found: true`, empty `links`/`missing`
+/// - the claim exists with links and/or missing notes -> `found: true`,
+///   populated `links`/`missing`
+///
+/// Scoped by `(claim, session)` together, mirroring
+/// `evidence_graph_for_claim`'s own authorization-boundary scoping — a
+/// caller cannot probe another session's claim ids.
+async fn api_evidence_graph(
+    State(state): State<AppState>,
+    Query(q): Query<EvidenceGraphQuery>,
+) -> Json<serde_json::Value> {
+    let claims = match state.store.claims_for_session(&q.session).await {
+        Ok(claims) => claims,
+        Err(e) => {
+            return Json(
+                serde_json::json!({ "claim": q.claim, "session": q.session, "error": e.to_string() }),
+            )
+        }
+    };
+    let claim_exists = claims.iter().any(|c| c.id.to_string() == q.claim);
+    if !claim_exists {
+        return Json(serde_json::json!({
+            "claim": q.claim,
+            "session": q.session,
+            "found": false,
+            "reason": "no claim with this id is on record for this session",
+        }));
+    }
+
+    match state
+        .store
+        .evidence_graph_for_claim(&q.claim, &q.session)
+        .await
+    {
+        Ok(graph) => Json(serde_json::json!({
+            "claim": q.claim,
+            "session": q.session,
+            "found": true,
+            "links": graph.links,
+            "missing": graph.missing,
+        })),
+        Err(e) => Json(
+            serde_json::json!({ "claim": q.claim, "session": q.session, "error": e.to_string() }),
+        ),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct FusionQuery {
+    claim: String,
+    session: String,
+}
+
+/// Converts one `Store::findings_for_session` row into a real `Finding`, for
+/// `fusion::project_graph`'s fallback path (see `api_fusion`). Store rows
+/// serialize `verdict` as a bare snake_case tag and `evidence_ids` as a JSON
+/// array string — the same shapes `Store`'s own (private) `tag`/`from_tag`
+/// helpers produce, decoded here since neither is exported.
+fn finding_row_to_finding(row: &fornax_store::FindingRow) -> anyhow::Result<Finding> {
+    Ok(Finding {
+        id: row.id.parse()?,
+        claim_id: row.claim_id.parse()?,
+        verdict: serde_json::from_value(serde_json::Value::String(row.verdict.clone()))?,
+        evidence_ids: serde_json::from_str(&row.evidence_ids)?,
+        verifier_name: row.verifier_name.clone(),
+        rationale: row.rationale.clone(),
+        computed_at: row.computed_at.clone(),
+    })
+}
+
+/// Outcome of [`compute_fusion`] — the shared claim-lookup/graph-resolution/
+/// fusion logic behind both `/api/fusion` (FORNX-304) and `/api/decision`
+/// (FORNX-96), factored out so neither endpoint duplicates the other's
+/// graph-loading/projection code (FORNX-96 implementation note).
+enum FusionOutcome {
+    /// No claim with this id is on record for this session.
+    NotFound { reason: &'static str },
+    /// A store/decode error occurred while resolving the claim's evidence.
+    Error { message: String },
+    /// A live `FusedFinding` was computed successfully. Boxed: this variant
+    /// carries the claim/graph/evidence pool alongside `fused` (FORNX-94),
+    /// which makes it much larger than `NotFound`/`Error` --
+    /// `clippy::large_enum_variant` wants that size difference contained in
+    /// one heap allocation rather than paid on every `FusionOutcome` value.
+    Found(Box<FusionFound>),
+}
+
+/// Payload of [`FusionOutcome::Found`] (FORNX-94): the claim + resolved
+/// graph/evidence pool that produced `fused` are retained so `/api/judge`
+/// can build a `fornax_verify::judge::JudgeInput` without re-running the
+/// claim-lookup/graph-resolution logic in [`compute_fusion`] a second time.
+/// `/api/fusion`/`/api/decision` ignore `claim`/`graph`/`evidence_pool`,
+/// same as before this ticket.
+struct FusionFound {
+    graph_source: &'static str,
+    fused: fornax_verify::fusion::FusedFinding,
+    claim: fornax_types::Claim,
+    graph: fornax_types::EvidenceGraph,
+    evidence_pool: Vec<fornax_types::Evidence>,
+}
+
+/// FORNX-304 (extended by FORNX-96 to be shared with `/api/decision`):
+/// computes a live `FusedFinding` for one claim —
+/// `fusion::BaselineFusionPolicy::fuse` run over FORNX-89's real evidence
+/// graph, following the FORNX-90 `api_evidence_graph` precedent
+/// (compute-on-demand, not persisted; no new `fornax-store` migration).
+///
+/// Prefers `Store::evidence_graph_for_claim`'s real, persisted graph; when
+/// it comes back with zero links *and* zero missing-evidence notes (today's
+/// actual production state — nothing on the live claim path writes graph
+/// rows yet, per `fusion.rs`'s own module docs), falls back to
+/// `fusion::project_graph()` over the claim's existing `Finding`(s) for this
+/// session. The returned `graph_source` names which path was used.
+///
+/// `chrono::Utc::now()` is called exactly once, right here, to produce
+/// `computed_at` — the one place in this feature the wall clock is read;
+/// `fusion.rs` itself stays clock-free (FORNX-304 AC).
+///
+/// Scoped by `(claim, session)` together, mirroring `api_evidence_graph`'s
+/// own authorization-boundary scoping.
+async fn compute_fusion(state: &AppState, claim_id: &str, session: &str) -> FusionOutcome {
+    let claims = match state.store.claims_for_session(session).await {
+        Ok(claims) => claims,
+        Err(e) => {
+            return FusionOutcome::Error {
+                message: e.to_string(),
+            }
+        }
+    };
+    let Some(claim) = claims.into_iter().find(|c| c.id.to_string() == claim_id) else {
+        return FusionOutcome::NotFound {
+            reason: "no claim with this id is on record for this session",
+        };
+    };
+
+    let real_graph = match state
+        .store
+        .evidence_graph_for_claim(claim_id, session)
+        .await
+    {
+        Ok(g) => g,
+        Err(e) => {
+            return FusionOutcome::Error {
+                message: e.to_string(),
+            }
+        }
+    };
+
+    let (graph, graph_source) = if real_graph.links.is_empty() && real_graph.missing.is_empty() {
+        let finding_rows = match state.store.findings_for_session(session).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                return FusionOutcome::Error {
+                    message: e.to_string(),
+                }
+            }
+        };
+        let mut findings = Vec::new();
+        for row in finding_rows.iter().filter(|r| r.claim_id == claim_id) {
+            match finding_row_to_finding(row) {
+                Ok(f) => findings.push(f),
+                Err(e) => {
+                    return FusionOutcome::Error {
+                        message: format!("failed to decode finding {}: {e}", row.id),
+                    }
+                }
+            }
+        }
+        (project_graph(&claim, &findings), "projected")
+    } else {
+        (real_graph, "graph")
+    };
+
+    let evidence_read = match state.store.evidence_for_session(session).await {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            return FusionOutcome::Error {
+                message: e.to_string(),
+            }
+        }
+    };
+
+    let input = FusionInput {
+        claim: &claim,
+        graph: &graph,
+        evidence: &evidence_read.evidence,
+    };
+    let computed_at = chrono::Utc::now().to_rfc3339();
+    let fused = BaselineFusionPolicy.fuse(&input, &computed_at);
+
+    FusionOutcome::Found(Box::new(FusionFound {
+        graph_source,
+        fused,
+        claim,
+        graph,
+        evidence_pool: evidence_read.evidence,
+    }))
+}
+
+async fn api_fusion(
+    State(state): State<AppState>,
+    Query(q): Query<FusionQuery>,
+) -> Json<serde_json::Value> {
+    match compute_fusion(&state, &q.claim, &q.session).await {
+        FusionOutcome::Error { message } => {
+            Json(serde_json::json!({ "claim": q.claim, "session": q.session, "error": message }))
+        }
+        FusionOutcome::NotFound { reason } => Json(serde_json::json!({
+            "claim": q.claim,
+            "session": q.session,
+            "found": false,
+            "reason": reason,
+        })),
+        FusionOutcome::Found(found) => Json(serde_json::json!({
+            "claim": q.claim,
+            "session": q.session,
+            "found": true,
+            "graph_source": found.graph_source,
+            "fused": found.fused,
+        })),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct DecisionQuery {
+    claim: String,
+    session: String,
+    /// Risk class name (`strict`/`balanced`/`lenient`), defaults to
+    /// `balanced` when omitted (FORNX-96 AC-adjacent contract: a caller who
+    /// doesn't specify a risk class gets the class every hard safety floor
+    /// in `fornax_verify::decision` is written against).
+    #[serde(default)]
+    risk: Option<String>,
+}
+
+fn parse_risk_class(s: Option<&str>) -> Result<fornax_verify::decision::RiskClass, String> {
+    use fornax_verify::decision::RiskClass;
+    match s.unwrap_or("balanced") {
+        "strict" => Ok(RiskClass::Strict),
+        "balanced" => Ok(RiskClass::Balanced),
+        "lenient" => Ok(RiskClass::Lenient),
+        other => Err(format!(
+            "unknown risk class '{other}' -- expected one of strict, balanced, lenient"
+        )),
+    }
+}
+
+/// FORNX-96 (local half): `GET /api/decision?claim=&session=&risk=`.
+/// Reuses `compute_fusion` (the same graph-loading/projection logic
+/// `/api/fusion` uses) rather than duplicating it, then applies
+/// `DefaultRiskPolicy` for the requested `RiskClass`. Always returns the
+/// `Recommendation` alongside the full underlying `FusedFinding` in the
+/// same response — never the recommendation alone — which is what "the
+/// recommendation never replaces the underlying Finding/evidence graph"
+/// means operationally at this layer.
+async fn api_decision(
+    State(state): State<AppState>,
+    Query(q): Query<DecisionQuery>,
+) -> Json<serde_json::Value> {
+    use fornax_verify::decision::{DecisionPolicy, DefaultRiskPolicy};
+
+    let risk = match parse_risk_class(q.risk.as_deref()) {
+        Ok(r) => r,
+        Err(message) => {
+            return Json(
+                serde_json::json!({ "claim": q.claim, "session": q.session, "error": message }),
+            )
+        }
+    };
+
+    match compute_fusion(&state, &q.claim, &q.session).await {
+        FusionOutcome::Error { message } => {
+            Json(serde_json::json!({ "claim": q.claim, "session": q.session, "error": message }))
+        }
+        FusionOutcome::NotFound { reason } => Json(serde_json::json!({
+            "claim": q.claim,
+            "session": q.session,
+            "found": false,
+            "reason": reason,
+        })),
+        FusionOutcome::Found(found) => {
+            let recommendation = DefaultRiskPolicy.decide(&found.fused, risk);
+            Json(serde_json::json!({
+                "claim": q.claim,
+                "session": q.session,
+                "found": true,
+                "graph_source": found.graph_source,
+                "recommendation": recommendation,
+                "fused": found.fused,
+            }))
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct JudgeQuery {
+    claim: String,
+    session: String,
+    /// Explicit opt-in to send unredacted evidence content to the judge
+    /// (FORNX-94 AC: "raw protected evidence is not sent unless an
+    /// explicit policy permits it"). Defaults to `false` when omitted.
+    #[serde(default)]
+    allow_raw_evidence: bool,
+}
+
+/// Maps a computed `Verdict` to the "does deterministic evidence support the
+/// claim" boolean `JudgeOutput::with_disagreement_check` expects — `None`
+/// for any verdict that isn't a clean yes/no (FORNX-94: disagreement is only
+/// meaningful when there is an actual objective side to disagree with).
+fn objective_supported_for_disagreement_check(verdict: fornax_types::Verdict) -> Option<bool> {
+    match verdict {
+        fornax_types::Verdict::Verified => Some(true),
+        fornax_types::Verdict::Contradicted => Some(false),
+        fornax_types::Verdict::Unverified
+        | fornax_types::Verdict::Unavailable
+        | fornax_types::Verdict::Review => None,
+    }
+}
+
+/// FORNX-94: `GET /api/judge?claim=&session=&allow_raw_evidence=`. Reuses
+/// `compute_fusion`'s claim-lookup/graph-resolution logic (same as
+/// `/api/fusion`/`/api/decision`) to build a `JudgeInput`, then runs the
+/// configured `LocalSelfHostedJudgeProvider` (`[semantic_judge]` in
+/// `$FORNAX_HOME/config.toml`, disabled by default) via `spawn_blocking` —
+/// the judge's HTTP client is sync (`fornax_verify::judge`'s module docs),
+/// so it must not run directly on the async runtime thread.
+///
+/// Always returns the judge output alongside the full `FusedFinding` it was
+/// computed from (same "never show one instead of the other" discipline as
+/// `/api/decision`), plus a `disagreement` field surfaced explicitly rather
+/// than the deterministic fusion result being silently overwritten. A judge
+/// that is disabled/unreachable/timed out still returns `found: true` with
+/// `judge.verdict: "unavailable"` — this is not treated as a daemon error,
+/// since deterministic verification/fusion/decision must keep working
+/// identically regardless of judge availability.
+async fn api_judge(
+    State(state): State<AppState>,
+    Query(q): Query<JudgeQuery>,
+) -> Json<serde_json::Value> {
+    use fornax_verify::judge::{
+        judge_output_to_evidence, JudgeInput, LocalSelfHostedJudgeProvider, SemanticJudgeConfig,
+        SemanticJudgeProvider,
+    };
+
+    match compute_fusion(&state, &q.claim, &q.session).await {
+        FusionOutcome::Error { message } => {
+            Json(serde_json::json!({ "claim": q.claim, "session": q.session, "error": message }))
+        }
+        FusionOutcome::NotFound { reason } => Json(serde_json::json!({
+            "claim": q.claim,
+            "session": q.session,
+            "found": false,
+            "reason": reason,
+        })),
+        FusionOutcome::Found(found) => {
+            let FusionFound {
+                graph_source,
+                fused,
+                claim,
+                graph,
+                evidence_pool,
+            } = *found;
+            let input = JudgeInput::from_claim_and_graph(
+                &claim,
+                &graph,
+                &evidence_pool,
+                q.allow_raw_evidence,
+            );
+            let config = SemanticJudgeConfig::load_default();
+            let objective = objective_supported_for_disagreement_check(fused.verdict);
+
+            let judge_result = tokio::task::spawn_blocking(move || {
+                let provider = LocalSelfHostedJudgeProvider::new(config);
+                provider.judge(&input)
+            })
+            .await;
+
+            let output = match judge_result {
+                Ok(Ok(output)) => output.with_disagreement_check(objective),
+                Ok(Err(e)) => {
+                    return Json(serde_json::json!({
+                        "claim": q.claim,
+                        "session": q.session,
+                        "error": e.to_string(),
+                    }))
+                }
+                Err(e) => {
+                    return Json(serde_json::json!({
+                        "claim": q.claim,
+                        "session": q.session,
+                        "error": format!("judge task panicked: {e}"),
+                    }))
+                }
+            };
+
+            let derived_from_ids: Vec<uuid::Uuid> = graph
+                .links
+                .iter()
+                .map(|l| l.evidence_id)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let judge_evidence = judge_output_to_evidence(
+                &output,
+                &q.session,
+                claim.source_event_id,
+                derived_from_ids,
+            );
+
+            Json(serde_json::json!({
+                "claim": q.claim,
+                "session": q.session,
+                "found": true,
+                "graph_source": graph_source,
+                "judge": output,
+                "judge_evidence": judge_evidence,
+                "fused": fused,
+            }))
+        }
     }
 }
 
@@ -966,6 +1452,366 @@ mod tests {
         );
     }
 
+    /// FORNX-85: `/api/capabilities?session=<id>` must surface the exact
+    /// signal/state pairs announced by a real capability probe, not a
+    /// collapsed boolean summary — proves both the "announced" shape and
+    /// that individual `SignalClass`/`SignalAvailability` values survive the
+    /// full announce -> persist -> read round trip.
+    #[tokio::test]
+    async fn api_capabilities_surfaces_announced_signals_for_a_session() {
+        use fornax_types::{CapabilitySignal, Provider, SignalAvailability, SignalClass};
+
+        let state = test_state().await;
+        let mut hint = None;
+        let session_id = "fornx-85-capabilities-endpoint".to_string();
+
+        let caps = RuntimeCapabilities {
+            schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
+            provider: Provider::ClaudeCode,
+            signals: vec![
+                CapabilitySignal {
+                    class: SignalClass::ToolInvocation,
+                    state: SignalAvailability::Available,
+                    detail: None,
+                },
+                CapabilitySignal {
+                    class: SignalClass::RawReasoning,
+                    state: SignalAvailability::Redacted,
+                    detail: Some("thinking blocks withheld by privacy boundary".to_string()),
+                },
+                CapabilitySignal {
+                    class: SignalClass::ProcessResult,
+                    state: SignalAvailability::Unsupported,
+                    detail: None,
+                },
+            ],
+            notes: [("session_id".to_string(), session_id.clone())].into(),
+        };
+        handle_message(&state, IngestMessage::Capabilities(caps), &mut hint)
+            .await
+            .expect("handle capabilities");
+
+        let query = Query(CapabilitiesQuery {
+            session: session_id.clone(),
+        });
+        let resp = api_capabilities(State(state), query).await;
+        assert_eq!(
+            resp.0.get("announced").and_then(|b| b.as_bool()),
+            Some(true)
+        );
+        let capabilities = resp.0["capabilities"]
+            .as_array()
+            .expect("capabilities must be an array");
+        assert_eq!(capabilities.len(), 1);
+        let signals = capabilities[0]["signals"]
+            .as_array()
+            .expect("signals must be an array");
+        let tool_invocation = signals
+            .iter()
+            .find(|s| s["class"] == "tool_invocation")
+            .expect("tool_invocation signal present");
+        assert_eq!(tool_invocation["state"], "available");
+        let raw_reasoning = signals
+            .iter()
+            .find(|s| s["class"] == "raw_reasoning")
+            .expect("raw_reasoning signal present");
+        assert_eq!(raw_reasoning["state"], "redacted");
+        let process_result = signals
+            .iter()
+            .find(|s| s["class"] == "process_result")
+            .expect("process_result signal present");
+        assert_eq!(process_result["state"], "unsupported");
+    }
+
+    /// FORNX-85 regression: a session with no capability announcement on
+    /// record must return a clear "not announced" shape distinct from an
+    /// error — never a fabricated capability set (D4/D7: absence of a
+    /// capability must never be silently treated as available).
+    #[tokio::test]
+    async fn api_capabilities_reports_not_announced_for_unknown_session() {
+        let state = test_state().await;
+        let query = Query(CapabilitiesQuery {
+            session: "no-such-session".to_string(),
+        });
+        let resp = api_capabilities(State(state), query).await;
+        assert_eq!(
+            resp.0.get("announced").and_then(|b| b.as_bool()),
+            Some(false)
+        );
+        assert!(resp.0["capabilities"]
+            .as_array()
+            .expect("capabilities must be an array")
+            .is_empty());
+        assert!(resp.0.get("reason").and_then(|s| s.as_str()).is_some());
+    }
+
+    /// FORNX-90: `/api/evidence-graph` must surface every linked-evidence
+    /// relation and every missing-evidence note for a real claim, not a
+    /// collapsed count — proves the full round trip through
+    /// `evidence_graph_for_claim`.
+    #[tokio::test]
+    async fn api_evidence_graph_surfaces_links_and_missing_for_a_real_claim() {
+        use fornax_types::{
+            EvidenceLink, EvidenceRelation, MissingEvidence, SignalAvailability, SignalClass,
+        };
+
+        let state = test_state().await;
+        let mut hint = None;
+        let session_id = "fornx-90-evidence-graph-endpoint".to_string();
+
+        let event_id = Uuid::new_v4();
+        let event = AgentEvent {
+            id: event_id,
+            session_id: session_id.clone(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-09-01T00:00:00Z".to_string(),
+            tool_name: Some("Bash".to_string()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        handle_message(&state, IngestMessage::Event(event), &mut hint)
+            .await
+            .expect("handle event");
+
+        let claim = Claim {
+            id: Uuid::new_v4(),
+            session_id: session_id.clone(),
+            source_event_id: event_id,
+            text: "all tests passed".to_string(),
+            subject: "test_result".to_string(),
+            claimed_at: "2026-09-01T00:00:00Z".to_string(),
+        };
+        handle_message(&state, IngestMessage::Claim(claim.clone()), &mut hint)
+            .await
+            .expect("handle claim");
+
+        // `claim_evidence_links.evidence_id` is a foreign key into `evidence`
+        // (0006_evidence_graph.sql) — a linked evidence id must reference a
+        // real, already-stored `Evidence` row.
+        let evidence_id = Uuid::new_v4();
+        let evidence = fornax_types::Evidence {
+            id: evidence_id,
+            session_id: session_id.clone(),
+            source_event_id: event_id,
+            kind: fornax_types::EvidenceKind::ProcessObservation,
+            observed_at: "2026-09-01T00:00:00Z".to_string(),
+            payload: serde_json::json!({}),
+            provenance: "claude_code:1.2.3:PostToolUse:Bash#tool_response".to_string(),
+            source: None,
+            extension: None,
+        };
+        handle_message(&state, IngestMessage::Evidence(evidence), &mut hint)
+            .await
+            .expect("handle evidence");
+
+        state
+            .store
+            .insert_evidence_link(&EvidenceLink {
+                id: Uuid::new_v4(),
+                session_id: session_id.clone(),
+                claim_id: claim.id,
+                evidence_id,
+                relation: EvidenceRelation::Contradicts,
+                linked_at: "2026-09-01T00:00:01Z".to_string(),
+            })
+            .await
+            .expect("insert evidence link");
+        state
+            .store
+            .insert_missing_evidence(&MissingEvidence {
+                id: Uuid::new_v4(),
+                session_id: session_id.clone(),
+                claim_id: claim.id,
+                signal_class: SignalClass::ProcessResult,
+                availability: SignalAvailability::Unavailable,
+                detail: Some("no exit code sensor ran for this claim".to_string()),
+                noted_at: "2026-09-01T00:00:02Z".to_string(),
+            })
+            .await
+            .expect("insert missing evidence");
+
+        let query = Query(EvidenceGraphQuery {
+            claim: claim.id.to_string(),
+            session: session_id,
+        });
+        let resp = api_evidence_graph(State(state), query).await;
+        assert_eq!(resp.0.get("found").and_then(|b| b.as_bool()), Some(true));
+        let links = resp.0["links"].as_array().expect("links must be an array");
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0]["relation"], "contradicts");
+        let missing = resp.0["missing"]
+            .as_array()
+            .expect("missing must be an array");
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0]["signal_class"], "process_result");
+        assert_eq!(missing[0]["availability"], "unavailable");
+    }
+
+    /// FORNX-90 regression: an unknown claim id must report `found: false`,
+    /// never a fabricated empty graph — "the claim doesn't exist" must stay
+    /// distinguishable from "the claim exists but nobody has looked".
+    #[tokio::test]
+    async fn api_evidence_graph_reports_not_found_for_unknown_claim() {
+        let state = test_state().await;
+        let query = Query(EvidenceGraphQuery {
+            claim: Uuid::new_v4().to_string(),
+            session: "no-such-session".to_string(),
+        });
+        let resp = api_evidence_graph(State(state), query).await;
+        assert_eq!(resp.0.get("found").and_then(|b| b.as_bool()), Some(false));
+        assert!(resp.0.get("reason").and_then(|s| s.as_str()).is_some());
+    }
+
+    /// FORNX-90 regression: a real claim with zero links and zero missing
+    /// notes ("nobody has looked") must still report `found: true` with
+    /// empty arrays — distinct from both the not-found case above and the
+    /// looked-but-absent case covered by
+    /// `api_evidence_graph_surfaces_links_and_missing_for_a_real_claim`.
+    #[tokio::test]
+    async fn api_evidence_graph_distinguishes_nobody_looked_from_not_found() {
+        let state = test_state().await;
+        let mut hint = None;
+        let session_id = "fornx-90-nobody-looked".to_string();
+
+        let event_id = Uuid::new_v4();
+        let event = AgentEvent {
+            id: event_id,
+            session_id: session_id.clone(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-09-01T00:00:00Z".to_string(),
+            tool_name: Some("Bash".to_string()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        handle_message(&state, IngestMessage::Event(event), &mut hint)
+            .await
+            .expect("handle event");
+
+        let claim = Claim {
+            id: Uuid::new_v4(),
+            session_id: session_id.clone(),
+            source_event_id: event_id,
+            text: "nobody has linked evidence to this claim yet".to_string(),
+            subject: "test_result".to_string(),
+            claimed_at: "2026-09-01T00:00:00Z".to_string(),
+        };
+        handle_message(&state, IngestMessage::Claim(claim.clone()), &mut hint)
+            .await
+            .expect("handle claim");
+
+        let query = Query(EvidenceGraphQuery {
+            claim: claim.id.to_string(),
+            session: session_id,
+        });
+        let resp = api_evidence_graph(State(state), query).await;
+        assert_eq!(resp.0.get("found").and_then(|b| b.as_bool()), Some(true));
+        assert!(resp.0["links"]
+            .as_array()
+            .expect("links must be an array")
+            .is_empty());
+        assert!(resp.0["missing"]
+            .as_array()
+            .expect("missing must be an array")
+            .is_empty());
+    }
+
+    /// FORNX-90 regression, direct read of the AC bullet "graph queries
+    /// cannot cross tenant/session authorization boundaries": a claim that
+    /// really exists in session A must report `found: false` — not A's
+    /// graph — when queried under a different session id B, exactly like
+    /// querying a claim id that doesn't exist anywhere.
+    #[tokio::test]
+    async fn api_evidence_graph_does_not_leak_a_claim_across_sessions() {
+        use fornax_types::{EvidenceLink, EvidenceRelation};
+
+        let state = test_state().await;
+        let mut hint = None;
+        let owning_session = "fornx-90-owning-session".to_string();
+        let other_session = "fornx-90-other-session".to_string();
+
+        let event_id = Uuid::new_v4();
+        let event = AgentEvent {
+            id: event_id,
+            session_id: owning_session.clone(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-09-01T00:00:00Z".to_string(),
+            tool_name: Some("Bash".to_string()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        handle_message(&state, IngestMessage::Event(event), &mut hint)
+            .await
+            .expect("handle event");
+
+        let claim = Claim {
+            id: Uuid::new_v4(),
+            session_id: owning_session.clone(),
+            source_event_id: event_id,
+            text: "belongs to the owning session only".to_string(),
+            subject: "test_result".to_string(),
+            claimed_at: "2026-09-01T00:00:00Z".to_string(),
+        };
+        handle_message(&state, IngestMessage::Claim(claim.clone()), &mut hint)
+            .await
+            .expect("handle claim");
+
+        // `claim_evidence_links.evidence_id` is a foreign key into
+        // `evidence` (0006_evidence_graph.sql) — needs a real stored row.
+        let evidence_id = Uuid::new_v4();
+        let evidence = fornax_types::Evidence {
+            id: evidence_id,
+            session_id: owning_session.clone(),
+            source_event_id: event_id,
+            kind: fornax_types::EvidenceKind::ProcessObservation,
+            observed_at: "2026-09-01T00:00:00Z".to_string(),
+            payload: serde_json::json!({}),
+            provenance: "claude_code:1.2.3:PostToolUse:Bash#tool_response".to_string(),
+            source: None,
+            extension: None,
+        };
+        handle_message(&state, IngestMessage::Evidence(evidence), &mut hint)
+            .await
+            .expect("handle evidence");
+
+        state
+            .store
+            .insert_evidence_link(&EvidenceLink {
+                id: Uuid::new_v4(),
+                session_id: owning_session.clone(),
+                claim_id: claim.id,
+                evidence_id,
+                relation: EvidenceRelation::Supports,
+                linked_at: "2026-09-01T00:00:01Z".to_string(),
+            })
+            .await
+            .expect("insert evidence link");
+
+        let cross_session_query = Query(EvidenceGraphQuery {
+            claim: claim.id.to_string(),
+            session: other_session,
+        });
+        let resp = api_evidence_graph(State(state.clone()), cross_session_query).await;
+        assert_eq!(
+            resp.0.get("found").and_then(|b| b.as_bool()),
+            Some(false),
+            "a real claim queried under a different session id must not leak as found"
+        );
+
+        // Sanity: the same claim id under its real session does resolve.
+        let same_session_query = Query(EvidenceGraphQuery {
+            claim: claim.id.to_string(),
+            session: owning_session,
+        });
+        let resp2 = api_evidence_graph(State(state), same_session_query).await;
+        assert_eq!(resp2.0.get("found").and_then(|b| b.as_bool()), Some(true));
+    }
+
     /// FORNX-244 regression: `state.caps` is a single in-memory slot per
     /// `session_id`, but `session_id` here is provider-controlled data (an
     /// adapter reads it straight off the native payload). A malicious/buggy
@@ -1035,5 +1881,491 @@ mod tests {
             "the real provider's capability must not be silently downgraded by a \
              cross-provider announcement for the same session id"
         );
+    }
+
+    // --- FORNX-304: /api/fusion --------------------------------------------
+
+    /// Inserts a real `AgentEvent` and returns its id — `claims.source_event_id`
+    /// and `evidence.source_event_id` are both foreign keys into
+    /// `agent_events` (0006_evidence_graph.sql), so fixtures for either must
+    /// reference a row already stored via this, not a bare `Uuid::new_v4()`.
+    async fn test_event(state: &AppState, session_id: &str) -> Uuid {
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: session_id.to_string(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".to_string(),
+            tool_name: Some("Bash".to_string()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        state
+            .store
+            .insert_event(&event)
+            .await
+            .expect("insert event");
+        event.id
+    }
+
+    fn test_claim(session_id: &str, source_event_id: Uuid) -> Claim {
+        Claim {
+            id: Uuid::new_v4(),
+            session_id: session_id.to_string(),
+            source_event_id,
+            text: "the command exited successfully".to_string(),
+            subject: "command_succeeded".to_string(),
+            claimed_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn test_evidence(session_id: &str, source_event_id: Uuid) -> fornax_types::Evidence {
+        fornax_types::Evidence {
+            id: Uuid::new_v4(),
+            session_id: session_id.to_string(),
+            source_event_id,
+            kind: fornax_types::EvidenceKind::ExitCode,
+            observed_at: "2026-01-01T00:00:00Z".to_string(),
+            payload: serde_json::json!({}),
+            provenance: "test".to_string(),
+            source: None,
+            extension: None,
+        }
+    }
+
+    /// A claim with a real, persisted `claim_evidence_links` row must compute
+    /// fusion straight from `Store::evidence_graph_for_claim` — the
+    /// `project_graph` fallback must never fire when the real graph is
+    /// already populated (FORNX-304 AC).
+    #[tokio::test]
+    async fn api_fusion_uses_the_real_graph_when_populated() {
+        let state = test_state().await;
+        let session_id = "fornx-304-real-graph";
+        let event_id = test_event(&state, session_id).await;
+        let claim = test_claim(session_id, event_id);
+        let evidence = test_evidence(session_id, event_id);
+        state
+            .store
+            .insert_claim(&claim)
+            .await
+            .expect("insert claim");
+        state
+            .store
+            .insert_evidence(&evidence)
+            .await
+            .expect("insert evidence");
+        let link = fornax_types::EvidenceLink {
+            id: Uuid::new_v4(),
+            session_id: session_id.to_string(),
+            claim_id: claim.id,
+            evidence_id: evidence.id,
+            relation: fornax_types::EvidenceRelation::Supports,
+            linked_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        state
+            .store
+            .insert_evidence_link(&link)
+            .await
+            .expect("insert evidence link");
+
+        let response = api_fusion(
+            State(state),
+            Query(FusionQuery {
+                claim: claim.id.to_string(),
+                session: session_id.to_string(),
+            }),
+        )
+        .await;
+        let v = response.0;
+        assert_eq!(v["found"], serde_json::json!(true));
+        assert_eq!(v["graph_source"], serde_json::json!("graph"));
+        let fused = &v["fused"];
+        assert_eq!(fused["verdict"], serde_json::json!("verified"));
+        assert_eq!(
+            fused["counted_link_ids"],
+            serde_json::json!([link.id.to_string()])
+        );
+    }
+
+    /// A claim with a real `Finding` but nothing in the evidence-graph
+    /// tables must fall back to `fusion::project_graph` over that finding
+    /// (FORNX-304 AC: the projection fallback is today's actual production
+    /// state, per `fusion.rs`'s own module docs).
+    #[tokio::test]
+    async fn api_fusion_projects_from_findings_when_the_real_graph_is_empty() {
+        let state = test_state().await;
+        let session_id = "fornx-304-projection-fallback";
+        let event_id = test_event(&state, session_id).await;
+        let claim = test_claim(session_id, event_id);
+        let evidence = test_evidence(session_id, event_id);
+        state
+            .store
+            .insert_claim(&claim)
+            .await
+            .expect("insert claim");
+        state
+            .store
+            .insert_evidence(&evidence)
+            .await
+            .expect("insert evidence");
+        let finding = Finding {
+            id: Uuid::new_v4(),
+            claim_id: claim.id,
+            verdict: fornax_types::Verdict::Verified,
+            evidence_ids: vec![evidence.id],
+            verifier_name: "command_success_verifier_v1".to_string(),
+            rationale: "exit code 0 observed".to_string(),
+            computed_at: "2026-01-01T00:00:01Z".to_string(),
+        };
+        state
+            .store
+            .insert_finding(&finding)
+            .await
+            .expect("insert finding");
+
+        // No claim_evidence_links / claim_missing_evidence rows exist for
+        // this claim -- the real graph is empty, so this must fall back.
+        let real_graph = state
+            .store
+            .evidence_graph_for_claim(&claim.id.to_string(), session_id)
+            .await
+            .expect("read real graph");
+        assert!(real_graph.links.is_empty() && real_graph.missing.is_empty());
+
+        let response = api_fusion(
+            State(state),
+            Query(FusionQuery {
+                claim: claim.id.to_string(),
+                session: session_id.to_string(),
+            }),
+        )
+        .await;
+        let v = response.0;
+        assert_eq!(v["found"], serde_json::json!(true));
+        assert_eq!(v["graph_source"], serde_json::json!("projected"));
+        assert_eq!(v["fused"]["verdict"], serde_json::json!("verified"));
+    }
+
+    #[tokio::test]
+    async fn api_fusion_reports_not_found_for_unknown_claim() {
+        let state = test_state().await;
+        let response = api_fusion(
+            State(state),
+            Query(FusionQuery {
+                claim: Uuid::new_v4().to_string(),
+                session: "fornx-304-unknown-claim".to_string(),
+            }),
+        )
+        .await;
+        let v = response.0;
+        assert_eq!(v["found"], serde_json::json!(false));
+    }
+
+    // --- FORNX-96: /api/decision (local half) -------------------------------
+
+    /// `/api/decision` always returns both the `Recommendation` and the
+    /// full underlying `FusedFinding` in the same response -- FORNX-96 AC:
+    /// "recommendation never replaces the underlying Finding/evidence
+    /// graph". Uses the same real-graph fixture path as
+    /// `api_fusion_uses_the_real_graph_when_populated`.
+    #[tokio::test]
+    async fn api_decision_returns_recommendation_and_full_fused_finding_together() {
+        let state = test_state().await;
+        let session_id = "fornx-96-decision-real-graph";
+        let event_id = test_event(&state, session_id).await;
+        let claim = test_claim(session_id, event_id);
+        let evidence = test_evidence(session_id, event_id);
+        state
+            .store
+            .insert_claim(&claim)
+            .await
+            .expect("insert claim");
+        state
+            .store
+            .insert_evidence(&evidence)
+            .await
+            .expect("insert evidence");
+        let link = fornax_types::EvidenceLink {
+            id: Uuid::new_v4(),
+            session_id: session_id.to_string(),
+            claim_id: claim.id,
+            evidence_id: evidence.id,
+            relation: fornax_types::EvidenceRelation::Supports,
+            linked_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        state
+            .store
+            .insert_evidence_link(&link)
+            .await
+            .expect("insert evidence link");
+
+        let response = api_decision(
+            State(state),
+            Query(DecisionQuery {
+                claim: claim.id.to_string(),
+                session: session_id.to_string(),
+                risk: None,
+            }),
+        )
+        .await;
+        let v = response.0;
+        assert_eq!(v["found"], serde_json::json!(true));
+        // The recommendation is present -- a single Supports link with no
+        // recorded correlation group is Verified+Qualified (an
+        // IndependenceUnverified caveat fires), so the hard AC safety floor
+        // applies: never Proceed, at most Review.
+        assert_eq!(v["fused"]["uncertainty"], serde_json::json!("qualified"));
+        assert_eq!(v["recommendation"]["action"], serde_json::json!("review"));
+        assert_eq!(
+            v["recommendation"]["risk_class"],
+            serde_json::json!("balanced")
+        );
+        assert_eq!(
+            v["recommendation"]["policy_name"],
+            serde_json::json!("default_risk_policy_v1")
+        );
+        // ...and the full FusedFinding is present alongside it, not instead
+        // of it.
+        assert_eq!(v["fused"]["verdict"], serde_json::json!("verified"));
+        assert_eq!(
+            v["fused"]["counted_link_ids"],
+            serde_json::json!([link.id.to_string()])
+        );
+        // The recommendation points back at the claim, never embeds the
+        // fusion rationale itself.
+        assert_eq!(
+            v["recommendation"]["claim_id"],
+            serde_json::json!(claim.id.to_string())
+        );
+        assert!(v["recommendation"].get("rationale").is_none());
+    }
+
+    /// Omitting `risk` defaults to `balanced` -- confirmed above via
+    /// `risk: None`; this test confirms an explicit `risk=strict` changes
+    /// the action for the same underlying evidence (FORNX-96 AC: "same
+    /// finding can yield different actions under explicit policy/risk
+    /// contexts").
+    #[tokio::test]
+    async fn api_decision_risk_query_param_changes_the_recommended_action() {
+        let state = test_state().await;
+        let session_id = "fornx-96-decision-risk-param";
+        let event_id = test_event(&state, session_id).await;
+        let claim = test_claim(session_id, event_id);
+        let evidence = test_evidence(session_id, event_id);
+        state
+            .store
+            .insert_claim(&claim)
+            .await
+            .expect("insert claim");
+        state
+            .store
+            .insert_evidence(&evidence)
+            .await
+            .expect("insert evidence");
+        // A Contradicts link: Corroborated+Contradicted blocks under
+        // Strict/Balanced but only reviews under Lenient.
+        let link = fornax_types::EvidenceLink {
+            id: Uuid::new_v4(),
+            session_id: session_id.to_string(),
+            claim_id: claim.id,
+            evidence_id: evidence.id,
+            relation: fornax_types::EvidenceRelation::Contradicts,
+            linked_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        state
+            .store
+            .insert_evidence_link(&link)
+            .await
+            .expect("insert evidence link");
+
+        let strict = api_decision(
+            State(state.clone()),
+            Query(DecisionQuery {
+                claim: claim.id.to_string(),
+                session: session_id.to_string(),
+                risk: Some("strict".to_string()),
+            }),
+        )
+        .await
+        .0;
+        let lenient = api_decision(
+            State(state),
+            Query(DecisionQuery {
+                claim: claim.id.to_string(),
+                session: session_id.to_string(),
+                risk: Some("lenient".to_string()),
+            }),
+        )
+        .await
+        .0;
+
+        assert_eq!(
+            strict["fused"]["verdict"],
+            serde_json::json!("contradicted")
+        );
+        assert_eq!(
+            lenient["fused"]["verdict"],
+            serde_json::json!("contradicted")
+        );
+        assert_eq!(
+            strict["recommendation"]["action"],
+            serde_json::json!("block")
+        );
+        assert_eq!(
+            lenient["recommendation"]["action"],
+            serde_json::json!("review")
+        );
+        assert_ne!(
+            strict["recommendation"]["action"],
+            lenient["recommendation"]["action"]
+        );
+    }
+
+    #[tokio::test]
+    async fn api_decision_reports_not_found_for_unknown_claim() {
+        let state = test_state().await;
+        let response = api_decision(
+            State(state),
+            Query(DecisionQuery {
+                claim: Uuid::new_v4().to_string(),
+                session: "fornx-96-decision-unknown-claim".to_string(),
+                risk: None,
+            }),
+        )
+        .await;
+        let v = response.0;
+        assert_eq!(v["found"], serde_json::json!(false));
+        assert!(v.get("recommendation").is_none());
+    }
+
+    #[tokio::test]
+    async fn api_decision_reports_error_for_unknown_risk_class() {
+        let state = test_state().await;
+        let response = api_decision(
+            State(state),
+            Query(DecisionQuery {
+                claim: Uuid::new_v4().to_string(),
+                session: "fornx-96-decision-bad-risk".to_string(),
+                risk: Some("reckless".to_string()),
+            }),
+        )
+        .await;
+        let v = response.0;
+        assert!(v.get("error").is_some());
+    }
+
+    // --- FORNX-94: /api/judge -------------------------------------------
+
+    /// Deliberately does not assert `judge.verdict` is a specific value --
+    /// whether the local judge is enabled depends on this test machine's
+    /// `$FORNAX_HOME/config.toml`, which this test must not assume either
+    /// way (and must not mutate, for the same "don't mutate process-global
+    /// env vars shared with other tests" reason `sensor_config`'s own tests
+    /// document). What every environment must produce identically: `found:
+    /// true`, a `judge` object with a real verdict tag, and the SAME full
+    /// `fused` FusedFinding alongside it -- never the judge output instead
+    /// of the deterministic evidence trail.
+    #[tokio::test]
+    async fn api_judge_returns_judge_output_alongside_full_fused_finding() {
+        let state = test_state().await;
+        let session_id = "fornx-94-judge-real-graph";
+        let event_id = test_event(&state, session_id).await;
+        let claim = test_claim(session_id, event_id);
+        let evidence = test_evidence(session_id, event_id);
+        state
+            .store
+            .insert_claim(&claim)
+            .await
+            .expect("insert claim");
+        state
+            .store
+            .insert_evidence(&evidence)
+            .await
+            .expect("insert evidence");
+        let link = fornax_types::EvidenceLink {
+            id: Uuid::new_v4(),
+            session_id: session_id.to_string(),
+            claim_id: claim.id,
+            evidence_id: evidence.id,
+            relation: fornax_types::EvidenceRelation::Supports,
+            linked_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        state
+            .store
+            .insert_evidence_link(&link)
+            .await
+            .expect("insert evidence link");
+
+        let response = api_judge(
+            State(state),
+            Query(JudgeQuery {
+                claim: claim.id.to_string(),
+                session: session_id.to_string(),
+                allow_raw_evidence: false,
+            }),
+        )
+        .await;
+        let v = response.0;
+        assert_eq!(v["found"], serde_json::json!(true));
+        let verdict = v["judge"]["verdict"]
+            .as_str()
+            .expect("judge.verdict must be a string tag");
+        assert!(
+            ["supported", "contradicted", "inconclusive", "unavailable"].contains(&verdict),
+            "unexpected judge verdict tag: {verdict}"
+        );
+        assert!(v["judge"]["model"].is_string());
+        assert!(v["judge"]["endpoint"].is_string());
+        assert!(v["judge"]["rationale"].is_string());
+        // The full deterministic FusedFinding is present alongside the
+        // judge output, never instead of it.
+        assert_eq!(v["fused"]["verdict"], serde_json::json!("verified"));
+        assert_eq!(
+            v["fused"]["counted_link_ids"],
+            serde_json::json!([link.id.to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn api_judge_reports_not_found_for_unknown_claim() {
+        let state = test_state().await;
+        let response = api_judge(
+            State(state),
+            Query(JudgeQuery {
+                claim: Uuid::new_v4().to_string(),
+                session: "fornx-94-judge-unknown-claim".to_string(),
+                allow_raw_evidence: false,
+            }),
+        )
+        .await;
+        let v = response.0;
+        assert_eq!(v["found"], serde_json::json!(false));
+        assert!(v.get("judge").is_none());
+    }
+
+    // --- FORNX-94: objective/disagreement mapping ------------------------
+
+    #[test]
+    fn objective_supported_maps_verified_and_contradicted_only() {
+        assert_eq!(
+            objective_supported_for_disagreement_check(fornax_types::Verdict::Verified),
+            Some(true)
+        );
+        assert_eq!(
+            objective_supported_for_disagreement_check(fornax_types::Verdict::Contradicted),
+            Some(false)
+        );
+        for v in [
+            fornax_types::Verdict::Unverified,
+            fornax_types::Verdict::Unavailable,
+            fornax_types::Verdict::Review,
+        ] {
+            assert_eq!(
+                objective_supported_for_disagreement_check(v),
+                None,
+                "verdict={v:?} has no clean objective side to disagree against"
+            );
+        }
     }
 }

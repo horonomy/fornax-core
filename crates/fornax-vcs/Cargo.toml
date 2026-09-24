@@ -1,0 +1,16 @@
+[package]
+name = "fornax-vcs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Pure-Rust, in-process git implementation (the gitoxide project) — no
+# subprocess spawn, no FFI to a system `git` binary. See this crate's module
+# docs for why that matters (FORNX-238's zero-subprocess-surface invariant).
+gix = { version = "0.87", features = ["max-performance-safe"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true

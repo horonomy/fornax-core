@@ -11,3 +11,12 @@ serde_json.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
 uuid.workspace = true
+toml_edit.workspace = true
+# FORNX-94: the workspace already depends on reqwest (fornax-cli); this adds
+# the "blocking" feature so this crate's SemanticJudgeProvider trait can stay
+# sync (matching FusionPolicy's sync shape) while calling a local Ollama-
+# compatible HTTP endpoint. New feature flag on an existing workspace
+# dependency, not a new crate -- called out in the FORNX-94 PR body for
+# owner awareness per CLAUDE.md's "don't add new dependencies without
+# asking first".
+reqwest = { workspace = true, features = ["blocking", "json"] }

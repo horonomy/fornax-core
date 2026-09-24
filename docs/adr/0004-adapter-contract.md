@@ -142,6 +142,25 @@ adapter crate. That dependency direction exists only in
 `crates/fornax-adapter-conformance`, a test-only harness crate — see
 "Conformance harness" below.
 
+**One named exception (FORNX-302):** an adapter crate may additionally
+depend on `fornax-vcs`, and only `fornax-vcs`, for git-native
+filesystem/commit evidence. FORNX-91's original design for this evidence
+class was blocked by two constraints that still hold: shelling out to `git`
+is forbidden workspace-wide by
+`crates/fornax-daemon/tests/adversarial_daemon_input.rs::
+subprocess_surface_is_still_zero_in_production_code` (FORNX-238), and an
+in-process git library cannot live directly inside an adapter crate without
+widening what "thin" means for every adapter, not just the one that needs
+git access. `fornax-vcs` resolves this the same way `fornax-verify`/
+`fornax-store` are kept out of adapters generally: the git dependency
+(`gix`, pure-Rust, no subprocess, no FFI to a system `git`) lives in its own
+single-purpose crate with a small synchronous query surface
+(`fornax_vcs::working_tree_status`), and adapters call into it rather than
+embedding the dependency themselves. This exception is scoped to
+`fornax-vcs` by name — it does not open adapter dependencies to Fornax
+crates generally, and a future adapter need must not be assumed to qualify
+for the same treatment without its own explicit ADR amendment.
+
 ### Error semantics
 
 `normalize` never propagates an error. A malformed or unrecognized native

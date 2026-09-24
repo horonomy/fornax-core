@@ -46,8 +46,11 @@ crates/fornax-adapter-<provider>/
 Add both a `[lib]` and a `[[bin]]` target to `Cargo.toml` (see
 `crates/fornax-adapter-claude/Cargo.toml` for the exact shape), and add the
 crate path to the workspace `members` list in the repo-root `Cargo.toml`.
-`fornax-types` is the only Fornax crate this crate may depend on — see the
-ADR's "Allowed core dependencies".
+`fornax-types` is the only Fornax crate this crate may depend on, with one
+narrow, named exception: `fornax-vcs`, for git-native working-tree/commit
+evidence collection (FORNX-302) — see the ADR's "Allowed core dependencies"
+for why this is scoped to that single case rather than a general opening of
+adapter dependencies.
 
 ## 2. Implement `CapabilityProbe`
 

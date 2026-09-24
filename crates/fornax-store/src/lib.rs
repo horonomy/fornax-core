@@ -4,7 +4,8 @@
 //! dependency.
 
 use fornax_types::{
-    AgentEvent, Claim, Evidence, Finding, LegacyCapabilitiesWire, RuntimeCapabilities,
+    AgentEvent, Claim, Evidence, EvidenceGraph, EvidenceLink, Finding, LegacyCapabilitiesWire,
+    MissingEvidence, RuntimeCapabilities,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
@@ -182,6 +183,97 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Record a typed claim-to-evidence relationship (FORNX-89). Additive
+    /// linkage row — does not change how `claims`/`evidence` are stored or
+    /// interpreted. The caller is responsible for `link.session_id` matching
+    /// the session the referenced claim actually belongs to; this method
+    /// does not validate that against the `claims` table. A mismatched
+    /// `session_id` does not leak the row into another session's queries —
+    /// `evidence_graph_for_claim` scopes on the `(claim_id, session_id)`
+    /// pair — but it does make the row invisible to every query, since no
+    /// query will ever present that exact wrong pair.
+    pub async fn insert_evidence_link(&self, link: &EvidenceLink) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO claim_evidence_links (id, session_id, claim_id, evidence_id, relation, linked_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(link.id.to_string())
+        .bind(&link.session_id)
+        .bind(link.claim_id.to_string())
+        .bind(link.evidence_id.to_string())
+        .bind(tag(&link.relation)?)
+        .bind(&link.linked_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Record a claim's explicit note that evidence of a given `SignalClass`
+    /// was expected but could not be collected/observed (FORNX-89) — keeps
+    /// "no evidence found" distinguishable from "evidence could not exist".
+    pub async fn insert_missing_evidence(&self, missing: &MissingEvidence) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO claim_missing_evidence (id, session_id, claim_id, signal_class, availability, detail, noted_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .bind(missing.id.to_string())
+        .bind(&missing.session_id)
+        .bind(missing.claim_id.to_string())
+        .bind(tag(&missing.signal_class)?)
+        .bind(tag(&missing.availability)?)
+        .bind(&missing.detail)
+        .bind(&missing.noted_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The full evidence graph for one claim (FORNX-89): every typed
+    /// claim-to-evidence link plus every explicit missing-evidence note,
+    /// both ordered oldest first. Read-only, in-process — no HTTP surface
+    /// (FORNX-90 "Evidence Explorer" is the separate ticket that exposes
+    /// this to users). A `Finding` reaches its evidence graph via
+    /// `finding.claim_id` — there is no separate `evidence_graph_for_finding`.
+    ///
+    /// Scoped by `(claim_id, session_id)`, not `claim_id` alone (FORNX-89 AC:
+    /// "graph queries cannot cross tenant/session authorization boundaries")
+    /// — a caller must already know which session a claim belongs to, and a
+    /// mismatched pair returns an empty graph rather than another session's
+    /// rows.
+    pub async fn evidence_graph_for_claim(
+        &self,
+        claim_id: &str,
+        session_id: &str,
+    ) -> Result<EvidenceGraph> {
+        let link_rows = sqlx::query_as::<_, EvidenceLinkRow>(
+            "SELECT id, session_id, claim_id, evidence_id, relation, linked_at
+             FROM claim_evidence_links WHERE claim_id = ?1 AND session_id = ?2 ORDER BY linked_at ASC",
+        )
+        .bind(claim_id)
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let links = link_rows
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<_>>>()?;
+
+        let missing_rows = sqlx::query_as::<_, MissingEvidenceRow>(
+            "SELECT id, session_id, claim_id, signal_class, availability, detail, noted_at
+             FROM claim_missing_evidence WHERE claim_id = ?1 AND session_id = ?2 ORDER BY noted_at ASC",
+        )
+        .bind(claim_id)
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let missing = missing_rows
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(EvidenceGraph { links, missing })
     }
 
     /// All evidence rows for a session, oldest first — the input a verifier
@@ -521,6 +613,56 @@ impl TryFrom<ClaimRow> for Claim {
 }
 
 #[derive(sqlx::FromRow)]
+struct EvidenceLinkRow {
+    id: String,
+    session_id: String,
+    claim_id: String,
+    evidence_id: String,
+    relation: String,
+    linked_at: String,
+}
+
+impl TryFrom<EvidenceLinkRow> for EvidenceLink {
+    type Error = StoreError;
+    fn try_from(r: EvidenceLinkRow) -> Result<Self> {
+        Ok(EvidenceLink {
+            id: uuid::Uuid::parse_str(&r.id).unwrap_or_default(),
+            session_id: r.session_id,
+            claim_id: uuid::Uuid::parse_str(&r.claim_id).unwrap_or_default(),
+            evidence_id: uuid::Uuid::parse_str(&r.evidence_id).unwrap_or_default(),
+            relation: from_tag(&r.relation)?,
+            linked_at: r.linked_at,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct MissingEvidenceRow {
+    id: String,
+    session_id: String,
+    claim_id: String,
+    signal_class: String,
+    availability: String,
+    detail: Option<String>,
+    noted_at: String,
+}
+
+impl TryFrom<MissingEvidenceRow> for MissingEvidence {
+    type Error = StoreError;
+    fn try_from(r: MissingEvidenceRow) -> Result<Self> {
+        Ok(MissingEvidence {
+            id: uuid::Uuid::parse_str(&r.id).unwrap_or_default(),
+            session_id: r.session_id,
+            claim_id: uuid::Uuid::parse_str(&r.claim_id).unwrap_or_default(),
+            signal_class: from_tag(&r.signal_class)?,
+            availability: from_tag(&r.availability)?,
+            detail: r.detail,
+            noted_at: r.noted_at,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
 struct CapabilitiesRow {
     provider: String,
     supports_pre_tool_use: bool,
@@ -696,6 +838,8 @@ mod tests {
                     &fornax_types::TrustClass::HostObserved,
                     &fornax_types::CollectionMethod::ProcessObservation,
                 ),
+                correlation_group: None,
+                derived_from: Vec::new(),
             }),
             extension: None,
         };
@@ -1120,6 +1264,77 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// FORNX-92: a row written before `correlation_group`/`derived_from`
+    /// existed (a FORNX-157/159-era `EvidenceSource` blob) must read those
+    /// two fields back as their honest empty defaults (`None`, `[]`), never
+    /// a fabricated correlation group or origin — mirrors
+    /// `pre_migration_evidence_source_reads_back_new_fields_as_honest_unknown`
+    /// above for the same reason: no new `fornax-store` column was added,
+    /// so the honesty guarantee lives entirely in `EvidenceSource`'s
+    /// `#[serde(default)]`s, proven here through a full store round trip.
+    #[tokio::test]
+    async fn pre_fornx_92_evidence_source_reads_back_correlation_fields_as_honest_empty() {
+        let path = tmp_db_path("evidence-source-pre-fornx-92");
+        let store = Store::open(&path).await.expect("open db");
+
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "s6c".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("Bash".into()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        store.insert_event(&event).await.expect("insert event");
+
+        // The exact shape FORNX-157/159 persisted: no correlation_group,
+        // no derived_from key at all.
+        let legacy_source_json = serde_json::json!({
+            "sensor_name": "claude_bash_exit_code_sensor_v1",
+            "trust_class": "agent_adjacent",
+            "collected_at": "2026-01-01T00:00:01Z",
+            "provider": "claude_code",
+            "collection_method": "hook_callback",
+        })
+        .to_string();
+
+        sqlx::query(
+            "INSERT INTO evidence (id, session_id, source_event_id, kind, observed_at, payload, provenance, source)
+             VALUES (?1, 's6c', ?2, 'exit_code', '2026-01-01T00:00:01Z', '{\"exit_code\":0}', 'legacy', ?3)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(event.id.to_string())
+        .bind(&legacy_source_json)
+        .execute(&store.pool)
+        .await
+        .expect("hand-insert pre-FORNX-92 evidence row");
+
+        let fetched = store
+            .evidence_for_session("s6c")
+            .await
+            .expect("query evidence")
+            .evidence;
+        assert_eq!(fetched.len(), 1);
+        let source = fetched[0]
+            .source
+            .as_ref()
+            .expect("legacy source blob must still deserialize, not become None");
+
+        assert_eq!(
+            source.correlation_group, None,
+            "missing correlation_group must not be fabricated"
+        );
+        assert!(
+            source.derived_from.is_empty(),
+            "missing derived_from must not be fabricated"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
     /// FORNX-158: a row written before the 0005 migration (or with no
     /// provider-extension data at all, the common case) has `extension IS
     /// NULL`. It must read back cleanly as `Evidence::extension == None`,
@@ -1316,6 +1531,385 @@ mod tests {
             "failure reason must name the FORNX-158 incompatibility, got: {}",
             outcome.failed[0].error
         );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    // --- FORNX-89: evidence graph ------------------------------------------
+
+    fn sample_evidence(session_id: &str, source_event_id: Uuid) -> Evidence {
+        Evidence {
+            id: Uuid::new_v4(),
+            session_id: session_id.into(),
+            source_event_id,
+            kind: EvidenceKind::ExitCode,
+            observed_at: "2026-01-01T00:00:01Z".into(),
+            payload: serde_json::json!({"command": ["pytest"], "exit_code": 0}),
+            provenance: "test".into(),
+            source: None,
+            extension: None,
+        }
+    }
+
+    /// FORNX-89 core scenario: a claim with 2 supporting + 1 contradicting
+    /// evidence link, plus one explicit missing-evidence marker, round-trips
+    /// through the store — and none of this touches how `Evidence`/`Claim`
+    /// themselves are stored (asserted via the untouched
+    /// `evidence_for_session`/`claims_for_session` reads below).
+    #[tokio::test]
+    async fn claim_evidence_graph_round_trips_with_supports_contradicts_and_missing() {
+        use fornax_types::{EvidenceRelation, SignalAvailability, SignalClass};
+
+        let path = tmp_db_path("evidence-graph-roundtrip");
+        let store = Store::open(&path).await.expect("open db");
+
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "sg1".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("Bash".into()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        store.insert_event(&event).await.expect("insert event");
+
+        let claim = Claim {
+            id: Uuid::new_v4(),
+            session_id: "sg1".into(),
+            source_event_id: event.id,
+            text: "All tests passed.".into(),
+            subject: "test_result".into(),
+            claimed_at: "2026-01-01T00:00:02Z".into(),
+        };
+        store.insert_claim(&claim).await.expect("insert claim");
+
+        let ev_a = sample_evidence("sg1", event.id);
+        let ev_b = sample_evidence("sg1", event.id);
+        let ev_c = sample_evidence("sg1", event.id);
+        for ev in [&ev_a, &ev_b, &ev_c] {
+            store.insert_evidence(ev).await.expect("insert evidence");
+        }
+
+        let link_a = EvidenceLink {
+            id: Uuid::new_v4(),
+            session_id: "sg1".into(),
+            claim_id: claim.id,
+            evidence_id: ev_a.id,
+            relation: EvidenceRelation::Supports,
+            linked_at: "2026-01-01T00:00:03Z".into(),
+        };
+        let link_b = EvidenceLink {
+            id: Uuid::new_v4(),
+            session_id: "sg1".into(),
+            claim_id: claim.id,
+            evidence_id: ev_b.id,
+            relation: EvidenceRelation::Supports,
+            linked_at: "2026-01-01T00:00:04Z".into(),
+        };
+        let link_c = EvidenceLink {
+            id: Uuid::new_v4(),
+            session_id: "sg1".into(),
+            claim_id: claim.id,
+            evidence_id: ev_c.id,
+            relation: EvidenceRelation::Contradicts,
+            linked_at: "2026-01-01T00:00:05Z".into(),
+        };
+        for link in [&link_a, &link_b, &link_c] {
+            store
+                .insert_evidence_link(link)
+                .await
+                .expect("insert evidence link");
+        }
+
+        let missing = MissingEvidence {
+            id: Uuid::new_v4(),
+            session_id: "sg1".into(),
+            claim_id: claim.id,
+            signal_class: SignalClass::ProcessResult,
+            availability: SignalAvailability::Unavailable,
+            detail: Some("no process-result sensor observed this claim".into()),
+            noted_at: "2026-01-01T00:00:06Z".into(),
+        };
+        store
+            .insert_missing_evidence(&missing)
+            .await
+            .expect("insert missing evidence");
+
+        let graph = store
+            .evidence_graph_for_claim(&claim.id.to_string(), "sg1")
+            .await
+            .expect("query evidence graph");
+
+        assert_eq!(graph.links.len(), 3);
+        let supports = graph
+            .links
+            .iter()
+            .filter(|l| l.relation == EvidenceRelation::Supports)
+            .count();
+        let contradicts = graph
+            .links
+            .iter()
+            .filter(|l| l.relation == EvidenceRelation::Contradicts)
+            .count();
+        assert_eq!(supports, 2);
+        assert_eq!(contradicts, 1);
+
+        assert_eq!(graph.missing.len(), 1);
+        assert_eq!(graph.missing[0].signal_class, SignalClass::ProcessResult);
+        assert_eq!(
+            graph.missing[0].availability,
+            SignalAvailability::Unavailable
+        );
+        assert_eq!(
+            graph.missing[0].detail.as_deref(),
+            Some("no process-result sensor observed this claim")
+        );
+
+        // Nothing about existing Evidence/Claim storage changed shape.
+        let evidence = store
+            .evidence_for_session("sg1")
+            .await
+            .expect("query evidence")
+            .evidence;
+        assert_eq!(evidence.len(), 3);
+        let claims = store.claims_for_session("sg1").await.expect("query claims");
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].id, claim.id);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A claim with zero links and zero missing-evidence notes ("nobody has
+    /// looked yet") must be distinguishable from a claim with zero links but
+    /// a non-empty missing-evidence list ("evidence could not exist") — the
+    /// FORNX-89 core invariant, proven end-to-end through the store.
+    #[tokio::test]
+    async fn claim_with_no_evidence_is_distinguishable_from_claim_with_missing_evidence_noted() {
+        use fornax_types::{SignalAvailability, SignalClass};
+
+        let path = tmp_db_path("evidence-graph-missing-distinct");
+        let store = Store::open(&path).await.expect("open db");
+
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "sg2".into(),
+            provider: Provider::Codex,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: None,
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        store.insert_event(&event).await.expect("insert event");
+
+        let claim_untouched = Claim {
+            id: Uuid::new_v4(),
+            session_id: "sg2".into(),
+            source_event_id: event.id,
+            text: "Nobody has verified this yet.".into(),
+            subject: "test_result".into(),
+            claimed_at: "2026-01-01T00:00:01Z".into(),
+        };
+        let claim_known_absent = Claim {
+            id: Uuid::new_v4(),
+            session_id: "sg2".into(),
+            source_event_id: event.id,
+            text: "Deployment succeeded.".into(),
+            subject: "deployment_result".into(),
+            claimed_at: "2026-01-01T00:00:02Z".into(),
+        };
+        store
+            .insert_claim(&claim_untouched)
+            .await
+            .expect("insert claim");
+        store
+            .insert_claim(&claim_known_absent)
+            .await
+            .expect("insert claim");
+
+        store
+            .insert_missing_evidence(&MissingEvidence {
+                id: Uuid::new_v4(),
+                session_id: "sg2".into(),
+                claim_id: claim_known_absent.id,
+                signal_class: SignalClass::ProcessResult,
+                availability: SignalAvailability::Unsupported,
+                detail: Some("this runtime cannot observe deployment outcomes".into()),
+                noted_at: "2026-01-01T00:00:03Z".into(),
+            })
+            .await
+            .expect("insert missing evidence");
+
+        let untouched_graph = store
+            .evidence_graph_for_claim(&claim_untouched.id.to_string(), "sg2")
+            .await
+            .expect("query untouched graph");
+        let known_absent_graph = store
+            .evidence_graph_for_claim(&claim_known_absent.id.to_string(), "sg2")
+            .await
+            .expect("query known-absent graph");
+
+        assert!(untouched_graph.links.is_empty());
+        assert!(untouched_graph.missing.is_empty());
+
+        assert!(known_absent_graph.links.is_empty());
+        assert_eq!(known_absent_graph.missing.len(), 1);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// FORNX-89 AC: "graph queries cannot cross tenant/session authorization
+    /// boundaries." A correct `claim_id` paired with the *wrong*
+    /// `session_id` must come back empty, not leak another session's links.
+    #[tokio::test]
+    async fn evidence_graph_query_does_not_cross_session_boundary() {
+        use fornax_types::EvidenceRelation;
+
+        let path = tmp_db_path("evidence-graph-session-boundary");
+        let store = Store::open(&path).await.expect("open db");
+
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "sg3".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("Bash".into()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        store.insert_event(&event).await.expect("insert event");
+
+        let claim = Claim {
+            id: Uuid::new_v4(),
+            session_id: "sg3".into(),
+            source_event_id: event.id,
+            text: "All tests passed.".into(),
+            subject: "test_result".into(),
+            claimed_at: "2026-01-01T00:00:01Z".into(),
+        };
+        store.insert_claim(&claim).await.expect("insert claim");
+
+        let evidence = sample_evidence("sg3", event.id);
+        store
+            .insert_evidence(&evidence)
+            .await
+            .expect("insert evidence");
+
+        store
+            .insert_evidence_link(&EvidenceLink {
+                id: Uuid::new_v4(),
+                session_id: "sg3".into(),
+                claim_id: claim.id,
+                evidence_id: evidence.id,
+                relation: EvidenceRelation::Supports,
+                linked_at: "2026-01-01T00:00:02Z".into(),
+            })
+            .await
+            .expect("insert evidence link");
+
+        let correct_session = store
+            .evidence_graph_for_claim(&claim.id.to_string(), "sg3")
+            .await
+            .expect("query with correct session");
+        assert_eq!(correct_session.links.len(), 1);
+
+        let wrong_session = store
+            .evidence_graph_for_claim(&claim.id.to_string(), "some-other-session")
+            .await
+            .expect("query with wrong session must not error");
+        assert!(
+            wrong_session.links.is_empty(),
+            "a mismatched session_id must not return another session's evidence links"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// FORNX-89 AC: "existing v0.2 evidence can migrate/replay into the
+    /// graph model." Simulates a pre-FORNX-89 evidence row (hand-inserted,
+    /// `source IS NULL`, same shape as
+    /// `pre_migration_evidence_row_with_null_source_reads_back_as_none`)
+    /// being linked into the new graph model exactly as a replay pass would
+    /// — proving the graph accepts legacy evidence with no special-casing.
+    #[tokio::test]
+    async fn legacy_pre_migration_evidence_can_be_linked_into_the_evidence_graph() {
+        use fornax_types::EvidenceRelation;
+
+        let path = tmp_db_path("evidence-graph-legacy-replay");
+        let store = Store::open(&path).await.expect("open db");
+
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "sg4".into(),
+            provider: Provider::Codex,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("exec_command".into()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        store.insert_event(&event).await.expect("insert event");
+
+        let claim = Claim {
+            id: Uuid::new_v4(),
+            session_id: "sg4".into(),
+            source_event_id: event.id,
+            text: "All tests passed.".into(),
+            subject: "test_result".into(),
+            claimed_at: "2026-01-01T00:00:01Z".into(),
+        };
+        store.insert_claim(&claim).await.expect("insert claim");
+
+        // Legacy evidence row: no `source` column value at all, as a v0.2
+        // (pre-FORNX-157) evidence row would look on disk.
+        let legacy_evidence_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO evidence (id, session_id, source_event_id, kind, observed_at, payload, provenance)
+             VALUES (?1, 'sg4', ?2, 'exit_code', '2026-01-01T00:00:02Z', '{\"exit_code\":0}', 'legacy')",
+        )
+        .bind(legacy_evidence_id.to_string())
+        .bind(event.id.to_string())
+        .execute(&store.pool)
+        .await
+        .expect("hand-insert legacy pre-FORNX-89 evidence row");
+
+        // A replay pass links the legacy evidence into the graph model with
+        // no special API, no migration of the `evidence` row itself.
+        store
+            .insert_evidence_link(&EvidenceLink {
+                id: Uuid::new_v4(),
+                session_id: "sg4".into(),
+                claim_id: claim.id,
+                evidence_id: legacy_evidence_id,
+                relation: EvidenceRelation::Supports,
+                linked_at: "2026-01-01T00:00:03Z".into(),
+            })
+            .await
+            .expect("link legacy evidence into the graph");
+
+        let graph = store
+            .evidence_graph_for_claim(&claim.id.to_string(), "sg4")
+            .await
+            .expect("query evidence graph");
+        assert_eq!(graph.links.len(), 1);
+        assert_eq!(graph.links[0].evidence_id, legacy_evidence_id);
+
+        // The legacy evidence row itself is untouched: still reads back with
+        // `source == None`, exactly as before this ticket.
+        let evidence = store
+            .evidence_for_session("sg4")
+            .await
+            .expect("query evidence")
+            .evidence;
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].source, None);
 
         std::fs::remove_file(&path).ok();
     }
