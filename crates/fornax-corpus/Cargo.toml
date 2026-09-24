@@ -1,0 +1,22 @@
+[package]
+name = "fornax-corpus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "fornax_corpus"
+path = "src/lib.rs"
+
+[dependencies]
+fornax-types = { path = "../fornax-types" }
+fornax-verify = { path = "../fornax-verify" }
+fornax-replay = { path = "../fornax-replay" }
+fornax-bench = { path = "../fornax-bench" }
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+sha2.workspace = true
+hex.workspace = true

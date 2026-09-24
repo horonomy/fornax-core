@@ -52,7 +52,7 @@ use std::collections::{BTreeSet, HashSet};
 
 use fornax_types::{Evidence, EvidenceGraph, SignalAvailability, Verdict};
 use fornax_verify::decision::{DecisionPolicy, DefaultRiskPolicy, RecommendationAction, RiskClass};
-use fornax_verify::fusion::{BaselineFusionPolicy, FusionInput, FusionPolicy};
+use fornax_verify::fusion::{BaselineFusionPolicy, FusionInput, FusionPolicy, UncertaintyBand};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -95,7 +95,7 @@ impl HarnessConfig {
 /// `fornax_verify::decision`'s own "policy identity is separate from fusion
 /// policy identity" split — a caller must be able to tell whether a
 /// disagreement came from fusion or from the risk mapping on top of it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PredictionRecord {
     pub trajectory_id: String,
     pub claim_id: Uuid,
@@ -103,6 +103,17 @@ pub struct PredictionRecord {
     pub predicted_action: RecommendationAction,
     pub expected_verdict: Verdict,
     pub critical_failure: bool,
+    /// [`FusedFinding::uncertainty`] verbatim -- carried so
+    /// [`crate::regression::compare`] can report an uncertainty-band
+    /// regression on a case whose verdict/action did not change (FORNX-344
+    /// AC 3: "compares ... at case level").
+    pub uncertainty: UncertaintyBand,
+    /// [`FusedFinding::counted_link_ids`] verbatim.
+    pub counted_link_ids: Vec<Uuid>,
+    /// [`FusedFinding::discounted_link_ids`] verbatim.
+    pub discounted_link_ids: Vec<Uuid>,
+    /// [`FusedFinding::missing_evidence_ids`] verbatim.
+    pub missing_evidence_ids: Vec<Uuid>,
     /// True when the evidence this trajectory needed was not actually
     /// resolvable at fusion time — determined from the *input* state
     /// (concerning missing-evidence notes, unresolvable links, or this run's
@@ -278,6 +289,10 @@ pub fn run_harness(
                 predicted_action: recommendation.action,
                 expected_verdict: t.adjudicated_expected_outcome.expected_verdict,
                 critical_failure: t.adjudicated_expected_outcome.critical_failure,
+                uncertainty: fused.uncertainty,
+                counted_link_ids: fused.counted_link_ids.clone(),
+                discounted_link_ids: fused.discounted_link_ids.clone(),
+                missing_evidence_ids: fused.missing_evidence_ids.clone(),
                 evidence_unavailable,
                 ablation_removed_evidence,
                 is_synthetic: t.labeling_provenance.is_synthetic(),
@@ -399,6 +414,90 @@ mod harness_tests {
         assert_eq!(p.predicted_action, RecommendationAction::Review);
         assert!(!p.evidence_unavailable);
         assert!(p.is_synthetic);
+    }
+
+    /// FORNX-347 AC5: the naive-counting false-uplift regression fixture.
+    ///
+    /// Three `AgentAdjacent` Supports votes, each stamped with its OWN
+    /// distinct `correlation_group` -- naive per-group counting sees three
+    /// genuinely distinct sources, which would band this `Corroborated`
+    /// (no discounted link, no unrecorded-group caveat) and, under
+    /// `DefaultRiskPolicy`, `Proceed`. Two of the three, however, share the
+    /// same real `source_event_id` on the agent-reported channel -- the
+    /// live common-source-amplification shape this ticket exists for.
+    /// `fornax_verify::independence::SourceFamilyMap` catches this even
+    /// though the explicit groups differ (FORNX-347's additive-union
+    /// invariant: an explicit correlation_group can never *prevent* a
+    /// structural same-event collapse), so the real pipeline discounts one
+    /// of the two and correctly bands `Qualified` -> `Review`.
+    ///
+    /// This is a real fixture-vs-reality assertion, not a mock: both halves
+    /// are checked explicitly since there is no "naive" code path left to
+    /// literally run for comparison (this ticket replaced it).
+    #[test]
+    fn naive_group_counting_would_have_proceeded_the_real_pipeline_reviews() {
+        let event_a = Uuid::new_v4();
+        let make_ev = |group: Uuid, source_event_id: Uuid| Evidence {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            source_event_id,
+            kind: EvidenceKind::ToolResult,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            payload: serde_json::json!({}),
+            provenance: "test".into(),
+            source: Some(EvidenceSource {
+                sensor_name: "test_sensor".into(),
+                trust_class: TrustClass::AgentAdjacent,
+                collected_at: "2026-01-01T00:00:00Z".into(),
+                provider: None,
+                collection_method: CollectionMethod::HookCallback,
+                collector_version: None,
+                freshness: Freshness {
+                    clock_source: ClockSource::HostClock,
+                    caveat: None,
+                },
+                tamper_boundary: Default::default(),
+                correlation_group: Some(group),
+                derived_from: vec![],
+            }),
+            extension: None,
+            evidence_purged: false,
+        };
+
+        // ev_a and ev_b share source_event_id (the real collapse basis);
+        // ev_c is on a genuinely different event. All three carry distinct
+        // explicit correlation groups.
+        let ev_a = make_ev(Uuid::new_v4(), event_a);
+        let ev_b = make_ev(Uuid::new_v4(), event_a);
+        let ev_c = make_ev(Uuid::new_v4(), Uuid::new_v4());
+        let distinct_groups: std::collections::BTreeSet<Uuid> = [&ev_a, &ev_b, &ev_c]
+            .iter()
+            .filter_map(|e| e.source.as_ref().and_then(|s| s.correlation_group))
+            .collect();
+        assert_eq!(
+            distinct_groups.len(),
+            3,
+            "fixture precondition: naive per-group counting must see 3 distinct sources"
+        );
+
+        let t = trajectory(
+            "traj-false-uplift",
+            vec![ev_a, ev_b, ev_c],
+            EvidenceRelation::Supports,
+        );
+        let dataset = dataset_of(vec![t]);
+        let config = HarnessConfig::new(RiskClass::Balanced);
+
+        let predictions = run_harness(&dataset, &config, "2026-01-02T00:00:00Z");
+        assert_eq!(predictions.len(), 1);
+        let p = &predictions[0];
+        assert_eq!(p.predicted_verdict, Verdict::Verified);
+        // The naive/false-safe reading (3 distinct groups -> Corroborated
+        // -> Proceed) never happens: FORNX-347's common-source-family
+        // collapse discounts one of the two same-event votes, forcing
+        // Qualified, which DefaultRiskPolicy never lets Proceed under any
+        // risk class.
+        assert_eq!(p.predicted_action, RecommendationAction::Review);
     }
 
     #[test]

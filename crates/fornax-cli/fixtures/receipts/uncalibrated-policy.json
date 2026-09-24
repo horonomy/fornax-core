@@ -1,0 +1,12 @@
+{
+  "calibrated": false,
+  "policy_name": "example-uncalibrated",
+  "policy_version": 1,
+  "require_signature": false,
+  "allowed_verdicts": [],
+  "allowed_actions": [],
+  "forbidden_gap_kinds": [],
+  "require_expiry": true,
+  "max_age_seconds": null,
+  "require_calibration_valid": false
+}

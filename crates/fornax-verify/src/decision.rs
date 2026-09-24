@@ -275,6 +275,44 @@ impl DecisionPolicy for DefaultRiskPolicy {
     }
 }
 
+/// Apply a non-relaxing calibration floor to an already-decided
+/// [`Recommendation`] (FORNX-348). Standalone function, deliberately not a
+/// [`DecisionPolicy`] trait method -- a calibration state is a
+/// live-environment judgment made *after* `decide()` has already produced a
+/// pure `(FusedFinding, RiskClass) -> Recommendation` mapping, not an input
+/// to that mapping itself. See `crate::calibration` module docs, "Why this
+/// never touches `fuse()`".
+///
+/// The only rule: [`RecommendationAction::Proceed`] steps down to
+/// [`RecommendationAction::Review`] under any [`crate::calibration::CalibrationState`]
+/// other than `Valid`/`NoActiveCalibration` -- `NoActiveCalibration`
+/// applies no floor at all, since there is nothing to have gone stale or
+/// drifted relative to yet. `Review`/`Block` are already at or below the
+/// floor and are returned unchanged. The calibration reason is appended to
+/// `rationale_summary`, never replacing the fusion/decision rationale
+/// already recorded there.
+pub fn apply_calibration_floor(
+    rec: Recommendation,
+    state: &crate::calibration::CalibrationState,
+) -> Recommendation {
+    let Some(reason) = crate::calibration::suppression_reason(state) else {
+        return rec;
+    };
+
+    if rec.action != RecommendationAction::Proceed {
+        return rec;
+    }
+
+    Recommendation {
+        action: RecommendationAction::Review,
+        rationale_summary: format!(
+            "{} | calibration floor applied: {} -> review (FORNX-348 non-relaxing floor)",
+            rec.rationale_summary, reason
+        ),
+        ..rec
+    }
+}
+
 #[cfg(test)]
 mod decision_tests {
     use super::*;
@@ -651,5 +689,185 @@ mod decision_tests {
         let rec = DefaultRiskPolicy.decide(&f, RiskClass::Balanced);
         assert_eq!(rec.policy_name, "default_risk_policy_v1");
         assert_ne!(rec.policy_name, f.policy_name);
+    }
+
+    // --- apply_calibration_floor (FORNX-348) --------------------------
+
+    use crate::calibration::CalibrationState;
+    use crate::reliability::DriftState;
+
+    fn proceed_rec() -> Recommendation {
+        let f = fused(Verdict::Verified, UncertaintyBand::Corroborated, false);
+        DefaultRiskPolicy.decide(&f, RiskClass::Balanced)
+    }
+
+    #[test]
+    fn valid_calibration_never_touches_a_recommendation() {
+        let rec = proceed_rec();
+        let floored = apply_calibration_floor(rec.clone(), &CalibrationState::Valid);
+        assert_eq!(floored, rec);
+    }
+
+    #[test]
+    fn no_active_calibration_never_touches_a_recommendation() {
+        let rec = proceed_rec();
+        let floored = apply_calibration_floor(rec.clone(), &CalibrationState::NoActiveCalibration);
+        assert_eq!(floored, rec);
+    }
+
+    #[test]
+    fn stale_calibration_steps_proceed_down_to_review() {
+        let rec = proceed_rec();
+        assert_eq!(rec.action, RecommendationAction::Proceed);
+        let floored = apply_calibration_floor(
+            rec,
+            &CalibrationState::Stale {
+                changed_dimensions: vec!["adapter_version".to_string()],
+            },
+        );
+        assert_eq!(floored.action, RecommendationAction::Review);
+        assert!(floored
+            .rationale_summary
+            .contains("calibration floor applied"));
+        assert!(floored.rationale_summary.contains("adapter_version"));
+    }
+
+    #[test]
+    fn suspect_calibration_steps_proceed_down_to_review() {
+        let rec = proceed_rec();
+        let floored = apply_calibration_floor(
+            rec,
+            &CalibrationState::Suspect {
+                drift_state: DriftState::Drifted,
+            },
+        );
+        assert_eq!(floored.action, RecommendationAction::Review);
+    }
+
+    #[test]
+    fn insufficient_support_steps_proceed_down_to_review() {
+        let rec = proceed_rec();
+        let floored = apply_calibration_floor(
+            rec,
+            &CalibrationState::InsufficientSupport {
+                sample_support: fornax_types::SampleSupport::InsufficientSupport {
+                    sample_count: 2,
+                    minimum_required: 30,
+                },
+            },
+        );
+        assert_eq!(floored.action, RecommendationAction::Review);
+    }
+
+    #[test]
+    fn floor_never_relaxes_an_already_review_or_block_action() {
+        let f = fused(Verdict::Contradicted, UncertaintyBand::Corroborated, false);
+        let rec = DefaultRiskPolicy.decide(&f, RiskClass::Balanced);
+        assert_eq!(rec.action, RecommendationAction::Block);
+        let floored = apply_calibration_floor(
+            rec.clone(),
+            &CalibrationState::Stale {
+                changed_dimensions: vec!["adapter_version".to_string()],
+            },
+        );
+        // Still Block -- the floor only ever steps Proceed down, never
+        // touches an action already at or below the floor.
+        assert_eq!(floored.action, RecommendationAction::Block);
+        assert_eq!(floored.rationale_summary, rec.rationale_summary);
+    }
+
+    // --- End-to-end AC6 regression: assess_calibration -> apply_calibration_floor
+
+    fn revision_provenance() -> fornax_types::calibration::CalibrationProvenance {
+        fornax_types::calibration::CalibrationProvenance {
+            schema_version: 1,
+            provider: "claude_code".to_string(),
+            adapter_version: Some("claude-adapter-0.3.0".to_string()),
+            capability_schema_version: 1,
+            capability_fingerprint: vec![("tool_invocation".to_string(), "available".to_string())],
+            fusion_policy_name: "deterministic_baseline_v1".to_string(),
+            fusion_policy_version: 2,
+            decision_policy_name: "default_risk_policy_v1".to_string(),
+            decision_policy_version: 1,
+            reliability_policy_version: 1,
+            disabled_sensors: vec![],
+            active_policy_revision_digest: None,
+            model_version: None,
+            model_family: None,
+        }
+    }
+
+    /// FORNX-348 AC6: a calibration revision recorded at one
+    /// `adapter_version` must never be treated as still valid once live
+    /// provenance reports a different one -- proven end-to-end through both
+    /// halves this ticket built: `assess_calibration` must classify the
+    /// mismatch as `Stale`, and `apply_calibration_floor` must then step a
+    /// `Proceed` recommendation down to `Review` because of it.
+    #[test]
+    fn stale_adapter_version_cannot_cross_the_boundary_and_never_relaxes_to_proceed() {
+        let recorded = revision_provenance();
+        let mut live = revision_provenance();
+        live.adapter_version = Some("claude-adapter-0.4.0".to_string());
+
+        let assessment =
+            crate::calibration::assess_calibration(Some(&recorded), &live, None, false);
+        assert_eq!(
+            assessment.state,
+            crate::calibration::CalibrationState::Stale {
+                changed_dimensions: vec!["adapter_version".to_string()]
+            }
+        );
+
+        let f = fused(Verdict::Verified, UncertaintyBand::Corroborated, false);
+        let rec = DefaultRiskPolicy.decide(&f, RiskClass::Balanced);
+        assert_eq!(rec.action, RecommendationAction::Proceed);
+        let floored = apply_calibration_floor(rec, &assessment.state);
+        assert_eq!(floored.action, RecommendationAction::Review);
+    }
+
+    /// Negative arm of the same AC6 property: identical provenance never
+    /// falsely reports `Stale`, and a `Proceed` recommendation is left
+    /// completely untouched.
+    #[test]
+    fn matching_adapter_version_never_falsely_reports_stale_or_touches_proceed() {
+        let recorded = revision_provenance();
+        let live = revision_provenance();
+
+        let assessment =
+            crate::calibration::assess_calibration(Some(&recorded), &live, None, false);
+        assert_eq!(
+            assessment.state,
+            crate::calibration::CalibrationState::Valid
+        );
+
+        let f = fused(Verdict::Verified, UncertaintyBand::Corroborated, false);
+        let rec = DefaultRiskPolicy.decide(&f, RiskClass::Balanced);
+        let floored = apply_calibration_floor(rec.clone(), &assessment.state);
+        assert_eq!(floored, rec);
+    }
+
+    /// Second arm of AC6: a `capability_fingerprint` mismatch is exactly as
+    /// disqualifying as an `adapter_version` mismatch -- the floor does not
+    /// special-case one observable dimension over the other.
+    #[test]
+    fn stale_capability_fingerprint_also_never_relaxes_to_proceed() {
+        let recorded = revision_provenance();
+        let mut live = revision_provenance();
+        live.capability_fingerprint =
+            vec![("tool_invocation".to_string(), "unavailable".to_string())];
+
+        let assessment =
+            crate::calibration::assess_calibration(Some(&recorded), &live, None, false);
+        assert_eq!(
+            assessment.state,
+            crate::calibration::CalibrationState::Stale {
+                changed_dimensions: vec!["capability_fingerprint".to_string()]
+            }
+        );
+
+        let f = fused(Verdict::Verified, UncertaintyBand::Corroborated, false);
+        let rec = DefaultRiskPolicy.decide(&f, RiskClass::Balanced);
+        let floored = apply_calibration_floor(rec, &assessment.state);
+        assert_eq!(floored.action, RecommendationAction::Review);
     }
 }

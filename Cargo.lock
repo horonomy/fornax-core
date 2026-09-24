@@ -832,6 +832,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "fornax-acquire"
+version = "0.0.1"
+dependencies = [
+ "chrono",
+ "fornax-experiment-runner",
+ "fornax-types",
+ "fornax-vcs",
+ "fornax-verify",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+ "toml_edit",
+ "uuid",
+]
+
+[[package]]
+name = "fornax-acquire-exec"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "fornax-acquire",
+ "fornax-ci",
+ "fornax-experiment-runner",
+ "fornax-store",
+ "fornax-types",
+ "fornax-verify",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "toml_edit",
+ "uuid",
+]
+
+[[package]]
 name = "fornax-adapter-claude"
 version = "0.0.1"
 dependencies = [
@@ -924,15 +964,37 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "clap",
+ "fornax-bench",
+ "fornax-corpus",
  "fornax-experiment-runner",
+ "fornax-receipt",
+ "fornax-replay",
  "fornax-store",
  "fornax-types",
+ "fornax-verify",
  "reqwest",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "tokio",
  "toml_edit",
+ "uuid",
+]
+
+[[package]]
+name = "fornax-corpus"
+version = "0.0.1"
+dependencies = [
+ "chrono",
+ "fornax-bench",
+ "fornax-replay",
+ "fornax-types",
+ "fornax-verify",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
  "uuid",
 ]
 
@@ -945,12 +1007,16 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "ed25519-dalek",
+ "fornax-acquire",
+ "fornax-experiment-runner",
  "fornax-store",
  "fornax-types",
  "fornax-verify",
+ "hex",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sqlx",
  "tokio",
  "tracing",
@@ -968,6 +1034,23 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml_edit",
+ "uuid",
+]
+
+[[package]]
+name = "fornax-receipt"
+version = "0.0.1"
+dependencies = [
+ "base64 0.23.1",
+ "chrono",
+ "ed25519-dalek",
+ "fornax-types",
+ "fornax-verify",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
  "uuid",
 ]
 
@@ -1012,6 +1095,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "ed25519-dalek",
+ "hex",
  "serde",
  "serde_json",
  "sha2 0.11.0",

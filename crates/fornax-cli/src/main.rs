@@ -4,7 +4,12 @@
 
 use clap::{Parser, Subcommand};
 
+mod adjudicate_cmd;
+mod corpus_cmd;
+mod evidence_plan_cmd;
 mod experiment_ux;
+mod feedback_cmd;
+mod receipt_cmd;
 mod timeline;
 
 #[derive(Parser)]
@@ -91,6 +96,57 @@ enum Commands {
         #[arg(long, default_value = "balanced")]
         risk: String,
     },
+    /// Ranked evidence-acquisition plan for one claim (FORNX-345): which
+    /// concrete probes (rerun a test, inspect VCS state, query CI status,
+    /// verify an artifact hash, a bounded replay experiment, human review)
+    /// would close today's evidence gaps, ranked by discrimination,
+    /// independence from what fusion already counted, recency, cost,
+    /// latency, privacy sensitivity, and action risk. Reads
+    /// `GET /api/evidence-plan` on the daemon.
+    ///
+    /// Never shows the plan alone — always renders the same recommendation
+    /// and full fusion detail `decision` renders first, reusing that
+    /// rendering rather than duplicating it. A candidate that requires an
+    /// ungranted side effect or is administratively forbidden is always
+    /// listed, never silently dropped -- this planner only ranks candidates
+    /// for acquisition, it never decides or executes anything (FORNX-346 is
+    /// the executor).
+    EvidencePlan {
+        /// Claim id to look up.
+        claim: String,
+        /// Session id the claim belongs to.
+        session: String,
+        /// Risk class to evaluate under: `strict`, `balanced`, or
+        /// `lenient`. Defaults to `balanced`.
+        #[arg(long, default_value = "balanced")]
+        risk: String,
+    },
+    /// Executes one ranked candidate from `fornax evidence-plan` for real
+    /// (FORNX-346): `POST /api/acquire-evidence`. `rank` must be a rank
+    /// shown by a current `fornax evidence-plan` run for the same claim --
+    /// this command never accepts a raw probe request, only a rank, so it
+    /// cannot be used to smuggle a request the daemon's own plan didn't
+    /// produce.
+    ///
+    /// Renders the same recommendation + full fusion detail
+    /// `evidence-plan`/`decision` render for `fused_before`, then the
+    /// acquisition outcome, then `fused_after` if the probe actually
+    /// acquired anything -- so a caller sees exactly what changed, never
+    /// one without the other.
+    AcquireEvidence {
+        /// Claim id to look up.
+        claim: String,
+        /// Session id the claim belongs to.
+        session: String,
+        /// 1-based rank of the candidate to execute, from a current
+        /// `fornax evidence-plan` run.
+        #[arg(long)]
+        rank: u32,
+        /// Risk class the plan is recomputed under -- must match the run
+        /// `rank` came from. Defaults to `balanced`.
+        #[arg(long, default_value = "balanced")]
+        risk: String,
+    },
     /// Semantic Judge opinion for one claim (FORNX-94): sends the claim plus
     /// a bounded, structured evidence-graph excerpt to the configured local
     /// self-hosted judge (Ollama-compatible endpoint, `[semantic_judge]` in
@@ -142,6 +198,16 @@ enum Commands {
     // every other variant's size -- boxing keeps `Commands` itself cheap to
     // move/match regardless of which subcommand is chosen.
     Reliability(Box<ReliabilityArgs>),
+    /// Report whether the live environment (adapter version, capability
+    /// fingerprint, fusion/decision policy identity, disabled sensors)
+    /// still matches the most recently recorded calibration revision
+    /// (FORNX-348). Plain prose over `GET /api/calibration` -- never a bare
+    /// percentage.
+    Calibration {
+        /// Session id whose announced capabilities supply the live
+        /// provenance's capability fingerprint.
+        session: String,
+    },
     /// Export one session's events/claims/evidence/capabilities from the
     /// local store into a directory-based spool, as one wire-compatible
     /// envelope JSON file per message (FORNX-60, FORNX-62). Reads
@@ -238,6 +304,39 @@ enum Commands {
         /// Look up every finding for one session by id.
         #[arg(long)]
         session: Option<String>,
+    },
+    /// Integrity Corpus Factory (FORNX-341): mine real sessions into
+    /// sanitized candidate integrity cases, and export a versioned corpus
+    /// manifest. Reads `$FORNAX_HOME/fornax.db` directly, matching
+    /// `audit`/`timeline`'s precedent. Requires an explicit opt-in --
+    /// `FORNAX_CORPUS_MINING_ENABLED=1` -- before anything is persisted.
+    Corpus {
+        #[command(subcommand)]
+        action: corpus_cmd::CorpusAction,
+    },
+    /// Corpus adjudication workflow (FORNX-342): blinded review ->
+    /// disagreement -> adjudication -> frozen gold label -> export. Reads
+    /// `$FORNAX_HOME/fornax.db` directly. Registering a `human` reviewer
+    /// requires `--attested-by` and is itself audited.
+    Adjudicate {
+        #[command(subcommand)]
+        action: adjudicate_cmd::AdjudicateAction,
+    },
+    /// Product feedback on a live finding/recommendation (FORNX-349),
+    /// structurally separate from `fornax adjudicate` -- feedback here can
+    /// never become a frozen gold label. Reads `$FORNAX_HOME/fornax.db`
+    /// directly.
+    Feedback {
+        #[command(subcommand)]
+        action: feedback_cmd::FeedbackAction,
+    },
+    /// Portable integrity receipts (FORNX-350): issue a deterministic,
+    /// reference-only receipt from a real local finding, or verify one
+    /// against a gate policy. Verification-only -- `receipt issue` never
+    /// signs anything; see `fornax_types::receipt`'s module docs.
+    Receipt {
+        #[command(subcommand)]
+        action: receipt_cmd::ReceiptAction,
     },
 }
 
@@ -342,19 +441,27 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Status => match fetch_json(&format!("{}/api/status", base_url())).await {
             Ok(v) => println!("{}", render_status_line(&v)),
-            Err(_) => println!("🛡 fornax: daemon unreachable"),
+            // `status` keeps its historical short "daemon unreachable" text
+            // (no parenthetical) for the plain-connectivity case — other
+            // tooling (this repo's own daemon-readiness test harnesses)
+            // string-matches on it. An identity mismatch is a materially
+            // different, more specific failure and always prints in full.
+            Err(e) if e.to_string().starts_with("daemon unreachable") => {
+                println!("🛡 fornax: daemon unreachable")
+            }
+            Err(e) => println!("🛡 fornax: {e}"),
         },
         Commands::Detail => {
             match fetch_json(&format!("{}/api/findings/recent", base_url())).await {
                 Ok(v) => print_detail(&v),
-                Err(_) => println!("fornax: daemon unreachable (is `fornax-daemon` running?)"),
+                Err(e) => println!("fornax: {e}"),
             }
         }
         Commands::Capabilities { session } => {
             let url = format!("{}/api/capabilities?session={}", base_url(), session);
             match fetch_json(&url).await {
                 Ok(v) => print!("{}", render_capabilities(&v)),
-                Err(_) => println!("fornax: daemon unreachable (is `fornax-daemon` running?)"),
+                Err(e) => println!("fornax: {e}"),
             }
         }
         Commands::EvidenceGraph { claim, session } => {
@@ -366,7 +473,7 @@ async fn main() -> anyhow::Result<()> {
             );
             match fetch_json(&url).await {
                 Ok(v) => print!("{}", render_evidence_graph(&v)),
-                Err(_) => println!("fornax: daemon unreachable (is `fornax-daemon` running?)"),
+                Err(e) => println!("fornax: {e}"),
             }
         }
         Commands::Fusion { claim, session } => {
@@ -378,7 +485,7 @@ async fn main() -> anyhow::Result<()> {
             );
             match fetch_json(&url).await {
                 Ok(v) => print!("{}", render_fusion(&v)),
-                Err(_) => println!("fornax: daemon unreachable (is `fornax-daemon` running?)"),
+                Err(e) => println!("fornax: {e}"),
             }
         }
         Commands::Decision {
@@ -395,7 +502,43 @@ async fn main() -> anyhow::Result<()> {
             );
             match fetch_json(&url).await {
                 Ok(v) => print!("{}", render_decision(&v)),
-                Err(_) => println!("fornax: daemon unreachable (is `fornax-daemon` running?)"),
+                Err(e) => println!("fornax: {e}"),
+            }
+        }
+        Commands::EvidencePlan {
+            claim,
+            session,
+            risk,
+        } => {
+            let url = format!(
+                "{}/api/evidence-plan?claim={}&session={}&risk={}",
+                base_url(),
+                claim,
+                session,
+                risk
+            );
+            match fetch_json(&url).await {
+                Ok(v) => print!("{}", evidence_plan_cmd::render_evidence_plan(&v)),
+                Err(e) => println!("fornax: {e}"),
+            }
+        }
+        Commands::AcquireEvidence {
+            claim,
+            session,
+            rank,
+            risk,
+        } => {
+            let url = format!(
+                "{}/api/acquire-evidence?claim={}&session={}&rank={}&risk={}",
+                base_url(),
+                claim,
+                session,
+                rank,
+                risk
+            );
+            match post_json(&url).await {
+                Ok(v) => print!("{}", evidence_plan_cmd::render_acquire_evidence(&v)),
+                Err(e) => println!("fornax: {e}"),
             }
         }
         Commands::Judge {
@@ -412,7 +555,7 @@ async fn main() -> anyhow::Result<()> {
             );
             match fetch_json(&url).await {
                 Ok(v) => print!("{}", render_judge(&v)),
-                Err(_) => println!("fornax: daemon unreachable (is `fornax-daemon` running?)"),
+                Err(e) => println!("fornax: {e}"),
             }
         }
         Commands::Reliability(args) => {
@@ -446,7 +589,14 @@ async fn main() -> anyhow::Result<()> {
             }
             match fetch_json(&url).await {
                 Ok(v) => print!("{}", render_reliability(&v)),
-                Err(_) => println!("fornax: daemon unreachable (is `fornax-daemon` running?)"),
+                Err(e) => println!("fornax: {e}"),
+            }
+        }
+        Commands::Calibration { session } => {
+            let url = format!("{}/api/calibration?session={session}", base_url());
+            match fetch_json(&url).await {
+                Ok(v) => print!("{}", render_calibration(&v)),
+                Err(e) => println!("fornax: {e}"),
             }
         }
         Commands::ExportSpool { session, out } => export_spool(&session, &out).await?,
@@ -458,6 +608,10 @@ async fn main() -> anyhow::Result<()> {
         Commands::Policy { action } => handle_policy_action(action).await?,
         Commands::Audit { action } => handle_audit_action(action).await?,
         Commands::Timeline { finding, session } => handle_timeline_action(finding, session).await?,
+        Commands::Corpus { action } => corpus_cmd::handle(action, &fornax_home()).await?,
+        Commands::Adjudicate { action } => adjudicate_cmd::handle(action, &fornax_home()).await?,
+        Commands::Feedback { action } => feedback_cmd::handle(action, &fornax_home()).await?,
+        Commands::Receipt { action } => receipt_cmd::handle(action, &fornax_home()).await?,
     }
     Ok(())
 }
@@ -1327,8 +1481,58 @@ async fn export_spool_from_store(
     Ok(())
 }
 
+/// Header the daemon stamps on every HTTP response with its `$FORNAX_HOME`
+/// identity — see `fornax_types::home_identity` and
+/// `fornax-daemon`'s `stamp_home_identity` middleware (FORNX-339).
+const HOME_IDENTITY_HEADER: &str = "x-fornax-home-id";
+
 async fn fetch_json(url: &str) -> anyhow::Result<serde_json::Value> {
-    Ok(reqwest::get(url).await?.json::<serde_json::Value>().await?)
+    let response = reqwest::get(url)
+        .await
+        .map_err(|_| anyhow::anyhow!("daemon unreachable (is `fornax-daemon` running?)"))?;
+    verify_daemon_identity(&response)?;
+    Ok(response.json::<serde_json::Value>().await?)
+}
+
+/// FORNX-346: `POST` counterpart of [`fetch_json`] -- same daemon-identity
+/// verification, for the one endpoint (`/api/acquire-evidence`) that
+/// performs a real side effect and so is not a `GET`.
+async fn post_json(url: &str) -> anyhow::Result<serde_json::Value> {
+    let client = reqwest::Client::new();
+    let response = client
+        .post(url)
+        .send()
+        .await
+        .map_err(|_| anyhow::anyhow!("daemon unreachable (is `fornax-daemon` running?)"))?;
+    verify_daemon_identity(&response)?;
+    Ok(response.json::<serde_json::Value>().await?)
+}
+
+/// FORNX-339: refuse to trust a response from a daemon that isn't serving
+/// this process's own `$FORNAX_HOME` — fail closed (an error, surfaced by
+/// every call site as `UNAVAILABLE`-style text) rather than silently
+/// showing another session's evidence. This is the actual invariant: a
+/// client must be able to prove which daemon/home it's talking to, and any
+/// mismatch is a hard stop, never a best-effort guess.
+fn verify_daemon_identity(response: &reqwest::Response) -> anyhow::Result<()> {
+    let expected = fornax_types::home_identity(&fornax_home());
+    match response
+        .headers()
+        .get(HOME_IDENTITY_HEADER)
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(actual) if actual == expected => Ok(()),
+        Some(actual) => Err(anyhow::anyhow!(
+            "UNAVAILABLE: daemon identity mismatch (this daemon is serving a different \
+             $FORNAX_HOME than expected: got {actual}, expected {expected}) -- another \
+             session's daemon is bound to this port; set a distinct FORNAX_HTTP_PORT per \
+             session or stop the other daemon first (FORNX-339)"
+        )),
+        None => Err(anyhow::anyhow!(
+            "UNAVAILABLE: daemon did not report its $FORNAX_HOME identity -- refusing to trust \
+             its response (FORNX-339)"
+        )),
+    }
 }
 
 fn render_status_line(v: &serde_json::Value) -> String {
@@ -1616,7 +1820,90 @@ fn render_evidence_graph(v: &serde_json::Value) -> String {
         }
     }
 
+    // FORNX-347: plain prose, no graph-theory vocabulary -- "why several
+    // records may count as one correlated source family" (this ticket's
+    // AC6). Only rendered when at least one family genuinely groups more
+    // than one record; a graph made entirely of singleton families adds
+    // nothing worth saying here.
+    let families = v
+        .get("source_families")
+        .and_then(|f| f.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let multi_member_count = families
+        .iter()
+        .filter(|f| {
+            f.get("evidence_ids")
+                .and_then(|e| e.as_array())
+                .map(|e| e.len() > 1)
+                .unwrap_or(false)
+        })
+        .count();
+    if multi_member_count > 0 {
+        out.push_str(&format!("  ⚯ source families ({})\n", families.len()));
+        for (i, family) in families.iter().enumerate() {
+            let evidence_ids: Vec<&str> = family
+                .get("evidence_ids")
+                .and_then(|e| e.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str())
+                .collect();
+            let bases = family
+                .get("bases")
+                .and_then(|b| b.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if evidence_ids.len() > 1 {
+                out.push_str(&format!(
+                    "    family {} -- {} records, counted as ONE source\n",
+                    i + 1,
+                    evidence_ids.len()
+                ));
+                for basis in &bases {
+                    out.push_str(&format!("      why: {}\n", describe_family_basis(basis)));
+                }
+            } else {
+                out.push_str(&format!("    family {} -- 1 record, independent\n", i + 1));
+            }
+            for evidence_id in &evidence_ids {
+                out.push_str(&format!("      evidence: {evidence_id}\n"));
+            }
+        }
+    }
+
     out
+}
+
+/// Plain-prose description of one `independence::FamilyBasis` JSON value --
+/// no graph/union-find vocabulary, per FORNX-347 AC6.
+fn describe_family_basis(basis: &serde_json::Value) -> String {
+    if basis.as_str() == Some("unknown_provenance") {
+        return "no recorded provenance".to_string();
+    }
+    if let Some(obj) = basis.as_object() {
+        if let Some(group) = obj
+            .get("explicit_correlation_group")
+            .and_then(|v| v.as_str())
+        {
+            return format!("recorded correlation group {group}");
+        }
+        if let Some(ancestry) = obj.get("derivation_ancestry") {
+            let parent = ancestry
+                .get("parent")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            return format!("derived from evidence {parent}");
+        }
+        if let Some(turn) = obj.get("same_agent_turn") {
+            let event = turn
+                .get("source_event_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            return format!("same agent turn (event {event})");
+        }
+    }
+    "unrecognized basis".to_string()
 }
 
 /// Icon for a `RuleEffect` tag, mirroring `verdict_icon`/`availability_icon`'s
@@ -1981,15 +2268,20 @@ fn render_reliability_estimate(estimate: &serde_json::Value) -> String {
 /// prints an estimate without the context dimensions already present in the
 /// same returned string.
 ///
-/// `superseded_by_drift`, when `true` (FORNX-105 AC: "drift ... does not
-/// silently reuse stale confidence"), replaces the estimate line with an
-/// explicit stale/superseded marker instead of the numeric estimate — used
-/// by [`render_drift_assessment`] on the baseline side of a `Drifted`
-/// comparison.
+/// `suppressed_because`, when `Some` (FORNX-105 AC: "drift ... does not
+/// silently reuse stale confidence"; widened by FORNX-348 to cover any
+/// calibration-suppression reason, not just drift), replaces the estimate
+/// line with an explicit stale/superseded marker naming the actual reason,
+/// instead of the numeric estimate — used by [`render_drift_assessment`] on
+/// the baseline side of a `Drifted` comparison, and by
+/// [`render_calibration`] whenever `estimate_suppressed_because` is present
+/// on a `CalibratedReliabilityView`. Was a bare `superseded_by_drift: bool`
+/// before FORNX-348 — that could only ever say "drift superseded this",
+/// never "stale provenance" or "insufficient support".
 fn render_reliability_signal(
     label: &str,
     signal: &serde_json::Value,
-    superseded_by_drift: bool,
+    suppressed_because: Option<&str>,
 ) -> String {
     let mut out = String::new();
     let Some(context_block) = signal
@@ -2010,8 +2302,10 @@ fn render_reliability_signal(
             out.push_str(&format!("  not evaluable: {not_evaluable}\n"));
         }
     }
-    if superseded_by_drift {
-        out.push_str("  ⚠ stale -- superseded by drift, not shown as current confidence\n");
+    if let Some(reason) = suppressed_because {
+        out.push_str(&format!(
+            "  ⚠ stale -- not shown as current confidence ({reason})\n"
+        ));
     } else if let Some(estimate) = signal.get("reliability_estimate") {
         out.push_str(&render_reliability_estimate(estimate));
     }
@@ -2088,7 +2382,7 @@ fn render_reliability(v: &serde_json::Value) -> String {
     }
 
     if let Some(signal) = v.get("signal") {
-        out.push_str(&render_reliability_signal("  ", signal, false));
+        out.push_str(&render_reliability_signal("  ", signal, None));
         return out;
     }
 
@@ -2099,19 +2393,114 @@ fn render_reliability(v: &serde_json::Value) -> String {
             .unwrap_or(serde_json::Value::Null);
         out.push_str(&format!("  drift: {}\n", drift_state_label(&state)));
         let is_drifted = state.as_str() == Some("drifted");
+        let drift_reason = is_drifted.then_some("superseded by drift");
 
         if let Some(baseline) = assessment.get("baseline_signal") {
             out.push_str("  baseline:\n");
-            out.push_str(&render_reliability_signal("    ", baseline, is_drifted));
+            out.push_str(&render_reliability_signal("    ", baseline, drift_reason));
         }
         if let Some(comparison) = assessment.get("comparison_signal") {
             out.push_str("  comparison:\n");
-            out.push_str(&render_reliability_signal("    ", comparison, false));
+            out.push_str(&render_reliability_signal("    ", comparison, None));
         }
         return out;
     }
 
     out.push_str("  no reliability data returned\n");
+    out
+}
+
+/// Renders a serialized `CalibrationState` (FORNX-348), covering all five
+/// states distinctly plus a forward-compat fallback -- mirroring
+/// `drift_state_label`'s own never-collapse-the-taxonomy convention.
+/// `Stale` names every changed dimension explicitly; `Suspect` reuses
+/// `drift_state_label` for its nested `DriftState` rather than
+/// re-describing it.
+fn calibration_state_label(state: &serde_json::Value) -> String {
+    if let Some(s) = state.as_str() {
+        return match s {
+            "valid" => "✓ valid -- live environment matches the recorded calibration".to_string(),
+            "no_active_calibration" => "◌ no active calibration has been recorded yet".to_string(),
+            other => format!("◌ {other}"),
+        };
+    }
+    if let Some(stale) = state.get("stale") {
+        let dims: Vec<&str> = stale
+            .get("changed_dimensions")
+            .and_then(|d| d.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        return format!(
+            "⚠ stale -- environment changed since the recorded calibration: {}",
+            dims.join(", ")
+        );
+    }
+    if let Some(suspect) = state.get("suspect") {
+        let drift = suspect
+            .get("drift_state")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        return format!(
+            "⚠ suspect -- {}",
+            drift_state_label(&drift).trim_start_matches("⚠ ")
+        );
+    }
+    if let Some(insufficient) = state.get("insufficient_support") {
+        return format!(
+            "? insufficient support -- not enough observations to confirm validity: {}",
+            render_sample_support(
+                insufficient
+                    .get("sample_support")
+                    .unwrap_or(&serde_json::Value::Null)
+            )
+            .trim()
+        );
+    }
+    "◌ unrecognized calibration state".to_string()
+}
+
+/// Renders `GET /api/calibration`'s response (FORNX-348): whether the live
+/// environment still matches the most recently recorded calibration
+/// revision. Distinguishes "no capabilities announced" (a live provenance
+/// read cannot be built) from an actual assessment, same discipline as
+/// `render_reliability`. Returns the rendered text so it can be asserted on
+/// in tests.
+fn render_calibration(v: &serde_json::Value) -> String {
+    let mut out = String::new();
+    let session = v.get("session").and_then(|s| s.as_str()).unwrap_or("?");
+    out.push_str(&format!("session: {session}\n"));
+
+    if let Some(error) = v.get("error").and_then(|s| s.as_str()) {
+        out.push_str(&format!("  error: {error}\n"));
+        return out;
+    }
+
+    if let Some(false) = v.get("capabilities_announced").and_then(|b| b.as_bool()) {
+        let reason = v
+            .get("reason")
+            .and_then(|s| s.as_str())
+            .unwrap_or("no capabilities announced yet for this session");
+        out.push_str(&format!("  {reason}\n"));
+        return out;
+    }
+
+    if let Some(assessment) = v.get("assessment") {
+        let state = assessment
+            .get("state")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        out.push_str(&format!(
+            "  calibration: {}\n",
+            calibration_state_label(&state)
+        ));
+        let policy_version = assessment
+            .get("policy_version")
+            .and_then(|p| p.as_u64())
+            .unwrap_or(0);
+        out.push_str(&format!("  policy_version: {policy_version}\n"));
+    } else {
+        out.push_str("  no calibration data returned\n");
+    }
     out
 }
 
@@ -2272,6 +2661,53 @@ mod tests {
         assert!(rendered.contains("evidence: e2"));
         assert!(rendered.contains("evidence: e3"));
         assert!(!rendered.contains("no evidence linked"));
+    }
+
+    /// FORNX-347 AC6: source-family rationale is rendered in plain prose,
+    /// no graph-theory vocabulary, and only when a family genuinely groups
+    /// more than one record.
+    #[test]
+    fn render_evidence_graph_explains_a_multi_record_source_family_in_plain_prose() {
+        let event = "1a2b3c4d-0000-0000-0000-000000000000";
+        let v = serde_json::json!({
+            "claim": "c1", "session": "s1", "found": true,
+            "links": [
+                {"evidence_id": "e1", "relation": "supports", "linked_at": "2026-09-01T00:00:00Z", "source_family": 0},
+                {"evidence_id": "e2", "relation": "supports", "linked_at": "2026-09-01T00:00:01Z", "source_family": 0},
+            ],
+            "missing": [],
+            "source_families": [
+                {
+                    "evidence_ids": ["e1", "e2"],
+                    "bases": [{"same_agent_turn": {"source_event_id": event}}],
+                },
+            ],
+        });
+        let rendered = render_evidence_graph(&v);
+        assert!(rendered.contains("⚯ source families (1)"));
+        assert!(rendered.contains("2 records, counted as ONE source"));
+        assert!(rendered.contains(&format!("same agent turn (event {event})")));
+        // No graph/union-find jargon.
+        assert!(!rendered.to_lowercase().contains("union"));
+        assert!(!rendered.to_lowercase().contains("dag"));
+    }
+
+    /// A graph made entirely of singleton families adds nothing worth
+    /// saying -- the section is omitted rather than printed as noise.
+    #[test]
+    fn render_evidence_graph_omits_source_families_section_when_all_are_singletons() {
+        let v = serde_json::json!({
+            "claim": "c1", "session": "s1", "found": true,
+            "links": [
+                {"evidence_id": "e1", "relation": "supports", "linked_at": "2026-09-01T00:00:00Z", "source_family": 0},
+            ],
+            "missing": [],
+            "source_families": [
+                {"evidence_ids": ["e1"], "bases": []},
+            ],
+        });
+        let rendered = render_evidence_graph(&v);
+        assert!(!rendered.contains("source families"));
     }
 
     /// FORNX-319 AC3: a link whose evidence has been purged must render an
@@ -3670,10 +4106,71 @@ trust_level = \"trusted\"\n";
         // -- this must never be reachable as a rendered percentage.
         let mut signal = confident_signal_fixture("claude-sonnet-5", 0.93);
         signal.as_object_mut().unwrap().remove("context_key");
-        let rendered = render_reliability_signal("  ", &signal, false);
+        let rendered = render_reliability_signal("  ", &signal, None);
         assert!(!rendered.contains("93.0%"));
         assert!(!rendered.contains("reliability estimate:"));
         assert!(rendered.contains("context key incomplete"));
+    }
+
+    #[test]
+    fn render_reliability_signal_names_the_suppression_reason_when_given_one() {
+        let signal = confident_signal_fixture("claude-sonnet-5", 0.93);
+        let rendered = render_reliability_signal("  ", &signal, Some("calibration stale"));
+        assert!(!rendered.contains("93.0%"));
+        assert!(rendered.contains("calibration stale"));
+    }
+
+    // --- render_calibration (FORNX-348) ---------------------------------
+
+    #[test]
+    fn render_calibration_reports_no_capabilities_announced() {
+        let v = serde_json::json!({
+            "session": "s1",
+            "capabilities_announced": false,
+            "reason": "no capabilities announced for this session -- a live calibration \
+                       provenance read cannot be built without one",
+        });
+        let rendered = render_calibration(&v);
+        assert!(rendered.contains("s1"));
+        assert!(rendered.contains("no capabilities announced"));
+    }
+
+    #[test]
+    fn render_calibration_names_every_changed_dimension_for_a_stale_state() {
+        let v = serde_json::json!({
+            "session": "s1",
+            "capabilities_announced": true,
+            "assessment": {
+                "state": { "stale": { "changed_dimensions": ["adapter_version", "disabled_sensors"] } },
+                "policy_version": 1,
+            },
+        });
+        let rendered = render_calibration(&v);
+        assert!(rendered.contains("stale"));
+        assert!(rendered.contains("adapter_version"));
+        assert!(rendered.contains("disabled_sensors"));
+    }
+
+    #[test]
+    fn render_calibration_reports_valid() {
+        let v = serde_json::json!({
+            "session": "s1",
+            "capabilities_announced": true,
+            "assessment": { "state": "valid", "policy_version": 1 },
+        });
+        let rendered = render_calibration(&v);
+        assert!(rendered.contains("✓ valid"));
+    }
+
+    #[test]
+    fn render_calibration_reports_no_active_calibration() {
+        let v = serde_json::json!({
+            "session": "s1",
+            "capabilities_announced": true,
+            "assessment": { "state": "no_active_calibration", "policy_version": 1 },
+        });
+        let rendered = render_calibration(&v);
+        assert!(rendered.contains("no active calibration"));
     }
 
     #[test]
@@ -3696,7 +4193,7 @@ trust_level = \"trusted\"\n";
         // ...but the baseline's stale confidence must be qualified, never
         // shown plain beside the new one (AC4).
         assert!(!rendered.contains("95.0%"));
-        assert!(rendered.contains("stale -- superseded by drift"));
+        assert!(rendered.contains("stale -- not shown as current confidence (superseded by drift)"));
     }
 
     #[test]

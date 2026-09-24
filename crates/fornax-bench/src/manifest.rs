@@ -138,7 +138,7 @@ mod manifest_tests {
             "2026-01-02T00:00:00Z",
         );
         assert_eq!(manifest.fusion_policy_name, "deterministic_baseline_v1");
-        assert_eq!(manifest.fusion_policy_version, 1);
+        assert_eq!(manifest.fusion_policy_version, 2);
         assert_eq!(manifest.decision_policy_name, "default_risk_policy_v1");
         assert_eq!(manifest.decision_policy_version, 1);
         assert_eq!(manifest.risk_class, RiskClass::Balanced);

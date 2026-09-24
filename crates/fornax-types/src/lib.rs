@@ -15,6 +15,7 @@ use uuid::Uuid;
 pub mod adapter;
 pub mod audit;
 pub mod audit_checkpoint;
+pub mod calibration;
 pub mod capabilities;
 pub mod causal;
 pub mod experiment;
@@ -22,6 +23,7 @@ pub mod extension;
 pub mod graph;
 pub mod policy;
 pub mod privacy;
+pub mod receipt;
 pub mod redact;
 pub mod reliability_context;
 pub mod sensor;
@@ -92,7 +94,9 @@ pub use sensor::{
     collect_with_disable_check, ClockSource, CollectionMethod, EvidenceSensor, EvidenceSource,
     Freshness, SensorOutcome, TamperBoundary, TrustClass,
 };
-pub use sensor_config::{default_fornax_home, SensorConfigError, SensorDisableConfig};
+pub use sensor_config::{
+    default_fornax_home, home_identity, SensorConfigError, SensorDisableConfig,
+};
 
 /// Which coding-agent runtime an event/capability originated from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -107,6 +111,20 @@ pub enum Provider {
     /// separate, closed ingest enum, which does not know this variant.
     /// `default_unknown_caps()` is the only producer of this value.
     Unknown,
+}
+
+impl Provider {
+    /// This variant's own `#[serde(rename_all = "snake_case")]` wire tag
+    /// (e.g. `ClaudeCode` -> `"claude_code"`), derived from the real
+    /// serialization rather than a second, hand-maintained string table
+    /// that could drift from it. Falls back to `"unknown"` only if
+    /// serialization itself ever fails (never true for this enum today).
+    pub fn wire_tag(self) -> String {
+        serde_json::to_value(self)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_else(|| "unknown".to_string())
+    }
 }
 
 /// Normalized lifecycle event kind. One variant per canonical concept a
@@ -353,6 +371,12 @@ pub enum ProcessObservationDetail {
         head_commit: Option<String>,
         path_is_dirty: bool,
     },
+    /// FORNX-346: a real, host-computed SHA-256 hash of a contained
+    /// artifact on disk, produced by `fornax-acquire`'s
+    /// `VerifyArtifactHash` probe -- `TrustClass::HostObserved`, since it is
+    /// this host reading the actual file, never a provider's own claim
+    /// about a hash.
+    ArtifactHashVerified { path: String, sha256_hex: String },
     /// FORNX-302: aggregated CI check-run status for one commit SHA, queried
     /// from the CI provider's own API (GitHub Actions, via the `fornax-ci`
     /// crate's `GitHubCiStatusSensor` — the one producer today).

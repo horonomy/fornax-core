@@ -1,0 +1,12 @@
+{
+  "calibrated": true,
+  "policy_name": "example-require-signature",
+  "policy_version": 1,
+  "require_signature": true,
+  "allowed_verdicts": ["verified"],
+  "allowed_actions": ["proceed"],
+  "forbidden_gap_kinds": ["no_evidence_at_all", "unresolved_conflict", "all_votes_discounted"],
+  "require_expiry": true,
+  "max_age_seconds": 86400,
+  "require_calibration_valid": false
+}
