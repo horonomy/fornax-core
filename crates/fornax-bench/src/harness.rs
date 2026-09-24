@@ -331,6 +331,7 @@ mod harness_tests {
                 derived_from: vec![],
             }),
             extension: None,
+            evidence_purged: false,
         }
     }
 

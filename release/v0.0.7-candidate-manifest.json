@@ -1,0 +1,39 @@
+{
+  "version": "v0.0.7",
+  "release_notes_path": "docs/release/v0.0.7-release-notes.md",
+  "risk_class": "TRUST_BOUNDARY",
+  "repos": [
+    {
+      "name": "fornax-core",
+      "owner": "horonomy",
+      "sha": "a55883b22607b5231a4fea6d70c59713f7e9b6c2",
+      "publishes_artifact": true
+    }
+  ],
+  "evidence": [
+    {
+      "gate": "qa",
+      "jira_key": "FORNX-402",
+      "jira_url": "https://lightning-dust-mite.atlassian.net/browse/FORNX-402",
+      "applies_to_repos": ["fornax-core"]
+    },
+    {
+      "gate": "security",
+      "jira_key": "FORNX-402",
+      "jira_url": "https://lightning-dust-mite.atlassian.net/browse/FORNX-402",
+      "applies_to_repos": ["fornax-core"]
+    },
+    {
+      "gate": "docs",
+      "jira_key": "FORNX-402",
+      "jira_url": "https://lightning-dust-mite.atlassian.net/browse/FORNX-402",
+      "applies_to_repos": []
+    },
+    {
+      "gate": "stage",
+      "jira_key": "FORNX-402",
+      "jira_url": "https://lightning-dust-mite.atlassian.net/browse/FORNX-402",
+      "applies_to_repos": []
+    }
+  ]
+}

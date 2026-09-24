@@ -1,0 +1,32 @@
+{
+  "version": "v0.0.7",
+  "generated_at": "2026-09-24T05:56:00Z",
+  "threat_model_version": 2,
+  "full_review": false,
+  "boundaries_touched": [
+    {
+      "surface": "event_transport",
+      "feature_delta_ids": ["FD-v0.0.7-0001"],
+      "review": "Tamper-evident local audit ledger: hash-chained entries with three independent divergence checks (missing-sequence, relinked-prev-hash, hash-mismatch) plus truncated-tail detection via a persisted high-water mark. verify_audit_chain_conn recomputes each entry's hash from its own (seq, prev_hash, payload) and compares against the stored entry_hash — not a computed-and-ignored integrity field. Real callers (compliance_report.rs, audit_checkpoint.rs, audit_checkpoint_submit.rs, CLI verify subcommand) all surface the real verification result rather than suppressing a divergence.",
+      "adversarial_coverage": "direct_sql_delete_of_trailing_rows_is_detected_as_truncated_tail, truncated_tail_survives_a_subsequent_legitimate_append (both directly exercise raw-SQL tamper detection, not just application-layer mutation)."
+    },
+    {
+      "surface": "event_transport",
+      "feature_delta_ids": ["FD-v0.0.7-0002"],
+      "review": "Checkpoint submission to the cloud is an honest witness — it reports its own divergence status rather than suppressing it, consistent with fornax-cloud's own 'witness, not verifier' pattern (already reviewed this session on the cloud side). Response size is bounded (MAX_RESPONSE_BYTES = 64KB) to prevent resource exhaustion from a malicious/misbehaving server response.",
+      "adversarial_coverage": "Independently re-verified by reading audit_checkpoint_submit.rs directly (bound enforced at line 272); cross-repo live verification of the checkpoint/witness relationship already exercised during FORNX-124's (Stage 6b) real end-to-end gate testing."
+    },
+    {
+      "surface": "event_transport",
+      "feature_delta_ids": ["FD-v0.0.7-0003"],
+      "review": "Five sqlx::AssertSqlSafe call sites, required by the sqlx 0.9 upgrade's stricter SqlSafeStr trait, were individually re-verified (not just trusted from the isolation pass) to interpolate only compile-time-constant identifiers (a const RECEIPT_COLUMNS array and a pub const KNOWN_RECORD_TABLES array) — never runtime or request-derived input. This is a manual safety-assertion bypass, so each site was checked independently rather than accepted on the isolating pass's characterization alone.",
+      "adversarial_coverage": "Independently re-read all 5 call sites (audit_checkpoint.rs:198,210,220; retention.rs:1258,1638) confirming the interpolated segments trace only to hardcoded const arrays, never a function parameter or external input."
+    },
+    {
+      "surface": "event_transport",
+      "feature_delta_ids": ["FD-v0.0.7-0004"],
+      "review": "Retention sweeps are explicitly bounded per call (report.examined == 200, test-asserted 'one call processes one bounded batch, not the whole backlog'), preventing unbounded-sweep resource exhaustion. fornax-core's retention module has no legal_hold concept by design — it is a purely local-device data-lifecycle boundary, distinct from fornax-cloud's separate tenant-level legal-hold control over centrally-stored data; this is a legitimate architectural boundary, documented here so it is not mistaken for a missing check.",
+      "adversarial_coverage": "Bounded-batch behavior confirmed via existing test assertion on report.examined; legal-hold boundary confirmed by absence of any legal_hold reference anywhere in fornax-core's retention module, contrasted with fornax-cloud's own legal-hold implementation (already reviewed this session, FORNX-325's TOCTOU fix)."
+    }
+  ]
+}
