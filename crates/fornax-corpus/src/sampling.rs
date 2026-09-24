@@ -158,7 +158,13 @@ pub fn signals_for_case(
             }
             EvidenceGapKind::ExpectedSignalMissing { .. }
             | EvidenceGapKind::SignalClassUnobservable { .. }
-            | EvidenceGapKind::StaleSupport => {}
+            | EvidenceGapKind::StaleSupport
+            // FORNX-378: an unmet epistemic-contract obligation is not yet
+            // one of this corpus tool's tracked sampling signals -- no
+            // existing SamplingSignal variant maps to it cleanly, and
+            // inventing one is out of FORNX-378's scope (this crate's own
+            // ticket, not this one's).
+            | EvidenceGapKind::ContractObligationUnmet { .. } => {}
         }
     }
 
