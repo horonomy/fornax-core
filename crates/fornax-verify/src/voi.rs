@@ -437,7 +437,7 @@ fn probes_for_class(signal_class: &SignalClass) -> Vec<EvidenceRequest> {
     }
 }
 
-fn probes_for_gap(gap: &EvidenceGap) -> Vec<EvidenceRequest> {
+pub(crate) fn probes_for_gap(gap: &EvidenceGap) -> Vec<EvidenceRequest> {
     let describe = |kind: ProbeKind,
                     class: SignalClass,
                     trust: TrustClass,
