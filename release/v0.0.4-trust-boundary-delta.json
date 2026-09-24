@@ -1,0 +1,26 @@
+{
+  "version": "v0.0.4",
+  "generated_at": "2026-09-24T00:00:00Z",
+  "threat_model_version": 2,
+  "full_review": false,
+  "boundaries_touched": [
+    {
+      "surface": "adapter_provider_input",
+      "feature_delta_ids": ["FD-v0.0.4-0001"],
+      "review": "Two new independent sensor sources landed this Stage-4 pass: fornax-vcs (git-native working-tree/commit evidence, crates/fornax-vcs) and fornax-ci (GitHub CI-status evidence via GitHubCiStatusSensor, crates/fornax-ci). Both are read-only collectors: fornax-vcs shells out to git for status/log data local to the working tree already under Fornax's control; fornax-ci queries the GitHub API for check-run status on a commit the local repo already references, using least-privilege read scopes. Neither sensor executes or evaluates untrusted content -- collected data is wrapped as canonical Evidence with explicit provenance and flows through the same redaction boundary as every other sensor.",
+      "adversarial_coverage": "crates/fornax-vcs and crates/fornax-ci unit/integration tests exercise malformed/missing git state and CI-API error responses without panicking; see FORNX-91's own PR test suites."
+    },
+    {
+      "surface": "evidence_provenance",
+      "feature_delta_ids": ["FD-v0.0.4-0002"],
+      "review": "SEC-v0.0.4-0001 (Medium, fixed): the local Semantic Judge's response parser (crates/fornax-verify/src/judge.rs::parse_model_response) could invert a negated model verdict (\"UNSUPPORTED\"/\"NOT SUPPORTED\" both contain the substring \"SUPPORTED\") to JudgeVerdict::Supported -- the opposite of the model's actual answer, a real provenance-integrity defect since a fused finding's rationale would then misrepresent its own evidence source. Fixed by checking CONTRADICTED first and excluding negated forms from the SUPPORTED match, falling back to Inconclusive for anything not cleanly one of the three expected words. Found and fixed within the same review pass (FORNX-97's 2026-09-02 gate procedure), not by an external reporter.",
+      "adversarial_coverage": "crates/fornax-verify/src/judge.rs::judge_tests::parse_model_response_does_not_invert_a_negated_supported_reply (added in fix commit 27d25f0) -- asserts parse_model_response(\"UNSUPPORTED\\n...\") and parse_model_response(\"NOT SUPPORTED\\n...\") both resolve to JudgeVerdict::Inconclusive, not Supported."
+    },
+    {
+      "surface": "egress_redaction",
+      "feature_delta_ids": ["FD-v0.0.4-0003"],
+      "review": "SEC-v0.0.4-0002 (Low, fixed): crates/fornax-verify/src/judge.rs::evidence_payload_summary redacted after truncating a payload to 200 chars for the judge's prompt context, so a secret whose matchable span straddled that cut could leave only a short, sub-detection-threshold prefix surviving into redaction -- the same class of ordering defect FORNX-280 (v0.0.1) fixed for the daemon's own storage path, here recurring in the judge's separate summarization path. Fixed by redacting the full payload first, then truncating to 200 chars.",
+      "adversarial_coverage": "crates/fornax-verify/src/judge.rs::judge_tests::evidence_payload_summary_redacts_a_secret_that_straddles_the_truncation_boundary (added in fix commit 27d25f0) -- constructs a payload with a 190-char pad plus a GitHub-token-shaped secret past the old 200-char cut and asserts the secret does not survive in the returned summary."
+    }
+  ]
+}

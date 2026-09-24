@@ -1,0 +1,36 @@
+{
+  "version": "v0.0.4",
+  "candidate_repos": [
+    { "name": "fornax-core", "owner": "horonomy", "sha": "e542379a89d18f884e6aeacc2c3b83d532564389" }
+  ],
+  "risk_class": "TRUST_BOUNDARY",
+  "trust_boundary_delta_ref": "release/v0.0.4-trust-boundary-delta.json",
+  "threat_model_version": 2,
+  "findings": [
+    {
+      "id": "SEC-v0.0.4-0001",
+      "severity": "medium",
+      "title": "Semantic Judge's local-model response parser inverted a negated verdict (UNSUPPORTED/NOT SUPPORTED read as Supported)",
+      "evidence": "crates/fornax-verify/src/judge.rs::parse_model_response checked contains(\"SUPPORTED\") before contains(\"CONTRADICTED\"); both \"UNSUPPORTED\" and \"NOT SUPPORTED\" contain the substring \"SUPPORTED\", so a negated model reply flipped to JudgeVerdict::Supported -- the opposite of what the model said. Found during FORNX-97's gate-procedure security/privacy review of FORNX-94 (2026-09-02). Fixed in commit 27d25f0af3b37b0ccd50548c5c44d3112f33f4d1: CONTRADICTED is now checked first, and SUPPORTED excludes the negated forms, falling back to Inconclusive for anything not cleanly one of the three expected words. Regression tests added in the same commit (crates/fornax-verify/src/judge.rs::judge_tests module).",
+      "disposition": "fixed",
+      "waiver_ref": null
+    },
+    {
+      "id": "SEC-v0.0.4-0002",
+      "severity": "low",
+      "title": "evidence_payload_summary truncated before redacting, letting a secret spanning the 200-char cut survive with only a sub-detection-threshold prefix",
+      "evidence": "crates/fornax-verify/src/judge.rs::evidence_payload_summary called redact_text(&raw) after truncating raw to 200 chars; a secret whose matchable span straddled that cut could leave a fragment too short for the redaction detector to recognize. Fixed in the same commit as SEC-v0.0.4-0001 (27d25f0): redact the full payload first, then truncate to 200 chars.",
+      "disposition": "fixed",
+      "waiver_ref": null
+    },
+    {
+      "id": "SEC-v0.0.4-0003",
+      "severity": "informational",
+      "title": "New sensors (fornax-vcs git-native evidence, fornax-ci GitHub CI-status evidence) apply pre-existing untrusted-input handling patterns, not a new exposure class",
+      "evidence": "Confirmed via code review during FORNX-97's 2026-09-02 gate-procedure security pass (see that ticket's comment for the full review record): credential handling, trust-class tagging, fail-safe behavior on collection failure, and subprocess/network boundaries were traced end to end for fornax-vcs and fornax-ci and found consistent with sensors already reviewed under prior candidates -- no new exposure class introduced.",
+      "disposition": "accepted_risk",
+      "waiver_ref": null
+    }
+  ],
+  "verdict": "PASS"
+}
