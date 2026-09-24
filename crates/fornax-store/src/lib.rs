@@ -12,6 +12,7 @@ use sqlx::SqlitePool;
 use std::path::Path;
 use std::str::FromStr;
 
+pub mod policy_cache;
 pub mod retention;
 
 #[derive(Debug, thiserror::Error)]
@@ -20,6 +21,12 @@ pub enum StoreError {
     Db(#[from] sqlx::Error),
     #[error("serialization error: {0}")]
     Json(#[from] serde_json::Error),
+    /// FORNX-119: a persisted policy-cache row failed to reconstruct into
+    /// its typed form (e.g. a timestamp column that fails RFC3339 parsing).
+    /// This should never happen for a row this crate itself wrote — it
+    /// indicates on-disk corruption or manual tampering with `fornax.db`.
+    #[error("policy cache data corrupt: {0}")]
+    PolicyCacheCorrupt(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
