@@ -1,0 +1,15 @@
+{
+  "version": "v0.0.6",
+  "candidate_repos": [
+    {
+      "name": "fornax-core",
+      "owner": "horonomy",
+      "sha": "09f132e6d05b8064e0d0953973378608230b7d10"
+    }
+  ],
+  "risk_class": "TRUST_BOUNDARY",
+  "trust_boundary_delta_ref": "release/v0.0.6-trust-boundary-delta.json",
+  "threat_model_version": 2,
+  "findings": [],
+  "verdict": "PASS"
+}
