@@ -1,0 +1,59 @@
+{
+  "body": {
+    "schema_version": 1,
+    "policy_id": "11112222-3333-4444-5555-666677778888",
+    "revision": 1,
+    "supersedes": null,
+    "published_at": "2026-01-01T00:00:00Z",
+    "display_name": "example v1 fixture policy",
+    "content": {
+      "collection": {
+        "longitudinal_aggregation_allowed": false
+      },
+      "egress": {
+        "cloud_sync_allowed": true,
+        "redaction_profile": "standard",
+        "allowed_content": [
+          "finding_verdicts",
+          "claim_text"
+        ]
+      },
+      "sensors": {
+        "disabled": [
+          "claude_file_write_confirmed_sensor_v1"
+        ],
+        "required_signals": [
+          "process_result"
+        ]
+      },
+      "enforcement": {
+        "rules": [
+          {
+            "action_class": "shell_command",
+            "risk_class": "elevated",
+            "outcomes": {
+              "verified": "allow",
+              "unverified": "observe_only",
+              "contradicted": "warn",
+              "review": "observe_only",
+              "unavailable": "observe_only"
+            }
+          }
+        ]
+      },
+      "cache": {
+        "max_age_seconds_by_risk": {
+          "low": 86400,
+          "elevated": 21600,
+          "high": 3600,
+          "critical": 900
+        },
+        "offline_grace_seconds": 604800
+      }
+    },
+    "pinned_fields": [
+      "egress_cloud_sync_allowed"
+    ]
+  },
+  "digest": "sha256:f5288a0e0be0d5ce4771b3ead73d581fafa5215aa0fc63a44a3f18468114bf81"
+}

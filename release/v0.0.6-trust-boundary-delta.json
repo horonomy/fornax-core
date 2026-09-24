@@ -1,0 +1,38 @@
+{
+  "version": "v0.0.6",
+  "generated_at": "2026-09-24T05:30:00Z",
+  "threat_model_version": 2,
+  "full_review": false,
+  "boundaries_touched": [
+    {
+      "surface": "enterprise_policy_deployment",
+      "feature_delta_ids": ["FD-v0.0.6-0001"],
+      "review": "New cryptographic policy-bundle verification trust boundary: signature verification is strict-canonical (no lenient base64 decode), domain-separated (BUNDLE_SIGNING_DOMAIN/REVOCATION_SIGNING_DOMAIN are distinct), uses verify_strict (rejects malleable/cofactored signatures), and fails closed on an unrecognized signature algorithm (an explicit, documented inversion of the module's own fail-open policy-application default). Key rotation runs the verification loop to completion so an expired key earlier in the list cannot mask a valid later one.",
+      "adversarial_coverage": "Independently re-verified by reading crates/fornax-types/src/policy/bundle.rs directly; FORNX-124's own live gate additionally exercised a real corrupted-signature-byte tamper against a real running fornax-daemon and confirmed rejection with active generation unchanged."
+    },
+    {
+      "surface": "enterprise_policy_deployment",
+      "feature_delta_ids": ["FD-v0.0.6-0002"],
+      "review": "Rollback/replay via bundle sequence: bundle.rs explicitly does not check sequence monotonicity itself (by design, deferred to the cache layer). cache.rs::evaluate_activation closes this with a persisted per-(issuer, policy_id) high-water mark that rejects a candidate sequence below the mark (SequenceNotAdvanced) and detects sequence-reuse-with-different-content (SequenceReused).",
+      "adversarial_coverage": "crates/fornax-types/src/policy/cache_tests.rs:336, cache_tests.rs:414."
+    },
+    {
+      "surface": "enterprise_policy_deployment",
+      "feature_delta_ids": ["FD-v0.0.6-0003"],
+      "review": "Revocation-list integrity and replay: revocation lists are a separately-signed artifact (own domain), enforced sticky/union-only so a newer list can never un-revoke an entry a previously-ingested list already recorded (no expiry field exists on entries by design). Replaying an old, validly-signed revocation list to suppress a later revocation is blocked by evaluate_revocation_ingest's own persisted per-issuer high-water mark. Revocation is checked first in evaluate_activation, before lineage/sequence, so a revoked-but-validly-signed bundle is always caught.",
+      "adversarial_coverage": "crates/fornax-types/src/policy/revocation_tests.rs:352. FORNX-124's live gate additionally exercised a real revocation POST against a real running fornax-daemon and confirmed the previously-active generation was evicted (loaded_slot: null), not left silently standing."
+    },
+    {
+      "surface": "enterprise_policy_deployment",
+      "feature_delta_ids": ["FD-v0.0.6-0004"],
+      "review": "Fail-open/fail-closed risk enforcement: RiskClass (content.rs) is a deliberately closed enum with no Unrecognized/serde(other) fallback — an unparseable risk-class value is a hard deserialization failure, not a silent permissive default, per the module's own documented rationale (\"an unknown tier cannot be ordered, so it cannot exist\").",
+      "adversarial_coverage": "Deserialization failure path confirmed by reading crates/fornax-types/src/policy/content.rs's RiskClass enum definition directly (no serde(other) variant present)."
+    },
+    {
+      "surface": "enterprise_policy_deployment",
+      "feature_delta_ids": ["FD-v0.0.6-0005"],
+      "review": "Rollout targeting and resource exhaustion: targeting (target.rs) matches against a locally-established DeviceContext (org/team/project/device id from the already-reviewed device-auth/service-identity layer), not attacker-suppliable wire data. Attacker-controlled input is bounded pre-authentication: MAX_PAYLOAD_BYTES (1MB), MAX_SIGNATURES (8), MAX_REVOCATION_ENTRIES (4096). PolicyContent's rule structure is flat (no recursion/nesting), eliminating combinatorial-explosion risk within the payload bound.",
+      "adversarial_coverage": "Bound constants confirmed by reading crates/fornax-types/src/policy/bundle.rs and revocation.rs directly. FORNX-124's live gate additionally exercised real staged-rollout targeting with two devices in the same org (one bound, one not) and confirmed only the bound device activated."
+    }
+  ]
+}
