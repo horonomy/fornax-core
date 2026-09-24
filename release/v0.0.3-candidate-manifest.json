@@ -1,0 +1,40 @@
+{
+  "version": "v0.0.3",
+  "release_notes_path": "CHANGELOG.md",
+  "risk_class": "TRUST_BOUNDARY",
+  "note": "Single-repo release: fornax-core only. This train ('Extensible Evidence Platform', epic FORNX-138) is unrelated to fornax-cloud's already-shipped, already-tagged v0.0.3 ('Enterprise IAM, Compliance & Self-Hosting', tag v0.0.3 at b7a7c5d, merged 2026-09-xx) - the two share a version number by coincidence, not by coordinated release. Do not re-tag or touch fornax-cloud's v0.0.3 for this release. Candidate frozen at the last QA/security-verified commit (f551ec0, merge of PR #81 closing FORNX-244's FORNX-14/16 coverage gap), not the current next/v0.0.3 tip (8044f2e) - two newer tickets (FORNX-85, FORNX-301) landed after sign-off and are unverified against it; deferred to the next fornax-core release rather than included as unverified drift.",
+  "repos": [
+    {
+      "name": "fornax-core",
+      "owner": "horonomy",
+      "sha": "f551ec0140ba545210af2e891796f17d12ccdd21",
+      "publishes_artifact": true
+    }
+  ],
+  "evidence": [
+    {
+      "gate": "qa",
+      "jira_key": "FORNX-244",
+      "jira_url": "https://lightning-dust-mite.atlassian.net/browse/FORNX-244",
+      "applies_to_repos": ["fornax-core"]
+    },
+    {
+      "gate": "security",
+      "jira_key": "FORNX-244",
+      "jira_url": "https://lightning-dust-mite.atlassian.net/browse/FORNX-244",
+      "applies_to_repos": ["fornax-core"]
+    },
+    {
+      "gate": "docs",
+      "jira_key": "FORNX-219",
+      "jira_url": "https://lightning-dust-mite.atlassian.net/browse/FORNX-219",
+      "applies_to_repos": []
+    },
+    {
+      "gate": "stage",
+      "jira_key": "FORNX-138",
+      "jira_url": "https://lightning-dust-mite.atlassian.net/browse/FORNX-138",
+      "applies_to_repos": []
+    }
+  ]
+}

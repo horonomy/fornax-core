@@ -43,7 +43,7 @@ jobs:
     outputs:
       code: ${{ steps.filter.outputs.code }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: determine affected surface
@@ -81,7 +81,7 @@ jobs:
       - name: t0
         id: t0
         run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: t1 (post-checkout)
         id: t1
         run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
@@ -91,7 +91,7 @@ jobs:
       - name: t2 (post-toolchain)
         id: t2
         run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
-      - uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         id: rust_cache
       - name: t3 (post-cache-restore)
         id: t3
@@ -150,7 +150,7 @@ jobs:
       - name: t0
         id: t0
         run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: t1 (post-checkout)
         id: t1
         run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
@@ -160,7 +160,7 @@ jobs:
       - name: t2 (post-toolchain)
         id: t2
         run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
-      - uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         id: rust_cache
       - name: t3 (post-cache-restore)
         id: t3
@@ -217,9 +217,9 @@ jobs:
   security:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: check workspace has crates
         id: has_crates
         run: |
