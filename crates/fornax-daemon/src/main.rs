@@ -26,7 +26,9 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, RwLock};
 
+mod audit_checkpoint_submit;
 mod policy_poll;
+mod retention_sweep;
 
 fn fornax_home() -> PathBuf {
     std::env::var("FORNAX_HOME")
@@ -312,6 +314,18 @@ async fn main() -> anyhow::Result<()> {
     // `policy_poll::resolve_poll_config`.
     let poll_task = policy_poll::spawn(state.clone(), home.clone());
 
+    // FORNX-317: background audit checkpoint submission transport, best-
+    // effort and never load-bearing for the local critical path (ADR-0001
+    // D2). Disabled by default (no FORNAX_AUDIT_CHECKPOINT_URL / cloud sync
+    // not enabled) -- see `audit_checkpoint_submit::resolve_submit_config`.
+    let checkpoint_task = audit_checkpoint_submit::spawn(state.clone(), home.clone());
+
+    // FORNX-319: background retention sweep, alongside the UDS ingest and
+    // policy poll tasks. Always enabled (unlike policy polling, which
+    // requires opt-in configuration) — see `retention_sweep`'s module docs
+    // for why it deliberately does not hold `AppState::processing`.
+    let retention_sweep_task = retention_sweep::spawn(state.clone(), db_path.clone());
+
     let app = Router::new()
         .route("/api/status", get(api_status))
         .route("/api/findings/recent", get(api_findings_recent))
@@ -341,6 +355,8 @@ async fn main() -> anyhow::Result<()> {
     // a crash" — there's nothing left to distinguish.
     uds_task.abort();
     poll_task.abort();
+    checkpoint_task.abort();
+    retention_sweep_task.abort();
     let _ = std::fs::remove_file(&sock_path);
     let _ = std::fs::remove_file(&pid_path);
     tracing::info!("fornaxd stopped");
@@ -910,13 +926,37 @@ async fn api_evidence_graph(
         .evidence_graph_for_claim(&q.claim, &q.session)
         .await
     {
-        Ok(graph) => Json(serde_json::json!({
-            "claim": q.claim,
-            "session": q.session,
-            "found": true,
-            "links": graph.links,
-            "missing": graph.missing,
-        })),
+        Ok(graph) => {
+            // FORNX-319 AC3: annotate each link with whether its evidence
+            // has since been purged, so a renderer can say "evidence
+            // expired" explicitly instead of rendering the payload as if
+            // nothing was ever collected. A lookup failure (should not
+            // happen for a real evidence id) degrades to `false` — never
+            // fabricate "expired" for a row this call couldn't actually
+            // read.
+            let mut links_json = Vec::with_capacity(graph.links.len());
+            for link in &graph.links {
+                let purged = state
+                    .store
+                    .is_evidence_purged(&link.evidence_id.to_string())
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or(false);
+                let mut value = serde_json::to_value(link).unwrap_or(serde_json::Value::Null);
+                if let serde_json::Value::Object(ref mut map) = value {
+                    map.insert("evidence_purged".to_string(), serde_json::json!(purged));
+                }
+                links_json.push(value);
+            }
+            Json(serde_json::json!({
+                "claim": q.claim,
+                "session": q.session,
+                "found": true,
+                "links": links_json,
+                "missing": graph.missing,
+            }))
+        }
         Err(e) => Json(
             serde_json::json!({ "claim": q.claim, "session": q.session, "error": e.to_string() }),
         ),
@@ -1722,6 +1762,7 @@ mod tests {
             provenance: "claude_code:1.2.3:PostToolUse:Edit#heuristic:tool_input".to_string(),
             source: None,
             extension: None,
+            evidence_purged: false,
         };
         handle_message(&state, IngestMessage::Evidence(evidence), &mut hint)
             .await
@@ -1798,6 +1839,7 @@ mod tests {
             provenance: "opencode:1.18.25:PostToolUse:bash#tool_response".to_string(),
             source: None,
             extension: Some(extension),
+            evidence_purged: false,
         };
         handle_message(&state, IngestMessage::Evidence(evidence), &mut hint)
             .await
@@ -1885,6 +1927,7 @@ mod tests {
             provenance: "claude_code:1.2.3:PostToolUse:Bash#tool_response:git_commit".to_string(),
             source: None,
             extension: None,
+            evidence_purged: false,
         };
         handle_message(&state, IngestMessage::Evidence(evidence), &mut hint)
             .await
@@ -2058,6 +2101,7 @@ mod tests {
                 Some("0.0.1".to_string()),
             )),
             extension: None,
+            evidence_purged: false,
         };
         handle_message(&state, IngestMessage::Evidence(evidence), &mut hint)
             .await
@@ -2258,6 +2302,7 @@ mod tests {
             provenance: "claude_code:1.2.3:PostToolUse:Bash#tool_response".to_string(),
             source: None,
             extension: None,
+            evidence_purged: false,
         };
         handle_message(&state, IngestMessage::Evidence(evidence), &mut hint)
             .await
@@ -2304,6 +2349,95 @@ mod tests {
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0]["signal_class"], "process_result");
         assert_eq!(missing[0]["availability"], "unavailable");
+    }
+
+    /// FORNX-319 AC3: once evidence is purged, `/api/evidence-graph` must
+    /// say so explicitly on the affected link rather than rendering as if
+    /// the evidence were still fully present.
+    #[tokio::test]
+    async fn api_evidence_graph_marks_a_purged_evidence_link_as_evidence_purged() {
+        use fornax_types::{EvidenceLink, EvidenceRelation};
+
+        let state = test_state().await;
+        let mut hint = None;
+        let session_id = "fornx-319-evidence-graph-purge".to_string();
+
+        let event_id = Uuid::new_v4();
+        let event = AgentEvent {
+            id: event_id,
+            session_id: session_id.clone(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-09-01T00:00:00Z".to_string(),
+            tool_name: Some("Bash".to_string()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        handle_message(&state, IngestMessage::Event(event), &mut hint)
+            .await
+            .expect("handle event");
+
+        let claim = Claim {
+            id: Uuid::new_v4(),
+            session_id: session_id.clone(),
+            source_event_id: event_id,
+            text: "all tests passed".to_string(),
+            subject: "test_result".to_string(),
+            claimed_at: "2026-09-01T00:00:00Z".to_string(),
+        };
+        handle_message(&state, IngestMessage::Claim(claim.clone()), &mut hint)
+            .await
+            .expect("handle claim");
+
+        let evidence_id = Uuid::new_v4();
+        let evidence = fornax_types::Evidence {
+            id: evidence_id,
+            session_id: session_id.clone(),
+            source_event_id: event_id,
+            kind: fornax_types::EvidenceKind::ExitCode,
+            observed_at: "2026-09-01T00:00:00Z".to_string(),
+            payload: serde_json::json!({"command": [], "exit_code": 0}),
+            provenance: "claude_code:1.2.3:PostToolUse:Bash#tool_response".to_string(),
+            source: None,
+            extension: None,
+            evidence_purged: false,
+        };
+        handle_message(&state, IngestMessage::Evidence(evidence), &mut hint)
+            .await
+            .expect("handle evidence");
+
+        state
+            .store
+            .insert_evidence_link(&EvidenceLink {
+                id: Uuid::new_v4(),
+                session_id: session_id.clone(),
+                claim_id: claim.id,
+                evidence_id,
+                relation: EvidenceRelation::Supports,
+                linked_at: "2026-09-01T00:00:01Z".to_string(),
+            })
+            .await
+            .expect("insert evidence link");
+
+        state
+            .store
+            .purge_evidence_payload(&evidence_id.to_string(), Utc::now())
+            .await
+            .expect("purge evidence payload");
+
+        let query = Query(EvidenceGraphQuery {
+            claim: claim.id.to_string(),
+            session: session_id,
+        });
+        let resp = api_evidence_graph(State(state), query).await;
+        let links = resp.0["links"].as_array().expect("links must be an array");
+        assert_eq!(links.len(), 1);
+        assert_eq!(
+            links[0]["evidence_purged"],
+            serde_json::json!(true),
+            "the link for purged evidence must be explicitly marked"
+        );
     }
 
     /// FORNX-90 regression: an unknown claim id must report `found: false`,
@@ -2431,6 +2565,7 @@ mod tests {
             provenance: "claude_code:1.2.3:PostToolUse:Bash#tool_response".to_string(),
             source: None,
             extension: None,
+            evidence_purged: false,
         };
         handle_message(&state, IngestMessage::Evidence(evidence), &mut hint)
             .await
@@ -2588,6 +2723,7 @@ mod tests {
             provenance: "test".to_string(),
             source: None,
             extension: None,
+            evidence_purged: false,
         }
     }
 

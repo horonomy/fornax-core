@@ -840,6 +840,7 @@ mod fusion_tests {
             provenance: "test".into(),
             source: None,
             extension: None,
+            evidence_purged: false,
         }
     }
 
@@ -1558,6 +1559,7 @@ mod fusion_tests {
             provenance: "codex:rollout:exec_command_end".into(),
             source: None,
             extension: None,
+            evidence_purged: false,
         };
         let caps = fornax_types::RuntimeCapabilities {
             schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
@@ -1600,6 +1602,7 @@ mod fusion_tests {
             provenance: "codex:rollout:exec_command_end".into(),
             source: None,
             extension: None,
+            evidence_purged: false,
         };
         let caps = fornax_types::RuntimeCapabilities {
             schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
@@ -1672,6 +1675,7 @@ mod fusion_tests {
                 provenance: "claude_code:1.2.3:PostToolUse:Bash#tool_response:git_commit".into(),
                 source: None,
                 extension: None,
+                evidence_purged: false,
             }
         }
 

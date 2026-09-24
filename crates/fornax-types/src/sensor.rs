@@ -966,6 +966,7 @@ mod tests {
             provenance: "test:partial".into(),
             source: None,
             extension: None,
+            evidence_purged: false,
         };
         let outcome = SensorOutcome {
             evidence: vec![ev.clone()],

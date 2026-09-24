@@ -404,19 +404,27 @@ fn parse_rfc3339_plain(value: &str) -> Result<DateTime<Utc>, ()> {
 /// The authenticated result of [`verify_signed_envelope`]: the raw payload
 /// bytes (not yet parsed into any typed payload) and which trusted key
 /// verified them.
-pub(super) struct VerifiedEnvelope {
-    pub(super) payload_bytes: Vec<u8>,
-    pub(super) verified_by: KeyId,
+///
+/// `pub(crate)` (not `pub(super)`) so [`super::super::audit_checkpoint`]
+/// (FORNX-317) -- a top-level sibling of `policy`, not one of its
+/// submodules -- can reuse [`verify_signed_envelope`] under its own signing
+/// domain, exactly as [`super::revocation::verify_revocation_list`] already
+/// does from inside this module tree.
+pub(crate) struct VerifiedEnvelope {
+    pub(crate) payload_bytes: Vec<u8>,
+    pub(crate) verified_by: KeyId,
 }
 
 /// Exhaustive envelope/signature-layer failure vocabulary for
 /// [`verify_signed_envelope`] -- deliberately **not** [`BundleRejection`].
-/// [`verify_bundle`] and [`super::revocation::verify_revocation_list`] each
-/// map this 1:1 into their own rejection enum, so neither one can end up
+/// [`verify_bundle`], [`super::revocation::verify_revocation_list`], and
+/// [`super::super::audit_checkpoint::verify_audit_checkpoint`] each map
+/// this 1:1 into their own rejection enum, so none of them can end up
 /// claiming a check (e.g. a bundle-specific expiry window) that this
-/// envelope-layer helper never performs.
+/// envelope-layer helper never performs. `pub(crate)`, see
+/// [`VerifiedEnvelope`]'s doc comment for why.
 #[derive(Debug, Clone, thiserror::Error)]
-pub(super) enum EnvelopeVerificationError {
+pub(crate) enum EnvelopeVerificationError {
     #[error("payload_b64 is not valid strict-canonical base64: {detail}")]
     MalformedPayloadEncoding { detail: String },
     #[error("payload is {found} bytes, exceeding the {max}-byte limit")]
@@ -477,7 +485,7 @@ fn record_envelope_skip(
 /// current key whose signature simply doesn't check out -- tampering) >
 /// first_skip_reason (deterministic: the *first* known-but-unusable key's
 /// reason) > `UnknownKeyId`.
-pub(super) fn verify_signed_envelope(
+pub(crate) fn verify_signed_envelope(
     payload_b64: &str,
     signatures: &[BundleSignature],
     domain: &'static [u8],

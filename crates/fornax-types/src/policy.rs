@@ -46,6 +46,12 @@ pub use bundle::{
     CLOCK_SKEW_TOLERANCE_SECONDS, MAX_PAYLOAD_BYTES, MAX_SIGNATURES,
     SUPPORTED_BUNDLE_SCHEMA_VERSIONS,
 };
+/// Crate-internal only: lets [`super::audit_checkpoint`] (FORNX-317, a
+/// top-level sibling of this module, not one of its submodules) reuse the
+/// shared envelope/signature-verification helper under its own signing
+/// domain, exactly as [`revocation::verify_revocation_list`] already does
+/// from inside this module tree. Never re-exported crate-externally.
+pub(crate) use bundle::{verify_signed_envelope, EnvelopeVerificationError};
 pub use cache::{
     compute_posture, effective_outcome, evaluate_activation, evaluate_revocation_ingest, freshness,
     member_freshness, staleness_floor, ActivationDecision, ActivationOutcome, ActivationRejection,

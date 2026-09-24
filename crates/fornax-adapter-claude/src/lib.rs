@@ -285,6 +285,7 @@ impl EvidenceSensor for ClaudeBashExitCodeSensor {
                 self.collector_version(),
             )),
             extension: None,
+            evidence_purged: false,
         }])
     }
 }
@@ -485,6 +486,7 @@ impl EvidenceSensor for ClaudeEditWriteDiffSensor {
                 self.collector_version(),
             )),
             extension: None,
+            evidence_purged: false,
         }])
     }
 }
@@ -619,6 +621,7 @@ impl ClaudeFileWriteConfirmedSensor {
                 self.collector_version(),
             )),
             extension: None,
+            evidence_purged: false,
         }
     }
 }
@@ -1025,6 +1028,7 @@ impl EvidenceSensor for ClaudeGitOutcomeSensor {
                 self.collector_version(),
             )),
             extension: None,
+            evidence_purged: false,
         }])
     }
 }
@@ -1102,6 +1106,7 @@ impl ClaudeGitWorkingTreeSensor {
                 self.collector_version(),
             )),
             extension: None,
+            evidence_purged: false,
         }
     }
 }

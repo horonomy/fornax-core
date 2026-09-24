@@ -267,6 +267,7 @@ mod tests {
                 derived_from: vec![],
             }),
             extension: None,
+            evidence_purged: false,
         };
         let link = EvidenceLink {
             id: Uuid::new_v4(),

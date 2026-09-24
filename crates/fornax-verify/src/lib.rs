@@ -989,6 +989,7 @@ mod tests {
             provenance: "codex:rollout:exec_command_end".into(),
             source: None,
             extension: None,
+            evidence_purged: false,
         }
     }
 
@@ -1019,6 +1020,7 @@ mod tests {
             provenance: "codex:rollout:exec_command_end".into(),
             source: None,
             extension: None,
+            evidence_purged: false,
         }
     }
 
@@ -1181,6 +1183,7 @@ mod tests {
             provenance: "claude_code:1.2.3:PostToolUse:Bash#heuristic:stderr_nonempty".into(),
             source: None,
             extension: None,
+            evidence_purged: false,
         }];
         let f = v.verify(&c, &ev, &caps());
         assert_eq!(f.verdict, Verdict::Review);
@@ -1210,6 +1213,7 @@ mod tests {
             provenance: "claude_code:1.2.3:PostToolUse:Bash#heuristic:interrupted".into(),
             source: None,
             extension: None,
+            evidence_purged: false,
         }];
         let f = v.verify(&c, &ev, &caps());
         assert_eq!(f.verdict, Verdict::Contradicted);
@@ -1528,6 +1532,7 @@ mod command_success_verifier_tests {
             provenance: "claude_code:1.2.3:PostToolUse:Bash#heuristic:stderr_nonempty".into(),
             source: None,
             extension: None,
+            evidence_purged: false,
         }];
         let f = v.verify(&c, &ev, &caps());
         assert_eq!(f.verdict, Verdict::Review);
@@ -1555,6 +1560,7 @@ mod command_success_verifier_tests {
             provenance: "claude_code:1.2.3:PostToolUse:Bash#heuristic:interrupted".into(),
             source: None,
             extension: None,
+            evidence_purged: false,
         }];
         let f = v.verify(&c, &ev, &caps());
         assert_eq!(f.verdict, Verdict::Contradicted);
@@ -1618,6 +1624,7 @@ mod file_modified_verifier_tests {
             provenance: "claude_code:1.2.3:PostToolUse:Edit#heuristic:tool_input".into(),
             source: None,
             extension: None,
+            evidence_purged: false,
         }
     }
 
@@ -1771,6 +1778,7 @@ mod git_operation_verifier_tests {
             provenance: "claude_code:1.2.3:PostToolUse:Bash#tool_response:git_commit".into(),
             source: None,
             extension: None,
+            evidence_purged: false,
         }
     }
 
