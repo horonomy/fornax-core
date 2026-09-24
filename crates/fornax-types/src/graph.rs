@@ -184,7 +184,8 @@ impl EvidenceGraph {
 /// ([`crate::EvidenceKind::ProcessObservation`]'s `VcsOperation` detail)
 /// doesn't go stale the way a live process exit code
 /// ([`crate::EvidenceKind::ExitCode`]) might.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FreshnessWindow {
     /// This evidence kind records a fact that does not change once
     /// observed (e.g. a git commit SHA, a file diff, a transcript excerpt)
