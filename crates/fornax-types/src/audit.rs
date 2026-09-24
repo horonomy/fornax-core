@@ -104,6 +104,13 @@ pub enum AuditTarget {
     ComplianceReport {
         target_id: String,
     },
+    /// FORNX-342: one frozen [`crate::adjudication`]-style gold label
+    /// revision — `target_id` is `"{case_id}#{revision}"`, so the audit
+    /// trail names exactly which case and revision were frozen without
+    /// embedding the label content itself.
+    GoldLabel {
+        target_id: String,
+    },
     #[serde(other)]
     Unrecognized,
 }
@@ -128,6 +135,11 @@ pub enum AuditAction {
     /// Recording this as its own auditable action means generating a report
     /// is itself evidenced in the very ledger the report reads from.
     ComplianceReportGenerated,
+    /// FORNX-342: a corpus-adjudication gold label revision was frozen
+    /// (`fornax adjudicate freeze`). Every freeze is auditable so a gold
+    /// dataset's provenance chain is independently verifiable, not just
+    /// asserted by the `gold_labels` table's own `revision_digest`.
+    GoldLabelFrozen,
     /// Forward-compatibility catch-all. Preserves and round-trips the
     /// original wire string verbatim — see the module docs' "Two enum
     /// shapes" section.

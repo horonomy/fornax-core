@@ -8,6 +8,8 @@ license.workspace = true
 fornax-types = { path = "../fornax-types" }
 fornax-store = { path = "../fornax-store" }
 fornax-verify = { path = "../fornax-verify" }
+fornax-experiment-runner = { path = "../fornax-experiment-runner" }
+fornax-acquire = { path = "../fornax-acquire" }
 tokio.workspace = true
 axum.workspace = true
 serde.workspace = true
@@ -30,3 +32,5 @@ reqwest = { workspace = true, features = ["json", "rustls"] }
 base64.workspace = true
 ed25519-dalek.workspace = true
 sqlx.workspace = true
+sha2.workspace = true
+hex.workspace = true

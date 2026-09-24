@@ -12,9 +12,14 @@ use sqlx::SqlitePool;
 use std::path::Path;
 use std::str::FromStr;
 
+pub mod acquisition;
+pub mod adjudication;
 pub mod audit_checkpoint;
 pub mod audit_ledger;
+pub mod calibration;
 pub mod compliance_report;
+pub mod corpus;
+pub mod feedback;
 pub mod policy_cache;
 pub mod retention;
 
@@ -26,6 +31,15 @@ pub use compliance_report::{
     CheckpointAnchoringSection, ComplianceReport, ComplianceReportBody, LedgerIntegritySection,
     LedgerIntegrityStatus, RetentionClassObservation, RetentionSection,
 };
+
+/// Serializes every test in this crate that reads/writes
+/// `FORNAX_CORPUS_MINING_ENABLED` (`retention.rs` and `corpus.rs` both have
+/// one) -- `std::env::set_var` is process-global and cargo runs tests in
+/// parallel by default, so two tests in different files touching the same
+/// env var race each other even though each is individually a single,
+/// self-contained test per that file's own convention.
+#[cfg(test)]
+pub(crate) static CORPUS_MINING_GATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -47,6 +61,21 @@ pub enum StoreError {
     /// error path -- see `audit_ledger.rs`'s trust-boundary doc comment).
     #[error("audit ledger data corrupt: {0}")]
     AuditLedgerCorrupt(String),
+    /// FORNX-341: `Store::insert_corpus_candidate` refuses to persist while
+    /// `fornax_types::privacy::corpus_mining_allowed` is closed (the
+    /// default). Unlike `retention::longitudinal_persistence_allowed`'s
+    /// other classes, nothing upstream of this insert already checked the
+    /// gate — this is the enforcement point, not just documentation of one.
+    #[error(
+        "corpus mining is disabled -- set FORNAX_CORPUS_MINING_ENABLED=1 to opt in (FORNX-341)"
+    )]
+    CorpusMiningDisabled,
+    /// FORNX-342: `gold_labels` is insert-only (`(case_id, revision)` is its
+    /// primary key) -- a caller must compute the next revision number via
+    /// `fornax_corpus::adjudication::next_revision`, never overwrite an
+    /// existing one.
+    #[error("gold label revision {case_id}#{revision} is already frozen -- relabeling must use the next revision number, never overwrite one")]
+    GoldLabelAlreadyFrozen { case_id: String, revision: u32 },
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;

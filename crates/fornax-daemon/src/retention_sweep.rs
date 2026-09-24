@@ -302,10 +302,16 @@ mod tests {
             store,
             caps: std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             processing: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            home_id: std::sync::Arc::from(format!("test-home-{}", uuid::Uuid::new_v4()).as_str()),
             trust: std::sync::Arc::new(None),
             policy: std::sync::Arc::new(tokio::sync::RwLock::new(
                 crate::PolicyCacheSnapshot::empty(),
             )),
+            experiment_policy: std::sync::Arc::new(
+                fornax_experiment_runner::GlobalExperimentPolicy::new(std::iter::empty()),
+            ),
+            sensor_disable: std::sync::Arc::new(fornax_types::SensorDisableConfig::empty()),
+            acquisition_roots: std::sync::Arc::new(fornax_acquire::AcquisitionRoots::default()),
         };
 
         let config = SweepConfig {

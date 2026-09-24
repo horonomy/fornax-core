@@ -3,16 +3,21 @@
 //! status line, detail command, and dashboard (FORNX-30/31/32). No cloud
 //! dependency on the critical path (D2, ADR 0001).
 
-use axum::extract::{Query, State};
-use axum::routing::get;
+use axum::extract::{Query, Request, State};
+use axum::http::HeaderValue;
+use axum::middleware::{self, Next};
+use axum::response::Response;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
+use fornax_experiment_runner::GlobalExperimentPolicy;
 use fornax_store::policy_cache::RevocationIngestOutcome;
 use fornax_types::redact::{redact_json, redact_text};
 use fornax_types::{
-    compute_posture, verify_bundle, verify_revocation_list, ActivationOutcome, ActivationRejection,
-    BoundRevision, CacheSlotKind, Finding, IngestMessage, PolicyCacheState, PolicyContent,
-    PolicyDiagnostic, RuntimeCapabilities, TrustedVerificationKeys,
+    compute_posture, home_identity, verify_bundle, verify_revocation_list, ActivationOutcome,
+    ActivationRejection, BoundRevision, CacheSlotKind, Finding, IngestMessage, PolicyCacheState,
+    PolicyContent, PolicyDiagnostic, RuntimeCapabilities, SensorDisableConfig,
+    TrustedVerificationKeys,
 };
 use fornax_verify::fusion::{project_graph, BaselineFusionPolicy, FusionInput, FusionPolicy};
 use fornax_verify::{
@@ -126,6 +131,11 @@ struct AppState {
     /// serialized in arrival order, not to make verification tolerant of
     /// partial evidence. Held for the full duration of `handle_message`.
     processing: Arc<Mutex<()>>,
+    /// FORNX-339: this daemon's `$FORNAX_HOME` identity, sent as a response
+    /// header on every HTTP reply so a client can prove it's talking to the
+    /// daemon serving its own home rather than a different one that won the
+    /// race for the shared default port — see [`fornax_types::home_identity`].
+    home_id: Arc<str>,
     /// FORNX-119: never `None` if `resolve_trust_store` found and parsed a
     /// trust store at startup; static configuration, never re-read at
     /// runtime (trust roots do not rotate mid-process).
@@ -136,6 +146,21 @@ struct AppState {
     /// from the UDS ingest path -- never abandoned on a policy failure
     /// (ADR-0001 D2).
     policy: Arc<RwLock<PolicyCacheSnapshot>>,
+    /// FORNX-345: the real side-effect grant boundary `/api/evidence-plan`
+    /// gates acquisition candidates against -- loaded once at startup from
+    /// `$FORNAX_HOME/config.toml` (`GlobalExperimentPolicy::load`), same as
+    /// `trust`/`policy` above. Static for the process lifetime: side-effect
+    /// grants do not rotate mid-process any more than trust roots do.
+    experiment_policy: Arc<GlobalExperimentPolicy>,
+    /// FORNX-345: which sensors are administratively disabled -- loaded once
+    /// at startup (`SensorDisableConfig::load`), fed into
+    /// `fornax_verify::voi::AcquisitionPolicy::disabled_sensors`.
+    sensor_disable: Arc<SensorDisableConfig>,
+    /// FORNX-346: the operator-approved set of real directories
+    /// `/api/acquire-evidence` may ever read a target from -- loaded once at
+    /// startup (`AcquisitionRoots::load`), empty (deny-all) by default. See
+    /// `fornax_acquire::containment`'s module docs.
+    acquisition_roots: Arc<fornax_acquire::AcquisitionRoots>,
 }
 
 /// FORNX-311: the background policy poll task's most recent attempt.
@@ -240,6 +265,26 @@ fn remediation_for_rejection(r: &ActivationRejection) -> &'static str {
     }
 }
 
+/// Response header carrying [`AppState::home_id`] — checked by
+/// `fornax-cli`'s `verify_daemon_identity` before trusting any response
+/// body (FORNX-339).
+const HOME_IDENTITY_HEADER: &str = "x-fornax-home-id";
+
+/// Axum middleware: stamp every HTTP response with this daemon's home
+/// identity, unconditionally — including error responses, so a client never
+/// has a code path that skips the check.
+async fn stamp_home_identity(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    if let Ok(value) = HeaderValue::from_str(&state.home_id) {
+        response.headers_mut().insert(HOME_IDENTITY_HEADER, value);
+    }
+    response
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -293,12 +338,44 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // FORNX-345: never abort startup on a malformed experiment-policy or
+    // sensor-disable config (same ADR-0001 D2 discipline as the trust
+    // store/policy cache above) -- log and continue with the empty/default
+    // config, which denies every side effect and disables nothing.
+    let experiment_policy = match GlobalExperimentPolicy::load(&home) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load experiment policy; denying all side effects");
+            GlobalExperimentPolicy::new(std::iter::empty())
+        }
+    };
+    let sensor_disable = match SensorDisableConfig::load(&home) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load sensor disable config; treating no sensors as disabled");
+            SensorDisableConfig::empty()
+        }
+    };
+    // FORNX-346: same discipline -- a malformed [acquisition] table never
+    // aborts startup, it degrades to the empty (deny-all) default.
+    let acquisition_roots = match fornax_acquire::AcquisitionRoots::load(&home) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load acquisition roots; denying every acquisition target");
+            fornax_acquire::AcquisitionRoots::default()
+        }
+    };
+
     let state = AppState {
         store,
         caps: Arc::new(Mutex::new(HashMap::new())),
         processing: Arc::new(Mutex::new(())),
+        home_id: Arc::from(home_identity(&home).as_str()),
         trust: Arc::new(trusted),
         policy: Arc::new(RwLock::new(policy_snapshot)),
+        experiment_policy: Arc::new(experiment_policy),
+        sensor_disable: Arc::new(sensor_disable),
+        acquisition_roots: Arc::new(acquisition_roots),
     };
 
     let uds_sock_path = sock_path.clone();
@@ -334,9 +411,17 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/fusion", get(api_fusion))
         .route("/api/decision", get(api_decision))
         .route("/api/judge", get(api_judge))
+        .route("/api/evidence-plan", get(api_evidence_plan))
+        .route("/api/acquire-evidence", post(api_acquire_evidence))
+        .route("/api/reverify", post(api_reverify))
         .route("/api/reliability", get(api_reliability))
+        .route("/api/calibration", get(api_calibration))
         .route("/api/policy", get(api_policy))
         .route("/dashboard", get(dashboard))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            stamp_home_identity,
+        ))
         .with_state(state);
 
     let port: u16 = std::env::var("FORNAX_HTTP_PORT")
@@ -529,23 +614,7 @@ async fn handle_message(
                 );
             }
             let evidence = evidence_read.evidence;
-
-            // FORNX-14: registry stays a flat Vec, per the ticket's own
-            // maintainability requirement ("verifier registry/dispatch only
-            // as complex as the first real verifier set requires") — five
-            // verifiers dispatched by `applies_to` doesn't yet justify more.
-            let verifiers: Vec<Box<dyn Verifier + Send + Sync>> = vec![
-                Box::new(TestResultVerifier),
-                Box::new(CommandExecutedVerifier),
-                Box::new(CommandSuccessVerifier),
-                Box::new(FileModifiedVerifier),
-                Box::new(GitOperationVerifier),
-            ];
-            for verifier in verifiers.iter().filter(|v| v.applies_to(&claim)) {
-                let finding = verifier.verify(&claim, &evidence, &caps);
-                tracing::info!(verdict = ?finding.verdict, claim = %claim.text, "finding computed");
-                state.store.insert_finding(&finding).await?;
-            }
+            run_verifiers_and_persist_findings(state, &claim, &evidence, &caps).await?;
         }
     }
     Ok(())
@@ -927,6 +996,40 @@ async fn api_evidence_graph(
         .await
     {
         Ok(graph) => {
+            // FORNX-347: build the source-family map over the FULL session
+            // evidence pool (ancestry/event-union can run through evidence
+            // not directly linked to this claim), same
+            // Store::evidence_for_session call `compute_fusion` already
+            // uses -- no new store method. Only families containing at
+            // least one evidence id linked on THIS claim are surfaced, so
+            // the response never leaks unrelated session families.
+            let family_map = match state.store.evidence_for_session(&q.session).await {
+                Ok(read) => Some(fornax_verify::independence::SourceFamilyMap::build(
+                    &read.evidence,
+                )),
+                Err(_) => None,
+            };
+            let claim_evidence_ids: Vec<uuid::Uuid> =
+                graph.links.iter().map(|l| l.evidence_id).collect();
+            let relevant_families = family_map
+                .as_ref()
+                .map(|m| m.families_among(&claim_evidence_ids))
+                .unwrap_or_default();
+            let mut family_index_by_evidence: HashMap<uuid::Uuid, usize> = HashMap::new();
+            let source_families_json: Vec<serde_json::Value> = relevant_families
+                .iter()
+                .enumerate()
+                .map(|(i, family)| {
+                    for id in &family.evidence_ids {
+                        family_index_by_evidence.insert(*id, i);
+                    }
+                    serde_json::json!({
+                        "evidence_ids": family.evidence_ids,
+                        "bases": family.bases,
+                    })
+                })
+                .collect();
+
             // FORNX-319 AC3: annotate each link with whether its evidence
             // has since been purged, so a renderer can say "evidence
             // expired" explicitly instead of rendering the payload as if
@@ -946,6 +1049,13 @@ async fn api_evidence_graph(
                 let mut value = serde_json::to_value(link).unwrap_or(serde_json::Value::Null);
                 if let serde_json::Value::Object(ref mut map) = value {
                     map.insert("evidence_purged".to_string(), serde_json::json!(purged));
+                    map.insert(
+                        "source_family".to_string(),
+                        family_index_by_evidence
+                            .get(&link.evidence_id)
+                            .map(|i| serde_json::json!(i))
+                            .unwrap_or(serde_json::Value::Null),
+                    );
                 }
                 links_json.push(value);
             }
@@ -955,6 +1065,7 @@ async fn api_evidence_graph(
                 "found": true,
                 "links": links_json,
                 "missing": graph.missing,
+                "source_families": source_families_json,
             }))
         }
         Err(e) => Json(
@@ -984,6 +1095,37 @@ fn finding_row_to_finding(row: &fornax_store::FindingRow) -> anyhow::Result<Find
         rationale: row.rationale.clone(),
         computed_at: row.computed_at.clone(),
     })
+}
+
+/// Runs the fixed verifier registry against `claim`/`evidence`/`caps` and
+/// persists every resulting `Finding` -- extracted (FORNX-346) from the
+/// `IngestMessage::Claim` handler so `/api/acquire-evidence` can re-run the
+/// exact same real re-verification after newly acquired evidence lands,
+/// rather than duplicating this dispatch loop or inventing a second one.
+///
+/// FORNX-14: registry stays a flat Vec, per the ticket's own
+/// maintainability requirement ("verifier registry/dispatch only as complex
+/// as the first real verifier set requires") — five verifiers dispatched by
+/// `applies_to` doesn't yet justify more.
+async fn run_verifiers_and_persist_findings(
+    state: &AppState,
+    claim: &fornax_types::Claim,
+    evidence: &[fornax_types::Evidence],
+    caps: &RuntimeCapabilities,
+) -> anyhow::Result<()> {
+    let verifiers: Vec<Box<dyn Verifier + Send + Sync>> = vec![
+        Box::new(TestResultVerifier),
+        Box::new(CommandExecutedVerifier),
+        Box::new(CommandSuccessVerifier),
+        Box::new(FileModifiedVerifier),
+        Box::new(GitOperationVerifier),
+    ];
+    for verifier in verifiers.iter().filter(|v| v.applies_to(claim)) {
+        let finding = verifier.verify(claim, evidence, caps);
+        tracing::info!(verdict = ?finding.verdict, claim = %claim.text, "finding computed");
+        state.store.insert_finding(&finding).await?;
+    }
+    Ok(())
 }
 
 /// Outcome of [`compute_fusion`] — the shared claim-lookup/graph-resolution/
@@ -1198,6 +1340,19 @@ async fn api_decision(
         })),
         FusionOutcome::Found(found) => {
             let recommendation = DefaultRiskPolicy.decide(&found.fused, risk);
+            // FORNX-348: apply the non-relaxing calibration floor strictly
+            // downstream of decide() -- never touches `found.fused` (the
+            // frozen fusion output) itself. `None` (no announced
+            // capabilities for this session) applies no floor at all;
+            // there is nothing to have gone stale or drifted relative to.
+            let recommendation = match calibration_assessment_for_session(&state, &q.session).await
+            {
+                Some(assessment) => fornax_verify::decision::apply_calibration_floor(
+                    recommendation,
+                    &assessment.state,
+                ),
+                None => recommendation,
+            };
             Json(serde_json::json!({
                 "claim": q.claim,
                 "session": q.session,
@@ -1336,6 +1491,431 @@ async fn api_judge(
             }))
         }
     }
+}
+
+/// Rebuilds the effective `SideEffectAllowList` `GlobalExperimentPolicy`
+/// currently grants (FORNX-345: `GlobalExperimentPolicy` exposes only a
+/// per-class `permits` check, not an iterable set) and wraps it, alongside
+/// `cloud_sync_allowed()`/`state.sensor_disable`, into the
+/// `fornax_verify::voi::AcquisitionPolicy` gate both `/api/evidence-plan`
+/// (FORNX-345) and `/api/acquire-evidence` (FORNX-346) use -- never a
+/// fabricated `AUTO_SAFE`/`REQUIRE_APPROVAL`/`FORBIDDEN` model.
+fn build_acquisition_policy(state: &AppState) -> fornax_verify::voi::AcquisitionPolicy {
+    use fornax_types::experiment::{SideEffectAllowList, SideEffectClass};
+    let granted_side_effects = SideEffectAllowList::new(
+        [
+            SideEffectClass::EphemeralWorktreeMutation,
+            SideEffectClass::ProcessSpawn,
+            SideEffectClass::NetworkCall,
+            SideEffectClass::FilesystemWriteOutsideWorktree,
+        ]
+        .into_iter()
+        .filter(|class| state.experiment_policy.permits(*class)),
+    );
+    fornax_verify::voi::AcquisitionPolicy {
+        granted_side_effects,
+        egress_allowed: fornax_types::privacy::cloud_sync_allowed(),
+        disabled_sensors: (*state.sensor_disable).clone(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct EvidencePlanQuery {
+    claim: String,
+    session: String,
+    /// Same contract as `DecisionQuery::risk` -- defaults to `balanced`.
+    #[serde(default)]
+    risk: Option<String>,
+}
+
+/// FORNX-345: `GET /api/evidence-plan?claim=&session=&risk=`.
+///
+/// Reuses `compute_fusion` (the same graph-loading/projection logic behind
+/// `/api/fusion`/`/api/decision`/`/api/judge`) so this endpoint never
+/// re-derives the claim/graph/evidence pool a second time. Builds the
+/// `fornax_verify::voi::AcquisitionPolicy` gate from the daemon's own
+/// startup-loaded `experiment_policy`/`sensor_disable` state (never a
+/// fabricated `AUTO_SAFE`/`REQUIRE_APPROVAL`/`FORBIDDEN` model -- see ADR
+/// 0015), then runs `DeterministicVoiPolicy::plan` over it.
+///
+/// Reads `Store::capabilities_for_session` (all announcing providers), the
+/// same choice `/api/capabilities` makes over the in-memory single-provider
+/// `state.caps` cache, since under-reporting a provider here would silently
+/// under-report `EvidenceGapKind::SignalClassUnobservable`/
+/// `ExpectedSignalMissing` gaps.
+///
+/// Always returns the recommendation and the full `FusedFinding` alongside
+/// the plan -- same "never show one instead of the other" discipline as
+/// `/api/decision` -- plus the plan's own `outcome`, ranked/unavailable
+/// candidates, and gaps.
+async fn api_evidence_plan(
+    State(state): State<AppState>,
+    Query(q): Query<EvidencePlanQuery>,
+) -> Json<serde_json::Value> {
+    use fornax_verify::decision::{DecisionPolicy, DefaultRiskPolicy};
+    use fornax_verify::voi::{DeterministicVoiPolicy, PlanInput, VoiPolicy};
+
+    let risk = match parse_risk_class(q.risk.as_deref()) {
+        Ok(r) => r,
+        Err(message) => {
+            return Json(
+                serde_json::json!({ "claim": q.claim, "session": q.session, "error": message }),
+            )
+        }
+    };
+
+    let capabilities = match state.store.capabilities_for_session(&q.session).await {
+        Ok(caps) => caps,
+        Err(e) => {
+            return Json(
+                serde_json::json!({ "claim": q.claim, "session": q.session, "error": e.to_string() }),
+            )
+        }
+    };
+
+    match compute_fusion(&state, &q.claim, &q.session).await {
+        FusionOutcome::Error { message } => {
+            Json(serde_json::json!({ "claim": q.claim, "session": q.session, "error": message }))
+        }
+        FusionOutcome::NotFound { reason } => Json(serde_json::json!({
+            "claim": q.claim,
+            "session": q.session,
+            "found": false,
+            "reason": reason,
+        })),
+        FusionOutcome::Found(found) => {
+            let recommendation = DefaultRiskPolicy.decide(&found.fused, risk);
+            let acquisition = build_acquisition_policy(&state);
+            let input = PlanInput {
+                claim: &found.claim,
+                graph: &found.graph,
+                evidence: &found.evidence_pool,
+                fused: &found.fused,
+                risk,
+                capabilities: &capabilities,
+                acquisition: &acquisition,
+            };
+            let computed_at = chrono::Utc::now().to_rfc3339();
+            let plan = DeterministicVoiPolicy.plan(&input, &computed_at);
+
+            Json(serde_json::json!({
+                "claim": q.claim,
+                "session": q.session,
+                "found": true,
+                "graph_source": found.graph_source,
+                "recommendation": recommendation,
+                "fused": found.fused,
+                "plan": plan,
+            }))
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct AcquireEvidenceQuery {
+    claim: String,
+    session: String,
+    /// 1-based `AcquisitionCandidate::rank` from a freshly computed
+    /// `EvidencePlan` -- never a client-supplied `EvidenceRequest`. Accepting
+    /// an arbitrary request from the caller would let a client craft a
+    /// fake low-side-effect request and bypass gating entirely; selecting
+    /// by rank out of a plan this endpoint computes itself is what keeps
+    /// every acquisition gated by the server's own current policy.
+    rank: u32,
+    /// Same contract as `DecisionQuery::risk` -- defaults to `balanced`.
+    /// Affects only the plan's candidate ranking, not the gate itself.
+    #[serde(default)]
+    risk: Option<String>,
+}
+
+/// FORNX-346: `POST /api/acquire-evidence?claim=&session=&rank=&risk=`.
+///
+/// Closes the loop from FORNX-345's ranked plan to real evidence: recomputes
+/// the exact same `EvidencePlan` `/api/evidence-plan` would for this
+/// `(claim, session, risk)` (never trusts a stale plan a client might hold),
+/// selects the candidate at `rank`, and calls
+/// `fornax_acquire::acquire_evidence` -- which re-gates against *current*
+/// policy itself before touching anything.
+///
+/// On `Acquired`, the new evidence is persisted, `run_verifiers_and_persist_findings`
+/// re-runs the same real verifier registry the `Claim` ingest path uses (no
+/// separate/parallel interpretation logic invented here), and fusion is
+/// recomputed -- the response carries both `fused_before` and `fused_after`
+/// together, never one without the other, so a caller can see exactly what
+/// changed. Every attempt (whatever its outcome) is persisted to
+/// `acquisition_log`.
+async fn api_acquire_evidence(
+    State(state): State<AppState>,
+    Query(q): Query<AcquireEvidenceQuery>,
+) -> Json<serde_json::Value> {
+    use fornax_verify::voi::{DeterministicVoiPolicy, PlanInput, VoiPolicy};
+
+    let risk = match parse_risk_class(q.risk.as_deref()) {
+        Ok(r) => r,
+        Err(message) => {
+            return Json(
+                serde_json::json!({ "claim": q.claim, "session": q.session, "error": message }),
+            )
+        }
+    };
+    let capabilities = match state.store.capabilities_for_session(&q.session).await {
+        Ok(caps) => caps,
+        Err(e) => {
+            return Json(
+                serde_json::json!({ "claim": q.claim, "session": q.session, "error": e.to_string() }),
+            )
+        }
+    };
+
+    let found = match compute_fusion(&state, &q.claim, &q.session).await {
+        FusionOutcome::Error { message } => {
+            return Json(
+                serde_json::json!({ "claim": q.claim, "session": q.session, "error": message }),
+            )
+        }
+        FusionOutcome::NotFound { reason } => {
+            return Json(serde_json::json!({
+                "claim": q.claim,
+                "session": q.session,
+                "found": false,
+                "reason": reason,
+            }))
+        }
+        FusionOutcome::Found(found) => found,
+    };
+    let fused_before = found.fused.clone();
+
+    let acquisition = build_acquisition_policy(&state);
+    let plan_input = PlanInput {
+        claim: &found.claim,
+        graph: &found.graph,
+        evidence: &found.evidence_pool,
+        fused: &found.fused,
+        risk,
+        capabilities: &capabilities,
+        acquisition: &acquisition,
+    };
+    let computed_at = chrono::Utc::now().to_rfc3339();
+    let plan = DeterministicVoiPolicy.plan(&plan_input, &computed_at);
+
+    let Some(candidate) = plan.candidates.iter().find(|c| c.rank == Some(q.rank)) else {
+        return Json(serde_json::json!({
+            "claim": q.claim,
+            "session": q.session,
+            "found": true,
+            "error": format!("no candidate with rank {} in the current plan", q.rank),
+        }));
+    };
+
+    let outcome = fornax_acquire::acquire_evidence(
+        candidate,
+        &found.evidence_pool,
+        &q.session,
+        found.claim.source_event_id,
+        &state.acquisition_roots,
+        &state.experiment_policy,
+        &computed_at,
+    );
+
+    let (outcome_kind, outcome_json): (&str, serde_json::Value) = match &outcome {
+        fornax_acquire::AcquisitionOutcome::Acquired(evidence) => {
+            ("acquired", serde_json::json!({ "evidence": evidence }))
+        }
+        fornax_acquire::AcquisitionOutcome::Refused { reason } => {
+            ("refused", serde_json::json!({ "reason": reason }))
+        }
+        fornax_acquire::AcquisitionOutcome::Unavailable { reason } => {
+            ("unavailable", serde_json::json!({ "reason": reason }))
+        }
+        fornax_acquire::AcquisitionOutcome::Failed { reason } => {
+            ("failed", serde_json::json!({ "reason": reason }))
+        }
+        fornax_acquire::AcquisitionOutcome::Unsupported { reason } => {
+            ("unsupported", serde_json::json!({ "reason": reason }))
+        }
+        fornax_acquire::AcquisitionOutcome::TimedOut { reason, elapsed_ms } => (
+            "timed_out",
+            serde_json::json!({ "reason": reason, "elapsed_ms": elapsed_ms }),
+        ),
+    };
+
+    let log_document = serde_json::json!({
+        "request": candidate.request,
+        "outcome": outcome_json,
+    });
+    if let Err(e) = state
+        .store
+        .insert_acquisition_log_entry(
+            &uuid::Uuid::new_v4().to_string(),
+            &q.session,
+            &q.claim,
+            &format!("{:?}", candidate.request.kind),
+            &plan.policy_name,
+            plan.policy_version,
+            outcome_kind,
+            &computed_at,
+            &log_document.to_string(),
+        )
+        .await
+    {
+        tracing::warn!(error = %e, "failed to persist acquisition_log entry");
+    }
+
+    let fused_after = if let fornax_acquire::AcquisitionOutcome::Acquired(evidence) = outcome {
+        if let Err(e) = state.store.insert_evidence(&evidence).await {
+            return Json(serde_json::json!({
+                "claim": q.claim,
+                "session": q.session,
+                "found": true,
+                "outcome": outcome_kind,
+                "error": format!("acquired evidence but failed to persist it: {e}"),
+                "fused_before": fused_before,
+            }));
+        }
+        let caps = state
+            .caps
+            .lock()
+            .await
+            .get(&q.session)
+            .cloned()
+            .unwrap_or_else(default_unknown_caps);
+        let evidence_after = match state.store.evidence_for_session(&q.session).await {
+            Ok(read) => read.evidence,
+            Err(e) => {
+                return Json(serde_json::json!({
+                    "claim": q.claim,
+                    "session": q.session,
+                    "found": true,
+                    "outcome": outcome_kind,
+                    "error": format!("failed to re-read evidence after acquisition: {e}"),
+                    "fused_before": fused_before,
+                }))
+            }
+        };
+        if let Err(e) =
+            run_verifiers_and_persist_findings(&state, &found.claim, &evidence_after, &caps).await
+        {
+            return Json(serde_json::json!({
+                "claim": q.claim,
+                "session": q.session,
+                "found": true,
+                "outcome": outcome_kind,
+                "error": format!("failed to re-verify after acquisition: {e}"),
+                "fused_before": fused_before,
+            }));
+        }
+        match compute_fusion(&state, &q.claim, &q.session).await {
+            FusionOutcome::Found(after) => Some(after.fused),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    Json(serde_json::json!({
+        "claim": q.claim,
+        "session": q.session,
+        "found": true,
+        "rank": q.rank,
+        "outcome": outcome_kind,
+        "detail": outcome_json,
+        "fused_before": fused_before,
+        "fused_after": fused_after,
+    }))
+}
+
+#[derive(serde::Deserialize)]
+struct ReverifyQuery {
+    claim: String,
+    session: String,
+}
+
+/// FORNX-346 Part 2: `POST /api/reverify?claim=&session=`.
+///
+/// Deliberately **not** an endpoint that accepts client-supplied `Evidence`
+/// -- see `docs/adr/0016-evidence-acquisition-boundary.md` for why
+/// `/api/acquire-evidence` already refuses a client-supplied
+/// `EvidenceRequest`, and accepting a client-supplied `Evidence` directly
+/// would be strictly worse (no gate at all on what "evidence" claims to be).
+/// This endpoint accepts only identifiers the caller can already read (a
+/// claim id, a session id) and re-runs verification against whatever
+/// evidence is **already persisted** in the store -- the privileged
+/// `fornax-acquire-exec` binary (`exec/fornax-acquire-exec`, ADR 0022) is
+/// expected to call `Store::insert_evidence` directly *before* calling this
+/// endpoint, exactly the same order `/api/acquire-evidence` itself already
+/// uses internally.
+///
+/// Reuses the exact same `compute_fusion` / `run_verifiers_and_persist_findings`
+/// dispatch `/api/acquire-evidence` uses -- no new interpretation logic.
+/// This handler contains no acquisition logic, no subprocess spawn, and no
+/// network call of its own; it purely re-runs verification over
+/// already-persisted state.
+async fn api_reverify(
+    State(state): State<AppState>,
+    Query(q): Query<ReverifyQuery>,
+) -> Json<serde_json::Value> {
+    let found = match compute_fusion(&state, &q.claim, &q.session).await {
+        FusionOutcome::Error { message } => {
+            return Json(
+                serde_json::json!({ "claim": q.claim, "session": q.session, "error": message }),
+            )
+        }
+        FusionOutcome::NotFound { reason } => {
+            return Json(serde_json::json!({
+                "claim": q.claim,
+                "session": q.session,
+                "found": false,
+                "reason": reason,
+            }))
+        }
+        FusionOutcome::Found(found) => found,
+    };
+    let fused_before = found.fused.clone();
+
+    let evidence = match state.store.evidence_for_session(&q.session).await {
+        Ok(read) => read.evidence,
+        Err(e) => {
+            return Json(serde_json::json!({
+                "claim": q.claim,
+                "session": q.session,
+                "found": true,
+                "error": format!("failed to read evidence: {e}"),
+                "fused_before": fused_before,
+            }))
+        }
+    };
+
+    let caps = state
+        .caps
+        .lock()
+        .await
+        .get(&q.session)
+        .cloned()
+        .unwrap_or_else(default_unknown_caps);
+
+    if let Err(e) = run_verifiers_and_persist_findings(&state, &found.claim, &evidence, &caps).await
+    {
+        return Json(serde_json::json!({
+            "claim": q.claim,
+            "session": q.session,
+            "found": true,
+            "error": format!("failed to re-verify: {e}"),
+            "fused_before": fused_before,
+        }));
+    }
+
+    let fused_after = match compute_fusion(&state, &q.claim, &q.session).await {
+        FusionOutcome::Found(after) => Some(after.fused),
+        _ => None,
+    };
+
+    Json(serde_json::json!({
+        "claim": q.claim,
+        "session": q.session,
+        "found": true,
+        "fused_before": fused_before,
+        "fused_after": fused_after,
+    }))
 }
 
 /// FORNX-105: `GET /api/reliability?session=&provider=&model_family=&model_version=&
@@ -1511,6 +2091,141 @@ async fn reliability_response(
     }
 }
 
+/// The active policy bundle's revision digest(s), if any are currently
+/// loaded (FORNX-348). `state.policy`'s active generation can carry more
+/// than one bundle member; every member's digest is included, sorted, so
+/// this can never silently under-report a multi-bundle activation the way
+/// picking just `.first()` would. `None` when nothing is active yet.
+async fn active_policy_revision_digests(state: &AppState) -> Option<String> {
+    let snapshot = state.policy.read().await;
+    let active = snapshot.state.active.as_ref()?;
+    if active.members.is_empty() {
+        return None;
+    }
+    let mut digests: Vec<String> = active
+        .members
+        .iter()
+        .map(|m| m.revision_digest.as_str().to_string())
+        .collect();
+    digests.sort();
+    digests.dedup();
+    Some(digests.join(","))
+}
+
+/// Build the live [`fornax_types::calibration::CalibrationProvenance`] this
+/// deployment observes right now, for one session's already-resolved
+/// [`RuntimeCapabilities`] (FORNX-348). Thin async wrapper resolving the one
+/// input that requires I/O (`active_policy_revision_digests`) and
+/// delegating everything else to [`fornax_verify::calibration::live_provenance`]
+/// (FORNX-350, extracted so `fornax receipt issue` can build the identical
+/// provenance without a daemon dependency or a second implementation).
+async fn build_calibration_provenance(
+    state: &AppState,
+    capabilities: &RuntimeCapabilities,
+    model_version: Option<String>,
+    model_family: Option<String>,
+) -> fornax_types::calibration::CalibrationProvenance {
+    let active_policy_revision_digest = active_policy_revision_digests(state).await;
+    fornax_verify::calibration::live_provenance(
+        capabilities,
+        state.sensor_disable.disabled_names(),
+        active_policy_revision_digest,
+        model_version,
+        model_family,
+    )
+}
+
+/// The most recently recorded calibration revision's provenance, if one has
+/// ever been recorded -- `None` when `calibration_revisions` is empty or
+/// the stored document fails to parse (an honest "no active calibration",
+/// never a fabricated one).
+async fn active_calibration_provenance(
+    state: &AppState,
+) -> Option<fornax_types::calibration::CalibrationProvenance> {
+    let row = state.store.latest_calibration_revision().await.ok()??;
+    serde_json::from_str(&row.document).ok()
+}
+
+/// Assess calibration for one session (FORNX-348), reusing the exact same
+/// capability-lookup discipline `reliability_response` established: pick
+/// the row matching the session's FIRST announced provider when more than
+/// one has announced, since there is no explicit provider context here the
+/// way `/api/reliability` has via its query. `None` when the session has no
+/// announced capabilities at all -- there is no live provenance to compare
+/// against, so no calibration judgment can be made.
+///
+/// **No `ReliabilityObservation`s are persisted anywhere in this codebase
+/// yet** (see `reliability_response`'s own doc comment) -- `drift` is
+/// therefore always `None` here; only the provenance-mismatch half
+/// (`Stale`) is ever actually reachable on live traffic today. See
+/// ADR-0018.
+async fn calibration_assessment_for_session(
+    state: &AppState,
+    session: &str,
+) -> Option<fornax_verify::calibration::CalibrationAssessment> {
+    use fornax_verify::reliability::ReliabilityAggregationConfig;
+
+    let caps = state.store.capabilities_for_session(session).await.ok()?;
+    let capabilities = caps.into_iter().next()?;
+    let live = build_calibration_provenance(state, &capabilities, None, None).await;
+    let active = active_calibration_provenance(state).await;
+    let config = ReliabilityAggregationConfig::load_default();
+    Some(fornax_verify::calibration::assess_calibration(
+        active.as_ref(),
+        &live,
+        None,
+        config.historical_aggregation_enabled,
+    ))
+}
+
+#[derive(serde::Deserialize)]
+struct CalibrationQuery {
+    session: String,
+}
+
+/// FORNX-348: `GET /api/calibration?session=`. Reports whether the
+/// session's live, observable environment (adapter version, capability
+/// fingerprint, fusion/decision policy identity, disabled sensors) still
+/// matches the most recently recorded calibration revision -- see
+/// `fornax_verify::calibration` module docs for the full state vocabulary.
+/// This is the read half of the same assessment `/api/decision` applies as
+/// a non-relaxing floor on its `Recommendation` (FORNX-348 AC4).
+async fn api_calibration(
+    State(state): State<AppState>,
+    Query(q): Query<CalibrationQuery>,
+) -> Json<serde_json::Value> {
+    let caps = match state.store.capabilities_for_session(&q.session).await {
+        Ok(caps) => caps,
+        Err(e) => return Json(serde_json::json!({ "session": q.session, "error": e.to_string() })),
+    };
+    let Some(capabilities) = caps.into_iter().next() else {
+        return Json(serde_json::json!({
+            "session": q.session,
+            "capabilities_announced": false,
+            "reason": "no capabilities announced for this session -- a live calibration \
+                       provenance read cannot be built without one",
+        }));
+    };
+
+    let live = build_calibration_provenance(&state, &capabilities, None, None).await;
+    let active = active_calibration_provenance(&state).await;
+    let config = fornax_verify::reliability::ReliabilityAggregationConfig::load_default();
+    let assessment = fornax_verify::calibration::assess_calibration(
+        active.as_ref(),
+        &live,
+        None,
+        config.historical_aggregation_enabled,
+    );
+
+    Json(serde_json::json!({
+        "session": q.session,
+        "capabilities_announced": true,
+        "active_provenance": active,
+        "live_provenance": live,
+        "assessment": assessment,
+    }))
+}
+
 #[derive(serde::Deserialize)]
 struct ReliabilityQuery {
     session: String,
@@ -1639,8 +2354,12 @@ mod tests {
             store,
             caps: Arc::new(Mutex::new(HashMap::new())),
             processing: Arc::new(Mutex::new(())),
+            home_id: Arc::from(format!("test-home-{}", Uuid::new_v4()).as_str()),
             trust: Arc::new(None),
             policy: Arc::new(RwLock::new(PolicyCacheSnapshot::empty())),
+            experiment_policy: Arc::new(GlobalExperimentPolicy::new(std::iter::empty())),
+            sensor_disable: Arc::new(SensorDisableConfig::empty()),
+            acquisition_roots: Arc::new(fornax_acquire::AcquisitionRoots::default()),
         }
     }
 
@@ -2351,6 +3070,148 @@ mod tests {
         assert_eq!(missing[0]["availability"], "unavailable");
     }
 
+    /// FORNX-347: two `AgentAdjacent` evidence rows sharing one
+    /// `source_event_id` must be surfaced as one `source_families` entry,
+    /// with both links pointing at the same `source_family` index -- the
+    /// real, live common-source-amplification shape (two sensors reading
+    /// one PostToolUse hook), not a fixture-only correlation_group case.
+    #[tokio::test]
+    async fn api_evidence_graph_surfaces_a_real_common_source_family() {
+        use fornax_types::graph::{EvidenceLink, EvidenceRelation};
+        use fornax_types::sensor::{
+            ClockSource, CollectionMethod, EvidenceSource, Freshness, TamperBoundary, TrustClass,
+        };
+
+        let state = test_state().await;
+        let mut hint = None;
+        let session_id = "fornx-347-evidence-graph-source-family".to_string();
+
+        let event_id = Uuid::new_v4();
+        let event = AgentEvent {
+            id: event_id,
+            session_id: session_id.clone(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-09-01T00:00:00Z".to_string(),
+            tool_name: Some("Bash".to_string()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        handle_message(&state, IngestMessage::Event(event), &mut hint)
+            .await
+            .expect("handle event");
+
+        let claim = Claim {
+            id: Uuid::new_v4(),
+            session_id: session_id.clone(),
+            source_event_id: event_id,
+            text: "git commit succeeded".to_string(),
+            subject: "command_succeeded".to_string(),
+            claimed_at: "2026-09-01T00:00:00Z".to_string(),
+        };
+        handle_message(&state, IngestMessage::Claim(claim.clone()), &mut hint)
+            .await
+            .expect("handle claim");
+
+        let agent_source = |sensor_name: &'static str| EvidenceSource {
+            sensor_name: sensor_name.to_string(),
+            trust_class: TrustClass::AgentAdjacent,
+            collected_at: "2026-09-01T00:00:00Z".to_string(),
+            provider: None,
+            collection_method: CollectionMethod::HookCallback,
+            collector_version: None,
+            freshness: Freshness {
+                clock_source: ClockSource::HostClock,
+                caveat: None,
+            },
+            tamper_boundary: TamperBoundary::default(),
+            correlation_group: None,
+            derived_from: vec![],
+        };
+
+        let ev_a_id = Uuid::new_v4();
+        let ev_a = fornax_types::Evidence {
+            id: ev_a_id,
+            session_id: session_id.clone(),
+            source_event_id: event_id,
+            kind: fornax_types::EvidenceKind::ExitCode,
+            observed_at: "2026-09-01T00:00:00Z".to_string(),
+            payload: serde_json::json!({}),
+            provenance: "claude_code:1.2.3:PostToolUse:Bash#exit_code".to_string(),
+            source: Some(agent_source("claude_bash_exit_code_sensor_v1")),
+            extension: None,
+            evidence_purged: false,
+        };
+        let ev_b_id = Uuid::new_v4();
+        let ev_b = fornax_types::Evidence {
+            id: ev_b_id,
+            session_id: session_id.clone(),
+            source_event_id: event_id,
+            kind: fornax_types::EvidenceKind::ProcessObservation,
+            observed_at: "2026-09-01T00:00:00Z".to_string(),
+            payload: serde_json::json!({}),
+            provenance: "claude_code:1.2.3:PostToolUse:Bash#git_outcome".to_string(),
+            source: Some(agent_source("claude_git_outcome_sensor_v1")),
+            extension: None,
+            evidence_purged: false,
+        };
+        handle_message(&state, IngestMessage::Evidence(ev_a), &mut hint)
+            .await
+            .expect("handle evidence a");
+        handle_message(&state, IngestMessage::Evidence(ev_b), &mut hint)
+            .await
+            .expect("handle evidence b");
+
+        for evidence_id in [ev_a_id, ev_b_id] {
+            state
+                .store
+                .insert_evidence_link(&EvidenceLink {
+                    id: Uuid::new_v4(),
+                    session_id: session_id.clone(),
+                    claim_id: claim.id,
+                    evidence_id,
+                    relation: EvidenceRelation::Supports,
+                    linked_at: "2026-09-01T00:00:01Z".to_string(),
+                })
+                .await
+                .expect("insert evidence link");
+        }
+
+        let query = Query(EvidenceGraphQuery {
+            claim: claim.id.to_string(),
+            session: session_id,
+        });
+        let resp = api_evidence_graph(State(state), query).await;
+        let links = resp.0["links"].as_array().expect("links must be an array");
+        assert_eq!(links.len(), 2);
+        let family_indices: Vec<u64> = links
+            .iter()
+            .map(|l| l["source_family"].as_u64().expect("source_family present"))
+            .collect();
+        assert_eq!(
+            family_indices[0], family_indices[1],
+            "two AgentAdjacent evidence rows on the same source_event_id must be one family"
+        );
+
+        let families = resp.0["source_families"]
+            .as_array()
+            .expect("source_families array");
+        assert_eq!(families.len(), 1);
+        let family_evidence_ids: Vec<String> = families[0]["evidence_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(family_evidence_ids.len(), 2);
+        assert!(families[0]["bases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b.get("same_agent_turn").is_some()));
+    }
+
     /// FORNX-319 AC3: once evidence is purged, `/api/evidence-graph` must
     /// say so explicitly on the affected link rather than rendering as if
     /// the evidence were still fully present.
@@ -3046,6 +3907,737 @@ mod tests {
         .await;
         let v = response.0;
         assert!(v.get("error").is_some());
+    }
+
+    // --- FORNX-348: /api/calibration + the decision-layer floor ---------
+
+    #[tokio::test]
+    async fn api_calibration_reports_no_capabilities_announced() {
+        let state = test_state().await;
+        let response = api_calibration(
+            State(state),
+            Query(CalibrationQuery {
+                session: "fornx-348-calibration-no-caps".to_string(),
+            }),
+        )
+        .await;
+        let v = response.0;
+        assert_eq!(v["capabilities_announced"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
+    async fn api_calibration_reports_no_active_calibration_when_none_recorded_yet() {
+        use fornax_types::{CapabilitySignal, Provider, SignalAvailability, SignalClass};
+        let state = test_state().await;
+        let session_id = "fornx-348-calibration-no-active-revision";
+        let caps = RuntimeCapabilities {
+            schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
+            provider: Provider::ClaudeCode,
+            signals: vec![CapabilitySignal {
+                class: SignalClass::ToolTrace,
+                state: SignalAvailability::Available,
+                detail: None,
+            }],
+            notes: [("session_id".to_string(), session_id.to_string())].into(),
+        };
+        let mut hint = None;
+        handle_message(&state, IngestMessage::Capabilities(caps), &mut hint)
+            .await
+            .expect("handle capabilities");
+
+        let response = api_calibration(
+            State(state),
+            Query(CalibrationQuery {
+                session: session_id.to_string(),
+            }),
+        )
+        .await;
+        let v = response.0;
+        assert_eq!(v["capabilities_announced"], serde_json::json!(true));
+        assert_eq!(
+            v["assessment"]["state"],
+            serde_json::json!("no_active_calibration")
+        );
+        assert!(
+            v["live_provenance"]["adapter_version"].is_null()
+                || v["live_provenance"].get("adapter_version").is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn api_calibration_reports_stale_when_a_recorded_revision_disagrees() {
+        use fornax_types::{CapabilitySignal, Provider, SignalAvailability, SignalClass};
+        let state = test_state().await;
+        let session_id = "fornx-348-calibration-stale-revision";
+        let caps = RuntimeCapabilities {
+            schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
+            provider: Provider::ClaudeCode,
+            signals: vec![CapabilitySignal {
+                class: SignalClass::ToolTrace,
+                state: SignalAvailability::Available,
+                detail: None,
+            }],
+            notes: [
+                ("session_id".to_string(), session_id.to_string()),
+                (
+                    "adapter_version".to_string(),
+                    "claude-adapter-0.3.0".to_string(),
+                ),
+            ]
+            .into(),
+        };
+        let mut hint = None;
+        handle_message(&state, IngestMessage::Capabilities(caps.clone()), &mut hint)
+            .await
+            .expect("handle capabilities");
+
+        // Record a revision whose provenance matches everything about the
+        // live environment except `adapter_version` -- built the same way
+        // `build_calibration_provenance` would, but with a different
+        // adapter version, so this is a genuine mismatch on exactly one
+        // dimension, not a fabricated one.
+        let mut stale = build_calibration_provenance(&state, &caps, None, None).await;
+        stale.adapter_version = Some("claude-adapter-0.2.0".to_string());
+        state
+            .store
+            .insert_calibration_revision(
+                "rev-1",
+                "2026-01-01T00:00:00Z",
+                &serde_json::to_string(&stale).expect("serialize provenance"),
+            )
+            .await
+            .expect("insert revision");
+
+        let response = api_calibration(
+            State(state),
+            Query(CalibrationQuery {
+                session: session_id.to_string(),
+            }),
+        )
+        .await;
+        let v = response.0;
+        assert_eq!(
+            v["assessment"]["state"]["stale"]["changed_dimensions"],
+            serde_json::json!(["adapter_version"])
+        );
+    }
+
+    #[tokio::test]
+    async fn api_calibration_reports_valid_when_a_recorded_revision_matches_live_provenance() {
+        use fornax_types::{CapabilitySignal, Provider, SignalAvailability, SignalClass};
+        let state = test_state().await;
+        let session_id = "fornx-348-calibration-valid-revision";
+        let caps = RuntimeCapabilities {
+            schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
+            provider: Provider::ClaudeCode,
+            signals: vec![CapabilitySignal {
+                class: SignalClass::ToolTrace,
+                state: SignalAvailability::Available,
+                detail: None,
+            }],
+            notes: [("session_id".to_string(), session_id.to_string())].into(),
+        };
+        let mut hint = None;
+        handle_message(&state, IngestMessage::Capabilities(caps.clone()), &mut hint)
+            .await
+            .expect("handle capabilities");
+
+        let matching = build_calibration_provenance(&state, &caps, None, None).await;
+        state
+            .store
+            .insert_calibration_revision(
+                "rev-1",
+                "2026-01-01T00:00:00Z",
+                &serde_json::to_string(&matching).expect("serialize provenance"),
+            )
+            .await
+            .expect("insert revision");
+
+        let response = api_calibration(
+            State(state),
+            Query(CalibrationQuery {
+                session: session_id.to_string(),
+            }),
+        )
+        .await;
+        let v = response.0;
+        assert_eq!(v["assessment"]["state"], serde_json::json!("valid"));
+    }
+
+    /// `/api/decision` calls `calibration_assessment_for_session` for every
+    /// request -- confirmed here by checking that a session with no
+    /// announced capabilities still returns a normal recommendation (the
+    /// `None` branch applies no floor and never errors), matching
+    /// `api_decision_returns_recommendation_and_full_fused_finding_together`'s
+    /// existing baseline (single `Supports` link, no correlation group ->
+    /// `Verified`/`Qualified` -> `Review`, already at the floor regardless
+    /// of calibration state).
+    #[tokio::test]
+    async fn api_decision_applies_calibration_assessment_without_erroring() {
+        let state = test_state().await;
+        let session_id = "fornx-348-decision-calibration-wiring";
+        let event_id = test_event(&state, session_id).await;
+        let claim = test_claim(session_id, event_id);
+        let evidence = test_evidence(session_id, event_id);
+        state
+            .store
+            .insert_claim(&claim)
+            .await
+            .expect("insert claim");
+        state
+            .store
+            .insert_evidence(&evidence)
+            .await
+            .expect("insert evidence");
+        let link = fornax_types::EvidenceLink {
+            id: Uuid::new_v4(),
+            session_id: session_id.to_string(),
+            claim_id: claim.id,
+            evidence_id: evidence.id,
+            relation: fornax_types::EvidenceRelation::Supports,
+            linked_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        state
+            .store
+            .insert_evidence_link(&link)
+            .await
+            .expect("insert evidence link");
+
+        let response = api_decision(
+            State(state),
+            Query(DecisionQuery {
+                claim: claim.id.to_string(),
+                session: session_id.to_string(),
+                risk: None,
+            }),
+        )
+        .await;
+        let v = response.0;
+        assert_eq!(v["found"], serde_json::json!(true));
+        assert_eq!(v["recommendation"]["action"], serde_json::json!("review"));
+    }
+
+    // --- FORNX-345: /api/evidence-plan -----------------------------------
+
+    /// Real end-to-end flow, no mocking: a claim with a single `Supports`
+    /// link whose evidence carries no `source` (so no trust class/
+    /// correlation group is recorded) is persisted to a real store, then
+    /// `api_evidence_plan` is called against it -- the same
+    /// `IndependenceUnverified` caveat `api_decision_returns_recommendation_
+    /// and_full_fused_finding_together` exercises for `/api/decision` also
+    /// derives a real `EvidenceGap` here. Under `test_state()`'s deny-all
+    /// `GlobalExperimentPolicy`, the gap's `QueryCiStatus` probe (needs
+    /// `NetworkCall`, ungranted) comes back `RequiresApproval` naming
+    /// exactly that grant, while its zero-side-effect `HumanReview` probe
+    /// stays `Available` -- confirming this daemon wiring reaches the same
+    /// per-candidate gating the `fornax-verify` unit tests already prove in
+    /// isolation, now through a real persisted claim/evidence/link.
+    #[tokio::test]
+    async fn api_evidence_plan_surfaces_a_real_independence_gap_and_gates_its_candidates() {
+        let state = test_state().await;
+        let session_id = "fornx-345-evidence-plan-real-graph";
+        let event_id = test_event(&state, session_id).await;
+        let claim = test_claim(session_id, event_id);
+        let evidence = test_evidence(session_id, event_id);
+        state
+            .store
+            .insert_claim(&claim)
+            .await
+            .expect("insert claim");
+        state
+            .store
+            .insert_evidence(&evidence)
+            .await
+            .expect("insert evidence");
+        let link = fornax_types::EvidenceLink {
+            id: Uuid::new_v4(),
+            session_id: session_id.to_string(),
+            claim_id: claim.id,
+            evidence_id: evidence.id,
+            relation: fornax_types::EvidenceRelation::Supports,
+            linked_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        state
+            .store
+            .insert_evidence_link(&link)
+            .await
+            .expect("insert evidence link");
+
+        let response = api_evidence_plan(
+            State(state),
+            Query(EvidencePlanQuery {
+                claim: claim.id.to_string(),
+                session: session_id.to_string(),
+                risk: None,
+            }),
+        )
+        .await;
+        let v = response.0;
+
+        assert_eq!(v["found"], serde_json::json!(true));
+        // Same recommendation + full fusion detail /api/decision returns --
+        // never shown without the underlying evidence.
+        assert_eq!(v["recommendation"]["action"], serde_json::json!("review"));
+        assert_eq!(v["fused"]["uncertainty"], serde_json::json!("qualified"));
+
+        let plan = &v["plan"];
+        let gaps = plan["gaps"].as_array().expect("gaps array");
+        assert!(
+            gaps.iter()
+                .any(|g| g["kind"] == serde_json::json!("independence_unverified")),
+            "expected an independence_unverified gap, got: {gaps:?}"
+        );
+        assert_eq!(
+            plan["outcome"],
+            serde_json::json!("candidates_ranked"),
+            "the gap's zero-side-effect HumanReview probe is always Available"
+        );
+        let candidates = plan["candidates"].as_array().expect("candidates array");
+        // Never silently dropped -- the ungranted NetworkCall candidate is
+        // still listed, naming exactly what to grant.
+        assert!(candidates.iter().any(|c| c["availability"]["kind"]
+            == serde_json::json!("requires_approval")
+            && c["availability"]["missing_grant"] == serde_json::json!("NetworkCall")));
+        // ...alongside the one candidate that genuinely needs no grant.
+        assert!(candidates.iter().any(|c| c["request"]["kind"]
+            == serde_json::json!("human_review")
+            && c["availability"]["kind"] == serde_json::json!("available")));
+    }
+
+    #[tokio::test]
+    async fn api_evidence_plan_reports_not_found_for_unknown_claim() {
+        let state = test_state().await;
+        let response = api_evidence_plan(
+            State(state),
+            Query(EvidencePlanQuery {
+                claim: Uuid::new_v4().to_string(),
+                session: "fornx-345-evidence-plan-unknown-claim".to_string(),
+                risk: None,
+            }),
+        )
+        .await;
+        let v = response.0;
+        assert_eq!(v["found"], serde_json::json!(false));
+        assert!(v.get("plan").is_none());
+    }
+
+    // --- FORNX-346: /api/acquire-evidence ---------------------------------
+
+    /// Real end-to-end flow, no mocking: a claim with a real `FileDiff`
+    /// evidence row (pointing at a real temp file) and a real
+    /// `MissingEvidence` note for `ToolResultPayload` is persisted to a
+    /// seeded store; `AcquisitionRoots` is configured to contain the temp
+    /// file's directory. Calls `/api/evidence-plan` to find the real rank
+    /// `VerifyArtifactHash` was assigned (never hardcoded -- ranking is an
+    /// implementation detail of `DeterministicVoiPolicy::plan`), then calls
+    /// `/api/acquire-evidence` with that rank and confirms: the probe
+    /// actually ran (real SHA-256 of the real file content), the resulting
+    /// evidence was persisted, verifiers re-ran, fusion was recomputed, and
+    /// an `acquisition_log` row was written.
+    #[tokio::test]
+    async fn api_acquire_evidence_runs_a_real_verify_artifact_hash_probe_end_to_end() {
+        use fornax_types::graph::MissingEvidence;
+        use fornax_types::SignalAvailability;
+        use fornax_types::SignalClass;
+        use sha2::Digest;
+
+        let target =
+            std::env::temp_dir().join(format!("fornax-acquire-e2e-{}.txt", Uuid::new_v4()));
+        std::fs::write(&target, b"claimed content").unwrap();
+        let root = target.parent().unwrap().to_path_buf();
+
+        let db_path = std::env::temp_dir().join(format!("fornax-test-{}.db", Uuid::new_v4()));
+        let store = fornax_store::Store::open(&db_path)
+            .await
+            .expect("open test store");
+        let state = AppState {
+            store,
+            caps: Arc::new(Mutex::new(HashMap::new())),
+            processing: Arc::new(Mutex::new(())),
+            home_id: Arc::from(format!("test-home-{}", Uuid::new_v4()).as_str()),
+            trust: Arc::new(None),
+            policy: Arc::new(RwLock::new(PolicyCacheSnapshot::empty())),
+            experiment_policy: Arc::new(GlobalExperimentPolicy::new(std::iter::empty())),
+            sensor_disable: Arc::new(SensorDisableConfig::empty()),
+            acquisition_roots: Arc::new(fornax_acquire::AcquisitionRoots::new([root])),
+        };
+
+        let session_id = "fornx-346-acquire-evidence-real-probe";
+        let event_id = test_event(&state, session_id).await;
+        let claim = test_claim(session_id, event_id);
+        state
+            .store
+            .insert_claim(&claim)
+            .await
+            .expect("insert claim");
+        state
+            .store
+            .insert_missing_evidence(&MissingEvidence {
+                id: Uuid::new_v4(),
+                session_id: session_id.to_string(),
+                claim_id: claim.id,
+                signal_class: SignalClass::ToolResultPayload,
+                availability: SignalAvailability::Unavailable,
+                detail: None,
+                noted_at: "2026-01-01T00:00:00Z".to_string(),
+            })
+            .await
+            .expect("insert missing evidence");
+        let file_diff = fornax_types::Evidence {
+            id: Uuid::new_v4(),
+            session_id: session_id.to_string(),
+            source_event_id: event_id,
+            kind: fornax_types::EvidenceKind::FileDiff,
+            observed_at: "2026-01-01T00:00:00Z".to_string(),
+            payload: serde_json::json!({ "path": target.to_string_lossy(), "diff": "" }),
+            provenance: "test".to_string(),
+            source: None,
+            extension: None,
+            evidence_purged: false,
+        };
+        state
+            .store
+            .insert_evidence(&file_diff)
+            .await
+            .expect("insert file diff evidence");
+
+        // Find the real rank VerifyArtifactHash was assigned.
+        let plan_response = api_evidence_plan(
+            State(state.clone()),
+            Query(EvidencePlanQuery {
+                claim: claim.id.to_string(),
+                session: session_id.to_string(),
+                risk: None,
+            }),
+        )
+        .await;
+        let candidates = plan_response.0["plan"]["candidates"]
+            .as_array()
+            .cloned()
+            .expect("candidates array");
+        let rank = candidates
+            .iter()
+            .find(|c| c["request"]["kind"] == serde_json::json!("verify_artifact_hash"))
+            .and_then(|c| c["rank"].as_u64())
+            .expect(
+                "VerifyArtifactHash must be a ranked candidate given an empty acquisition policy",
+            ) as u32;
+
+        let response = api_acquire_evidence(
+            State(state.clone()),
+            Query(AcquireEvidenceQuery {
+                claim: claim.id.to_string(),
+                session: session_id.to_string(),
+                rank,
+                risk: None,
+            }),
+        )
+        .await;
+        let v = response.0;
+
+        assert_eq!(v["found"], serde_json::json!(true));
+        assert_eq!(v["outcome"], serde_json::json!("acquired"));
+        let sha256_hex = v["detail"]["evidence"]["payload"]["observation"]["sha256_hex"]
+            .as_str()
+            .expect("sha256_hex present");
+        // sha256("claimed content")
+        assert_eq!(
+            sha256_hex,
+            hex::encode(sha2::Sha256::digest(b"claimed content"))
+        );
+        assert!(v.get("fused_before").is_some());
+        assert!(v.get("fused_after").is_some());
+
+        // The acquired evidence was actually persisted, not just returned.
+        let evidence_after = state
+            .store
+            .evidence_for_session(session_id)
+            .await
+            .expect("read evidence")
+            .evidence;
+        assert!(evidence_after
+            .iter()
+            .any(|e| e.kind == fornax_types::EvidenceKind::ProcessObservation));
+
+        // The attempt was logged.
+        let log = state
+            .store
+            .acquisition_log_for_claim(session_id, &claim.id.to_string())
+            .await
+            .expect("read acquisition log");
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].outcome_kind, "acquired");
+
+        std::fs::remove_file(&target).ok();
+    }
+
+    /// FORNX-346 AC6: `session_id` is threaded through `/api/acquire-evidence`
+    /// as an explicit parameter, not ambient/thread-local state -- but no
+    /// prior test exercised two DIFFERENT sessions concurrently against the
+    /// same daemon to prove that threading actually keeps their evidence and
+    /// `acquisition_log` rows apart under real concurrency (the existing
+    /// end-to-end test above only ever runs one session at a time). Two real
+    /// probes, two distinct temp files, run via `tokio::join!` against the
+    /// same shared `AppState`/store; each session's own acquired evidence
+    /// must carry ONLY its own file's content hash, and each session's
+    /// `acquisition_log` must contain exactly its own attempt -- never the
+    /// other session's.
+    #[tokio::test]
+    async fn api_acquire_evidence_keeps_concurrent_sessions_isolated() {
+        use fornax_types::graph::MissingEvidence;
+        use fornax_types::SignalAvailability;
+        use fornax_types::SignalClass;
+        use sha2::Digest;
+
+        async fn seed_and_acquire(
+            state: AppState,
+            session_id: &'static str,
+            content: &'static [u8],
+        ) -> (String, serde_json::Value) {
+            let target = std::env::temp_dir()
+                .join(format!("fornax-acquire-concurrent-{}.txt", Uuid::new_v4()));
+            std::fs::write(&target, content).unwrap();
+
+            let event_id = test_event(&state, session_id).await;
+            let claim = test_claim(session_id, event_id);
+            state
+                .store
+                .insert_claim(&claim)
+                .await
+                .expect("insert claim");
+            state
+                .store
+                .insert_missing_evidence(&MissingEvidence {
+                    id: Uuid::new_v4(),
+                    session_id: session_id.to_string(),
+                    claim_id: claim.id,
+                    signal_class: SignalClass::ToolResultPayload,
+                    availability: SignalAvailability::Unavailable,
+                    detail: None,
+                    noted_at: "2026-01-01T00:00:00Z".to_string(),
+                })
+                .await
+                .expect("insert missing evidence");
+            let file_diff = fornax_types::Evidence {
+                id: Uuid::new_v4(),
+                session_id: session_id.to_string(),
+                source_event_id: event_id,
+                kind: fornax_types::EvidenceKind::FileDiff,
+                observed_at: "2026-01-01T00:00:00Z".to_string(),
+                payload: serde_json::json!({ "path": target.to_string_lossy(), "diff": "" }),
+                provenance: "test".to_string(),
+                source: None,
+                extension: None,
+                evidence_purged: false,
+            };
+            state
+                .store
+                .insert_evidence(&file_diff)
+                .await
+                .expect("insert file diff evidence");
+
+            let plan_response = api_evidence_plan(
+                State(state.clone()),
+                Query(EvidencePlanQuery {
+                    claim: claim.id.to_string(),
+                    session: session_id.to_string(),
+                    risk: None,
+                }),
+            )
+            .await;
+            let candidates = plan_response.0["plan"]["candidates"]
+                .as_array()
+                .cloned()
+                .expect("candidates array");
+            let rank = candidates
+                .iter()
+                .find(|c| c["request"]["kind"] == serde_json::json!("verify_artifact_hash"))
+                .and_then(|c| c["rank"].as_u64())
+                .expect("VerifyArtifactHash must be ranked") as u32;
+
+            let response = api_acquire_evidence(
+                State(state.clone()),
+                Query(AcquireEvidenceQuery {
+                    claim: claim.id.to_string(),
+                    session: session_id.to_string(),
+                    rank,
+                    risk: None,
+                }),
+            )
+            .await;
+
+            std::fs::remove_file(&target).ok();
+            (claim.id.to_string(), response.0)
+        }
+
+        // Same acquisition_roots covers both temp files -- they share
+        // std::env::temp_dir() as their parent.
+        let root = std::env::temp_dir();
+        let db_path = std::env::temp_dir().join(format!("fornax-test-{}.db", Uuid::new_v4()));
+        let store = fornax_store::Store::open(&db_path)
+            .await
+            .expect("open test store");
+        let state = AppState {
+            store,
+            caps: Arc::new(Mutex::new(HashMap::new())),
+            processing: Arc::new(Mutex::new(())),
+            home_id: Arc::from(format!("test-home-{}", Uuid::new_v4()).as_str()),
+            trust: Arc::new(None),
+            policy: Arc::new(RwLock::new(PolicyCacheSnapshot::empty())),
+            experiment_policy: Arc::new(GlobalExperimentPolicy::new(std::iter::empty())),
+            sensor_disable: Arc::new(SensorDisableConfig::empty()),
+            acquisition_roots: Arc::new(fornax_acquire::AcquisitionRoots::new([root])),
+        };
+
+        let session_a = "fornx-346-concurrent-session-a";
+        let session_b = "fornx-346-concurrent-session-b";
+        let ((claim_a, resp_a), (claim_b, resp_b)) = tokio::join!(
+            seed_and_acquire(state.clone(), session_a, b"session A content"),
+            seed_and_acquire(state.clone(), session_b, b"session B content"),
+        );
+
+        assert_eq!(resp_a["outcome"], serde_json::json!("acquired"));
+        assert_eq!(resp_b["outcome"], serde_json::json!("acquired"));
+
+        // Each session's acquired evidence carries ONLY its own content hash.
+        let sha_a = resp_a["detail"]["evidence"]["payload"]["observation"]["sha256_hex"]
+            .as_str()
+            .expect("session A sha256_hex present");
+        let sha_b = resp_b["detail"]["evidence"]["payload"]["observation"]["sha256_hex"]
+            .as_str()
+            .expect("session B sha256_hex present");
+        assert_eq!(
+            sha_a,
+            hex::encode(sha2::Sha256::digest(b"session A content"))
+        );
+        assert_eq!(
+            sha_b,
+            hex::encode(sha2::Sha256::digest(b"session B content"))
+        );
+        assert_ne!(sha_a, sha_b);
+
+        // Each session's own evidence pool contains only ITS acquired
+        // observation, never the other session's.
+        let evidence_a = state
+            .store
+            .evidence_for_session(session_a)
+            .await
+            .expect("read session A evidence")
+            .evidence;
+        let evidence_b = state
+            .store
+            .evidence_for_session(session_b)
+            .await
+            .expect("read session B evidence")
+            .evidence;
+        assert!(evidence_a
+            .iter()
+            .any(|e| e.kind == fornax_types::EvidenceKind::ProcessObservation
+                && e.payload["observation"]["sha256_hex"] == serde_json::json!(sha_a)));
+        assert!(!evidence_a
+            .iter()
+            .any(|e| e.payload["observation"]["sha256_hex"] == serde_json::json!(sha_b)));
+        assert!(evidence_b
+            .iter()
+            .any(|e| e.kind == fornax_types::EvidenceKind::ProcessObservation
+                && e.payload["observation"]["sha256_hex"] == serde_json::json!(sha_b)));
+        assert!(!evidence_b
+            .iter()
+            .any(|e| e.payload["observation"]["sha256_hex"] == serde_json::json!(sha_a)));
+
+        // Each session's acquisition_log contains exactly its own attempt.
+        let log_a = state
+            .store
+            .acquisition_log_for_claim(session_a, &claim_a)
+            .await
+            .expect("read session A acquisition log");
+        let log_b = state
+            .store
+            .acquisition_log_for_claim(session_b, &claim_b)
+            .await
+            .expect("read session B acquisition log");
+        assert_eq!(log_a.len(), 1);
+        assert_eq!(log_b.len(), 1);
+        assert_eq!(log_a[0].outcome_kind, "acquired");
+        assert_eq!(log_b[0].outcome_kind, "acquired");
+
+        // Cross-session log lookup returns nothing -- confirms attribution
+        // is scoped by session_id, not merely by claim_id coincidence.
+        let cross_log = state
+            .store
+            .acquisition_log_for_claim(session_b, &claim_a)
+            .await
+            .expect("cross-session log lookup");
+        assert!(cross_log.is_empty());
+    }
+
+    /// A candidate that needs an ungranted side effect must be refused, not
+    /// silently executed -- the actual enforcement of "approval-required
+    /// and forbidden probes cannot silently execute" (FORNX-346 AC3).
+    #[tokio::test]
+    async fn api_acquire_evidence_refuses_a_candidate_requiring_an_ungranted_side_effect() {
+        use fornax_types::graph::MissingEvidence;
+        use fornax_types::SignalAvailability;
+        use fornax_types::SignalClass;
+
+        let state = test_state().await;
+        let session_id = "fornx-346-acquire-evidence-refused";
+        let event_id = test_event(&state, session_id).await;
+        let claim = test_claim(session_id, event_id);
+        state
+            .store
+            .insert_claim(&claim)
+            .await
+            .expect("insert claim");
+        state
+            .store
+            .insert_missing_evidence(&MissingEvidence {
+                id: Uuid::new_v4(),
+                session_id: session_id.to_string(),
+                claim_id: claim.id,
+                signal_class: SignalClass::ProcessResult,
+                availability: SignalAvailability::Unavailable,
+                detail: None,
+                noted_at: "2026-01-01T00:00:00Z".to_string(),
+            })
+            .await
+            .expect("insert missing evidence");
+
+        // ProcessResult's only probe is RerunTest, which requires
+        // ProcessSpawn -- never granted by test_state()'s empty policy.
+        let plan_response = api_evidence_plan(
+            State(state.clone()),
+            Query(EvidencePlanQuery {
+                claim: claim.id.to_string(),
+                session: session_id.to_string(),
+                risk: None,
+            }),
+        )
+        .await;
+        let candidates = plan_response.0["plan"]["candidates"]
+            .as_array()
+            .cloned()
+            .expect("candidates array");
+        let rank = candidates
+            .iter()
+            .find(|c| c["request"]["kind"] == serde_json::json!("rerun_test"))
+            .and_then(|c| c["rank"].as_u64())
+            .expect("RerunTest must still be a listed (RequiresApproval) candidate")
+            as u32;
+
+        let response = api_acquire_evidence(
+            State(state),
+            Query(AcquireEvidenceQuery {
+                claim: claim.id.to_string(),
+                session: session_id.to_string(),
+                rank,
+                risk: None,
+            }),
+        )
+        .await;
+        let v = response.0;
+        assert_eq!(v["outcome"], serde_json::json!("refused"));
+        assert!(v["fused_after"].is_null());
     }
 
     // --- FORNX-94: /api/judge -------------------------------------------

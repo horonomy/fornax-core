@@ -1,0 +1,71 @@
+{
+  "baseline_schema_version": "1",
+  "manifest": {
+    "manifest_schema_version": "1",
+    "dataset_version": "0.0.0-mechanism-test",
+    "dataset_content_hash": "8cb83274-475a-5640-bcf1-34945aee1d8a",
+    "contains_synthetic_labels": true,
+    "fusion_policy_name": "deterministic_baseline_v1",
+    "fusion_policy_version": 2,
+    "decision_policy_name": "default_risk_policy_v1",
+    "decision_policy_version": 1,
+    "risk_class": "balanced",
+    "disabled_sensors": [],
+    "run_at": "2026-09-10T14:17:04.343839+00:00"
+  },
+  "predictions": [
+    {
+      "trajectory_id": "mech-contradiction-1",
+      "claim_id": "67664a19-07fb-4d96-9989-9395e0f4c6ad",
+      "predicted_verdict": "review",
+      "predicted_action": "block",
+      "expected_verdict": "contradicted",
+      "critical_failure": true,
+      "uncertainty": "conflicted",
+      "counted_link_ids": [
+        "419d9fbb-ae7e-48f0-9627-ee9ce127376c",
+        "7aa1d35a-804b-4de4-be5c-26f77e18eaf1"
+      ],
+      "discounted_link_ids": [],
+      "missing_evidence_ids": [],
+      "evidence_unavailable": false,
+      "ablation_removed_evidence": false,
+      "is_synthetic": true
+    },
+    {
+      "trajectory_id": "mech-control-1",
+      "claim_id": "56d94649-2143-427b-80f4-aef1f8e55f6b",
+      "predicted_verdict": "verified",
+      "predicted_action": "review",
+      "expected_verdict": "verified",
+      "critical_failure": false,
+      "uncertainty": "qualified",
+      "counted_link_ids": [
+        "893589ea-71de-406d-b5b4-20d2315a8e2b"
+      ],
+      "discounted_link_ids": [],
+      "missing_evidence_ids": [],
+      "evidence_unavailable": false,
+      "ablation_removed_evidence": false,
+      "is_synthetic": true
+    }
+  ],
+  "metrics": {
+    "total": 2,
+    "evidence_unavailable_count": 0,
+    "evidence_coverage": 1.0,
+    "evaluable_count": 2,
+    "correct_count": 1,
+    "incorrect_count": 1,
+    "critical_failure_recall": 1.0,
+    "precision": 1.0,
+    "false_positive_rate": 0.0,
+    "review_burden": 1.0,
+    "contains_synthetic_labels": true
+  },
+  "cost": {
+    "Unmeasured": {
+      "reason": "no costed dependency (judge call, paid API) is on this crate's fusion/decision path"
+    }
+  }
+}
