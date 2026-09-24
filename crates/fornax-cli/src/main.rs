@@ -96,6 +96,19 @@ enum Commands {
         #[arg(long, default_value = "balanced")]
         risk: String,
     },
+    /// Epistemic-contract satisfaction report for one claim (FORNX-378):
+    /// resolves the claim's subject to a FORNX-377 claim class and shows
+    /// every proof obligation's satisfaction state, which evidence matched
+    /// it, and which evidence was rejected and why — never collapsed into a
+    /// single pass/fail. A claim whose subject has no registered contract
+    /// renders `unknown`, never a fabricated pass. Reads `GET /api/contract`
+    /// on the daemon.
+    Contract {
+        /// Claim id to look up.
+        claim: String,
+        /// Session id the claim belongs to.
+        session: String,
+    },
     /// Ranked evidence-acquisition plan for one claim (FORNX-345): which
     /// concrete probes (rerun a test, inspect VCS state, query CI status,
     /// verify an artifact hash, a bounded replay experiment, human review)
@@ -502,6 +515,18 @@ async fn main() -> anyhow::Result<()> {
             );
             match fetch_json(&url).await {
                 Ok(v) => print!("{}", render_decision(&v)),
+                Err(e) => println!("fornax: {e}"),
+            }
+        }
+        Commands::Contract { claim, session } => {
+            let url = format!(
+                "{}/api/contract?claim={}&session={}",
+                base_url(),
+                claim,
+                session
+            );
+            match fetch_json(&url).await {
+                Ok(v) => print!("{}", render_contract(&v)),
                 Err(e) => println!("fornax: {e}"),
             }
         }
@@ -2092,6 +2117,119 @@ fn render_decision(v: &serde_json::Value) -> String {
         }
     }
     out.push_str(&render_fusion(v));
+    out
+}
+
+/// Icon for a [`fornax_types::epistemic_contract::SatisfactionState`] value
+/// -- one icon per distinct state, never collapsed to a boolean.
+fn satisfaction_icon(state: &str) -> &'static str {
+    match state {
+        "satisfied" => "✓",
+        "unsatisfied" => "✗",
+        "unavailable" => "?",
+        "stale" => "⏳",
+        "contradicted" => "⚠",
+        "not_applicable" => "–",
+        "unknown" => "?",
+        _ => "?",
+    }
+}
+
+/// Renders `GET /api/contract`'s response (FORNX-378): every proof
+/// obligation's satisfaction state, its matched evidence, and any rejected
+/// evidence with the reason it was rejected -- never collapsed into a single
+/// pass/fail line. A claim class with no registered contract (`overall:
+/// unknown`, empty `per_requirement`) renders that fact plainly rather than
+/// omitting the section.
+fn render_contract(v: &serde_json::Value) -> String {
+    let mut out = String::new();
+    let found = v.get("found").and_then(|b| b.as_bool()).unwrap_or(false);
+    if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+        out.push_str(&format!("error: {err}\n"));
+        return out;
+    }
+    if !found {
+        out.push_str("claim not found\n");
+        return out;
+    }
+    let Some(assessment) = v.get("assessment") else {
+        out.push_str("no assessment in response\n");
+        return out;
+    };
+    let claim_class = v
+        .get("claim_class")
+        .and_then(|c| c.get("name"))
+        .and_then(|n| n.as_str())
+        .unwrap_or("?");
+    let claim_class_version = v
+        .get("claim_class")
+        .and_then(|c| c.get("version"))
+        .and_then(|n| n.as_u64())
+        .unwrap_or(0);
+    let overall = assessment
+        .get("overall")
+        .and_then(|s| s.as_str())
+        .unwrap_or("?");
+    out.push_str(&format!(
+        "epistemic contract: {} {} (claim class {}v{})\n",
+        satisfaction_icon(overall),
+        overall.to_uppercase(),
+        claim_class,
+        claim_class_version
+    ));
+    if let Some(reqs) = assessment.get("per_requirement").and_then(|r| r.as_array()) {
+        if reqs.is_empty() {
+            out.push_str("  (no contract registered for this claim class)\n");
+        }
+        for req in reqs {
+            let id = req
+                .get("requirement_id")
+                .and_then(|s| s.as_str())
+                .unwrap_or("?");
+            let state = req.get("state").and_then(|s| s.as_str()).unwrap_or("?");
+            let level = req
+                .get("level")
+                .and_then(|l| {
+                    l.as_str()
+                        .map(|s| s.to_string())
+                        .or_else(|| l.get("conditional").map(|_| "conditional".to_string()))
+                })
+                .unwrap_or_else(|| "?".to_string());
+            out.push_str(&format!(
+                "  {} {} [{}]: {}\n",
+                satisfaction_icon(state),
+                id,
+                level,
+                state
+            ));
+            if let Some(rejected) = req.get("rejected_evidence").and_then(|r| r.as_array()) {
+                for r in rejected {
+                    let ev_id = r.get("evidence_id").and_then(|s| s.as_str()).unwrap_or("?");
+                    let reason = r.get("reason").and_then(|s| s.as_str()).unwrap_or("?");
+                    out.push_str(&format!("      rejected {ev_id}: {reason}\n"));
+                }
+            }
+        }
+    }
+    if let Some(violations) = v.get("family_violations").and_then(|f| f.as_array()) {
+        for viol in violations {
+            let req_id = viol
+                .get("requirement_id")
+                .and_then(|s| s.as_str())
+                .unwrap_or("?");
+            let shared_with = viol
+                .get("shared_with_requirement_id")
+                .and_then(|s| s.as_str())
+                .unwrap_or("?");
+            let ev_id = viol
+                .get("evidence_id")
+                .and_then(|s| s.as_str())
+                .unwrap_or("?");
+            out.push_str(&format!(
+                "  ⚠ duplicate-source amplification caught: evidence {ev_id} for '{req_id}' shares a source family with evidence already claimed by '{shared_with}'\n"
+            ));
+        }
+    }
     out
 }
 

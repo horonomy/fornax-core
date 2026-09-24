@@ -10,6 +10,7 @@ use fornax_types::{
 use uuid::Uuid;
 
 pub mod calibration;
+pub mod contract_satisfaction;
 pub mod decision;
 pub mod fusion;
 pub mod independence;

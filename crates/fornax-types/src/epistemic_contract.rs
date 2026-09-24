@@ -455,6 +455,39 @@ impl ContractRegistry {
     }
 }
 
+/// Why one piece of candidate evidence did not count toward a requirement's
+/// coverage (FORNX-378 AC: "evidence rejected for trust/freshness/dependency
+/// reasons remains visible with rationale rather than disappearing"). A
+/// side channel to the coverage decision computed by [`evaluate_requirement`]
+/// — it explains [`SatisfactionState`], it never influences it. Evidence of
+/// the wrong [`EvidenceKind`] for a requirement is not recorded here at all
+/// (it was never relevant to this requirement in the first place, so
+/// "rejected" would be noise, not signal).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RejectionReason {
+    /// Evidence's recorded (or absent) [`TrustClass`] is not in the
+    /// requirement's `acceptable_trust_classes`.
+    WrongTrustClass,
+    /// [`staleness_of`] returned `Stale` for this evidence/claim pair.
+    Stale,
+    /// [`staleness_of`] returned `Indeterminate` (unparseable timestamp, or
+    /// evidence observed after the claim) — never silently treated as fresh.
+    IndeterminateFreshness,
+    /// This evidence was already claimed by a requirement this one must be
+    /// independent of ([`IndependenceRule::MustBeIndependentOf`]) and so
+    /// cannot double-count here.
+    ClaimedByIndependentRequirement,
+}
+
+/// One piece of evidence that matched a requirement's `evidence_kind` but
+/// did not count toward its coverage, plus why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RejectedEvidence {
+    pub evidence_id: uuid::Uuid,
+    pub reason: RejectionReason,
+}
+
 /// Per-requirement assessment result plus the requirement it was assessed
 /// against, so a caller can render *why* without re-deriving it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -462,6 +495,16 @@ pub struct RequirementAssessment {
     pub requirement_id: String,
     pub level: RequirementLevel,
     pub state: SatisfactionState,
+    /// Evidence ids actually claimed toward this requirement's coverage bar
+    /// (bounded by `min_coverage.min_items`, per [`evaluate_requirement`]'s
+    /// doc comment on why surplus qualifying evidence is left unclaimed).
+    /// Empty when `state` is anything but [`SatisfactionState::Satisfied`].
+    pub matched_evidence: Vec<uuid::Uuid>,
+    /// Evidence that matched this requirement's `evidence_kind` but was
+    /// rejected, and why — never dropped silently (FORNX-378 AC). Empty for
+    /// a [`SatisfactionState::NotApplicable`] requirement (never evaluated
+    /// against evidence at all).
+    pub rejected_evidence: Vec<RejectedEvidence>,
 }
 
 /// The full result of [`assess_claim`] (ticket AC dimension: "unknown claim
@@ -487,8 +530,9 @@ fn evaluate_requirement(
     evidence: &[&Evidence],
     excluded: &std::collections::HashSet<uuid::Uuid>,
     trust_class_of: &dyn Fn(&Evidence) -> Option<TrustClass>,
-) -> (SatisfactionState, Vec<uuid::Uuid>) {
+) -> (SatisfactionState, Vec<uuid::Uuid>, Vec<RejectedEvidence>) {
     let mut qualifying: Vec<&Evidence> = Vec::new();
+    let mut rejected: Vec<RejectedEvidence> = Vec::new();
     let mut saw_wrong_trust = false;
     let mut saw_stale = false;
     let mut saw_excluded = false;
@@ -502,6 +546,10 @@ fn evaluate_requirement(
             // one must be independent of (IndependenceRule::MustBeIndependentOf)
             // — it cannot double-count toward both obligations.
             saw_excluded = true;
+            rejected.push(RejectedEvidence {
+                evidence_id: ev.id,
+                reason: RejectionReason::ClaimedByIndependentRequirement,
+            });
             continue;
         }
         let trust = trust_class_of(ev);
@@ -514,16 +562,28 @@ fn evaluate_requirement(
         };
         if !trust_ok {
             saw_wrong_trust = true;
+            rejected.push(RejectedEvidence {
+                evidence_id: ev.id,
+                reason: RejectionReason::WrongTrustClass,
+            });
             continue;
         }
         match staleness_of(ev, claim, requirement.freshness) {
             StalenessAssessment::Stale { .. } => {
                 saw_stale = true;
+                rejected.push(RejectedEvidence {
+                    evidence_id: ev.id,
+                    reason: RejectionReason::Stale,
+                });
             }
             StalenessAssessment::Indeterminate { .. } => {
                 // An unparseable timestamp can never silently count as fresh
                 // (mirrors staleness_of's own documented conservatism).
                 saw_stale = true;
+                rejected.push(RejectedEvidence {
+                    evidence_id: ev.id,
+                    reason: RejectionReason::IndeterminateFreshness,
+                });
             }
             StalenessAssessment::Fresh { .. } | StalenessAssessment::NotTimeSensitive => {
                 qualifying.push(ev);
@@ -551,7 +611,7 @@ fn evaluate_requirement(
     } else {
         SatisfactionState::Unavailable
     };
-    (state, qualifying_ids)
+    (state, qualifying_ids, rejected)
 }
 
 /// Assess a claim against its epistemic contract (ticket AC: "same frozen
@@ -600,7 +660,7 @@ pub fn assess_claim(
             RequirementLevel::Required | RequirementLevel::Recommended => true,
         };
         if applicable {
-            let (_, qualifying_ids) =
+            let (_, qualifying_ids, _) =
                 evaluate_requirement(req, claim, evidence, &empty_exclusion, trust_class_of);
             unconstrained_qualifying.insert(req.id.clone(), qualifying_ids);
         }
@@ -619,8 +679,8 @@ pub fn assess_claim(
             RequirementLevel::Conditional { condition } => conditions_met.contains(condition),
             RequirementLevel::Required | RequirementLevel::Recommended => true,
         };
-        let state = if !applicable {
-            SatisfactionState::NotApplicable
+        let (state, matched_evidence, rejected_evidence) = if !applicable {
+            (SatisfactionState::NotApplicable, Vec::new(), Vec::new())
         } else {
             let excluded: std::collections::HashSet<uuid::Uuid> = match &req.independence {
                 IndependenceRule::None => std::collections::HashSet::new(),
@@ -634,8 +694,7 @@ pub fn assess_claim(
                     })
                     .collect(),
             };
-            let (state, _) = evaluate_requirement(req, claim, evidence, &excluded, trust_class_of);
-            state
+            evaluate_requirement(req, claim, evidence, &excluded, trust_class_of)
         };
 
         let is_blocking_level = matches!(req.level, RequirementLevel::Required)
@@ -648,6 +707,8 @@ pub fn assess_claim(
             requirement_id: req.id.clone(),
             level: req.level.clone(),
             state,
+            matched_evidence,
+            rejected_evidence,
         });
     }
 

@@ -72,6 +72,18 @@ pub enum EvidenceGapKind {
     SingleSourceCorroboration,
     /// `FusedFinding::unresolved_conflict` is true.
     UnresolvedConflict,
+    /// A FORNX-377 epistemic-contract obligation for this claim's class is
+    /// not [`fornax_types::epistemic_contract::SatisfactionState::Satisfied`]
+    /// (FORNX-378) — distinct from every gap kind above, since this can fire
+    /// even when fusion has no complaint at all (e.g. a `Verified` +
+    /// `Corroborated` finding whose sole evidence item came from a trust
+    /// class the claim's contract does not accept). See
+    /// `crate::contract_satisfaction::gaps_from_assessment`, the only
+    /// producer of this variant.
+    ContractObligationUnmet {
+        requirement_id: String,
+        state: fornax_types::epistemic_contract::SatisfactionState,
+    },
 }
 
 /// One reason to want more evidence for a claim, naming exactly which
@@ -425,7 +437,7 @@ fn probes_for_class(signal_class: &SignalClass) -> Vec<EvidenceRequest> {
     }
 }
 
-fn probes_for_gap(gap: &EvidenceGap) -> Vec<EvidenceRequest> {
+pub(crate) fn probes_for_gap(gap: &EvidenceGap) -> Vec<EvidenceRequest> {
     let describe = |kind: ProbeKind,
                     class: SignalClass,
                     trust: TrustClass,
@@ -529,6 +541,22 @@ fn probes_for_gap(gap: &EvidenceGap) -> Vec<EvidenceRequest> {
                 TrustClass::HumanReviewed,
                 &[],
                 "a human can resolve what automated evidence alone could not",
+            ),
+        ],
+        EvidenceGapKind::ContractObligationUnmet { .. } => vec![
+            describe(
+                ProbeKind::InspectVcsState,
+                SignalClass::ToolTrace,
+                TrustClass::HostObserved,
+                &[],
+                "a host-observed check may satisfy this unmet epistemic-contract obligation",
+            ),
+            describe(
+                ProbeKind::HumanReview,
+                SignalClass::FinalResponse,
+                TrustClass::HumanReviewed,
+                &[],
+                "a human-reviewed disposition may satisfy this unmet epistemic-contract obligation",
             ),
         ],
         EvidenceGapKind::NoEvidenceAtAll => {
