@@ -14,10 +14,13 @@ use uuid::Uuid;
 
 pub mod adapter;
 pub mod capabilities;
+pub mod causal;
+pub mod experiment;
 pub mod extension;
 pub mod graph;
 pub mod privacy;
 pub mod redact;
+pub mod reliability_context;
 pub mod sensor;
 pub mod sensor_config;
 
@@ -26,6 +29,16 @@ pub use capabilities::{
     CapabilityProbe, CapabilitySignal, LegacyCapabilitiesWire, RuntimeCapabilities,
     SignalAvailability, SignalClass, CAPABILITY_SCHEMA_VERSION,
 };
+pub use causal::{
+    causal_evidence_from_experiment_result, CausalEvidenceLink, CausalExperimentEvidence,
+    EvidenceProvenanceClass, InterventionalProvenance,
+};
+pub use experiment::{
+    Baseline, CompletedExperiment, ExpectedObservation, ExperimentKind, ExperimentOutcome,
+    ExperimentProvenance, ExperimentResult, ExperimentSpec, Hypothesis, Intervention,
+    SideEffectAllowList, SideEffectClass, StopCondition, EXPERIMENT_SCHEMA_VERSION,
+    SUPPORTED_EXPERIMENT_SCHEMA_VERSIONS,
+};
 pub use extension::{
     ContentClass, ExtensionEnvelope, EXTENSION_SCHEMA_VERSION, SUPPORTED_EXTENSION_SCHEMA_VERSIONS,
 };
@@ -33,6 +46,12 @@ pub use graph::{
     staleness_of, staleness_of_default, EvidenceConflict, EvidenceGraph, EvidenceLink,
     EvidenceRelation, FreshnessWindow, MissingEvidence, StalenessAssessment,
     DEFAULT_EXIT_CODE_FRESHNESS_SECONDS,
+};
+pub use reliability_context::{
+    aggregate_context, capability_fingerprint, cohort_id_for, evaluate_sample_support,
+    CohortIdentity, DatasetLineageTag, ModelFamily, RawReliabilityContext, RawRepositoryContext,
+    ReliabilityContextKey, RepositoryClass, RetentionClass, SampleSupport, TaskClass, TenantRef,
+    ToolClass, MINIMUM_COHORT_SAMPLE_SUPPORT, RELIABILITY_CONTEXT_SCHEMA_VERSION,
 };
 pub use sensor::{
     collect_with_disable_check, ClockSource, CollectionMethod, EvidenceSensor, EvidenceSource,

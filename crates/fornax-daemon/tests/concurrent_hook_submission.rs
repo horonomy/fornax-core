@@ -265,26 +265,15 @@ async fn independent_sessions_submitted_concurrently_are_not_lost_or_mixed_up() 
     }
 
     for session in &sessions {
-        // FORNX-372: wait on the Finding, not on the Claim. `handle_message`
-        // persists the Claim (main.rs:327) and only then runs the verifiers,
-        // inserting each Finding as a separate write (main.rs:361), with no
-        // transaction around the pair — so a visible Claim does not imply its
-        // Finding exists yet. Waiting on the Claim left the finding assertion
-        // below racing exactly that gap. The Finding is the last artefact this
-        // session's Stop submission produces, and the daemon's global
-        // `processing` mutex preserves arrival order, so its presence also
-        // implies the earlier Event and Claim writes are durable. This is the
-        // same barrier the sibling test below already uses.
         wait_for(Duration::from_secs(15), || {
             let store = &store;
             let session = session.clone();
             async move {
-                store
-                    .recent_findings(500)
+                !store
+                    .claims_for_session(&session)
                     .await
-                    .expect("recent findings")
-                    .iter()
-                    .any(|f| f.session_id == session)
+                    .expect("claims")
+                    .is_empty()
             }
         })
         .await;
@@ -319,6 +308,29 @@ async fn independent_sessions_submitted_concurrently_are_not_lost_or_mixed_up() 
             "session {session} claim text corrupted/mixed up: {}",
             claims[0].text
         );
+
+        // Finding computation runs asynchronously *after* the claim is
+        // persisted (verifier dispatch, not part of the claim-write itself),
+        // so waiting only for the claim (above) is not sufficient here --
+        // under concurrent load (10 sessions racing) it can lag behind the
+        // claim by more than a few milliseconds. Poll for it the same way
+        // the claim itself is polled for, rather than reading
+        // `recent_findings` exactly once immediately after the claim
+        // appears (a real, reproducible flake this test previously had:
+        // "session ... should produce exactly its own one finding, got 0").
+        wait_for(Duration::from_secs(15), || {
+            let store = &store;
+            let session = session.clone();
+            async move {
+                store
+                    .recent_findings(500)
+                    .await
+                    .expect("recent findings")
+                    .into_iter()
+                    .any(|f| f.session_id == session)
+            }
+        })
+        .await;
 
         let findings: Vec<_> = store
             .recent_findings(500)

@@ -1,0 +1,27 @@
+[package]
+name = "fornax-replay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "fornax_replay"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fornax-replay"
+path = "src/main.rs"
+
+[dependencies]
+fornax-types = { path = "../fornax-types" }
+fornax-verify = { path = "../fornax-verify" }
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+fornax-adapter-conformance = { path = "../fornax-adapter-conformance" }
+fornax-adapter-claude = { path = "../fornax-adapter-claude" }
+fornax-adapter-codex = { path = "../fornax-adapter-codex" }

@@ -34,9 +34,14 @@
 //!   evidence-unavailable/incorrect distinction (AC 3, AC 4).
 //! - [`ablation`] — the per-sensor sweep (AC 2).
 //! - [`manifest`] — the versioned, reproducible run manifest (AC 1).
+//! - [`reliability_eval`] — FORNX-104 AC 5's decision-value evaluation
+//!   mechanism, comparing predictions with vs. without a contextual
+//!   reliability signal applied. Mechanism-verification only, over
+//!   synthetic data — see that module's docs.
 
 pub mod ablation;
 pub mod dataset;
 pub mod harness;
 pub mod manifest;
 pub mod metrics;
+pub mod reliability_eval;

@@ -165,6 +165,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/fusion", get(api_fusion))
         .route("/api/decision", get(api_decision))
         .route("/api/judge", get(api_judge))
+        .route("/api/reliability", get(api_reliability))
         .route("/dashboard", get(dashboard))
         .with_state(state);
 
@@ -897,6 +898,262 @@ async fn api_judge(
             }))
         }
     }
+}
+
+/// FORNX-105: `GET /api/reliability?session=&provider=&model_family=&model_version=&
+/// adapter_version=&task_class=&toolset=&repository_class=&policy_version=&
+/// verifier_version=&fusion_version=[&compare_model_version=&compare_adapter_version=]`.
+///
+/// This is the display/wiring layer over FORNX-103's context schema and
+/// FORNX-104's statistics — it computes no new statistic itself. It:
+///
+/// - Refuses to even attempt aggregation when
+///   `fornax_verify::reliability::ReliabilityAggregationConfig` (`[reliability]`
+///   in `$FORNAX_HOME/config.toml`) has `historical_aggregation_enabled: false`
+///   (the AC 5 opt-in gate) — returns `{"available": false, "reason": ...}`
+///   before any context key is even built, a state kept structurally
+///   distinct from "we looked and there isn't enough data" so a client can
+///   never render "policy forbids this" as "insufficient support".
+/// - Sources the `RuntimeCapabilities` half of the context key from the
+///   session's own announced capabilities (`store.capabilities_for_session`,
+///   the same lookup `/api/capabilities` uses) rather than a synthetic
+///   value, so the fingerprint reflects what the session's runtime actually
+///   declared. A session with no announced capabilities is its own
+///   renderable fact (`"capabilities_announced": false`), not a silently
+///   empty fingerprint.
+/// - Builds a full `ReliabilityContextKey` via `fornax_types::aggregate_context`
+///   from the request's explicit context dimensions — there is no path here
+///   that accepts a bare provider/model and returns a number (FORNX-104's
+///   own hard boundary).
+/// - **No `ReliabilityObservation`s are persisted anywhere in this codebase
+///   yet** (FORNX-104's module docs: writing real observations from the live
+///   claim path is a distinct future ticket). `compute_reliability`/
+///   `detect_drift` are therefore always invoked against an empty
+///   observation set here — honestly reported by `sample_support` as
+///   `insufficient_support` with `sample_count: 0`, never fabricated. This
+///   endpoint's job is the rendering/wiring contract for when a real
+///   observation store exists; `render_reliability`'s `Confident`/`Drifted`
+///   rendering paths are exercised by synthetic JSON fixtures in
+///   `fornax-cli`'s test module (mirroring `render_judge`'s own
+///   `judge_fixture()` precedent), not by this live path today.
+/// - When `compare_model_version`/`compare_adapter_version` is supplied,
+///   additionally runs `detect_drift` between the primary context (baseline)
+///   and the same context with those two dimensions swapped (comparison) —
+///   the only two dimensions a drift check exists to let vary.
+async fn api_reliability(
+    State(state): State<AppState>,
+    Query(q): Query<ReliabilityQuery>,
+) -> Json<serde_json::Value> {
+    use fornax_verify::reliability::ReliabilityAggregationConfig;
+
+    let config = ReliabilityAggregationConfig::load_default();
+    Json(reliability_response(&state, &q, config).await)
+}
+
+/// The testable core of [`api_reliability`], taking the privacy-gate config
+/// as a plain parameter rather than reading `$FORNAX_HOME/config.toml`
+/// itself — this crate's own `api_judge_returns_judge_output...` test
+/// documents why daemon tests must not mutate that process-global,
+/// machine-shared path; passing the config in directly makes the gate's
+/// on/off behavior a deterministic, parallel-safe unit test instead.
+async fn reliability_response(
+    state: &AppState,
+    q: &ReliabilityQuery,
+    config: fornax_verify::reliability::ReliabilityAggregationConfig,
+) -> serde_json::Value {
+    use fornax_verify::reliability::{compute_reliability, detect_drift};
+
+    if !config.historical_aggregation_enabled {
+        return serde_json::json!({
+            "session": q.session,
+            "available": false,
+            "reason": "historical reliability aggregation is disabled by local policy \
+                       (set [reliability].historical_aggregation_enabled = true in \
+                       $FORNAX_HOME/config.toml to opt in)",
+        });
+    }
+
+    let requested_provider: fornax_types::Provider = match parse_context_tag(
+        "provider",
+        &q.provider,
+    ) {
+        Ok(p) => p,
+        Err(message) => {
+            return serde_json::json!({ "session": q.session, "available": true, "error": message })
+        }
+    };
+
+    let caps = match state.store.capabilities_for_session(&q.session).await {
+        Ok(caps) => caps,
+        Err(e) => {
+            return serde_json::json!({ "session": q.session, "available": true, "error": e.to_string() })
+        }
+    };
+    // `capabilities_for_session` returns one row per announcing provider
+    // (see its own doc comment: "a session with more than one announcing
+    // provider would be silently under-reported" if read from the
+    // single-slot in-memory cache instead). Selecting `.next()` here would
+    // reintroduce exactly that failure at one remove: a session announced by
+    // both `claude_code` and `codex`, queried with `--provider codex`, would
+    // silently build a context key tagged `codex` but fingerprinted from
+    // `claude_code`'s capabilities -- a wrong cohort in precisely the
+    // dimension AC1/AC3 exist to make trustworthy. Match the row to the
+    // provider the caller actually asked about instead.
+    let Some(capabilities) = caps.into_iter().find(|c| c.provider == requested_provider) else {
+        return serde_json::json!({
+            "session": q.session,
+            "available": true,
+            "capabilities_announced": false,
+            "reason": format!(
+                "no capabilities announced for provider `{}` in this session -- \
+                 a reliability context key cannot be built without one",
+                q.provider
+            ),
+        });
+    };
+
+    let baseline_key = match build_reliability_context_key(q, capabilities.clone()) {
+        Ok(key) => key,
+        Err(message) => {
+            return serde_json::json!({ "session": q.session, "available": true, "error": message })
+        }
+    };
+
+    let observations: Vec<fornax_verify::reliability::ReliabilityObservation> = Vec::new();
+    let policy_version = fornax_verify::reliability::RELIABILITY_POLICY_VERSION;
+
+    match (&q.compare_model_version, &q.compare_adapter_version) {
+        (None, None) => {
+            let signal = compute_reliability(&baseline_key, &observations, policy_version);
+            serde_json::json!({
+                "session": q.session,
+                "available": true,
+                "capabilities_announced": true,
+                "signal": signal,
+            })
+        }
+        _ => {
+            let comparison_key =
+                fornax_types::aggregate_context(fornax_types::RawReliabilityContext {
+                    provider: baseline_key.provider,
+                    model_family: baseline_key.model_family.clone(),
+                    model_version: q
+                        .compare_model_version
+                        .clone()
+                        .unwrap_or_else(|| q.model_version.clone()),
+                    adapter_version: q
+                        .compare_adapter_version
+                        .clone()
+                        .unwrap_or_else(|| q.adapter_version.clone()),
+                    task_class: baseline_key.task_class.clone(),
+                    toolset: baseline_key.toolset.clone(),
+                    repository: fornax_types::RawRepositoryContext {
+                        identifying_hint: None,
+                        class: baseline_key.repository_class.clone(),
+                    },
+                    policy_version: baseline_key.policy_version.clone(),
+                    verifier_version: baseline_key.verifier_version.clone(),
+                    fusion_version: baseline_key.fusion_version.clone(),
+                    capabilities,
+                });
+            let assessment = detect_drift(
+                &baseline_key,
+                &observations,
+                &comparison_key,
+                &observations,
+                policy_version,
+            );
+            serde_json::json!({
+                "session": q.session,
+                "available": true,
+                "capabilities_announced": true,
+                "drift_assessment": assessment,
+            })
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ReliabilityQuery {
+    session: String,
+    provider: String,
+    model_family: String,
+    model_version: String,
+    adapter_version: String,
+    task_class: String,
+    /// Comma-separated `ToolClass` tags, e.g. `shell,file_edit`.
+    toolset: String,
+    repository_class: String,
+    policy_version: String,
+    verifier_version: String,
+    fusion_version: String,
+    /// Opt-in second dimension for a drift comparison (FORNX-105 AC:
+    /// "drift after a runtime/model change is visible"). Supplying either
+    /// of this pair runs `detect_drift` instead of a plain `compute_reliability`.
+    #[serde(default)]
+    compare_model_version: Option<String>,
+    #[serde(default)]
+    compare_adapter_version: Option<String>,
+}
+
+/// Parse one context-dimension query value into its closed (or
+/// `Unrecognized`-tailed) enum type by round-tripping through its own wire
+/// form -- every enum this module needs to parse
+/// (`Provider`/`ModelFamily`/`TaskClass`/`ToolClass`/`RepositoryClass`) is
+/// `#[serde(rename_all = "snake_case")]` and forward-compatible, so a plain
+/// JSON string deserialization is the correct, already-existing parse path
+/// rather than a hand-written match per enum.
+fn parse_context_tag<T: for<'de> serde::Deserialize<'de>>(
+    field: &str,
+    value: &str,
+) -> Result<T, String> {
+    serde_json::from_value(serde_json::Value::String(value.to_string()))
+        .map_err(|_| format!("invalid `{field}`: {value:?}"))
+}
+
+/// Build the primary (baseline) [`fornax_types::ReliabilityContextKey`] from
+/// a [`ReliabilityQuery`] and the session's announced capabilities. The only
+/// way to get a key is through [`fornax_types::aggregate_context`], which
+/// (per FORNX-103) requires every dimension explicitly -- there is no path
+/// here that could construct a key from `provider` alone.
+fn build_reliability_context_key(
+    q: &ReliabilityQuery,
+    capabilities: RuntimeCapabilities,
+) -> Result<fornax_types::ReliabilityContextKey, String> {
+    use fornax_types::{
+        aggregate_context, ModelFamily, RawReliabilityContext, RawRepositoryContext,
+        RepositoryClass, TaskClass, ToolClass,
+    };
+
+    let provider: fornax_types::Provider = parse_context_tag("provider", &q.provider)?;
+    let model_family: ModelFamily = parse_context_tag("model_family", &q.model_family)?;
+    let task_class: TaskClass = parse_context_tag("task_class", &q.task_class)?;
+    let repository_class: RepositoryClass =
+        parse_context_tag("repository_class", &q.repository_class)?;
+    let toolset: Vec<ToolClass> = q
+        .toolset
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| parse_context_tag("toolset", s))
+        .collect::<Result<Vec<ToolClass>, String>>()?;
+
+    Ok(aggregate_context(RawReliabilityContext {
+        provider,
+        model_family,
+        model_version: q.model_version.clone(),
+        adapter_version: q.adapter_version.clone(),
+        task_class,
+        toolset,
+        repository: RawRepositoryContext {
+            identifying_hint: None,
+            class: repository_class,
+        },
+        policy_version: q.policy_version.clone(),
+        verifier_version: q.verifier_version.clone(),
+        fusion_version: q.fusion_version.clone(),
+        capabilities,
+    }))
 }
 
 async fn dashboard(State(state): State<AppState>) -> axum::response::Html<String> {
@@ -2367,5 +2624,207 @@ mod tests {
                 "verdict={v:?} has no clean objective side to disagree against"
             );
         }
+    }
+
+    // --- FORNX-105: /api/reliability ---------------------------------------
+
+    fn reliability_query(session: &str) -> ReliabilityQuery {
+        ReliabilityQuery {
+            session: session.to_string(),
+            provider: "claude_code".to_string(),
+            model_family: "claude".to_string(),
+            model_version: "claude-sonnet-5".to_string(),
+            adapter_version: "0.0.4".to_string(),
+            task_class: "test_execution".to_string(),
+            toolset: "shell,file_edit".to_string(),
+            repository_class: "public_oss".to_string(),
+            policy_version: "policy-v3".to_string(),
+            verifier_version: "verifier-v2".to_string(),
+            fusion_version: "fusion-v1".to_string(),
+            compare_model_version: None,
+            compare_adapter_version: None,
+        }
+    }
+
+    async fn announce_reliability_caps(state: &AppState, session_id: &str) {
+        announce_reliability_caps_for(state, session_id, fornax_types::Provider::ClaudeCode).await;
+    }
+
+    async fn announce_reliability_caps_for(
+        state: &AppState,
+        session_id: &str,
+        provider: fornax_types::Provider,
+    ) {
+        use fornax_types::{CapabilitySignal, SignalAvailability, SignalClass};
+
+        let caps = RuntimeCapabilities {
+            schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
+            provider,
+            signals: vec![CapabilitySignal {
+                class: SignalClass::ToolTrace,
+                state: SignalAvailability::Available,
+                detail: None,
+            }],
+            notes: [("session_id".to_string(), session_id.to_string())].into(),
+        };
+        let mut hint = None;
+        handle_message(state, IngestMessage::Capabilities(caps), &mut hint)
+            .await
+            .expect("handle capabilities");
+    }
+
+    fn aggregation_enabled() -> fornax_verify::reliability::ReliabilityAggregationConfig {
+        fornax_verify::reliability::ReliabilityAggregationConfig {
+            historical_aggregation_enabled: true,
+        }
+    }
+
+    fn aggregation_disabled() -> fornax_verify::reliability::ReliabilityAggregationConfig {
+        fornax_verify::reliability::ReliabilityAggregationConfig::default()
+    }
+
+    /// AC5: the privacy/opt-in gate defaults closed, and the closed state is
+    /// reported *before* any capability lookup or context-key construction
+    /// even happens -- `available: false`, never conflated with
+    /// "insufficient support" (a distinct outcome tested below).
+    #[tokio::test]
+    async fn reliability_response_reports_unavailable_when_aggregation_disabled() {
+        let state = test_state().await;
+        let q = reliability_query("fornx-105-gate-closed");
+        let v = reliability_response(&state, &q, aggregation_disabled()).await;
+        assert_eq!(v["available"], serde_json::json!(false));
+        assert!(v.get("signal").is_none());
+        assert!(v.get("capabilities_announced").is_none());
+    }
+
+    /// A session with no announced capabilities cannot have a context key
+    /// built at all -- this must render as its own fact, not a fabricated
+    /// empty capability fingerprint, and never as "aggregation unavailable".
+    #[tokio::test]
+    async fn reliability_response_reports_no_capabilities_announced() {
+        let state = test_state().await;
+        let q = reliability_query("fornx-105-no-caps");
+        let v = reliability_response(&state, &q, aggregation_enabled()).await;
+        assert_eq!(v["available"], serde_json::json!(true));
+        assert_eq!(v["capabilities_announced"], serde_json::json!(false));
+        assert!(v.get("signal").is_none());
+    }
+
+    /// With aggregation enabled and capabilities announced, but no
+    /// `ReliabilityObservation`s persisted anywhere yet (honest limitation,
+    /// documented on `api_reliability`), the signal must read
+    /// `insufficient_support` with `sample_count: 0` -- never a fabricated
+    /// estimate.
+    #[tokio::test]
+    async fn reliability_response_computes_an_honest_insufficient_signal_with_no_observations() {
+        let state = test_state().await;
+        let session_id = "fornx-105-signal-empty-observations";
+        announce_reliability_caps(&state, session_id).await;
+        let q = reliability_query(session_id);
+        let v = reliability_response(&state, &q, aggregation_enabled()).await;
+        assert_eq!(v["available"], serde_json::json!(true));
+        assert_eq!(v["capabilities_announced"], serde_json::json!(true));
+        let signal = &v["signal"];
+        assert_eq!(
+            signal["sample_support"]["insufficient_support"]["sample_count"],
+            serde_json::json!(0)
+        );
+        assert!(signal.get("reliability_estimate").is_none());
+        // The full context key must be present so a client can render it.
+        assert_eq!(signal["context_key"]["provider"], "claude_code");
+        assert_eq!(signal["context_key"]["model_version"], "claude-sonnet-5");
+    }
+
+    /// Requesting a drift comparison runs `detect_drift` between the primary
+    /// context and the same context with only model/adapter version swapped
+    /// -- with no observations on either side, this must read
+    /// `insufficient_data_for_comparison`, never a fabricated `Stable`/
+    /// `Drifted` verdict.
+    #[tokio::test]
+    async fn reliability_response_drift_with_no_observations_is_insufficient_data() {
+        let state = test_state().await;
+        let session_id = "fornx-105-drift-empty-observations";
+        announce_reliability_caps(&state, session_id).await;
+        let mut q = reliability_query(session_id);
+        q.compare_model_version = Some("claude-sonnet-4".to_string());
+        let v = reliability_response(&state, &q, aggregation_enabled()).await;
+        assert_eq!(v["available"], serde_json::json!(true));
+        let assessment = &v["drift_assessment"];
+        assert_eq!(
+            assessment["drift_state"],
+            serde_json::json!("insufficient_data_for_comparison")
+        );
+        assert_eq!(
+            assessment["baseline_signal"]["context_key"]["model_version"],
+            "claude-sonnet-5"
+        );
+        assert_eq!(
+            assessment["comparison_signal"]["context_key"]["model_version"],
+            "claude-sonnet-4"
+        );
+    }
+
+    /// `Provider` is the one context dimension with no `Unrecognized`
+    /// forward-compat tail (see `fornax_types::Provider`'s own doc comment),
+    /// so an unparsable provider tag must be reported as an explicit error,
+    /// never silently coerced or ignored.
+    #[tokio::test]
+    async fn reliability_response_reports_error_for_invalid_provider_tag() {
+        let state = test_state().await;
+        let session_id = "fornx-105-invalid-tag";
+        announce_reliability_caps(&state, session_id).await;
+        let mut q = reliability_query(session_id);
+        q.provider = "not_a_real_provider".to_string();
+        let v = reliability_response(&state, &q, aggregation_enabled()).await;
+        // Still honestly reports availability before the parse failure.
+        assert_eq!(v["available"], serde_json::json!(true));
+        assert!(v.get("error").is_some());
+        assert!(v.get("signal").is_none());
+    }
+
+    /// A session announced by more than one provider must select the
+    /// capabilities row matching the *requested* provider, never just the
+    /// first row `capabilities_for_session` happens to return (its own doc
+    /// comment: rows are `ORDER BY provider ASC`, so `claude_code` always
+    /// sorts before `codex`). Regression for a real bug caught in review:
+    /// querying `--provider codex` on a session also announced by
+    /// `claude_code` must never silently build a `codex`-tagged context key
+    /// fingerprinted from Claude Code's capabilities.
+    #[tokio::test]
+    async fn reliability_response_selects_capabilities_matching_the_requested_provider() {
+        let state = test_state().await;
+        let session_id = "fornx-105-multi-provider-session";
+        // Announce claude_code first (sorts first alphabetically) then codex.
+        announce_reliability_caps_for(&state, session_id, fornax_types::Provider::ClaudeCode).await;
+        announce_reliability_caps_for(&state, session_id, fornax_types::Provider::Codex).await;
+
+        let mut q = reliability_query(session_id);
+        q.provider = "codex".to_string();
+        let v = reliability_response(&state, &q, aggregation_enabled()).await;
+
+        assert_eq!(v["available"], serde_json::json!(true));
+        assert_eq!(v["capabilities_announced"], serde_json::json!(true));
+        assert_eq!(v["signal"]["context_key"]["provider"], "codex");
+    }
+
+    /// The mirror case: a session announced by a provider the query does
+    /// *not* ask about must read "no capabilities announced for provider
+    /// X", never fall back to whatever the first announced row happens to
+    /// be.
+    #[tokio::test]
+    async fn reliability_response_reports_no_capabilities_for_the_requested_provider_specifically()
+    {
+        let state = test_state().await;
+        let session_id = "fornx-105-wrong-provider-only";
+        announce_reliability_caps_for(&state, session_id, fornax_types::Provider::ClaudeCode).await;
+
+        let mut q = reliability_query(session_id);
+        q.provider = "codex".to_string();
+        let v = reliability_response(&state, &q, aggregation_enabled()).await;
+
+        assert_eq!(v["available"], serde_json::json!(true));
+        assert_eq!(v["capabilities_announced"], serde_json::json!(false));
+        let reason = v["reason"].as_str().unwrap_or("");
+        assert!(reason.contains("codex"), "reason was: {reason}");
     }
 }
