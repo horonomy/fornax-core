@@ -12,6 +12,8 @@ use sqlx::SqlitePool;
 use std::path::Path;
 use std::str::FromStr;
 
+pub mod retention;
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("database error: {0}")]
@@ -63,7 +65,7 @@ fn chmod_owner_only(path: &Path) {
 
 #[derive(Clone)]
 pub struct Store {
-    pool: SqlitePool,
+    pub(crate) pool: SqlitePool,
 }
 
 impl Store {

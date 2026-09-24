@@ -1,0 +1,21 @@
+[package]
+name = "fornax-experiment-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fornax-types = { path = "../fornax-types" }
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+toml_edit.workspace = true
+# Ephemeral directory creation with automatic (`Drop`-based) cleanup — the
+# same pattern this crate's own `StagedWorktree` guard follows. Already
+# present transitively via `gix` (see `Cargo.lock`); declared directly here
+# because this crate depends on its API, not just its behavior.
+tempfile = "3"
+
+[dev-dependencies]

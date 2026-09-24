@@ -4,6 +4,8 @@
 
 use clap::{Parser, Subcommand};
 
+mod experiment_ux;
+
 #[derive(Parser)]
 #[command(
     name = "fornax",
@@ -110,6 +112,35 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         allow_raw_evidence: bool,
     },
+    /// Context-scoped historical reliability signal, plus an optional drift
+    /// check against a second model/adapter version (FORNX-105). Renders
+    /// FORNX-103's `ReliabilityContextKey` schema and FORNX-104's
+    /// `compute_reliability`/`detect_drift` statistics as a purely local,
+    /// display/wiring layer -- this subcommand computes no new statistic
+    /// itself. Reads `GET /api/reliability` on the daemon.
+    ///
+    /// Never shows a bare provider/model trust percentage: a reliability
+    /// estimate is only ever rendered together with the full context
+    /// dimensions it is scoped to (provider, model family/version, adapter
+    /// version, task class, toolset, repository class, policy/verifier/
+    /// fusion versions), in the same output. Sparse cohorts render an
+    /// explicit "insufficient data -- N of M needed" message, never a
+    /// numeric-looking placeholder. A `Drifted` comparison renders an
+    /// explicit `⚠ drift detected` banner and marks the baseline's
+    /// confidence as stale/superseded rather than showing it plainly beside
+    /// the new one.
+    ///
+    /// Historical reliability aggregation is off by default: the daemon
+    /// refuses to aggregate at all unless
+    /// `[reliability].historical_aggregation_enabled = true` is set in
+    /// `$FORNAX_HOME/config.toml` (the local/SaaS privacy policy gate) --
+    /// rendered as its own distinct "aggregation unavailable" message, never
+    /// conflated with "insufficient support".
+    // Boxed (clippy::large_enum_variant): this variant's context-describing
+    // args are ~10 owned `String`/`Option<String>` fields, several times
+    // every other variant's size -- boxing keeps `Commands` itself cheap to
+    // move/match regardless of which subcommand is chosen.
+    Reliability(Box<ReliabilityArgs>),
     /// Export one session's events/claims/evidence/capabilities from the
     /// local store into a directory-based spool, as one wire-compatible
     /// envelope JSON file per message (FORNX-60, FORNX-62). Reads
@@ -167,6 +198,63 @@ enum Commands {
     /// to run when nothing is installed, including when
     /// `~/.codex/config.toml` does not exist.
     UninstallCodex,
+    /// Counterfactual verification flow (FORNX-101): preview/run/render a
+    /// bounded robustness experiment against a claim, wiring together
+    /// FORNX-99's `ExperimentSpec` contract, FORNX-100's isolated
+    /// `ExperimentExecutor`, and FORNX-102's causal evidence mapping. Runs
+    /// entirely client-side against local filesystem paths (no daemon
+    /// dependency) — see `experiment_ux`'s module docs for why.
+    Experiment {
+        #[command(subcommand)]
+        action: experiment_ux::ExperimentAction,
+    },
+}
+
+/// Args for `fornax reliability` (FORNX-105), factored out of the `Commands`
+/// enum and boxed at the call site (`Commands::Reliability(Box<Self>)`) so
+/// this variant's ~10 owned string fields don't blow up `Commands`' overall
+/// stack size (`clippy::large_enum_variant`).
+#[derive(clap::Args)]
+struct ReliabilityArgs {
+    /// Session id whose announced capabilities supply the context key's
+    /// capability fingerprint.
+    session: String,
+    #[arg(long)]
+    provider: String,
+    #[arg(long)]
+    model_family: String,
+    #[arg(long)]
+    model_version: String,
+    #[arg(long)]
+    adapter_version: String,
+    #[arg(long)]
+    task_class: String,
+    /// Comma-separated tool classes, e.g. `shell,file_edit`. Required, like
+    /// every other context dimension (FORNX-103's `ReliabilityContextKey`
+    /// deliberately has no `Default`/partial constructor) -- pass `""`
+    /// explicitly for a genuinely tool-less context rather than omitting the
+    /// flag, so an empty toolset is always a stated fact, never an
+    /// accidental omission silently scoping a different cohort.
+    #[arg(long)]
+    toolset: String,
+    #[arg(long)]
+    repository_class: String,
+    #[arg(long)]
+    policy_version: String,
+    #[arg(long)]
+    verifier_version: String,
+    #[arg(long)]
+    fusion_version: String,
+    /// Compare against this model version for a drift check
+    /// (`fornax_verify::reliability::detect_drift`) instead of a plain
+    /// reliability read. May be supplied independently of
+    /// `--compare-adapter-version` -- either one alone is a legitimate
+    /// drift query; any dimension left unspecified falls back to the
+    /// baseline's own value.
+    #[arg(long)]
+    compare_model_version: Option<String>,
+    #[arg(long)]
+    compare_adapter_version: Option<String>,
 }
 
 fn base_url() -> String {
@@ -254,11 +342,46 @@ async fn main() -> anyhow::Result<()> {
                 Err(_) => println!("fornax: daemon unreachable (is `fornax-daemon` running?)"),
             }
         }
+        Commands::Reliability(args) => {
+            let ReliabilityArgs {
+                session,
+                provider,
+                model_family,
+                model_version,
+                adapter_version,
+                task_class,
+                toolset,
+                repository_class,
+                policy_version,
+                verifier_version,
+                fusion_version,
+                compare_model_version,
+                compare_adapter_version,
+            } = *args;
+            let mut url = format!(
+                "{}/api/reliability?session={session}&provider={provider}&model_family={model_family}\
+                 &model_version={model_version}&adapter_version={adapter_version}&task_class={task_class}\
+                 &toolset={toolset}&repository_class={repository_class}&policy_version={policy_version}\
+                 &verifier_version={verifier_version}&fusion_version={fusion_version}",
+                base_url()
+            );
+            if let Some(cmv) = compare_model_version {
+                url.push_str(&format!("&compare_model_version={cmv}"));
+            }
+            if let Some(cav) = compare_adapter_version {
+                url.push_str(&format!("&compare_adapter_version={cav}"));
+            }
+            match fetch_json(&url).await {
+                Ok(v) => print!("{}", render_reliability(&v)),
+                Err(_) => println!("fornax: daemon unreachable (is `fornax-daemon` running?)"),
+            }
+        }
         Commands::ExportSpool { session, out } => export_spool(&session, &out).await?,
         Commands::InstallClaude => install_claude()?,
         Commands::UninstallClaude => uninstall_claude()?,
         Commands::InstallCodex => install_codex()?,
         Commands::UninstallCodex => uninstall_codex()?,
+        Commands::Experiment { action } => experiment_ux::handle(action, &fornax_home())?,
     }
     Ok(())
 }
@@ -1275,6 +1398,248 @@ fn render_judge(v: &serde_json::Value) -> String {
         }
     }
     out.push_str(&render_fusion(v));
+    out
+}
+
+/// Extract the context-key dimensions a reader needs to judge whether a
+/// historical prior is applicable to their current claim (FORNX-105 AC:
+/// "user can inspect the cohort/context behind a reliability signal") —
+/// provider, model family/version, adapter version, task class, toolset,
+/// repository class, and the policy/verifier/fusion versions the cohort was
+/// recorded under. Returns `None` if any required dimension is missing or
+/// malformed.
+///
+/// This is the **structural AC1 guard**: [`render_reliability_signal`] calls
+/// this *before* it ever reads `reliability_estimate`, and returns early
+/// on `None` without looking at the estimate at all — there is no code path
+/// in this renderer that can print a percentage without this context string
+/// having been produced first, in the same output.
+fn extract_context_dimensions(context_key: &serde_json::Value) -> Option<String> {
+    let provider = context_key.get("provider")?.as_str()?;
+    let model_family = context_key.get("model_family")?.as_str()?;
+    let model_version = context_key.get("model_version")?.as_str()?;
+    let adapter_version = context_key.get("adapter_version")?.as_str()?;
+    let task_class = context_key.get("task_class")?.as_str()?;
+    let repository_class = context_key.get("repository_class")?.as_str()?;
+    let toolset: Vec<&str> = context_key
+        .get("toolset")?
+        .as_array()?
+        .iter()
+        .filter_map(|t| t.as_str())
+        .collect();
+    let policy_version = context_key.get("policy_version")?.as_str()?;
+    let verifier_version = context_key.get("verifier_version")?.as_str()?;
+    let fusion_version = context_key.get("fusion_version")?.as_str()?;
+    Some(format!(
+        "  context: provider={provider} model_family={model_family} model_version={model_version} \
+         adapter_version={adapter_version} task_class={task_class} toolset=[{}] \
+         repository_class={repository_class} policy_version={policy_version} \
+         verifier_version={verifier_version} fusion_version={fusion_version}\n",
+        toolset.join(",")
+    ))
+}
+
+/// Renders a serialized `SampleSupport` (FORNX-103), distinguishing
+/// `Confident` from `InsufficientSupport` explicitly (FORNX-105 AC: sparse
+/// data is clearly labeled uncertain, never a bare/misleading number).
+fn render_sample_support(support: &serde_json::Value) -> String {
+    if let Some(confident) = support.get("confident") {
+        let n = confident
+            .get("sample_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        format!("  sample support: confident ({n} observations)\n")
+    } else if let Some(insufficient) = support.get("insufficient_support") {
+        let n = insufficient
+            .get("sample_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let needed = insufficient
+            .get("minimum_required")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        format!("  sample support: insufficient data -- {n} of {needed} needed\n")
+    } else {
+        "  sample support: unknown\n".to_string()
+    }
+}
+
+/// Renders a serialized `ReliabilityEstimate` (FORNX-104): the point
+/// estimate plus its Wilson-score confidence interval. Only ever called from
+/// [`render_reliability_signal`] after the full context has already been
+/// printed into the same output — see that function's doc comment.
+fn render_reliability_estimate(estimate: &serde_json::Value) -> String {
+    let rate = estimate
+        .get("success_rate")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let ci = estimate.get("confidence_interval");
+    let lower = ci
+        .and_then(|c| c.get("lower"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let upper = ci
+        .and_then(|c| c.get("upper"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let level = ci
+        .and_then(|c| c.get("confidence_level"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    format!(
+        "  reliability estimate: {:.1}% (CI [{:.1}%, {:.1}%] @ {:.0}% confidence)\n",
+        rate * 100.0,
+        lower * 100.0,
+        upper * 100.0,
+        level * 100.0
+    )
+}
+
+/// Renders one serialized `ReliabilitySignal` (FORNX-104): full context,
+/// sample support, and — only when both the context prints successfully AND
+/// the cohort is `Confident` AND the signal is not superseded by drift — the
+/// reliability estimate.
+///
+/// **This is the function AC1 ("no UI presents a context-free provider/model
+/// trust percentage") is a structural property of, not just a documented
+/// promise of**: `reliability_estimate` is read from `signal` only after
+/// [`extract_context_dimensions`] has already produced (and pushed into
+/// `out`) the context string — on `None` this returns immediately, before
+/// ever touching `reliability_estimate`. There is no reachable path that
+/// prints an estimate without the context dimensions already present in the
+/// same returned string.
+///
+/// `superseded_by_drift`, when `true` (FORNX-105 AC: "drift ... does not
+/// silently reuse stale confidence"), replaces the estimate line with an
+/// explicit stale/superseded marker instead of the numeric estimate — used
+/// by [`render_drift_assessment`] on the baseline side of a `Drifted`
+/// comparison.
+fn render_reliability_signal(
+    label: &str,
+    signal: &serde_json::Value,
+    superseded_by_drift: bool,
+) -> String {
+    let mut out = String::new();
+    let Some(context_block) = signal
+        .get("context_key")
+        .and_then(extract_context_dimensions)
+    else {
+        out.push_str(&format!(
+            "{label}context key incomplete -- no reliability estimate can be shown\n"
+        ));
+        return out;
+    };
+    out.push_str(&context_block);
+    if let Some(support) = signal.get("sample_support") {
+        out.push_str(&render_sample_support(support));
+    }
+    if let Some(not_evaluable) = signal.get("not_evaluable_count").and_then(|v| v.as_u64()) {
+        if not_evaluable > 0 {
+            out.push_str(&format!("  not evaluable: {not_evaluable}\n"));
+        }
+    }
+    if superseded_by_drift {
+        out.push_str("  ⚠ stale -- superseded by drift, not shown as current confidence\n");
+    } else if let Some(estimate) = signal.get("reliability_estimate") {
+        out.push_str(&render_reliability_estimate(estimate));
+    }
+    out
+}
+
+/// Renders a serialized `DriftState` (FORNX-104), covering all four states
+/// distinctly plus a forward-compat fallback — mirroring
+/// `verdict_icon`/`availability_icon`/`relation_icon`/`rule_effect_icon`'s
+/// never-collapse-the-taxonomy convention. `NotComparable` names every
+/// differing dimension explicitly (FORNX-105 AC: "explain why a historical
+/// prior is or is not applicable").
+fn drift_state_label(state: &serde_json::Value) -> String {
+    if let Some(s) = state.as_str() {
+        return match s {
+            "stable" => "✓ stable -- no meaningful reliability change detected".to_string(),
+            "drifted" => "⚠ drift detected -- reliability changed between versions".to_string(),
+            "insufficient_data_for_comparison" => {
+                "? insufficient data for comparison -- at least one side lacks sample support"
+                    .to_string()
+            }
+            other => format!("◌ {other}"),
+        };
+    }
+    if let Some(not_comparable) = state.get("not_comparable") {
+        let dims: Vec<&str> = not_comparable
+            .get("differing_dimensions")
+            .and_then(|d| d.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        return format!(
+            "✕ not comparable -- this historical prior does not apply: differs in {}",
+            dims.join(", ")
+        );
+    }
+    "◌ unrecognized drift state".to_string()
+}
+
+/// Renders `GET /api/reliability`'s response (FORNX-105): a context-scoped
+/// reliability signal, or a drift assessment when a comparison version was
+/// requested. Distinguishes three structurally different "no number shown"
+/// outcomes, never conflating them: aggregation forbidden by local policy
+/// (AC5), no capabilities announced for the session (a context key cannot be
+/// built), and an error. Returns the rendered text so it can be asserted on
+/// in tests, matching this file's other `render_*` functions.
+fn render_reliability(v: &serde_json::Value) -> String {
+    let mut out = String::new();
+    let session = v.get("session").and_then(|s| s.as_str()).unwrap_or("?");
+    out.push_str(&format!("session: {session}\n"));
+
+    if let Some(false) = v.get("available").and_then(|b| b.as_bool()) {
+        let reason = v
+            .get("reason")
+            .and_then(|s| s.as_str())
+            .unwrap_or("historical reliability aggregation is disabled by local policy");
+        out.push_str(&format!(
+            "  reliability aggregation unavailable: {reason}\n"
+        ));
+        return out;
+    }
+
+    if let Some(error) = v.get("error").and_then(|s| s.as_str()) {
+        out.push_str(&format!("  error: {error}\n"));
+        return out;
+    }
+
+    if let Some(false) = v.get("capabilities_announced").and_then(|b| b.as_bool()) {
+        let reason = v
+            .get("reason")
+            .and_then(|s| s.as_str())
+            .unwrap_or("no capabilities announced yet for this session");
+        out.push_str(&format!("  {reason}\n"));
+        return out;
+    }
+
+    if let Some(signal) = v.get("signal") {
+        out.push_str(&render_reliability_signal("  ", signal, false));
+        return out;
+    }
+
+    if let Some(assessment) = v.get("drift_assessment") {
+        let state = assessment
+            .get("drift_state")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        out.push_str(&format!("  drift: {}\n", drift_state_label(&state)));
+        let is_drifted = state.as_str() == Some("drifted");
+
+        if let Some(baseline) = assessment.get("baseline_signal") {
+            out.push_str("  baseline:\n");
+            out.push_str(&render_reliability_signal("    ", baseline, is_drifted));
+        }
+        if let Some(comparison) = assessment.get("comparison_signal") {
+            out.push_str("  comparison:\n");
+            out.push_str(&render_reliability_signal("    ", comparison, false));
+        }
+        return out;
+    }
+
+    out.push_str("  no reliability data returned\n");
     out
 }
 
@@ -2679,5 +3044,236 @@ trust_level = \"trusted\"\n";
         let rendered = render_judge(&v);
         assert!(rendered.contains("error:"));
         assert!(!rendered.contains("judge ("));
+    }
+
+    // --- render_reliability (FORNX-105) -------------------------------------
+
+    fn context_key_fixture(model_version: &str) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "provider": "claude_code",
+            "model_family": "claude",
+            "model_version": model_version,
+            "adapter_version": "0.0.4",
+            "task_class": "test_execution",
+            "toolset": ["shell", "file_edit"],
+            "repository_class": "public_oss",
+            "policy_version": "policy-v3",
+            "verifier_version": "verifier-v2",
+            "fusion_version": "fusion-v1",
+            "capability_schema_version": 1,
+            "capability_fingerprint": [["tool_trace", "available"]],
+        })
+    }
+
+    fn confident_signal_fixture(model_version: &str, success_rate: f64) -> serde_json::Value {
+        serde_json::json!({
+            "context_key": context_key_fixture(model_version),
+            "sample_support": {"confident": {"sample_count": 40}},
+            "not_evaluable_count": 0,
+            "policy_version": 1,
+            "reliability_estimate": {
+                "success_rate": success_rate,
+                "confidence_interval": {
+                    "lower": (success_rate - 0.1).max(0.0),
+                    "upper": (success_rate + 0.1).min(1.0),
+                    "confidence_level": 0.95,
+                },
+            },
+        })
+    }
+
+    fn insufficient_signal_fixture(model_version: &str) -> serde_json::Value {
+        serde_json::json!({
+            "context_key": context_key_fixture(model_version),
+            "sample_support": {"insufficient_support": {"sample_count": 3, "minimum_required": 30}},
+            "not_evaluable_count": 0,
+            "policy_version": 1,
+        })
+    }
+
+    #[test]
+    fn render_reliability_reports_unavailable_when_privacy_gate_is_closed() {
+        let v = serde_json::json!({
+            "session": "s1",
+            "available": false,
+            "reason": "historical reliability aggregation is disabled by local policy",
+        });
+        let rendered = render_reliability(&v);
+        assert!(rendered.contains("reliability aggregation unavailable"));
+        assert!(rendered.contains("disabled by local policy"));
+        // Must never be rendered as, or alongside, an "insufficient data" message
+        // -- these are two structurally distinct outcomes (AC5 vs AC2).
+        assert!(!rendered.contains("insufficient data"));
+    }
+
+    #[test]
+    fn render_reliability_reports_no_capabilities_announced_distinctly() {
+        let v = serde_json::json!({
+            "session": "s1",
+            "available": true,
+            "capabilities_announced": false,
+            "reason": "no capabilities announced yet by any adapter for this session -- \
+                       a reliability context key cannot be built without one",
+        });
+        let rendered = render_reliability(&v);
+        assert!(rendered.contains("no capabilities announced"));
+        assert!(!rendered.contains("insufficient data"));
+        assert!(!rendered.contains("unavailable"));
+    }
+
+    #[test]
+    fn render_reliability_shows_insufficient_support_as_explicit_message_never_a_number() {
+        let v = serde_json::json!({
+            "session": "s1",
+            "available": true,
+            "capabilities_announced": true,
+            "signal": insufficient_signal_fixture("claude-sonnet-5"),
+        });
+        let rendered = render_reliability(&v);
+        assert!(rendered.contains("insufficient data -- 3 of 30 needed"));
+        assert!(!rendered.contains("reliability estimate:"));
+        // Full context must still be inspectable even when sparse (AC3).
+        assert!(rendered.contains("provider=claude_code"));
+        assert!(rendered.contains("model_version=claude-sonnet-5"));
+    }
+
+    #[test]
+    fn render_reliability_never_shows_a_percentage_without_the_full_context_in_the_same_output() {
+        let v = serde_json::json!({
+            "session": "s1",
+            "available": true,
+            "capabilities_announced": true,
+            "signal": confident_signal_fixture("claude-sonnet-5", 0.90),
+        });
+        let rendered = render_reliability(&v);
+        assert!(rendered.contains("reliability estimate: 90.0%"));
+        // AC1: the exact context dimensions must appear in the SAME output
+        // as the percentage.
+        for expected in [
+            "provider=claude_code",
+            "model_family=claude",
+            "model_version=claude-sonnet-5",
+            "adapter_version=0.0.4",
+            "task_class=test_execution",
+            "repository_class=public_oss",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected:?} in:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_reliability_signal_suppresses_the_estimate_when_context_key_is_missing() {
+        // Adversarial payload: an estimate present but no context_key at all
+        // -- this must never be reachable as a rendered percentage.
+        let mut signal = confident_signal_fixture("claude-sonnet-5", 0.93);
+        signal.as_object_mut().unwrap().remove("context_key");
+        let rendered = render_reliability_signal("  ", &signal, false);
+        assert!(!rendered.contains("93.0%"));
+        assert!(!rendered.contains("reliability estimate:"));
+        assert!(rendered.contains("context key incomplete"));
+    }
+
+    #[test]
+    fn render_reliability_drift_detected_shows_banner_and_suppresses_stale_baseline_estimate() {
+        let v = serde_json::json!({
+            "session": "s1",
+            "available": true,
+            "capabilities_announced": true,
+            "drift_assessment": {
+                "baseline_signal": confident_signal_fixture("claude-sonnet-4", 0.95),
+                "comparison_signal": confident_signal_fixture("claude-sonnet-5", 0.55),
+                "drift_state": "drifted",
+                "policy_version": 1,
+            },
+        });
+        let rendered = render_reliability(&v);
+        assert!(rendered.contains("⚠ drift detected"));
+        // The comparison's live estimate is shown plainly...
+        assert!(rendered.contains("reliability estimate: 55.0%"));
+        // ...but the baseline's stale confidence must be qualified, never
+        // shown plain beside the new one (AC4).
+        assert!(!rendered.contains("95.0%"));
+        assert!(rendered.contains("stale -- superseded by drift"));
+    }
+
+    #[test]
+    fn render_reliability_stable_drift_shows_both_estimates_plainly_with_no_stale_marker() {
+        let v = serde_json::json!({
+            "session": "s1",
+            "available": true,
+            "capabilities_announced": true,
+            "drift_assessment": {
+                "baseline_signal": confident_signal_fixture("claude-sonnet-4", 0.90),
+                "comparison_signal": confident_signal_fixture("claude-sonnet-5", 0.92),
+                "drift_state": "stable",
+                "policy_version": 1,
+            },
+        });
+        let rendered = render_reliability(&v);
+        assert!(rendered.contains("✓ stable"));
+        assert!(rendered.contains("90.0%"));
+        assert!(rendered.contains("92.0%"));
+        assert!(!rendered.contains("stale -- superseded by drift"));
+    }
+
+    #[test]
+    fn render_reliability_not_comparable_drift_names_the_differing_dimensions() {
+        let v = serde_json::json!({
+            "session": "s1",
+            "available": true,
+            "capabilities_announced": true,
+            "drift_assessment": {
+                "baseline_signal": confident_signal_fixture("claude-sonnet-4", 0.90),
+                "comparison_signal": confident_signal_fixture("claude-sonnet-5", 0.30),
+                "drift_state": {"not_comparable": {"differing_dimensions": ["task_class"]}},
+                "policy_version": 1,
+            },
+        });
+        let rendered = render_reliability(&v);
+        assert!(rendered.contains("✕ not comparable"));
+        assert!(rendered.contains("differs in task_class"));
+        assert!(rendered.contains("does not apply"));
+    }
+
+    #[test]
+    fn render_reliability_insufficient_data_for_comparison_is_its_own_distinct_state() {
+        let v = serde_json::json!({
+            "session": "s1",
+            "available": true,
+            "capabilities_announced": true,
+            "drift_assessment": {
+                "baseline_signal": insufficient_signal_fixture("claude-sonnet-4"),
+                "comparison_signal": insufficient_signal_fixture("claude-sonnet-5"),
+                "drift_state": "insufficient_data_for_comparison",
+                "policy_version": 1,
+            },
+        });
+        let rendered = render_reliability(&v);
+        assert!(rendered.contains("insufficient data for comparison"));
+        assert!(!rendered.contains("stale -- superseded by drift"));
+    }
+
+    #[test]
+    fn drift_state_label_covers_every_state_distinctly_with_a_forward_compat_fallback() {
+        assert!(drift_state_label(&serde_json::json!("stable")).starts_with("✓"));
+        assert!(drift_state_label(&serde_json::json!("drifted")).starts_with("⚠"));
+        assert!(
+            drift_state_label(&serde_json::json!("insufficient_data_for_comparison"))
+                .starts_with("?")
+        );
+        assert!(drift_state_label(
+            &serde_json::json!({"not_comparable": {"differing_dimensions": []}})
+        )
+        .starts_with("✕"));
+        // Forward-compat: an unrecognized tag must not collapse onto an
+        // existing state's icon.
+        assert_eq!(
+            drift_state_label(&serde_json::json!("quantum_pending")),
+            "◌ quantum_pending"
+        );
     }
 }

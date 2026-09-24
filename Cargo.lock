@@ -862,6 +862,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
+ "fornax-experiment-runner",
  "fornax-store",
  "fornax-types",
  "reqwest",
@@ -887,6 +888,35 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "fornax-experiment-runner"
+version = "0.0.1"
+dependencies = [
+ "chrono",
+ "fornax-types",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "toml_edit",
+ "uuid",
+]
+
+[[package]]
+name = "fornax-replay"
+version = "0.0.1"
+dependencies = [
+ "clap",
+ "fornax-adapter-claude",
+ "fornax-adapter-codex",
+ "fornax-adapter-conformance",
+ "fornax-types",
+ "fornax-verify",
+ "serde",
+ "serde_json",
+ "thiserror",
  "uuid",
 ]
 
