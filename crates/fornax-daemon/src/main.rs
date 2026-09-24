@@ -410,6 +410,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/evidence-graph", get(api_evidence_graph))
         .route("/api/fusion", get(api_fusion))
         .route("/api/decision", get(api_decision))
+        .route("/api/contract", get(api_contract))
         .route("/api/judge", get(api_judge))
         .route("/api/evidence-plan", get(api_evidence_plan))
         .route("/api/acquire-evidence", post(api_acquire_evidence))
@@ -1361,6 +1362,71 @@ async fn api_decision(
                 "recommendation": recommendation,
                 "fused": found.fused,
             }))
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ContractQuery {
+    claim: String,
+    session: String,
+}
+
+/// FORNX-378: `GET /api/contract?claim=&session=`. Reuses
+/// `compute_fusion`'s claim/evidence resolution (same as
+/// `/api/fusion`/`/api/decision`/`/api/judge`) purely to fetch the claim and
+/// its evidence pool -- fusion's own `FusedFinding` is not used here at all,
+/// since contract satisfaction (FORNX-377/378) is evaluated directly against
+/// the claim/evidence pair, not against a fused verdict. Maps
+/// `Claim::subject` to a [`fornax_types::epistemic_contract::ClaimClassId`]
+/// at version 1 -- the version every `representative_contracts` entry
+/// declares (FORNX-377); a claim subject with no registered contract comes
+/// back as `SatisfactionState::Unknown`, never a fabricated pass.
+async fn api_contract(
+    State(state): State<AppState>,
+    Query(q): Query<ContractQuery>,
+) -> Json<serde_json::Value> {
+    use fornax_types::epistemic_contract::ClaimClassId;
+
+    match compute_fusion(&state, &q.claim, &q.session).await {
+        FusionOutcome::Error { message } => {
+            Json(serde_json::json!({ "claim": q.claim, "session": q.session, "error": message }))
+        }
+        FusionOutcome::NotFound { reason } => Json(serde_json::json!({
+            "claim": q.claim,
+            "session": q.session,
+            "found": false,
+            "reason": reason,
+        })),
+        FusionOutcome::Found(found) => {
+            let registry = fornax_verify::contract_satisfaction::default_registry();
+            let claim_class = ClaimClassId::new(found.claim.subject.clone(), 1);
+            match fornax_verify::contract_satisfaction::assess(
+                &registry,
+                &claim_class,
+                &found.claim,
+                &found.evidence_pool,
+                &[],
+            ) {
+                Ok(report) => Json(serde_json::json!({
+                    "claim": q.claim,
+                    "session": q.session,
+                    "found": true,
+                    "claim_class": claim_class,
+                    "assessment": report.assessment,
+                    "family_violations": report.family_violations.iter().map(|v| serde_json::json!({
+                        "requirement_id": v.requirement_id,
+                        "shared_with_requirement_id": v.shared_with_requirement_id,
+                        "evidence_id": v.evidence_id,
+                    })).collect::<Vec<_>>(),
+                })),
+                Err(e) => Json(serde_json::json!({
+                    "claim": q.claim,
+                    "session": q.session,
+                    "found": true,
+                    "error": format!("{e:?}"),
+                })),
+            }
         }
     }
 }
@@ -5222,5 +5288,258 @@ mod tests {
             .expect("load_policy_cache must never fail for a missing trust store");
         assert!(load.usable.is_empty());
         std::fs::remove_dir_all(&bad_home).ok();
+    }
+
+    /// FORNX-378 AC: "at least six FORNX-377 contracts are exercised
+    /// end-to-end through status/detail/API or Evidence Explorer." One
+    /// session per representative contract (never shared -- `compute_fusion`
+    /// pulls the *whole session's* evidence pool, so sharing a session
+    /// across claims of different classes could let one claim's evidence
+    /// accidentally satisfy another's requirement) exercises `GET
+    /// /api/contract` for every one of FORNX-377's six representative claim
+    /// classes with evidence genuinely shaped to satisfy that specific
+    /// contract -- not a generic fixture reused six times.
+    #[tokio::test]
+    async fn api_contract_exercises_all_six_representative_contracts() {
+        use fornax_types::sensor::{CollectionMethod, EvidenceSource};
+        use fornax_types::{Evidence, EvidenceKind, TrustClass};
+
+        let state = test_state().await;
+
+        async fn insert_claim_and_evidence(
+            state: &AppState,
+            session_id: &str,
+            subject: &str,
+            evidence_kind: EvidenceKind,
+            trust_class: TrustClass,
+            timestamp: &str,
+        ) -> Claim {
+            let event_id = test_event(state, session_id).await;
+            let claim = Claim {
+                id: Uuid::new_v4(),
+                session_id: session_id.to_string(),
+                source_event_id: event_id,
+                text: format!("claim about {subject}"),
+                subject: subject.to_string(),
+                claimed_at: timestamp.to_string(),
+            };
+            state
+                .store
+                .insert_claim(&claim)
+                .await
+                .expect("insert claim");
+            let evidence = Evidence {
+                id: Uuid::new_v4(),
+                session_id: session_id.to_string(),
+                source_event_id: event_id,
+                kind: evidence_kind,
+                observed_at: timestamp.to_string(),
+                payload: serde_json::json!({}),
+                provenance: "test".to_string(),
+                source: Some(EvidenceSource::now(
+                    "test_sensor",
+                    trust_class,
+                    None,
+                    CollectionMethod::default(),
+                    None,
+                )),
+                extension: None,
+                evidence_purged: false,
+            };
+            state
+                .store
+                .insert_evidence(&evidence)
+                .await
+                .expect("insert evidence");
+            claim
+        }
+
+        async fn assess_via_api(
+            state: AppState,
+            claim: &Claim,
+            session_id: &str,
+        ) -> serde_json::Value {
+            api_contract(
+                State(state),
+                Query(ContractQuery {
+                    claim: claim.id.to_string(),
+                    session: session_id.to_string(),
+                }),
+            )
+            .await
+            .0
+        }
+
+        // EvidenceSource::now stamps collected_at as real "now" -- use a
+        // fixed claimed_at/observed_at pair close enough together (same
+        // instant) that every representative contract's freshness window
+        // (the tightest is deployment_healthy's 300s) is satisfied
+        // regardless of when this test actually runs.
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // 1. tests_passed
+        let session = "fornx378-tests-passed";
+        let claim = insert_claim_and_evidence(
+            &state,
+            session,
+            "tests_passed",
+            EvidenceKind::ExitCode,
+            TrustClass::HostObserved,
+            &now,
+        )
+        .await;
+        let v = assess_via_api(state.clone(), &claim, session).await;
+        assert_eq!(v["found"], serde_json::json!(true), "tests_passed: {v}");
+        assert_eq!(
+            v["assessment"]["overall"],
+            serde_json::json!("satisfied"),
+            "tests_passed: {v}"
+        );
+
+        // 2. build_succeeded
+        let session = "fornx378-build-succeeded";
+        let claim = insert_claim_and_evidence(
+            &state,
+            session,
+            "build_succeeded",
+            EvidenceKind::ExitCode,
+            TrustClass::HostObserved,
+            &now,
+        )
+        .await;
+        let v = assess_via_api(state.clone(), &claim, session).await;
+        assert_eq!(
+            v["assessment"]["overall"],
+            serde_json::json!("satisfied"),
+            "build_succeeded: {v}"
+        );
+
+        // 3. file_changed
+        let session = "fornx378-file-changed";
+        let claim = insert_claim_and_evidence(
+            &state,
+            session,
+            "file_changed",
+            EvidenceKind::FileDiff,
+            TrustClass::AgentAdjacent,
+            &now,
+        )
+        .await;
+        let v = assess_via_api(state.clone(), &claim, session).await;
+        assert_eq!(
+            v["assessment"]["overall"],
+            serde_json::json!("satisfied"),
+            "file_changed: {v}"
+        );
+
+        // 4. commit_push_completed (no push condition met -> the
+        // conditional requirement is not_applicable, not evaluated)
+        let session = "fornx378-commit-push-completed";
+        let claim = insert_claim_and_evidence(
+            &state,
+            session,
+            "commit_push_completed",
+            EvidenceKind::ProcessObservation,
+            TrustClass::HostObserved,
+            &now,
+        )
+        .await;
+        let v = assess_via_api(state.clone(), &claim, session).await;
+        assert_eq!(
+            v["assessment"]["overall"],
+            serde_json::json!("satisfied"),
+            "commit_push_completed: {v}"
+        );
+
+        // 5. deployment_healthy (must be IndependentExternal, never
+        // agent-adjacent self-report)
+        let session = "fornx378-deployment-healthy";
+        let claim = insert_claim_and_evidence(
+            &state,
+            session,
+            "deployment_healthy",
+            EvidenceKind::ProcessObservation,
+            TrustClass::IndependentExternal,
+            &now,
+        )
+        .await;
+        let v = assess_via_api(state.clone(), &claim, session).await;
+        assert_eq!(
+            v["assessment"]["overall"],
+            serde_json::json!("satisfied"),
+            "deployment_healthy: {v}"
+        );
+
+        // 6. security_defect_fixed (needs BOTH a regression-test exit code
+        // AND an independent human-reviewed disposition)
+        let session = "fornx378-security-defect-fixed";
+        let event_id = test_event(&state, session).await;
+        let claim = Claim {
+            id: Uuid::new_v4(),
+            session_id: session.to_string(),
+            source_event_id: event_id,
+            text: "claim about security_defect_fixed".to_string(),
+            subject: "security_defect_fixed".to_string(),
+            claimed_at: now.clone(),
+        };
+        state
+            .store
+            .insert_claim(&claim)
+            .await
+            .expect("insert claim");
+        for (kind, trust) in [
+            (EvidenceKind::ExitCode, TrustClass::HostObserved),
+            (EvidenceKind::TranscriptExcerpt, TrustClass::HumanReviewed),
+        ] {
+            let evidence = Evidence {
+                id: Uuid::new_v4(),
+                session_id: session.to_string(),
+                source_event_id: event_id,
+                kind,
+                observed_at: now.clone(),
+                payload: serde_json::json!({}),
+                provenance: "test".to_string(),
+                source: Some(EvidenceSource::now(
+                    "test_sensor",
+                    trust,
+                    None,
+                    CollectionMethod::default(),
+                    None,
+                )),
+                extension: None,
+                evidence_purged: false,
+            };
+            state
+                .store
+                .insert_evidence(&evidence)
+                .await
+                .expect("insert evidence");
+        }
+        let v = assess_via_api(state.clone(), &claim, session).await;
+        assert_eq!(
+            v["assessment"]["overall"],
+            serde_json::json!("satisfied"),
+            "security_defect_fixed: {v}"
+        );
+
+        // Adversarial spot-check reusing this same fixture set: an
+        // AgentAdjacent self-report must never satisfy deployment_healthy
+        // -- production change-safety must never rest on agent say-so.
+        let session = "fornx378-deployment-healthy-adversarial";
+        let claim = insert_claim_and_evidence(
+            &state,
+            session,
+            "deployment_healthy",
+            EvidenceKind::ProcessObservation,
+            TrustClass::AgentAdjacent,
+            &now,
+        )
+        .await;
+        let v = assess_via_api(state.clone(), &claim, session).await;
+        assert_ne!(
+            v["assessment"]["overall"],
+            serde_json::json!("satisfied"),
+            "deployment_healthy must never be satisfied by an agent self-report: {v}"
+        );
     }
 }
