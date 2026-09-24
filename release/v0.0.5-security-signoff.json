@@ -1,0 +1,14 @@
+{
+  "version": "v0.0.5",
+  "candidate_repos": [
+    {
+      "name": "fornax-core",
+      "owner": "horonomy",
+      "sha": "27dc66cfa83b4603addc15a071d1579a962687ac"
+    }
+  ],
+  "risk_class": "FEATURE",
+  "trust_boundary_delta_ref": null,
+  "findings": [],
+  "verdict": "PASS"
+}
