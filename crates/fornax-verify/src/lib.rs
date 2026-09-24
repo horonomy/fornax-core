@@ -16,6 +16,7 @@ pub mod fusion;
 pub mod independence;
 pub mod judge;
 pub mod reliability;
+pub mod verification_budget;
 pub mod voi;
 
 pub trait Verifier {
