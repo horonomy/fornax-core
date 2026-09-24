@@ -18,6 +18,7 @@ pub mod audit_checkpoint;
 pub mod calibration;
 pub mod capabilities;
 pub mod causal;
+pub mod epistemic_contract;
 pub mod experiment;
 pub mod extension;
 pub mod graph;
@@ -48,6 +49,12 @@ pub use capabilities::{
 pub use causal::{
     causal_evidence_from_experiment_result, CausalEvidenceLink, CausalExperimentEvidence,
     EvidenceProvenanceClass, InterventionalProvenance,
+};
+pub use epistemic_contract::{
+    assess_claim, to_canonical_json, ClaimAssessment, ClaimClassId, ContractError, ContractLookup,
+    ContractRegistry, CoverageRequirement, EpistemicContract, EvidenceRequirement,
+    IndependenceRule, RequirementAssessment, RequirementLevel, SatisfactionState,
+    EPISTEMIC_CONTRACT_SCHEMA_VERSION, SUPPORTED_EPISTEMIC_CONTRACT_SCHEMA_VERSIONS,
 };
 pub use experiment::{
     Baseline, CompletedExperiment, ExpectedObservation, ExperimentKind, ExperimentOutcome,
