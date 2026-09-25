@@ -54,24 +54,38 @@ pub enum Freshness {
 /// Assesses `body`'s freshness against `now`. Pure -- `now` is always
 /// caller-supplied.
 pub fn assess_freshness(body: &ReceiptBody, now: DateTime<Utc>) -> Freshness {
-    let issued_at: DateTime<Utc> = match body.issued_at.parse() {
+    assess_freshness_of(&body.issued_at, body.not_after.as_deref(), now)
+}
+
+/// The same fail-closed expiry/clock-skew logic as [`assess_freshness`],
+/// generalized to any `(issued_at, not_after)` pair rather than a
+/// [`ReceiptBody`] specifically -- lets a different envelope type (e.g.
+/// `crate::delegation::DelegationEnvelopeBody`, FORNX-384) reuse this exact
+/// reasoning instead of re-deriving it. [`assess_freshness`] is now a thin
+/// wrapper over this.
+pub fn assess_freshness_of(
+    issued_at_str: &str,
+    not_after_str_opt: Option<&str>,
+    now: DateTime<Utc>,
+) -> Freshness {
+    let issued_at: DateTime<Utc> = match issued_at_str.parse() {
         Ok(t) => t,
         Err(_) => {
             return Freshness::MalformedTimestamp {
                 field: "issued_at",
-                value: body.issued_at.clone(),
+                value: issued_at_str.to_string(),
             }
         }
     };
 
     if issued_at > now + Duration::seconds(RECEIPT_CLOCK_SKEW_TOLERANCE_SECONDS) {
         return Freshness::IssuedInFuture {
-            issued_at: body.issued_at.clone(),
+            issued_at: issued_at_str.to_string(),
             now: now.to_rfc3339(),
         };
     }
 
-    let Some(not_after_str) = body.not_after.as_ref() else {
+    let Some(not_after_str) = not_after_str_opt else {
         return Freshness::NoExpiryDeclared;
     };
     let not_after: DateTime<Utc> = match not_after_str.parse() {
@@ -79,19 +93,19 @@ pub fn assess_freshness(body: &ReceiptBody, now: DateTime<Utc>) -> Freshness {
         Err(_) => {
             return Freshness::MalformedTimestamp {
                 field: "not_after",
-                value: not_after_str.clone(),
+                value: not_after_str.to_string(),
             }
         }
     };
 
     if now > not_after + Duration::seconds(RECEIPT_CLOCK_SKEW_TOLERANCE_SECONDS) {
         Freshness::Expired {
-            not_after: not_after_str.clone(),
+            not_after: not_after_str.to_string(),
             now: now.to_rfc3339(),
         }
     } else {
         Freshness::Fresh {
-            not_after: not_after_str.clone(),
+            not_after: not_after_str.to_string(),
         }
     }
 }

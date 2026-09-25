@@ -31,7 +31,11 @@
 //!   handling and reports [`verify::SignatureStatus`] (AC2).
 //! - [`gate`] — the fail-closed ACCEPT/REJECT/HOLD/UNTESTED policy verdict
 //!   over a [`verify::VerifiedReceipt`] (AC5).
+//! - [`delegation`] — the proof-carrying delegation envelope (FORNX-384):
+//!   extends the receipt above with delegation identity, scope, obligation
+//!   satisfaction, and an independent-consumer policy gate.
 
+pub mod delegation;
 pub mod freshness;
 pub mod gate;
 pub mod issue;
