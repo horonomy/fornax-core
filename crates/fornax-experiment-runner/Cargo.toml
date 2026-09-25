@@ -17,5 +17,14 @@ toml_edit.workspace = true
 # present transitively via `gix` (see `Cargo.lock`); declared directly here
 # because this crate depends on its API, not just its behavior.
 tempfile = "3"
+# FORNX-386's SQLite shadow-migration domain: an embedded, file-backed,
+# synchronous SQLite binding. Chosen over `sqlx`'s sqlite driver (already a
+# workspace dependency elsewhere) specifically because it is synchronous —
+# this crate has no async runtime and none of its other code needs one; a
+# shadow migration run is a handful of local file operations, not a
+# workload that benefits from `tokio`. `bundled` avoids requiring a system
+# SQLite install, keeping the shadow database self-contained like every
+# other resource this crate's isolation mechanism creates.
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
