@@ -46,6 +46,17 @@
 //!   must be independent of is stripped and the requirement's state
 //!   recomputed — see [`SatisfactionReport::family_violations`] for what
 //!   was caught, never silently.
+//! - **Capability/version spoofing (FORNX-380 finding).**
+//!   [`fornax_types::EvidenceRequirement::capability_prerequisites`] is part
+//!   of FORNX-377's schema and is populated on every representative
+//!   contract, but neither `evaluate_requirement` nor `assess_claim` ever
+//!   reads it — a requirement naming a prerequisite `SignalClass` is
+//!   satisfied identically whether or not the reporting adapter actually has
+//!   that capability, letting an old/degraded/spoofed adapter's evidence
+//!   count exactly as if the capability were real. [`assess_with_capabilities`]
+//!   closes this as a purely additive hardening layer on top of [`assess`]
+//!   (zero behavior change for `assess`'s existing callers) — see its own
+//!   doc comment.
 //!
 //! # Non-goals (inherited from FORNX-377, restated here)
 //!
@@ -275,6 +286,93 @@ pub fn assess(
         assessment,
         family_violations: violations,
     })
+}
+
+/// One requirement whose declared [`fornax_types::EvidenceRequirement::capability_prerequisites`]
+/// are not covered by the caller's `available_capabilities` — see
+/// [`assess_with_capabilities`]'s doc comment for why this hardening exists.
+/// Never silently dropped, mirroring [`FamilyIndependenceViolation`]'s
+/// visibility discipline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityViolation {
+    pub requirement_id: String,
+    pub missing_capabilities: Vec<fornax_types::SignalClass>,
+}
+
+/// [`assess`] hardened against a real, previously-unenforced gap (FORNX-380
+/// finding): [`fornax_types::EvidenceRequirement::capability_prerequisites`]
+/// is part of FORNX-377's schema and is populated on every representative
+/// contract, but neither `evaluate_requirement` nor `assess_claim` ever reads
+/// it — a requirement naming `SignalClass::ProcessResult` as a prerequisite
+/// is satisfied identically whether or not the reporting adapter actually has
+/// that capability. An old, degraded, or spoofed adapter that lacks a
+/// capability but still emits evidence of the matching `EvidenceKind` would
+/// have that evidence accepted exactly as if the capability were real --
+/// capability/version spoofing, named explicitly in FORNX-380's scope.
+///
+/// This function closes the gap **without changing [`assess`]'s signature or
+/// behavior** — every existing caller of `assess` is completely unaffected.
+/// It re-derives `assess`'s report, then for every requirement whose
+/// `capability_prerequisites` are not a subset of `available_capabilities`:
+/// if that requirement was `Satisfied`, its matched evidence is cleared and
+/// its state is forced to [`SatisfactionState::Unavailable`] (the capability
+/// to observe it at all was never actually present, which is a strictly
+/// different fact than "no qualifying evidence was submitted" but shares the
+/// same honest "we cannot vouch for this" semantics) — mirroring the exact
+/// strip/record/recompute shape `assess`'s own family-independence hardening
+/// already uses. Every violation is returned, never silently applied.
+pub fn assess_with_capabilities(
+    registry: &ContractRegistry,
+    claim_class: &ClaimClassId,
+    claim: &Claim,
+    evidence: &[Evidence],
+    conditions_met: &[String],
+    available_capabilities: &[fornax_types::SignalClass],
+) -> Result<(SatisfactionReport, Vec<CapabilityViolation>), ContractError> {
+    let mut report = assess(registry, claim_class, claim, evidence, conditions_met)?;
+    let mut violations = Vec::new();
+
+    if let ContractLookup::Found(_) = registry.lookup(claim_class) {
+        let requirements = registry.effective_requirements(claim_class)?;
+        let mut changed = false;
+
+        for req in &requirements {
+            if req.capability_prerequisites.is_empty() {
+                continue;
+            }
+            let missing: Vec<fornax_types::SignalClass> = req
+                .capability_prerequisites
+                .iter()
+                .filter(|c| !available_capabilities.contains(c))
+                .cloned()
+                .collect();
+            if missing.is_empty() {
+                continue;
+            }
+            if let Some(ra) = report
+                .assessment
+                .per_requirement
+                .iter_mut()
+                .find(|ra| ra.requirement_id == req.id)
+            {
+                if matches!(ra.state, SatisfactionState::Satisfied) {
+                    ra.matched_evidence.clear();
+                    ra.state = SatisfactionState::Unavailable;
+                    changed = true;
+                }
+            }
+            violations.push(CapabilityViolation {
+                requirement_id: req.id.clone(),
+                missing_capabilities: missing,
+            });
+        }
+
+        if changed {
+            report.assessment.overall = recompute_overall(&report.assessment.per_requirement);
+        }
+    }
+
+    Ok((report, violations))
 }
 
 /// Apply the critical-obligation safety floor (FORNX-378 AC: "a
@@ -790,6 +888,118 @@ mod tests {
             fornax_types::epistemic_contract::RejectionReason::Stale
         );
         let _ = stale_ev;
+    }
+
+    // --- FORNX-380 AC4 real finding: capability/version spoofing --------
+    // `capability_prerequisites` is declared on every representative
+    // contract but was never enforced anywhere -- see
+    // `assess_with_capabilities`'s doc comment.
+
+    #[test]
+    fn plain_assess_is_exploitable_by_a_spoofed_missing_capability() {
+        // Exploit: `tests_passed`'s `test_runner_exit_code` requirement
+        // declares `capability_prerequisites: [SignalClass::ProcessResult]`,
+        // but a caller that never actually has that capability (e.g. an old
+        // adapter, or one that never wired up process-exit-code collection)
+        // can still submit a well-formed `ExitCode`/`HostObserved` evidence
+        // row and have it accepted, since `assess`/`assess_claim` never read
+        // the prerequisite at all.
+        let reg = default_registry();
+        let cc = ClaimClassId::new("tests_passed", 1);
+        let claim = claim("tests_passed", "2026-09-24T00:10:00Z");
+        let ev = evidence_with_source(
+            EvidenceKind::ExitCode,
+            "2026-09-24T00:00:00Z",
+            TrustClass::HostObserved,
+            None,
+        );
+        let report = assess(&reg, &cc, &claim, std::slice::from_ref(&ev), &[]).expect("assess ok");
+        assert_eq!(
+            report.assessment.overall,
+            SatisfactionState::Satisfied,
+            "documents the pre-existing gap: plain `assess` has no notion of capability \
+             prerequisites at all, so a spoofed/absent capability is invisible to it"
+        );
+    }
+
+    #[test]
+    fn assess_with_capabilities_catches_the_spoofed_missing_capability() {
+        let reg = default_registry();
+        let cc = ClaimClassId::new("tests_passed", 1);
+        let claim = claim("tests_passed", "2026-09-24T00:10:00Z");
+        let ev = evidence_with_source(
+            EvidenceKind::ExitCode,
+            "2026-09-24T00:00:00Z",
+            TrustClass::HostObserved,
+            None,
+        );
+        // The caller declares it has NO capabilities at all -- e.g. a
+        // spoofed or genuinely degraded adapter.
+        let (report, violations) =
+            assess_with_capabilities(&reg, &cc, &claim, std::slice::from_ref(&ev), &[], &[])
+                .expect("assess ok");
+        assert_ne!(
+            report.assessment.overall,
+            SatisfactionState::Satisfied,
+            "a requirement whose prerequisite capability is absent must never be Satisfied"
+        );
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].requirement_id, "test_runner_exit_code");
+        assert_eq!(
+            violations[0].missing_capabilities,
+            vec![fornax_types::SignalClass::ProcessResult]
+        );
+        let req = report
+            .assessment
+            .per_requirement
+            .iter()
+            .find(|r| r.requirement_id == "test_runner_exit_code")
+            .unwrap();
+        assert_eq!(req.state, SatisfactionState::Unavailable);
+        assert!(req.matched_evidence.is_empty());
+    }
+
+    #[test]
+    fn assess_with_capabilities_is_a_pure_no_op_when_the_capability_is_present() {
+        // Sanity: this hardening must never over-reject a genuinely capable
+        // caller.
+        let reg = default_registry();
+        let cc = ClaimClassId::new("tests_passed", 1);
+        let claim = claim("tests_passed", "2026-09-24T00:10:00Z");
+        let ev = evidence_with_source(
+            EvidenceKind::ExitCode,
+            "2026-09-24T00:00:00Z",
+            TrustClass::HostObserved,
+            None,
+        );
+        let (report, violations) = assess_with_capabilities(
+            &reg,
+            &cc,
+            &claim,
+            std::slice::from_ref(&ev),
+            &[],
+            &[fornax_types::SignalClass::ProcessResult],
+        )
+        .expect("assess ok");
+        assert!(violations.is_empty());
+        assert_eq!(report.assessment.overall, SatisfactionState::Satisfied);
+    }
+
+    #[test]
+    fn assess_with_capabilities_never_changes_plain_assess_behavior() {
+        // `assess` itself must be completely unaffected by this hardening's
+        // existence -- every prior caller keeps working exactly as before.
+        let reg = default_registry();
+        let cc = ClaimClassId::new("build_succeeded", 1);
+        let claim = claim("build_succeeded", "2026-09-24T00:10:00Z");
+        let ev = evidence_with_source(
+            EvidenceKind::ExitCode,
+            "2026-09-24T00:00:00Z",
+            TrustClass::HostObserved,
+            None,
+        );
+        let plain = assess(&reg, &cc, &claim, std::slice::from_ref(&ev), &[]).expect("assess ok");
+        assert_eq!(plain.assessment.overall, SatisfactionState::Satisfied);
     }
 
     // --- adversarial: forged/malicious claim classification -------------
