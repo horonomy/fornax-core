@@ -183,6 +183,23 @@ mod tests {
         assert_eq!(decoded, d);
     }
 
+    /// AC5: raw protected content is not required in a portable message.
+    /// `fixtures::sample_delegation_envelope` is built from raw free text
+    /// ("run the test suite", "a pass/fail verdict with evidence") that
+    /// `issue_delegation_envelope` (FORNX-384) fingerprints before ever
+    /// reaching `DelegationEnvelopeBody` -- this test confirms wrapping
+    /// that envelope for the wire does not reintroduce it.
+    #[test]
+    fn wrapping_for_the_wire_never_reintroduces_raw_scope_text() {
+        let d = fixtures::sample_delegation_envelope();
+        let env = wrap_delegation_result(&d, BTreeSet::new());
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(
+            !json.contains("run the test suite") && !json.contains("a pass/fail verdict"),
+            "wrapped envelope must never carry the raw scope text, only its fingerprint"
+        );
+    }
+
     #[test]
     fn wrong_object_kind_is_rejected_explicitly() {
         let env = crate::envelope::seal_envelope(
