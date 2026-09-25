@@ -63,4 +63,5 @@ pub mod metrics;
 pub mod qualifying;
 pub mod regression;
 pub mod reliability_eval;
+pub mod self_integrity;
 pub mod slice;
