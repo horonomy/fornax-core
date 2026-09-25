@@ -1413,4 +1413,72 @@ mod tests {
             PromotionDecision::Rejected { .. }
         ));
     }
+
+    // --- FORNX-382: Self-Integrity property test (invariant #9) ---------
+    //
+    // "Partial failure cannot be reported as complete success" — for any
+    // arbitrary set of Required requirements where at least one is not
+    // Satisfied, a budget that cannot cover them all must never report
+    // `Planned` (which downstream code reads as "verification complete,
+    // nothing outstanding"), and the resulting `InsufficientVerification`
+    // outcome must always name every requirement it left uncovered.
+
+    use proptest::prelude::*;
+
+    fn arb_unmet_state() -> impl Strategy<Value = SatisfactionState> {
+        prop_oneof![
+            Just(SatisfactionState::Unsatisfied),
+            Just(SatisfactionState::Unavailable),
+            Just(SatisfactionState::Stale),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn prop_budget_exhaustion_never_reports_planned_while_a_required_obligation_is_unmet(
+            n in 1usize..6,
+            state in arb_unmet_state(),
+        ) {
+            let reqs: Vec<_> = (0..n)
+                .map(|i| requirement(&format!("req_{i}"), RequirementLevel::Required, state.clone()))
+                .collect();
+            let ids: std::collections::BTreeSet<String> =
+                reqs.iter().map(|r| r.requirement_id.clone()).collect();
+            let claim_assessment = assessment(reqs, state);
+
+            // Zero-probe budget: structurally nothing can be covered, no
+            // matter how many/what kind of requirements are unmet.
+            let starved = VerificationBudget {
+                max_probe_count: 0,
+                ..generous_budget()
+            };
+            let plan = DeterministicBudgetPolicy
+                .plan(&ctx(claim_assessment, BlastRadius::ReadOnlyObservation), &starved);
+
+            match &plan.outcome {
+                PlanOutcome::InsufficientVerification { unmet_requirement_ids } => {
+                    let reported: std::collections::BTreeSet<String> =
+                        unmet_requirement_ids.iter().cloned().collect();
+                    prop_assert_eq!(reported, ids, "every unmet Required obligation must be named, none silently dropped");
+                }
+                PlanOutcome::Planned => {
+                    prop_assert!(false, "must never report Planned while a Required obligation is unmet");
+                }
+            }
+
+            // Partial failure must never leave a would-be Proceed standing.
+            let rec = Recommendation {
+                claim_id: Uuid::new_v4(),
+                action: RecommendationAction::Proceed,
+                risk_class: RiskClass::Balanced,
+                policy_name: "test".to_string(),
+                policy_version: 1,
+                rationale_summary: "fusion says proceed".to_string(),
+            };
+            let floored = apply_verification_floor(rec, &plan);
+            prop_assert_eq!(floored.action, RecommendationAction::Review);
+        }
+    }
 }
