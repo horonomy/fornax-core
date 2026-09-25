@@ -469,6 +469,59 @@ fn record_envelope_skip(
     }
 }
 
+/// Outcome of checking a trusted key's `not_before`/`not_after` window
+/// against `now`. Extracted (FORNX-383) as a small, pure, crypto-free
+/// function purely so its temporal logic is Kani-provable in isolation from
+/// signature verification — [`verify_signed_envelope`] is unchanged in
+/// behavior, this is a refactor, not a new check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyTemporalStatus {
+    /// No window set, or `now` falls within `[not_before, not_after]`
+    /// inclusive.
+    Valid,
+    NotYetValid,
+    Retired,
+    /// `not_before`/`not_after` failed to parse as RFC 3339 — distinct from
+    /// `NotYetValid`/`Retired` so a caller never mistakes a malformed
+    /// timestamp for a real temporal decision.
+    MalformedNotBefore,
+    MalformedNotAfter,
+}
+
+/// Pure temporal-window check: no I/O, no signature verification, no
+/// allocation beyond what's already owned by the caller. `not_before`/
+/// `not_after` absent means unbounded on that side, matching
+/// [`verify_signed_envelope`]'s pre-extraction behavior exactly.
+///
+/// Kani-checked invariants (FORNX-383,
+/// `crates/fornax-types/tests/kani_key_temporal_status.rs`):
+/// - a key can never be simultaneously `NotYetValid` and `Retired`
+///   (the window is never empty in a way that admits no valid instant AND
+///   claims both boundary violations at once for the same `now`);
+/// - `Valid` if and only if `now` is within an existing window, or no
+///   window constrains that side at all.
+pub(crate) fn key_temporal_status(
+    not_before: Option<&str>,
+    not_after: Option<&str>,
+    now: DateTime<Utc>,
+) -> KeyTemporalStatus {
+    if let Some(nb) = not_before {
+        match parse_rfc3339_plain(nb) {
+            Ok(nb) if now < nb => return KeyTemporalStatus::NotYetValid,
+            Err(()) => return KeyTemporalStatus::MalformedNotBefore,
+            Ok(_) => {}
+        }
+    }
+    if let Some(na) = not_after {
+        match parse_rfc3339_plain(na) {
+            Ok(na) if now > na => return KeyTemporalStatus::Retired,
+            Err(()) => return KeyTemporalStatus::MalformedNotAfter,
+            Ok(_) => {}
+        }
+    }
+    KeyTemporalStatus::Valid
+}
+
 /// The envelope/signature-verification steps shared by [`verify_bundle`] and
 /// [`super::revocation::verify_revocation_list`], parameterized by `domain`
 /// (each artifact type has its own signing domain constant -- see
@@ -531,56 +584,53 @@ pub(crate) fn verify_signed_envelope(
             continue;
         };
 
-        if let Some(not_before) = &trusted_key.not_before {
-            match parse_rfc3339_plain(not_before) {
-                Ok(nb) if now < nb => {
-                    record_envelope_skip(
-                        &mut first_skip_reason,
-                        EnvelopeVerificationError::KeyNotYetValid {
-                            key_id: sig_entry.key_id.clone(),
-                            not_before: not_before.clone(),
-                            now,
-                        },
-                    );
-                    continue;
-                }
-                Err(()) => {
-                    record_envelope_skip(
-                        &mut first_skip_reason,
-                        EnvelopeVerificationError::MalformedKeyTimestamp {
-                            field: "trusted_key.not_before",
-                            value: not_before.clone(),
-                        },
-                    );
-                    continue;
-                }
-                Ok(_) => {}
+        match key_temporal_status(
+            trusted_key.not_before.as_deref(),
+            trusted_key.not_after.as_deref(),
+            now,
+        ) {
+            KeyTemporalStatus::Valid => {}
+            KeyTemporalStatus::NotYetValid => {
+                record_envelope_skip(
+                    &mut first_skip_reason,
+                    EnvelopeVerificationError::KeyNotYetValid {
+                        key_id: sig_entry.key_id.clone(),
+                        not_before: trusted_key.not_before.clone().unwrap_or_default(),
+                        now,
+                    },
+                );
+                continue;
             }
-        }
-        if let Some(not_after) = &trusted_key.not_after {
-            match parse_rfc3339_plain(not_after) {
-                Ok(na) if now > na => {
-                    record_envelope_skip(
-                        &mut first_skip_reason,
-                        EnvelopeVerificationError::KeyRetired {
-                            key_id: sig_entry.key_id.clone(),
-                            not_after: not_after.clone(),
-                            now,
-                        },
-                    );
-                    continue;
-                }
-                Err(()) => {
-                    record_envelope_skip(
-                        &mut first_skip_reason,
-                        EnvelopeVerificationError::MalformedKeyTimestamp {
-                            field: "trusted_key.not_after",
-                            value: not_after.clone(),
-                        },
-                    );
-                    continue;
-                }
-                Ok(_) => {}
+            KeyTemporalStatus::Retired => {
+                record_envelope_skip(
+                    &mut first_skip_reason,
+                    EnvelopeVerificationError::KeyRetired {
+                        key_id: sig_entry.key_id.clone(),
+                        not_after: trusted_key.not_after.clone().unwrap_or_default(),
+                        now,
+                    },
+                );
+                continue;
+            }
+            KeyTemporalStatus::MalformedNotBefore => {
+                record_envelope_skip(
+                    &mut first_skip_reason,
+                    EnvelopeVerificationError::MalformedKeyTimestamp {
+                        field: "trusted_key.not_before",
+                        value: trusted_key.not_before.clone().unwrap_or_default(),
+                    },
+                );
+                continue;
+            }
+            KeyTemporalStatus::MalformedNotAfter => {
+                record_envelope_skip(
+                    &mut first_skip_reason,
+                    EnvelopeVerificationError::MalformedKeyTimestamp {
+                        field: "trusted_key.not_after",
+                        value: trusted_key.not_after.clone().unwrap_or_default(),
+                    },
+                );
+                continue;
             }
         }
 
