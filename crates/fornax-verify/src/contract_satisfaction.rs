@@ -1444,4 +1444,196 @@ mod tests {
         );
         assert!(violations.is_empty());
     }
+
+    // --- FORNX-382: Self-Integrity property tests ------------------------
+    //
+    // Covers required invariants #2 ("UNAVAILABLE / failed collection
+    // cannot become support or contradiction"), #3 ("correlated/common-
+    // source evidence cannot manufacture independent corroboration") and
+    // #10 ("deterministic replay of pinned inputs produces the same
+    // semantic result") from the FORNX-382 registry
+    // (`fornax_bench::self_integrity`). These generalize the example-based
+    // tests above into randomized generators so a violation anywhere in
+    // the input space is caught, not just at the hand-picked cases already
+    // covered.
+
+    use proptest::prelude::*;
+
+    fn arb_evidence_kind() -> impl Strategy<Value = EvidenceKind> {
+        prop_oneof![
+            Just(EvidenceKind::ToolResult),
+            Just(EvidenceKind::ExitCode),
+            Just(EvidenceKind::FileDiff),
+            Just(EvidenceKind::ProcessObservation),
+            Just(EvidenceKind::TranscriptExcerpt),
+        ]
+    }
+
+    fn arb_trust_class() -> impl Strategy<Value = TrustClass> {
+        prop_oneof![
+            Just(TrustClass::AgentAdjacent),
+            Just(TrustClass::HostObserved),
+        ]
+    }
+
+    /// An arbitrary, always-irrelevant-to-`build_succeeded` evidence item:
+    /// any kind/trust class, but never the `ExitCode` + `HostObserved`
+    /// combination the contract actually requires. Used to prove invariant
+    /// #2 -- no amount of *irrelevant* evidence can manufacture a
+    /// `Satisfied` (or `Contradicted`) result out of thin air.
+    fn arb_irrelevant_evidence() -> impl Strategy<Value = Evidence> {
+        (arb_evidence_kind(), arb_trust_class(), 0u32..1000).prop_filter_map(
+            "must not accidentally satisfy build_succeeded's real requirement",
+            |(kind, trust, offset)| {
+                if matches!(kind, EvidenceKind::ExitCode)
+                    && matches!(trust, TrustClass::HostObserved)
+                {
+                    return None;
+                }
+                Some(evidence_with_source(
+                    kind,
+                    &format!("2026-09-24T00:{:02}:00Z", offset % 60),
+                    trust,
+                    None,
+                ))
+            },
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Invariant #2: no matter how much irrelevant evidence is thrown
+        /// at a Required requirement, absence of qualifying evidence can
+        /// only ever read as Unavailable/Unsatisfied -- never `Satisfied`,
+        /// and never `Contradicted` (nothing here disputes the claim, it
+        /// simply never speaks to it).
+        #[test]
+        fn prop_irrelevant_evidence_never_manufactures_satisfaction(
+            evidence in prop::collection::vec(arb_irrelevant_evidence(), 0..8)
+        ) {
+            let reg = default_registry();
+            let cc = ClaimClassId::new("build_succeeded", 1);
+            let c = claim("build_succeeded", "2026-09-24T00:10:00Z");
+            let report = assess(&reg, &cc, &c, &evidence, &[]).expect("assess ok");
+            prop_assert_ne!(report.assessment.overall.clone(), SatisfactionState::Satisfied);
+            prop_assert_ne!(report.assessment.overall, SatisfactionState::Contradicted);
+        }
+
+        /// Invariant #10: `assess` is a pure function of its inputs --
+        /// running it twice on cloned evidence (any size, any ordering)
+        /// must produce byte-identical canonical JSON.
+        #[test]
+        fn prop_assess_is_deterministic_for_arbitrary_evidence_pools(
+            evidence in prop::collection::vec(arb_irrelevant_evidence(), 0..8)
+        ) {
+            let reg = default_registry();
+            let cc = ClaimClassId::new("build_succeeded", 1);
+            let c = claim("build_succeeded", "2026-09-24T00:10:00Z");
+            let report_a = assess(&reg, &cc, &c, &evidence.clone(), &[]).expect("assess ok");
+            let report_b = assess(&reg, &cc, &c, &evidence, &[]).expect("assess ok");
+            let json_a = fornax_types::epistemic_contract::to_canonical_json(&report_a.assessment).unwrap();
+            let json_b = fornax_types::epistemic_contract::to_canonical_json(&report_b.assessment).unwrap();
+            prop_assert_eq!(json_a, json_b);
+        }
+    }
+
+    /// AC2 + AC3 combined demonstration (deliberately seeded, not a real
+    /// production bug -- the real FORNX-378 gap this mirrors was already
+    /// found and fixed before this ticket; see module docs "Real findings
+    /// fixed here"). This is a **test-only** reconstruction of what
+    /// `assess` looked like *before* its family-independence hardening
+    /// pass: it calls `assess_claim` directly and skips the
+    /// `SourceFamilyMap` second pass entirely. It exists solely to prove
+    /// that `prop_family_hardening_defeats_duplicate_source_amplification`
+    /// below is a real, capable test -- not a tautology that would pass
+    /// against any implementation.
+    fn naive_assess_without_family_hardening(
+        registry: &ContractRegistry,
+        claim_class: &ClaimClassId,
+        claim: &Claim,
+        evidence: &[Evidence],
+    ) -> ClaimAssessment {
+        let deduped = dedupe_by_id(evidence);
+        let evidence_refs: Vec<&Evidence> = deduped.iter().collect();
+        assess_claim(
+            registry,
+            claim_class,
+            claim,
+            &evidence_refs,
+            &[],
+            &trust_class_of,
+        )
+        .expect("test contract is always valid")
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        /// Invariant #3, mutation-tested (AC3): generates an arbitrary
+        /// number (2..6) of same-source-family `AgentAdjacent` evidence
+        /// items (one shared `source_event_id`, i.e. "one agent turn fanned
+        /// out to two sensors" per FORNX-347's real union rule) against a
+        /// contract requiring two *mutually independent* checks.
+        ///
+        /// - The real, shipped `assess()` must NEVER let same-family
+        ///   evidence satisfy both independent requirements (the property
+        ///   this ticket is verifying).
+        /// - `naive_assess_without_family_hardening` (test-only, see above)
+        ///   for the SAME generated input DOES incorrectly reach
+        ///   `Satisfied` once at least one item of each requirement's
+        ///   accepted kind/trust exists in the family -- proving this
+        ///   property test is capable of catching the removal of the real
+        ///   safety control (AC3: "mutation/fault-injection demonstrates
+        ///   that critical tests are capable of detecting removed safety
+        ///   controls"), and that the fix this test guards is load-bearing
+        ///   (AC2: a real violation class, deliberately reconstructed here
+        ///   for a controlled, minimizable demonstration rather than
+        ///   re-breaking shipped code and reverting it).
+        #[test]
+        fn prop_family_hardening_defeats_duplicate_source_amplification(
+            n in 2usize..6
+        ) {
+            let cc = ClaimClassId::new("fornx378_double_check", 1);
+            let c = claim("fornx378_double_check", "2026-09-24T00:10:00Z");
+            // Accept AgentAdjacent so the only dimension under test is
+            // independence/family, not trust class (mirrors
+            // `duplicate_source_amplification_cannot_satisfy_independence`
+            // above).
+            let mut reg = ContractRegistry::new();
+            let mut contract = double_check_contract(1);
+            for req in &mut contract.requirements {
+                req.acceptable_trust_classes = vec![TrustClass::AgentAdjacent];
+            }
+            reg.register(contract).unwrap();
+            let shared_turn = Uuid::new_v4();
+            let evidence: Vec<Evidence> = (0..n)
+                .map(|i| {
+                    evidence_with_source(
+                        EvidenceKind::ExitCode,
+                        &format!("2026-09-24T00:{:02}:00Z", i % 60),
+                        TrustClass::AgentAdjacent,
+                        Some(shared_turn),
+                    )
+                })
+                .collect();
+
+            let hardened = assess(&reg, &cc, &c, &evidence, &[]).expect("assess ok");
+            prop_assert_ne!(
+                hardened.assessment.overall,
+                SatisfactionState::Satisfied,
+                "the real, shipped assess() must never be fooled by same-family evidence"
+            );
+
+            let naive = naive_assess_without_family_hardening(&reg, &cc, &c, &evidence);
+            prop_assert_eq!(
+                naive.overall,
+                SatisfactionState::Satisfied,
+                "sanity check: without family-hardening this exact input WOULD wrongly satisfy \
+                 both independent requirements -- if this assertion itself starts failing, the \
+                 property test above has stopped being a meaningful safety net and must be \
+                 re-examined, not just re-asserted"
+            );
+        }
+    }
 }

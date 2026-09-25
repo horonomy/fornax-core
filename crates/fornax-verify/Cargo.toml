@@ -20,3 +20,9 @@ toml_edit.workspace = true
 # owner awareness per CLAUDE.md's "don't add new dependencies without
 # asking first".
 reqwest = { workspace = true, features = ["blocking", "json"] }
+
+[dev-dependencies]
+# FORNX-382: property-based tests for the trust-kernel self-integrity
+# invariants (session isolation, non-fabricated satisfaction, independence
+# hardening, determinism) alongside the existing example-based tests.
+proptest.workspace = true
