@@ -15,6 +15,7 @@ pub mod decision;
 pub mod fusion;
 pub mod independence;
 pub mod judge;
+pub mod meta_verification;
 pub mod reliability;
 pub mod verification_budget;
 pub mod voi;
