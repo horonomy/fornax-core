@@ -25,6 +25,12 @@ pub enum ConformanceCase {
     StaleNotAfterInThePast,
     UnsupportedProtocolVersion,
     WrongObjectKind,
+    /// The envelope decodes and unwraps to a *valid, untampered*
+    /// `DelegationEnvelope`, but it scopes a different claim class than the
+    /// consumer expected -- reuses `fornax_receipt::delegation::evaluate_delegation_gate`
+    /// (FORNX-384) rather than reinventing scope checking at the protocol
+    /// layer.
+    WrongScope,
     ForwardCompatibleUnknownField,
 }
 
@@ -171,6 +177,41 @@ pub fn run_case(case: ConformanceCase) -> ConformanceOutcome {
                 ),
             }
         }
+        ConformanceCase::WrongScope => {
+            let bytes = sample_delegation_envelope_bytes(BTreeSet::new());
+            let delegation = match decode_delegation_result(&bytes) {
+                Ok(d) => d,
+                Err(e) => {
+                    return ConformanceOutcome::HarnessError(format!(
+                        "fixture must decode/unwrap cleanly first: {e}"
+                    ))
+                }
+            };
+            let expected = fornax_receipt::delegation::ExpectedDelegationContext {
+                parent_agent_id: delegation.body().parent.agent_id.clone(),
+                parent_task_id: delegation.body().parent.task_id,
+                expected_claim_class: fornax_types::epistemic_contract::ClaimClassId::new(
+                    "a_totally_different_claim_class",
+                    1,
+                ),
+            };
+            let decision = fornax_receipt::delegation::evaluate_delegation_gate(
+                &delegation,
+                &expected,
+                &fornax_receipt::delegation::DelegationGatePolicy::require_fulfilled_only(),
+                chrono::Utc::now(),
+            );
+            let wrong_scope = decision.reasons.iter().find(|r| {
+                r.code == fornax_receipt::delegation::DelegationGateReasonCode::WrongScope
+            });
+            match wrong_scope {
+                Some(reason) => ConformanceOutcome::RejectedWithReason(reason.detail.clone()),
+                None => ConformanceOutcome::HarnessError(
+                    "a mismatched expected claim class must produce a WrongScope reason"
+                        .to_string(),
+                ),
+            }
+        }
         ConformanceCase::ForwardCompatibleUnknownField => {
             let d = crate::objects::fixtures::sample_delegation_envelope();
             let env = wrap_delegation_result(&d, BTreeSet::new());
@@ -253,6 +294,14 @@ mod tests {
     }
 
     #[test]
+    fn wrong_scope_is_rejected() {
+        assert!(matches!(
+            run_case(ConformanceCase::WrongScope),
+            ConformanceOutcome::RejectedWithReason(_)
+        ));
+    }
+
+    #[test]
     fn forward_compatible_unknown_field_is_accepted_not_rejected() {
         assert_eq!(
             run_case(ConformanceCase::ForwardCompatibleUnknownField),
@@ -273,6 +322,7 @@ mod tests {
             ConformanceCase::StaleNotAfterInThePast,
             ConformanceCase::UnsupportedProtocolVersion,
             ConformanceCase::WrongObjectKind,
+            ConformanceCase::WrongScope,
             ConformanceCase::ForwardCompatibleUnknownField,
         ] {
             let outcome = run_case(case);
