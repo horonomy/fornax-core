@@ -34,10 +34,16 @@
 //! - [`delegation`] — the proof-carrying delegation envelope (FORNX-384):
 //!   extends the receipt above with delegation identity, scope, obligation
 //!   satisfaction, and an independent-consumer policy gate.
+//! - [`multi_agent`] — multi-agent shared-failure and coordination-signal
+//!   detection (FORNX-385): generalizes [`delegation`]'s per-envelope
+//!   independence bookkeeping into a cross-agent dependency graph so
+//!   several agents sharing one root source cannot masquerade as
+//!   independent confirmation.
 
 pub mod delegation;
 pub mod freshness;
 pub mod gate;
 pub mod issue;
+pub mod multi_agent;
 pub mod schema;
 pub mod verify;
