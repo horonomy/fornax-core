@@ -193,6 +193,10 @@ pub fn registry() -> Vec<InvariantRecord> {
                 "fornax-verify::fusion::tests (FusionPolicy's five-state verdict \
                  vocabulary -- Contradicted always outranks any confidence-weighted \
                  support, see docs/adr/0001-architecture-invariants.md)",
+                "fornax-verify::meta_verification::meta_verification_tests::\
+                 a_confident_supporting_judge_cannot_force_verified_over_a_hard_contradiction \
+                 (FORNX-388: the same invariant exercised through a monitor-shaped \
+                 contribution, not a second enforcement mechanism)",
             ],
             release_gate: "FORNX-94 Semantic Judge gate",
         },
