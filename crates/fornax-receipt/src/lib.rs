@@ -44,11 +44,17 @@
 //!   policy [`fornax_verify::decision::Recommendation`] into a
 //!   machine-readable, human-reviewable claim/argument/evidence/limitations
 //!   case, with a before/after delta view across case versions.
+//! - [`incident`] — Integrity Incident Intelligence (FORNX-389): turns a
+//!   verified failure into a reproducible regression and mitigation-
+//!   knowledge record, extending [`schema`]'s reference/fingerprint
+//!   discipline and [`multi_agent`]'s evidence-gated characterization
+//!   idiom rather than building a second incident store.
 
 pub mod assurance_case;
 pub mod delegation;
 pub mod freshness;
 pub mod gate;
+pub mod incident;
 pub mod issue;
 pub mod multi_agent;
 pub mod schema;
