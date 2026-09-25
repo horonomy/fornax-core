@@ -9,6 +9,35 @@ Jira epic FORNX-20.
 
 Nothing yet.
 
+## [v0.0.8] — Agent Epistemic Trust Kernel
+
+Stage 9 (epic FORNX-376, HVDL-15). Full release notes:
+[`docs/release/v0.0.8-release-notes.md`](docs/release/v0.0.8-release-notes.md).
+Readiness-gate verdict (FORNX-392): **CONTINUE, with 3 disclosed
+carryovers** — not a clean pass. See release notes for the honest
+per-carryover detail; nothing here claims more than the gate evidence
+supports.
+
+Adds: Epistemic Contracts and claim/evidence satisfaction (FORNX-377/378),
+adaptive verification budgets (FORNX-379), an adversarial evidence corpus
+and evidence-authenticity hardening (FORNX-380/381), a self-integrity
+invariant/property/formal-methods program (FORNX-382/383), proof-carrying
+delegation and multi-agent shared-failure detection (FORNX-384/385),
+isolated shadow execution (FORNX-386), structured assurance cases
+(FORNX-387), a monitor-of-monitor meta-verification layer (FORNX-388),
+integrity incident-to-regression tooling (FORNX-389), and a public,
+independently-implementable Agent Evidence Protocol (FORNX-391). FORNX-390
+(federated calibration) is a research finding, not a shipped feature — its
+own decision record concluded narrow/defer.
+
+**Note on this CHANGELOG's own gaps:** entries for `v0.0.2`, `v0.0.4`,
+`v0.0.5`, `v0.0.6`, and `v0.0.7` were never added here even though all were
+really tagged and released (see each version's own
+`docs/release/vX.Y.Z-release-notes.md`, which is the actual source of
+truth for those versions). That gap predates this entry and is out of this
+release's scope to backfill; flagged here rather than silently continuing
+past it.
+
 ## [v0.0.3] — Extensible Evidence Platform
 
 Engineering complete: epic FORNX-138 and all children (FORNX-155–162,
