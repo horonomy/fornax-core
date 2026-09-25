@@ -26,11 +26,20 @@ use crate::shadow::{
 /// `seed_sql` populates it with representative rows (this is what makes
 /// AC3's fragility detection possible — a constraint violation surfaces
 /// only against real rows, never against an empty table), and
-/// `migration_sql` is the change under test. `connection_target` must
-/// satisfy [`is_local_only_target`] or the run is refused before anything
-/// is attempted.
+/// `migration_sql` is the change under test.
 #[derive(Debug, Clone)]
 pub struct MigrationProposal {
+    /// **Validated, not dispatched on.** This runner always creates its own
+    /// throwaway SQLite file at `staging_dir/shadow.sqlite3` regardless of
+    /// this field's value — it never opens `connection_target` itself. The
+    /// field exists purely as the caller's declared intent, checked against
+    /// [`is_local_only_target`] before anything runs: a caller naming a
+    /// real, non-local target (e.g. a real production DSN, by mistake or by
+    /// a malicious proposal) is refused up front, rather than silently
+    /// ignored in a way that could be mistaken for "verified against the
+    /// real target". A future runner that genuinely supports multiple
+    /// backends would need to make this field authoritative; this one does
+    /// not, and says so here rather than leaving it ambiguous.
     pub connection_target: String,
     pub setup_sql: Vec<String>,
     pub seed_sql: Vec<String>,
