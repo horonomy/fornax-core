@@ -1,0 +1,44 @@
+{
+  "version": "v0.0.8",
+  "generated_at": "2026-09-25T08:30:00Z",
+  "threat_model_version": 3,
+  "full_review": true,
+  "boundaries_touched": [
+    {
+      "surface": "evidence_provenance",
+      "feature_delta_ids": ["FD-v0.0.8-0001"],
+      "review": "Epistemic Contract schema (FORNX-377) and satisfaction engine (FORNX-378) evaluate whether real evidence meets a claim's declared proof obligations; the critical-obligation safety floor (apply_contract_floor) is non-relaxing, independently spot-checked against merged main -- only ever steps a Recommendation from Proceed to Review, never the reverse. FORNX-378's own security review found and fixed a real duplicate-source-amplification gap in FORNX-377's IndependenceRule (id-only exclusion evaded by two same-source rows with distinct ids); the fix reuses FORNX-347's SourceFamilyMap for a second hardening pass.",
+      "adversarial_coverage": "contract_floor_defeats_proceed_despite_high_aggregate_support, duplicate_source_amplification_cannot_satisfy_independence, forged_claim_class_is_never_satisfied_through_the_wrapper, contract_downgrade_attempt_surfaces_as_an_error_not_a_silent_pass, large_evidence_pool_does_not_panic_or_hang (all independently re-run by this session against merged main)."
+    },
+    {
+      "surface": "evidence_provenance",
+      "feature_delta_ids": ["FD-v0.0.8-0002"],
+      "review": "Adversarial evidence corpus (FORNX-380) and provenance/authenticity hardening (FORNX-381): a real threat model plus a 26-fixture attack corpus (currently 11 Detected, 10 Prevented, 4 Escaped, 1 Inconclusive -- disclosed in SEC-v0.0.8-0001), and authorize_sensor/authorize_evidence_source derive trust class from a known-sensor registry rather than accepting caller-supplied payload metadata. A real AC4 finding (capability/version spoofing: EvidenceRequirement::capability_prerequisites was declared but never enforced) was found and fixed via assess_with_capabilities, an additive hardening layer with zero behavior change for existing assess() callers.",
+      "adversarial_coverage": "plain_assess_is_exploitable_by_a_spoofed_missing_capability / assess_with_capabilities_catches_the_spoofed_missing_capability (paired exploit-then-fix proof); a_path_traversal_attempt_is_refused_not_clamped and a_symlink_escape_is_never_followed_into_the_shadow_copy live in the shadow-execution surface below but exercise the same evidence_provenance discipline for file-mutation evidence. All independently re-run by this session on merged main."
+    },
+    {
+      "surface": "evidence_provenance",
+      "feature_delta_ids": ["FD-v0.0.8-0003"],
+      "review": "Proof-carrying delegation (FORNX-384) extends FORNX-350's Integrity Receipt with a DelegationEnvelope: digest-tamper-evident (same #[serde(try_from)] mechanism as ReceiptBody), scope/freshness/expiry checked, and merged_source_family_bases dedupes independence across nested delegation levels so two receipts sharing a source family never manufacture extra corroboration. Multi-agent shared-failure detection (FORNX-385) extends this into a cross-agent dependency graph; CollusionHypothesis is structurally unconstructible with empty evidence (the only constructor returns None if supporting_evidence is empty) -- no detector in the module ever emits one from correlation alone.",
+      "adversarial_coverage": "agent_a_delegates_to_agent_b_and_holds_an_insufficient_result_end_to_end; stale/tampered/wrong-parent/wrong-scope delegation rejection tests; CollusionHypothesis empty-evidence-construction test. All independently re-run by this session on merged main."
+    },
+    {
+      "surface": "sdk_plugin_trust",
+      "feature_delta_ids": ["FD-v0.0.8-0004"],
+      "review": "Agent Evidence Protocol (FORNX-391): fornax-protocol-refclient has zero dependency on any other workspace crate -- a genuinely independent second implementation of the protocol's wire format, not a superficial separation. Canonical key-sorted-JSON digest scheme is distinct from every internal Rust-struct-order-dependent digest elsewhere in this repo. Conformance suite covers malformed, stale, tampered, wrong-scope, and downgraded fixtures with typed rejection reasons.",
+      "adversarial_coverage": "two_independent_implementations.rs (34 tests total across fornax-protocol + fornax-protocol-refclient, independently re-run by this session on merged main); 9-case conformance suite including a WrongScope case added specifically for AC3 completeness."
+    },
+    {
+      "surface": "judge_replay_execution",
+      "feature_delta_ids": ["FD-v0.0.8-0005"],
+      "review": "Meta-verification (FORNX-388) treats semantic judges/monitors as fallible evidence sources: availability gating bridges FORNX-348's real CalibrationState (stale/suspect calibration cannot retain authoritative weight), dependency_groups reuses FORNX-347's SourceFamilyMap directly for same-family monitor detection, and contextual performance reporting gates on a real minimum-sample-support threshold (30) -- every realistic test input correctly reports InsufficientSupport rather than a fabricated agreement rate, since no real Gold Corpus data exists.",
+      "adversarial_coverage": "a_confident_supporting_judge_cannot_force_verified_over_a_hard_contradiction (seeded overconfident-wrong-monitor scenario: fused verdict stays Review, the hard contradiction remains visible in counted_link_ids). Independently re-run by this session on merged main (10/10)."
+    },
+    {
+      "surface": "daemon_socket",
+      "feature_delta_ids": ["FD-v0.0.8-0006"],
+      "review": "Shadow execution (FORNX-386) adds isolated pre-flight verification for file-mutation and SQLite-migration domains, reusing Stage-5's fornax-experiment-runner isolation (StagedWorktree, GlobalExperimentPolicy, sweep_orphaned_staging_dirs) rather than a second experiment runtime. Every runner operates only against fully local, disposable resources (temp dirs, throwaway file-backed SQLite) -- no real network, credential, or production infrastructure is ever touched, by construction (is_local_only_target refuses every connection-string shape except :memory:/bare-path/file://). Infrastructure-plan/deployment-config domains were explicitly declined for this release since either would require real credentials/network reachability this release's own default-forbid policy disallows.",
+      "adversarial_coverage": "a_path_traversal_attempt_is_refused_not_clamped, a_symlink_escape_is_never_followed_into_the_shadow_copy (writes a real secret outside the sandbox, confirms it is untouched after an attempted escape write), network_shaped_targets_are_refused, credential_shaped_parameter_keys_are_detected_case_insensitively, destructive_side_effect_is_never_approved_even_for_a_critical_obligation. 20/20 shadow-execution tests independently re-run by this session in a fresh isolated worktree against the actual merged main commit, not just the feature branch."
+    }
+  ]
+}

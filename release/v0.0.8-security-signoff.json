@@ -1,0 +1,40 @@
+{
+  "version": "v0.0.8",
+  "candidate_repos": [
+    {
+      "name": "fornax-core",
+      "owner": "horonomy",
+      "sha": "742c6d742d7602aeefec95fb07e3cffd667a3943"
+    }
+  ],
+  "risk_class": "TRUST_BOUNDARY",
+  "trust_boundary_delta_ref": "release/v0.0.8-trust-boundary-delta.json",
+  "threat_model_version": 3,
+  "findings": [
+    {
+      "id": "SEC-v0.0.8-0001",
+      "severity": "medium",
+      "title": "Adversarial evidence corpus retains 4/26 documented Escape outcomes",
+      "evidence": "crates/fornax-bench/src/adversarial.rs::corpus() tallied live against candidate SHA 742c6d7: 11 Detected, 10 Prevented, 4 Escaped, 1 Inconclusive. The 4 Escaped fixtures (forged trust-class label authenticity; cross-claim evidence replay; FORNX-347's SourceFamilyMap O(n^2 log n) scalability gap) are individually documented in the corpus module's own doc comments and were disclosed, not hidden, by FORNX-380/381/385's own PRs. Full evaluation recorded in FORNX-392's gate comment.",
+      "disposition": "accepted_risk",
+      "waiver_ref": null
+    },
+    {
+      "id": "SEC-v0.0.8-0002",
+      "severity": "medium",
+      "title": "No daemon/acquisition-identity binding concept yet (FORNX-381 AC2)",
+      "evidence": "crates/fornax-types/src/provenance_guard.rs hardens sensor/trust-class authorization and payload-metadata spoofing, but cross-session attribution at the daemon/acquisition-identity layer is not yet a modeled concept in this codebase -- disclosed in FORNX-381's own PR body and re-confirmed by this session's independent code review; FORNX-381 remains DEV VERIFY, not Done, for exactly this reason.",
+      "disposition": "accepted_risk",
+      "waiver_ref": null
+    },
+    {
+      "id": "SEC-v0.0.8-0003",
+      "severity": "informational",
+      "title": "FORNX-383's second Kani proof target (acquisition-authorization state machine) is formally unverified",
+      "evidence": "cargo kani proof harnesses for the acquisition-authorization state machine compile but hit a real CBMC out-of-memory (~9GB, confirmed via ps during FORNX-383's own investigation) caused by Vec::sort()'s generic internals -- a tooling resource limit, not a discovered design flaw. The first target (key_temporal_status freshness logic) has 4 genuinely verified Kani proofs, independently re-run by this session against the merged main commit.",
+      "disposition": "open",
+      "waiver_ref": null
+    }
+  ],
+  "verdict": "PASS"
+}
