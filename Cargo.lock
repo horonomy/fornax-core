@@ -1078,6 +1078,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "fornax-protocol"
+version = "0.0.1"
+dependencies = [
+ "chrono",
+ "fornax-protocol-refclient",
+ "fornax-receipt",
+ "fornax-types",
+ "fornax-verify",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "fornax-protocol-refclient"
+version = "0.0.1"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+]
+
+[[package]]
 name = "fornax-receipt"
 version = "0.0.1"
 dependencies = [

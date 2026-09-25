@@ -1,0 +1,24 @@
+[package]
+name = "fornax-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "fornax_protocol"
+path = "src/lib.rs"
+
+[dependencies]
+fornax-types = { path = "../fornax-types" }
+fornax-verify = { path = "../fornax-verify" }
+fornax-receipt = { path = "../fornax-receipt" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+fornax-protocol-refclient = { path = "../fornax-protocol-refclient" }
