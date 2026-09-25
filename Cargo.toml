@@ -9,6 +9,14 @@ rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/horonomy/fornax-core"
 
+[workspace.lints.rust]
+# `cargo kani` compiles with `--cfg kani` to select `#[cfg(kani)] mod
+# kani_proofs` blocks (FORNX-383) -- registering it here means an ordinary
+# `cargo build`/`cargo test`/`cargo clippy` never even attempts those
+# modules (unaffected either way) and no longer warns about an "unexpected
+# cfg" for a name rustc doesn't otherwise recognize.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
