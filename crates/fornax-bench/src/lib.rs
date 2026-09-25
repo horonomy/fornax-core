@@ -51,11 +51,17 @@
 //! - [`gate`] — FORNX-344: the fail-closed PASS/BLOCK/INCONCLUSIVE/UNTESTED
 //!   verdict over a `RegressionComparison`, per
 //!   `docs/release-assurance-policy.md`'s verdict vocabulary.
+//! - [`federated_calibration`] — FORNX-390: a research-lane simulation of
+//!   privacy-preserving cross-tenant calibration-statistic aggregation.
+//!   Mechanism-verification only, over synthetic tenant data — see that
+//!   module's docs and `docs/research/federated-calibration-decision-record.md`
+//!   for this ticket's actual conclusion (narrow/defer for v0.3.0).
 
 pub mod ablation;
 pub mod adversarial;
 pub mod baseline;
 pub mod dataset;
+pub mod federated_calibration;
 pub mod gate;
 pub mod harness;
 pub mod manifest;
