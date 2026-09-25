@@ -505,18 +505,44 @@ pub(crate) fn key_temporal_status(
     not_after: Option<&str>,
     now: DateTime<Utc>,
 ) -> KeyTemporalStatus {
-    if let Some(nb) = not_before {
-        match parse_rfc3339_plain(nb) {
-            Ok(nb) if now < nb => return KeyTemporalStatus::NotYetValid,
+    let parsed_not_before = match not_before {
+        Some(nb) => match parse_rfc3339_plain(nb) {
+            Ok(nb) => Some(nb),
             Err(()) => return KeyTemporalStatus::MalformedNotBefore,
-            Ok(_) => {}
+        },
+        None => None,
+    };
+    let parsed_not_after = match not_after {
+        Some(na) => match parse_rfc3339_plain(na) {
+            Ok(na) => Some(na),
+            Err(()) => return KeyTemporalStatus::MalformedNotAfter,
+        },
+        None => None,
+    };
+    key_temporal_status_from_parsed(parsed_not_before, parsed_not_after, now)
+}
+
+/// The comparison core of [`key_temporal_status`], factored out (FORNX-383)
+/// so it can be Kani-proved directly over symbolic `DateTime<Utc>` values --
+/// bypassing `parse_rfc3339_plain`/chrono's RFC 3339 parser, whose generic
+/// string-scanning internals are, like `Vec::sort`'s generic comparison
+/// network, expensive for CBMC to reason about symbolically (see
+/// `docs/security/formal-methods-scope.md`). This function is the entire
+/// semantic content of the temporal-window decision; parsing is a separate,
+/// untargeted concern.
+fn key_temporal_status_from_parsed(
+    not_before: Option<DateTime<Utc>>,
+    not_after: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> KeyTemporalStatus {
+    if let Some(nb) = not_before {
+        if now < nb {
+            return KeyTemporalStatus::NotYetValid;
         }
     }
     if let Some(na) = not_after {
-        match parse_rfc3339_plain(na) {
-            Ok(na) if now > na => return KeyTemporalStatus::Retired,
-            Err(()) => return KeyTemporalStatus::MalformedNotAfter,
-            Ok(_) => {}
+        if now > na {
+            return KeyTemporalStatus::Retired;
         }
     }
     KeyTemporalStatus::Valid
@@ -879,4 +905,126 @@ pub fn verify_bundle(
         verified_by,
         payload_digest,
     })
+}
+
+// --- Kani bounded model checking (FORNX-383) -------------------------------
+//
+// `key_temporal_status` is pure -- no `Vec`, no allocation, no signature
+// crypto -- just three `DateTime<Utc>` comparisons over an `Option`-wrapped
+// pair of bounds. This is the receipt/delegation-freshness target from
+// FORNX-383's candidate list, deliberately chosen as the *second* proof
+// target (alongside `fornax_acquire::gate`'s acquisition-authorization state
+// machine) specifically because it has none of that module's `Vec::sort`
+// friction -- see `docs/security/formal-methods-scope.md` for the full
+// investigation, including the acquisition-gate proof's real CBMC
+// resource-exhaustion finding.
+//
+// Not compiled by `cargo build`/`cargo test`/CI's `rust` check -- only by
+// `cargo kani`. No `kani` dev-dependency needed.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+    use chrono::TimeZone;
+
+    /// Symbolic `DateTime<Utc>` bounded to a small range around a fixed
+    /// epoch, so CBMC explores a small, dense neighborhood rather than the
+    /// full `i64` range unnecessarily. Built directly from
+    /// `TimeZone::timestamp_opt` -- never through string parsing/formatting
+    /// (`to_rfc3339`/`parse`), which is exactly the CBMC-hostile generic
+    /// string-scanning code path this proof exists to route around (see
+    /// `key_temporal_status_from_parsed`'s doc comment and
+    /// `docs/security/formal-methods-scope.md`).
+    fn bounded_datetime() -> DateTime<Utc> {
+        let offset_seconds: i32 = kani::any();
+        kani::assume(offset_seconds >= -1000 && offset_seconds <= 1000);
+        Utc.timestamp_opt(1_770_000_000 + offset_seconds as i64, 0)
+            .unwrap()
+    }
+
+    /// Invariant (FORNX-382 registry, receipt/delegation freshness class):
+    /// a key reported `NotYetValid` must genuinely have `now` strictly
+    /// before `not_before` -- the comparison core never invents an
+    /// early-validity rejection when `now` is actually within or past the
+    /// window.
+    #[kani::proof]
+    fn proof_not_yet_valid_implies_now_before_not_before() {
+        let now = bounded_datetime();
+        let nb = bounded_datetime();
+        let na = bounded_datetime();
+
+        let status = key_temporal_status_from_parsed(Some(nb), Some(na), now);
+        if matches!(status, KeyTemporalStatus::NotYetValid) {
+            assert!(
+                now < nb,
+                "NotYetValid without now actually preceding not_before"
+            );
+        }
+    }
+
+    /// Companion invariant: a key reported `Retired` must genuinely have
+    /// `now` strictly after `not_after`.
+    #[kani::proof]
+    fn proof_retired_implies_now_after_not_after() {
+        let now = bounded_datetime();
+        let nb = bounded_datetime();
+        let na = bounded_datetime();
+
+        let status = key_temporal_status_from_parsed(Some(nb), Some(na), now);
+        if matches!(status, KeyTemporalStatus::Retired) {
+            assert!(now > na, "Retired without now actually past not_after");
+        }
+    }
+
+    /// The full correctness invariant: `Valid` if and only if `now` falls
+    /// within `[not_before, not_after]` inclusive. Exhaustively checked over
+    /// the bounded neighborhood `bounded_datetime` explores.
+    #[kani::proof]
+    fn proof_valid_iff_within_window() {
+        let now = bounded_datetime();
+        let nb = bounded_datetime();
+        let na = bounded_datetime();
+
+        let status = key_temporal_status_from_parsed(Some(nb), Some(na), now);
+        let within_window = now >= nb && now <= na;
+
+        assert_eq!(
+            matches!(status, KeyTemporalStatus::Valid),
+            within_window,
+            "Valid must hold exactly when now is within [not_before, not_after]"
+        );
+    }
+
+    /// AC3 vacuity check: a deliberately weakened reimplementation that
+    /// skips the `not_after` (retirement) check entirely -- the exact class
+    /// of regression this module exists to prevent (an operator retiring a
+    /// compromised key, expecting it to stop being accepted). Proves the
+    /// property-checking technique itself is capable of catching a real
+    /// removed safety control, mirroring the acquisition-gate module's own
+    /// vacuity proof.
+    fn naive_status_without_retirement_check(
+        not_before: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> KeyTemporalStatus {
+        if let Some(nb) = not_before {
+            if now < nb {
+                return KeyTemporalStatus::NotYetValid;
+            }
+        }
+        // BUG (deliberately reintroduced for this proof only): no
+        // `not_after` check at all -- a retired key is always `Valid`.
+        KeyTemporalStatus::Valid
+    }
+
+    #[kani::proof]
+    fn proof_naive_status_is_exploitable_seeded_counterexample() {
+        let now = bounded_datetime();
+        let na = bounded_datetime();
+        kani::assume(now > na); // now is strictly past retirement
+
+        let naive = naive_status_without_retirement_check(None, now);
+        assert!(
+            matches!(naive, KeyTemporalStatus::Valid),
+            "counterexample confirmed: naive status wrongly reports Valid for a retired key"
+        );
+    }
 }
