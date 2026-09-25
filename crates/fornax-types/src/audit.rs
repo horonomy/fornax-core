@@ -380,7 +380,7 @@ pub fn validate_audit_event(event: &AuditEvent) -> Result<(), AuditEventRejectio
 /// splits on the *first* colon only.
 ///
 /// [`RevocationEntry::audit_ref`]: crate::RevocationEntry::audit_ref
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditRef {
     pub issuer_scope: String,
     pub event_id: String,
