@@ -181,7 +181,7 @@ use crate::{AgentEvent, Evidence, Provider, RuntimeCapabilities, SignalAvailabil
 /// tail as [`SignalClass`]/[`SignalAvailability`] (FORNX-155 precedent) — a
 /// persisted `EvidenceSource` is exactly as durable a payload as a persisted
 /// `RuntimeCapabilities`, and must tolerate a future variant the same way.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TrustClass {
     /// Reported by the coding agent's own provider integration (e.g. Claude

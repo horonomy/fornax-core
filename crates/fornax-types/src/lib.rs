@@ -24,6 +24,7 @@ pub mod extension;
 pub mod graph;
 pub mod policy;
 pub mod privacy;
+pub mod provenance_guard;
 pub mod receipt;
 pub mod redact;
 pub mod reliability_context;
