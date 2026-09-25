@@ -1,0 +1,21 @@
+[package]
+name = "fornax-protocol-refclient"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "fornax_protocol_refclient"
+path = "src/lib.rs"
+
+# Deliberately depends on NOTHING from this workspace (no fornax-types,
+# fornax-verify, fornax-receipt, or fornax-protocol) -- see the crate's
+# module docs. This is the second, genuinely independent implementation of
+# the Agent Evidence Protocol's wire format (FORNX-391 AC2/AC1): it can only
+# use what a real external consumer could use -- the published wire schema,
+# nothing else.
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
