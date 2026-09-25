@@ -39,7 +39,13 @@
 //!   independence bookkeeping into a cross-agent dependency graph so
 //!   several agents sharing one root source cannot masquerade as
 //!   independent confirmation.
+//! - [`assurance_case`] — structured Assurance Cases (FORNX-387): projects
+//!   an [`fornax_verify::contract_satisfaction::SatisfactionReport`] plus a
+//!   policy [`fornax_verify::decision::Recommendation`] into a
+//!   machine-readable, human-reviewable claim/argument/evidence/limitations
+//!   case, with a before/after delta view across case versions.
 
+pub mod assurance_case;
 pub mod delegation;
 pub mod freshness;
 pub mod gate;
