@@ -40,6 +40,10 @@
 //!   synthetic data — see that module's docs.
 //! - [`slice`] — FORNX-344: breaks down metrics by the only trajectory
 //!   dimensions this codebase can actually observe (sensor, provider).
+//! - [`adversarial`] — FORNX-380: versioned Byzantine/poisoned-evidence
+//!   attack corpus over the FORNX-377/378/379 pipeline, with honest
+//!   detected/prevented/downgraded/escaped/inconclusive/unavailable outcome
+//!   bookkeeping.
 //! - [`baseline`] — FORNX-344: freezes a `BaselineReport` for a dataset +
 //!   config, the frozen artifact [`regression::compare`] diffs against.
 //! - [`regression`] — FORNX-344: case-level comparison between a frozen
@@ -49,6 +53,7 @@
 //!   `docs/release-assurance-policy.md`'s verdict vocabulary.
 
 pub mod ablation;
+pub mod adversarial;
 pub mod baseline;
 pub mod dataset;
 pub mod gate;
