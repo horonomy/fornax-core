@@ -72,6 +72,8 @@ use fornax_types::epistemic_contract::{
     assess_claim, ClaimAssessment, ClaimClassId, ContractError, ContractLookup, ContractRegistry,
     IndependenceRule, RequirementAssessment, RequirementLevel, SatisfactionState,
 };
+use fornax_types::provenance_guard::{authorize_evidence_source, bind_evidence_to_session};
+use fornax_types::provenance_guard::{CollectorAuthority, ProvenanceVerdict};
 use fornax_types::sensor::TrustClass;
 use fornax_types::{Claim, Evidence};
 use uuid::Uuid;
@@ -372,6 +374,85 @@ pub fn assess_with_capabilities(
         }
     }
 
+    Ok((report, violations))
+}
+
+/// One piece of evidence excluded before assessment ran at all, either
+/// because it was attributed to the wrong session (FORNX-381 AC2) or because
+/// its collector identity could not be authorized to assert its claimed
+/// trust class (FORNX-381 AC1/AC4) — see
+/// [`fornax_types::provenance_guard`]'s module docs. Never silently dropped,
+/// mirroring [`FamilyIndependenceViolation`] and [`CapabilityViolation`]'s
+/// visibility discipline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenanceGuardViolation {
+    pub evidence_id: Uuid,
+    pub reason: String,
+}
+
+/// [`assess`] hardened against two real, previously-`Escaped` FORNX-380
+/// attacks (FORNX-381): `fornx380-11-forged-trust-class-label` (nothing
+/// verified that a claimed [`TrustClass`] was actually assigned by the real
+/// sensor named on the evidence) and `fornx380-10-receipt-replay-cross-claim`'s
+/// sibling gap at the session-attribution layer — evidence carrying a
+/// different session's id was accepted identically to evidence genuinely
+/// from the claim's own session. See
+/// [`fornax_types::provenance_guard`]'s module docs for the full rationale
+/// and the ticket's disclosed scope note on the daemon/acquisition-request
+/// identity axes this does *not* yet cover.
+///
+/// This function closes both gaps **without changing [`assess`]'s signature
+/// or behavior** — every existing caller of `assess`/`assess_with_capabilities`
+/// is completely unaffected (FORNX-381 AC5: no loss of provenance for
+/// existing integrations, because nothing existing changes at all). Evidence
+/// is filtered *before* `assess` runs, not patched after the fact: an
+/// unauthorized or cross-session record contributes nothing to the
+/// assessment, which is the correct honest behavior per AC4 ("quarantined
+/// evidence... not counted negatively or positively") — a requirement with
+/// only quarantined evidence reads as [`SatisfactionState::Unavailable`],
+/// the same as a requirement with no evidence submitted at all, never as a
+/// fabricated contradiction.
+pub fn assess_with_provenance_guard(
+    registry: &ContractRegistry,
+    claim_class: &ClaimClassId,
+    claim: &Claim,
+    evidence: &[Evidence],
+    conditions_met: &[String],
+    authority: &CollectorAuthority,
+) -> Result<(SatisfactionReport, Vec<ProvenanceGuardViolation>), ContractError> {
+    let (bound, session_violations) = bind_evidence_to_session(claim, evidence);
+    let mut violations: Vec<ProvenanceGuardViolation> = session_violations
+        .into_iter()
+        .map(|v| ProvenanceGuardViolation {
+            evidence_id: v.evidence_id,
+            reason: format!(
+                "cross-session attribution: evidence session '{}' does not match claim session '{}'",
+                v.evidence_session_id, v.claim_session_id
+            ),
+        })
+        .collect();
+
+    let mut admitted: Vec<Evidence> = Vec::new();
+    for ev in bound {
+        match &ev.source {
+            Some(source) => match authorize_evidence_source(authority, source) {
+                ProvenanceVerdict::Trusted => admitted.push(ev.clone()),
+                ProvenanceVerdict::Quarantined { reason } => {
+                    violations.push(ProvenanceGuardViolation {
+                        evidence_id: ev.id,
+                        reason,
+                    });
+                }
+            },
+            None => violations.push(ProvenanceGuardViolation {
+                evidence_id: ev.id,
+                reason: "no EvidenceSource attached -- collector identity cannot be authenticated"
+                    .to_string(),
+            }),
+        }
+    }
+
+    let report = assess(registry, claim_class, claim, &admitted, conditions_met)?;
     Ok((report, violations))
 }
 
@@ -1136,5 +1217,231 @@ mod tests {
             "800-item evidence pool took unreasonably long: {:?}",
             started.elapsed()
         );
+    }
+
+    // --- FORNX-381 AC7: >= 5 provenance/source-authenticity attacks ------
+    // closed via `assess_with_provenance_guard`. Two are FORNX-380's own
+    // disclosed `Escaped` fixtures (11, 10); the rest are new attacks this
+    // ticket's own mechanisms specifically defend against, derived from the
+    // same FORNX-380 `AttackClass` taxonomy (`fornax-bench`).
+
+    fn evidence_full(
+        session_id: &str,
+        sensor_name: &str,
+        trust: TrustClass,
+        observed_at: &str,
+    ) -> Evidence {
+        Evidence {
+            id: Uuid::new_v4(),
+            session_id: session_id.to_string(),
+            source_event_id: Uuid::new_v4(),
+            kind: EvidenceKind::ExitCode,
+            observed_at: observed_at.to_string(),
+            payload: serde_json::json!({"exit_code": 0}),
+            provenance: "test".to_string(),
+            source: Some(EvidenceSource {
+                sensor_name: sensor_name.to_string(),
+                trust_class: trust,
+                collected_at: observed_at.to_string(),
+                provider: None,
+                collection_method: Default::default(),
+                collector_version: None,
+                freshness: Default::default(),
+                tamper_boundary: Default::default(),
+                correlation_group: None,
+                derived_from: Vec::new(),
+            }),
+            extension: None,
+            evidence_purged: false,
+        }
+    }
+
+    fn test_authority() -> CollectorAuthority {
+        CollectorAuthority::new()
+            .authorize_sensor("real_host_sensor", TrustClass::HostObserved)
+            .authorize_sensor("real_agent_sensor", TrustClass::AgentAdjacent)
+    }
+
+    // Attack 1 (fornx380-11-forged-trust-class-label, was Escaped): a
+    // registered collector claims a trust class it was never authorized
+    // for.
+    #[test]
+    fn attack_1_forged_trust_class_from_a_registered_but_unauthorized_sensor_is_quarantined() {
+        let reg = default_registry();
+        let cc = ClaimClassId::new("tests_passed", 1);
+        let c = claim("tests_passed", "2026-09-24T00:10:00Z");
+        // "real_agent_sensor" is only authorized for AgentAdjacent, but this
+        // evidence forges a HostObserved label under that same identity.
+        let forged = evidence_full(
+            "session-1",
+            "real_agent_sensor",
+            TrustClass::HostObserved,
+            "2026-09-24T00:00:00Z",
+        );
+        let (report, violations) =
+            assess_with_provenance_guard(&reg, &cc, &c, &[forged], &[], &test_authority())
+                .expect("assess ok");
+        assert_eq!(report.assessment.overall, SatisfactionState::Unavailable);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].reason.contains("not authorized"));
+    }
+
+    // Attack 2 (fornx380-10-receipt-replay-cross-claim, was Escaped): the
+    // same physical evidence row satisfying two unrelated claims across two
+    // separate assessment calls.
+    #[test]
+    fn attack_2_the_same_evidence_row_replayed_across_two_unrelated_claims_is_caught_by_the_ledger()
+    {
+        let mut ledger = fornax_types::provenance_guard::EvidenceConsumptionLedger::new();
+        let ev = evidence_full(
+            "session-1",
+            "real_host_sensor",
+            TrustClass::HostObserved,
+            "2026-09-24T00:00:00Z",
+        );
+        let claim_a = Uuid::new_v4();
+        let claim_b = Uuid::new_v4();
+        assert_eq!(
+            ledger.record_and_check(ev.id, claim_a),
+            fornax_types::provenance_guard::ReplayVerdict::FreshlyRecorded
+        );
+        let replay = ledger.record_and_check(ev.id, claim_b);
+        assert_eq!(
+            replay,
+            fornax_types::provenance_guard::ReplayVerdict::ReplayedAcrossClaims {
+                originally_consumed_by: claim_a
+            }
+        );
+    }
+
+    // Attack 3: a completely unregistered/fabricated collector identity
+    // (not merely unauthorized for one trust class, but never registered at
+    // all) is quarantined rather than trusted by default -- the general
+    // form of forged provenance FORNX-380 fixture 11 is one instance of.
+    #[test]
+    fn attack_3_a_fabricated_collector_identity_never_registered_at_all_is_quarantined() {
+        let reg = default_registry();
+        let cc = ClaimClassId::new("tests_passed", 1);
+        let c = claim("tests_passed", "2026-09-24T00:10:00Z");
+        let fabricated = evidence_full(
+            "session-1",
+            "totally_fabricated_sensor_v99",
+            TrustClass::HostObserved,
+            "2026-09-24T00:00:00Z",
+        );
+        let (report, violations) =
+            assess_with_provenance_guard(&reg, &cc, &c, &[fabricated], &[], &test_authority())
+                .expect("assess ok");
+        assert_eq!(report.assessment.overall, SatisfactionState::Unavailable);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].reason.contains("not a registered"));
+    }
+
+    // Attack 4: cross-session attribution -- evidence from an entirely
+    // different session (e.g. an attacker who captured or guessed another
+    // session's evidence) submitted against this claim's session.
+    #[test]
+    fn attack_4_cross_session_evidence_cannot_satisfy_a_claim_from_a_different_session() {
+        let reg = default_registry();
+        let cc = ClaimClassId::new("tests_passed", 1);
+        let c = claim("tests_passed", "2026-09-24T00:10:00Z"); // session-1 (see `claim` helper)
+        let foreign_session_evidence = evidence_full(
+            "session-ATTACKER",
+            "real_host_sensor",
+            TrustClass::HostObserved,
+            "2026-09-24T00:00:00Z",
+        );
+        let (report, violations) = assess_with_provenance_guard(
+            &reg,
+            &cc,
+            &c,
+            &[foreign_session_evidence],
+            &[],
+            &test_authority(),
+        )
+        .expect("assess ok");
+        assert_eq!(report.assessment.overall, SatisfactionState::Unavailable);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].reason.contains("cross-session"));
+    }
+
+    // Attack 5: coverage-gaming via a mixed pool -- one legitimate,
+    // correctly-sourced evidence item plus one forged-trust-class item,
+    // both submitted to satisfy a `min_coverage: 2` requirement. Proves the
+    // forged item cannot help satisfy coverage even when it rides alongside
+    // genuine evidence, an end-to-end integration exercise (not just the
+    // standalone `authorize_evidence_source` unit check).
+    #[test]
+    fn attack_5_a_forged_item_riding_alongside_legitimate_evidence_cannot_help_satisfy_coverage() {
+        let reg = registry_with_double_check(2);
+        let cc = ClaimClassId::new("fornx378_double_check", 1);
+        let c = claim("fornx378_double_check", "2026-09-24T00:10:00Z");
+        let legitimate_1 = evidence_full(
+            "session-1",
+            "real_host_sensor",
+            TrustClass::HostObserved,
+            "2026-09-24T00:00:00Z",
+        );
+        let legitimate_2 = evidence_full(
+            "session-1",
+            "real_host_sensor",
+            TrustClass::HostObserved,
+            "2026-09-24T00:00:01Z",
+        );
+        let forged = evidence_full(
+            "session-1",
+            "real_agent_sensor", // only authorized for AgentAdjacent
+            TrustClass::HostObserved,
+            "2026-09-24T00:00:02Z",
+        );
+        let (report, violations) = assess_with_provenance_guard(
+            &reg,
+            &cc,
+            &c,
+            &[legitimate_1, legitimate_2, forged],
+            &[],
+            &test_authority(),
+        )
+        .expect("assess ok");
+        // min_coverage is 2 -- only the two legitimate items are admitted,
+        // which is exactly enough on its own. This proves the forged item
+        // contributed nothing, not that it broke satisfaction outright.
+        assert_eq!(report.assessment.overall, SatisfactionState::Unsatisfied);
+        assert_eq!(
+            violations.len(),
+            1,
+            "exactly the forged item should be flagged"
+        );
+    }
+
+    // Hard negative: fully legitimate evidence, correctly sourced and
+    // session-matched, passes through `assess_with_provenance_guard`
+    // completely unaffected -- proves the guard doesn't false-positive on
+    // genuine evidence, mirroring FORNX-380's hard-negative discipline.
+    #[test]
+    fn hard_negative_legitimate_evidence_is_unaffected_by_the_provenance_guard() {
+        let reg = default_registry();
+        let cc = ClaimClassId::new("tests_passed", 1);
+        let c = claim("tests_passed", "2026-09-24T00:10:00Z");
+        let legitimate = evidence_full(
+            "session-1",
+            "real_host_sensor",
+            TrustClass::HostObserved,
+            "2026-09-24T00:00:00Z",
+        );
+        let plain_report =
+            assess(&reg, &cc, &c, std::slice::from_ref(&legitimate), &[]).expect("assess ok");
+        let (guarded_report, violations) =
+            assess_with_provenance_guard(&reg, &cc, &c, &[legitimate], &[], &test_authority())
+                .expect("assess ok");
+        assert_eq!(
+            guarded_report.assessment.overall,
+            plain_report.assessment.overall
+        );
+        assert_eq!(
+            guarded_report.assessment.overall,
+            SatisfactionState::Satisfied
+        );
+        assert!(violations.is_empty());
     }
 }
