@@ -26,6 +26,10 @@
 //!   left behind (AC5).
 //! - [`executor`] — ties the above together: two-layer gate, then stage,
 //!   apply, observe, and unconditionally clean up (AC3).
+//! - [`shadow`] — FORNX-386's Shadow Execution / Digital Twin Verification,
+//!   built on the four modules above rather than a second experiment
+//!   runtime: two isolated domain runners (file mutation, SQLite migration)
+//!   that verify a proposed high-impact action before real execution.
 //!
 //! # Invoked on demand, never on the critical path
 //!
@@ -39,6 +43,7 @@
 pub mod executor;
 pub mod orphan;
 pub mod policy;
+pub mod shadow;
 pub mod staging;
 
 pub use executor::{
