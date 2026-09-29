@@ -1541,11 +1541,7 @@ async fn post_json(url: &str) -> anyhow::Result<serde_json::Value> {
 /// mismatch is a hard stop, never a best-effort guess.
 fn verify_daemon_identity(response: &reqwest::Response) -> anyhow::Result<()> {
     let expected = fornax_types::home_identity(&fornax_home());
-    match response
-        .headers()
-        .get(HOME_IDENTITY_HEADER)
-        .and_then(|v| v.to_str().ok())
-    {
+    match read_daemon_identity(response) {
         Some(actual) if actual == expected => Ok(()),
         Some(actual) => Err(anyhow::anyhow!(
             "UNAVAILABLE: daemon identity mismatch (this daemon is serving a different \
@@ -1558,6 +1554,22 @@ fn verify_daemon_identity(response: &reqwest::Response) -> anyhow::Result<()> {
              its response (FORNX-339)"
         )),
     }
+}
+
+/// The raw value of [`HOME_IDENTITY_HEADER`], or `None` when the daemon did
+/// not send a readable one.
+///
+/// Split out of [`verify_daemon_identity`] so that a caller which must
+/// distinguish *mismatched* from *not reported* — the statusline provider,
+/// which renders those as two different bounded reason codes (HORO-1567) —
+/// can do so without string-matching on an error message. The FORNX-339
+/// comparison itself stays in one place: this returns what the daemon
+/// claimed, and nothing here decides whether that is acceptable.
+fn read_daemon_identity(response: &reqwest::Response) -> Option<&str> {
+    response
+        .headers()
+        .get(HOME_IDENTITY_HEADER)
+        .and_then(|v| v.to_str().ok())
 }
 
 fn render_status_line(v: &serde_json::Value) -> String {
