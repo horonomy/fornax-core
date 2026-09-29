@@ -367,6 +367,128 @@ pub fn reading(body: &Value, now: DateTime<Utc>) -> Value {
     payload
 }
 
+/// What kind of evidence a verifier sought, from its name.
+///
+/// The verifier set is closed — five names in `fornax-verify` — and a name
+/// carries no user content, which is what makes it safe to render. An
+/// unrecognised name yields `None` rather than being printed: a name this
+/// client does not know is unbounded output as far as it can prove.
+///
+/// This is deliberately *not* on the statusline. Two facts about one finding
+/// already cost the shared line a verdict, a reason clause and an age; a
+/// third would push Fornax past its share of a line it shares with the user's
+/// own statusline and every other product. HORO-1567's own answer to that is
+/// progressive disclosure, so it lives here, where there is room.
+fn evidence_sought(verifier_name: &str) -> Option<&'static str> {
+    match verifier_name {
+        "test_result_verifier_v1" => Some("test results"),
+        "command_executed_verifier_v1" => Some("command execution"),
+        "command_success_verifier_v1" => Some("command exit status"),
+        "file_modified_verifier_v1" => Some("file changes"),
+        "git_operation_verifier_v1" => Some("git operations"),
+        _ => None,
+    }
+}
+
+/// Human-readable explanation of the latest finding, for the read-only
+/// `explain` surface.
+///
+/// Given more room than a statusline, this says everything bounded that the
+/// authoritative model holds — and says plainly what it does *not* hold,
+/// which is the question a user reaches this surface with. What it never
+/// prints is the free-text half: `rationale`, `claim_text`, and the `detail`
+/// on a `MissingEvidence` row all carry claimed commands, file paths and
+/// branch names interpolated by the verifiers.
+///
+/// Claim and session ids are also left out. They are opaque identifiers that
+/// answer no question a reader of this surface is asking, and printing an
+/// identifier by default is how identifiers end up pasted into tickets.
+pub fn explain_text(status: &Value, fused: Option<&Value>, now: DateTime<Utc>) -> String {
+    let mut out = String::from("Fornax — latest finding on this machine (host-wide)\n\n");
+    let Some(latest) = status.get("latest").filter(|l| !l.is_null()) else {
+        out.push_str("  No findings recorded yet. The daemon is running and has\n");
+        out.push_str("  verified nothing so far, which is not the same as a pass.\n");
+        return out;
+    };
+    let verdict = latest
+        .get("verdict")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let rendering = verdict_rendering(verdict);
+    out.push_str(&format!("  verdict        {}\n", rendering.label));
+    match latest
+        .get("computed_at")
+        .and_then(|v| v.as_str())
+        .and_then(|raw| freshness(raw, now))
+    {
+        Some((stamp, age)) => out.push_str(&format!("  observed       {stamp} ({age}s ago)\n")),
+        None => out.push_str("  observed       timestamp unreadable\n"),
+    }
+    match latest
+        .get("verifier_name")
+        .and_then(|v| v.as_str())
+        .and_then(evidence_sought)
+    {
+        Some(kind) => out.push_str(&format!("  evidence for   {kind}\n")),
+        None => out.push_str("  evidence for   verifier this client does not know\n"),
+    }
+    if verdict == "unverified" {
+        out.push_str("  reason         not recorded\n\n");
+        out.push_str("  Fornax does not record a reason category for an unverified\n");
+        out.push_str("  finding. The finding does carry a free-text rationale, which\n");
+        out.push_str("  this surface deliberately does not show: the verifiers write\n");
+        out.push_str("  claimed commands, file paths and branch names into it.\n");
+        out.push_str("  `fornax detail` will show it, at that cost.\n");
+    }
+    out.push_str(&explain_fused(fused));
+    out
+}
+
+/// The fused view, appended to [`explain_text`].
+///
+/// This is where fusion's vocabulary is affordable: `UncertaintyBand` and
+/// `FusionRule` are closed, stable, snake_case names carrying no user
+/// content, and the whole-session load that produces them is fine off the hot
+/// path. `RationaleEntry::detail` is free text and is not printed.
+fn explain_fused(fused: Option<&Value>) -> String {
+    let mut out = String::from("\n  Fused view (read-only)\n");
+    let Some(fused) = fused else {
+        out.push_str("    unavailable — the fused view could not be computed\n");
+        return out;
+    };
+    if fused.get("found").and_then(|f| f.as_bool()) != Some(true) {
+        out.push_str("    no fused view for this claim yet\n");
+        return out;
+    }
+    let uncertainty = fused
+        .pointer("/fused/uncertainty")
+        .and_then(|u| u.as_str())
+        .unwrap_or("unreported");
+    out.push_str(&format!("    uncertainty  {uncertainty}\n"));
+    let rules: Vec<String> = fused
+        .pointer("/fused/rationale")
+        .and_then(|r| r.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| {
+                    let rule = e.get("rule").and_then(|r| r.as_str())?;
+                    let effect = e.get("effect").and_then(|r| r.as_str())?;
+                    Some(format!("{rule} ({effect})"))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if rules.is_empty() {
+        out.push_str("    rules        none recorded\n");
+    } else {
+        for rule in rules {
+            out.push_str(&format!("    rule         {rule}\n"));
+        }
+    }
+    out
+}
+
 /// Read the one endpoint the hot path is allowed to touch.
 ///
 /// Exactly one local HTTP `GET`, no retry and no fallback to a heavier
@@ -398,4 +520,70 @@ pub async fn probe() -> Result<Value, NoReading> {
         return Err(NoReading::StoreReadFailed);
     }
     Ok(body)
+}
+
+/// Read the fused view for the latest finding, for the `explain` surface only.
+///
+/// `GET /api/fusion` runs the baseline fusion policy over a whole session's
+/// claims, findings and evidence pool. That is far too expensive for a
+/// statusline refresh and is why the provider payload does not carry any of
+/// it; here, where the user has asked one question and is waiting for one
+/// answer, the cost is affordable.
+///
+/// Every failure collapses to `None`. The explain surface renders that as an
+/// explicit "unavailable" line rather than omitting the section, because a
+/// missing section reads as "there was nothing to say".
+pub async fn probe_fusion(latest: &Value) -> Option<Value> {
+    let claim = latest.get("claim_id").and_then(|v| v.as_str())?;
+    let session = latest.get("session_id").and_then(|v| v.as_str())?;
+    let url = format!(
+        "{}/api/fusion?claim={}&session={}",
+        crate::base_url(),
+        claim,
+        session
+    );
+    let response = reqwest::get(&url).await.ok()?;
+    let expected = fornax_types::home_identity(&crate::fornax_home());
+    if crate::read_daemon_identity(&response) != Some(expected.as_str()) {
+        return None;
+    }
+    response.json::<Value>().await.ok()
+}
+
+/// What the `explain` surface prints when there is no reading at all.
+///
+/// Says which of the five refusals happened and what the user can do about
+/// it. The statusline gets a bounded reason code for the same fact; this
+/// surface has room to say what the code means, which is the whole point of
+/// there being two surfaces.
+pub fn explain_unavailable(kind: NoReading) -> String {
+    let detail = match kind {
+        NoReading::DaemonUnreachable => {
+            "No Fornax daemon answered on this machine. Start it, or set \
+             FORNAX_HTTP_PORT if it listens somewhere else."
+        }
+        NoReading::DaemonIdentityMismatch => {
+            "A daemon answered but serves a different FORNAX_HOME than this \
+             client was configured with, so its findings are not this home's \
+             findings. Fornax refuses to read them rather than report another \
+             home's state as yours."
+        }
+        NoReading::DaemonIdentityNotReported => {
+            "A daemon answered but did not identify which FORNAX_HOME it \
+             serves, so this client cannot prove the findings are yours. That \
+             is usually an older daemon still running; restart it."
+        }
+        NoReading::StoreReadFailed => {
+            "The daemon is running but could not read its findings store."
+        }
+        NoReading::ResponseNotUnderstood => {
+            "The daemon answered with something this client could not parse, \
+             which usually means the two are different versions."
+        }
+    };
+    format!(
+        "Fornax — latest finding on this machine (host-wide)\n\n  {}\n  {}\n",
+        kind.label(),
+        detail
+    )
 }

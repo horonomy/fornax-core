@@ -461,6 +461,13 @@ enum StatuslineCommand {
     /// typed unavailability, because an empty answer renders as silence and
     /// silence reads as "all clear".
     Provider,
+    /// Explain the latest finding in full, read-only.
+    ///
+    /// The statusline is a shared line and gets one bounded state, one reason
+    /// code and one age. This is where the rest of what Fornax actually knows
+    /// is said — including, deliberately, what it does *not* know. Still
+    /// never prints the free-text rationale.
+    Explain,
 }
 
 fn base_url() -> String {
@@ -503,6 +510,21 @@ async fn main() -> anyhow::Result<()> {
                 };
                 println!("{payload}");
             }
+            // Not on the hot path, so this one may make the second, heavier
+            // call the provider refuses to make.
+            StatuslineCommand::Explain => match statusline::probe().await {
+                Ok(body) => {
+                    let fused = match body.get("latest").filter(|l| !l.is_null()) {
+                        Some(latest) => statusline::probe_fusion(latest).await,
+                        None => None,
+                    };
+                    print!(
+                        "{}",
+                        statusline::explain_text(&body, fused.as_ref(), chrono::Utc::now())
+                    );
+                }
+                Err(kind) => print!("{}", statusline::explain_unavailable(kind)),
+            },
         },
         Commands::Capabilities { session } => {
             let url = format!("{}/api/capabilities?session={}", base_url(), session);
