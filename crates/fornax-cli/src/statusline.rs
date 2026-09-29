@@ -28,7 +28,7 @@
 //! Code settings patcher; enabling and disabling this provider is the shared
 //! lifecycle tool's job (HORO-1566). This module reads one HTTP endpoint.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 use serde_json::{json, Value};
 
 /// Version of the cross-product provider contract (HORO-1564) this module
@@ -301,7 +301,11 @@ const MAX_AGE_SECONDS: i64 = 10 * 365 * 24 * 60 * 60;
 fn freshness(computed_at: &str, now: DateTime<Utc>) -> Option<(String, i64)> {
     let observed = DateTime::parse_from_rfc3339(computed_at)
         .ok()?
-        .with_timezone(&Utc);
+        .with_timezone(&Utc)
+        // Truncate before measuring, not after. The two fields then agree by
+        // construction, and the rounding error lands on the safe side: a
+        // truncated instant is earlier, so the age can only come out larger.
+        .trunc_subsecs(0);
     let age = (now - observed).num_seconds().clamp(0, MAX_AGE_SECONDS);
     Some((observed.format("%Y-%m-%dT%H:%M:%SZ").to_string(), age))
 }
