@@ -10,6 +10,7 @@ mod evidence_plan_cmd;
 mod experiment_ux;
 mod feedback_cmd;
 mod receipt_cmd;
+mod statusline;
 mod timeline;
 
 #[derive(Parser)]
@@ -30,6 +31,16 @@ enum Commands {
     Status,
     /// Full evidence/finding detail for recent sessions.
     Detail,
+    /// Structured, read-only provider for the shared Horonom statusline host
+    /// (HORO-1567). Productizes FORNX-30's `scripts/fornax-statusline.sh`:
+    /// where that wrapper had to own the host's single `statusLine.command`
+    /// to append its segment, this contributes one typed answer that the
+    /// shared host composes alongside the user's own statusline and every
+    /// other product's. Reads only; never writes host configuration.
+    Statusline {
+        #[command(subcommand)]
+        command: StatuslineCommand,
+    },
     /// Per-`SignalClass` capability availability for one session (FORNX-85):
     /// which signals the announcing runtime(s) actually exposed this
     /// session — available, unsupported, unavailable, redacted, collection-
@@ -442,6 +453,23 @@ struct ReliabilityArgs {
     compare_adapter_version: Option<String>,
 }
 
+#[derive(Subcommand)]
+enum StatuslineCommand {
+    /// Emit one HORO-1564 provider payload as JSON on stdout, for the shared
+    /// statusline host to compose. Always succeeds and always prints a
+    /// payload: a probe that could not read Fornax's state says so as a
+    /// typed unavailability, because an empty answer renders as silence and
+    /// silence reads as "all clear".
+    Provider,
+    /// Explain the latest finding in full, read-only.
+    ///
+    /// The statusline is a shared line and gets one bounded state, one reason
+    /// code and one age. This is where the rest of what Fornax actually knows
+    /// is said — including, deliberately, what it does *not* know. Still
+    /// never prints the free-text rationale.
+    Explain,
+}
+
 fn base_url() -> String {
     let port = std::env::var("FORNAX_HTTP_PORT").unwrap_or_else(|_| "4317".to_string());
     format!("http://127.0.0.1:{port}")
@@ -470,6 +498,35 @@ async fn main() -> anyhow::Result<()> {
                 Err(e) => println!("fornax: {e}"),
             }
         }
+        Commands::Statusline { command } => match command {
+            // Exits 0 in every case, including every failure. The host runs
+            // this on the statusline hot path and reads stdout; a non-zero
+            // exit would make a stopped daemon indistinguishable from a
+            // broken provider, and the payload already says which it is.
+            StatuslineCommand::Provider => {
+                let payload = match statusline::probe(statusline::HOT_PATH_BUDGET).await {
+                    Ok(body) => statusline::reading(&body, chrono::Utc::now()),
+                    Err(kind) => statusline::no_reading(kind),
+                };
+                println!("{payload}");
+            }
+            // Not on the hot path, so this one may make the second, heavier
+            // call the provider refuses to make.
+            StatuslineCommand::Explain => match statusline::probe(statusline::EXPLAIN_BUDGET).await
+            {
+                Ok(body) => {
+                    let fused = match body.get("latest").filter(|l| !l.is_null()) {
+                        Some(latest) => statusline::probe_fusion(latest).await,
+                        None => None,
+                    };
+                    print!(
+                        "{}",
+                        statusline::explain_text(&body, fused.as_ref(), chrono::Utc::now())
+                    );
+                }
+                Err(kind) => print!("{}", statusline::explain_unavailable(kind)),
+            },
+        },
         Commands::Capabilities { session } => {
             let url = format!("{}/api/capabilities?session={}", base_url(), session);
             match fetch_json(&url).await {
@@ -1541,11 +1598,7 @@ async fn post_json(url: &str) -> anyhow::Result<serde_json::Value> {
 /// mismatch is a hard stop, never a best-effort guess.
 fn verify_daemon_identity(response: &reqwest::Response) -> anyhow::Result<()> {
     let expected = fornax_types::home_identity(&fornax_home());
-    match response
-        .headers()
-        .get(HOME_IDENTITY_HEADER)
-        .and_then(|v| v.to_str().ok())
-    {
+    match read_daemon_identity(response) {
         Some(actual) if actual == expected => Ok(()),
         Some(actual) => Err(anyhow::anyhow!(
             "UNAVAILABLE: daemon identity mismatch (this daemon is serving a different \
@@ -1558,6 +1611,22 @@ fn verify_daemon_identity(response: &reqwest::Response) -> anyhow::Result<()> {
              its response (FORNX-339)"
         )),
     }
+}
+
+/// The raw value of [`HOME_IDENTITY_HEADER`], or `None` when the daemon did
+/// not send a readable one.
+///
+/// Split out of [`verify_daemon_identity`] so that a caller which must
+/// distinguish *mismatched* from *not reported* — the statusline provider,
+/// which renders those as two different bounded reason codes (HORO-1567) —
+/// can do so without string-matching on an error message. The FORNX-339
+/// comparison itself stays in one place: this returns what the daemon
+/// claimed, and nothing here decides whether that is acceptable.
+fn read_daemon_identity(response: &reqwest::Response) -> Option<&str> {
+    response
+        .headers()
+        .get(HOME_IDENTITY_HEADER)
+        .and_then(|v| v.to_str().ok())
 }
 
 fn render_status_line(v: &serde_json::Value) -> String {

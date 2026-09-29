@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 # Fornax status-line wrapper (FORNX-30 project-scoped dogfooding).
 #
+# SUPERSEDED by `fornax statusline provider` and the shared statusline host
+# (HORO-1567). Frozen deliberately: existing `.claude/settings.local.json`
+# files point at this path, so its behaviour and its stdout stay
+# byte-identical rather than changing underneath a working setup. It takes no
+# fixes -- its three known limitations (a hardcoded `~/.claude/statusline.py`
+# upstream, a hardcoded `target/debug/fornax`, and a bare shield codepoint
+# with no variation selector) are why it is superseded. See
+# docs/dogfooding-status-line.md for the migration path.
+#
 # A project-level `statusLine` command fully REPLACES the user's global one
 # for sessions rooted in this project (Claude Code does not merge non-list
 # settings across scopes). This script preserves that behavior instead of
