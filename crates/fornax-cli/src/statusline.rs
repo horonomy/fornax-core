@@ -709,6 +709,54 @@ mod tests {
     }
 
     #[test]
+    fn freshness_converts_the_stores_offset_timestamp_to_the_contracts_z_form() {
+        // The verifiers write `Utc::now().to_rfc3339()`: a `+00:00` offset
+        // with nanoseconds. The contract requires a literal `Z` and at most
+        // microseconds, and refuses an offset outright because an age
+        // computed from one is ambiguous across machines.
+        let payload = reading(&status_with("verified"), now());
+        assert_eq!(payload["observed_at"], "2026-09-29T11:59:00Z");
+        assert_eq!(segment(&payload)["age_seconds"], 60);
+    }
+
+    #[test]
+    fn a_future_timestamp_clamps_to_zero_rather_than_reporting_a_negative_age() {
+        // Not hypothetical: a timestamp under an agent's influence has
+        // already produced a nonsense age in the founder's own wrapper, and a
+        // huge number is the reading a user would trust and understand least.
+        let mut body = status_with("verified");
+        body["latest"]["computed_at"] = json!("2026-09-29T12:05:00+00:00");
+        assert_eq!(segment(&reading(&body, now()))["age_seconds"], 0);
+    }
+
+    #[test]
+    fn an_unreadable_timestamp_yields_no_freshness_cue_at_all() {
+        // Substituting "now" would present an unreadable timestamp as a fresh
+        // reading, which is the one direction that misleads. No cue is the
+        // honest answer, and the verdict is still worth reporting without one.
+        let mut body = status_with("verified");
+        body["latest"]["computed_at"] = json!("last Tuesday");
+        let payload = reading(&body, now());
+        assert!(payload.get("observed_at").is_none());
+        let seg = segment(&payload);
+        assert!(seg.get("age_seconds").is_none());
+        assert_eq!(seg["label"], "Verified");
+    }
+
+    #[test]
+    fn an_absurdly_old_timestamp_clamps_instead_of_failing_the_whole_payload() {
+        // The host rejects an age past its own ceiling, and a rejected
+        // provider renders as an unknown with no reading at all. "Very old"
+        // is a worse answer than the truth and a much better one than that.
+        let mut body = status_with("verified");
+        body["latest"]["computed_at"] = json!("1970-01-01T00:00:00+00:00");
+        assert_eq!(
+            segment(&reading(&body, now()))["age_seconds"],
+            MAX_AGE_SECONDS
+        );
+    }
+
+    #[test]
     fn availability_is_still_available_when_there_are_no_findings() {
         // The daemon answered. "Running and has verified nothing" is a live
         // reading, not an absence of one, and reporting it as unavailable
