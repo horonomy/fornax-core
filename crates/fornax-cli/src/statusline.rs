@@ -926,4 +926,89 @@ mod tests {
             assert!(!rendered.contains("4317"), "{kind:?} rendered a port");
         }
     }
+
+    #[test]
+    fn explain_says_the_reason_is_not_recorded_rather_than_omitting_it() {
+        // The whole point of this surface is that a user arrives asking "why
+        // is this unverified". Leaving the absence to be inferred from a
+        // missing line is the answer that sends them looking for a bug.
+        let text = explain_text(&status_with("unverified"), None, now());
+        assert!(text.contains("reason         not recorded"));
+        assert!(text.contains("does not record a reason category"));
+    }
+
+    #[test]
+    fn explain_does_not_volunteer_a_reason_line_for_a_verdict_that_has_no_gap() {
+        // `verified` and `contradicted` are decided answers. A "reason: not
+        // recorded" line beside them would invent a doubt.
+        for verdict in ["verified", "contradicted", "review"] {
+            let text = explain_text(&status_with(verdict), None, now());
+            assert!(!text.contains("not recorded"), "{verdict}");
+        }
+    }
+
+    #[test]
+    fn explain_names_the_kind_of_evidence_the_verifier_sought() {
+        // The closed five-name set from `fornax-verify`, and the cue this
+        // surface exists to carry instead of the statusline.
+        let text = explain_text(&status_with("unverified"), None, now());
+        assert!(text.contains("evidence for   test results"), "{text}");
+    }
+
+    #[test]
+    fn an_unrecognised_verifier_name_is_reported_as_unknown_not_printed() {
+        // A name this client has never seen is unbounded output as far as it
+        // can prove, so it is described rather than echoed.
+        let mut body = status_with("unverified");
+        body["latest"]["verifier_name"] = json!("some_future_verifier_v9");
+        let text = explain_text(&body, None, now());
+        assert!(!text.contains("some_future_verifier_v9"), "{text}");
+        assert!(
+            text.contains("verifier this client does not know"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn explain_distinguishes_no_fused_view_from_no_answer_about_one() {
+        // Three different facts, and a missing section would read as the
+        // absence of all three.
+        let body = status_with("unverified");
+        let unreachable = explain_text(&body, None, now());
+        assert!(unreachable.contains("unavailable"), "{unreachable}");
+
+        let not_found = explain_text(&body, Some(&json!({"found": false})), now());
+        assert!(not_found.contains("no fused view for this claim yet"));
+
+        let found = explain_text(
+            &body,
+            Some(&json!({"found": true, "fused": {"uncertainty": "undetermined"}})),
+            now(),
+        );
+        assert!(found.contains("uncertainty  undetermined"));
+        // No rationale array at all is "none recorded", not silence.
+        assert!(found.contains("rules        none recorded"), "{found}");
+    }
+
+    #[test]
+    fn explain_reports_no_findings_without_calling_it_a_pass() {
+        let text = explain_text(&json!({"latest": null}), None, now());
+        assert!(text.contains("No findings recorded yet"));
+        assert!(text.contains("not the same as a pass"));
+    }
+
+    #[test]
+    fn every_unavailable_explanation_says_what_to_do_about_it() {
+        // A diagnostic that names a state without naming a next step is a
+        // dead end, and four of these five are user-fixable.
+        for kind in ALL_NO_READINGS {
+            let text = explain_unavailable(kind);
+            assert!(text.contains(kind.label()), "{kind:?}");
+            // Longer than the label alone, i.e. it actually explains.
+            assert!(
+                text.len() > kind.label().len() + 60,
+                "{kind:?} explained nothing"
+            );
+        }
+    }
 }
