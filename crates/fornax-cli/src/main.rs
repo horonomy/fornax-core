@@ -498,7 +498,7 @@ async fn main() -> anyhow::Result<()> {
             // broken provider, and the payload already says which it is.
             StatuslineCommand::Provider => {
                 let payload = match statusline::probe().await {
-                    Ok(body) => statusline::reading(&body),
+                    Ok(body) => statusline::reading(&body, chrono::Utc::now()),
                     Err(kind) => statusline::no_reading(kind),
                 };
                 println!("{payload}");

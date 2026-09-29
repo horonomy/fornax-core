@@ -28,6 +28,7 @@
 //! Code settings patcher; enabling and disabling this provider is the shared
 //! lifecycle tool's job (HORO-1566). This module reads one HTTP endpoint.
 
+use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 
 /// Version of the cross-product provider contract (HORO-1564) this module
@@ -225,6 +226,39 @@ fn verdict_rendering(verdict: &str) -> VerdictRendering {
     }
 }
 
+/// Longest age the contract accepts, in seconds. Mirrored here so a wildly
+/// out-of-range timestamp degrades to a clamped age rather than making the
+/// host reject the whole payload — a rejected provider renders as an unknown
+/// with no reading at all, which is a worse answer than "very old".
+const MAX_AGE_SECONDS: i64 = 10 * 365 * 24 * 60 * 60;
+
+/// Turn a finding's `computed_at` into the contract's `observed_at` and an age.
+///
+/// This is the freshness cue HORO-1567 asks for, and it is derived
+/// *structurally* from a timestamp the store already holds — not inferred from
+/// how many events were collected, which the ticket rules out and which would
+/// be the wrong inference anyway.
+///
+/// Two conversions are needed. The verifiers write `computed_at` as
+/// `chrono::Utc::now().to_rfc3339()`, an offset form (`+00:00`) carrying
+/// nanoseconds; the contract requires an explicit `Z` and at most
+/// microseconds, and refuses a local offset outright because an age computed
+/// from one is ambiguous across machines. Truncating to whole seconds
+/// satisfies both and costs nothing a statusline could have displayed.
+///
+/// A timestamp in the future clamps to zero rather than reporting a negative
+/// age. That is not hypothetical: a value under an agent's influence has
+/// already produced a nonsense age in the founder's own wrapper, and an age
+/// that renders as a huge number is the one reading a user would trust least
+/// and understand least.
+fn freshness(computed_at: &str, now: DateTime<Utc>) -> Option<(String, i64)> {
+    let observed = DateTime::parse_from_rfc3339(computed_at)
+        .ok()?
+        .with_timezone(&Utc);
+    let age = (now - observed).num_seconds().clamp(0, MAX_AGE_SECONDS);
+    Some((observed.format("%Y-%m-%dT%H:%M:%SZ").to_string(), age))
+}
+
 /// Build the provider payload from a successful `/api/status` body.
 ///
 /// Both shapes the endpoint can return are real answers, and they are
@@ -232,7 +266,8 @@ fn verdict_rendering(verdict: &str) -> VerdictRendering {
 /// verified nothing yet — which is `neutral`, never `ok`. "Nothing has been
 /// checked" is not "everything checks out", and no count is reported either,
 /// because a zero here would read as a clean bill of health.
-pub fn reading(body: &Value) -> Value {
+pub fn reading(body: &Value, now: DateTime<Utc>) -> Value {
+    let mut observed_at = None;
     let segment = match body.get("latest").filter(|l| !l.is_null()) {
         None => json!({
             "key": "latest_finding",
@@ -246,15 +281,28 @@ pub fn reading(body: &Value) -> Value {
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
             let rendering = verdict_rendering(verdict);
-            json!({
+            let mut segment = json!({
                 "key": "latest_finding",
                 "state": rendering.state,
                 "label": rendering.label,
                 "explain_key": "fornax.latest_finding",
-            })
+            });
+            // A finding whose timestamp will not parse simply has no
+            // freshness cue. The alternative — substituting "now" — would
+            // present an unreadable timestamp as a fresh reading, which is
+            // the one direction that misleads.
+            if let Some((stamp, age)) = latest
+                .get("computed_at")
+                .and_then(|v| v.as_str())
+                .and_then(|raw| freshness(raw, now))
+            {
+                segment["age_seconds"] = json!(age);
+                observed_at = Some(stamp);
+            }
+            segment
         }
     };
-    json!({
+    let mut payload = json!({
         "contract_version": CONTRACT_VERSION,
         "provider": PROVIDER_ID,
         "provider_version": env!("CARGO_PKG_VERSION"),
@@ -262,7 +310,11 @@ pub fn reading(body: &Value) -> Value {
         "availability": "available",
         "order_hint": ORDER_HINT,
         "segments": [segment],
-    })
+    });
+    if let Some(stamp) = observed_at {
+        payload["observed_at"] = json!(stamp);
+    }
+    payload
 }
 
 /// Read the one endpoint the hot path is allowed to touch.
