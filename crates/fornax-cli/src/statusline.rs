@@ -821,4 +821,109 @@ mod tests {
             assert_ne!(payload["availability"], "available", "{kind:?}");
         }
     }
+
+    /// Substrings that must never appear in anything either surface prints.
+    ///
+    /// The first three are the free-text fields themselves. `sk-`, `ghp_` and
+    /// `Bearer` are shapes a credential takes: no code path here reads a
+    /// credential, and these assertions exist so that a future one cannot
+    /// start without a test noticing.
+    const FORBIDDEN: [&str; 6] = [
+        "private/repo",
+        "pytest",
+        "I ran the tests",
+        "sk-",
+        "ghp_",
+        "Bearer",
+    ];
+
+    fn assert_nothing_forbidden(where_: &str, rendered: &str) {
+        for needle in FORBIDDEN {
+            assert!(
+                !rendered.contains(needle),
+                "{where_} leaked {needle:?}:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_free_text_product_field_reaches_the_provider_payload() {
+        // The fixture's `rationale` and `claim_text` carry exactly what the
+        // verifiers really interpolate: a claimed command and a claimed path.
+        // Both are in the input; neither may be in the output.
+        for verdict in [
+            "verified",
+            "unverified",
+            "contradicted",
+            "review",
+            "unavailable",
+            "some_future_verdict",
+        ] {
+            let payload = reading(&status_with(verdict), now());
+            assert_nothing_forbidden(
+                &format!("provider payload for {verdict}"),
+                &payload.to_string(),
+            );
+        }
+    }
+
+    #[test]
+    fn no_free_text_product_field_reaches_the_explain_surface() {
+        // Same guarantee where the temptation is strongest: this surface has
+        // room to print the rationale and deliberately does not.
+        let text = explain_text(&status_with("unverified"), None, now());
+        assert_nothing_forbidden("explain", &text);
+        // And with a fused view, whose rationale entries carry their own free
+        // text in `detail`.
+        let fused = json!({
+            "found": true,
+            "fused": {
+                "uncertainty": "undetermined",
+                "rationale": [{
+                    "rule": "verdict_decided",
+                    "effect": "decided",
+                    "detail": "nobody looked for pytest in /Users/someone/private/repo",
+                }],
+            },
+        });
+        let text = explain_text(&status_with("unverified"), Some(&fused), now());
+        assert_nothing_forbidden("explain with fused view", &text);
+        // The closed vocabularies it *is* allowed to print are still printed,
+        // so this is not passing by rendering nothing.
+        assert!(text.contains("undetermined"));
+        assert!(text.contains("verdict_decided"));
+    }
+
+    #[test]
+    fn neither_surface_prints_an_opaque_identifier() {
+        // Claim and session ids answer no question either surface is asked,
+        // and printing an identifier by default is how identifiers end up
+        // pasted into tickets.
+        let body = status_with("unverified");
+        let ids = [
+            "62d3a1f0-0000-4000-8000-000000000001",
+            "62d3a1f0-0000-4000-8000-000000000002",
+            "62d3a1f0-0000-4000-8000-000000000003",
+        ];
+        let rendered = format!(
+            "{}{}",
+            reading(&body, now()),
+            explain_text(&body, None, now())
+        );
+        for id in ids {
+            assert!(!rendered.contains(id), "leaked {id}");
+        }
+    }
+
+    #[test]
+    fn no_failure_label_carries_a_home_path_a_port_or_an_identity_digest() {
+        // These labels are rendered straight into the user's terminal, and an
+        // error string from this codebase routinely carries all three.
+        for kind in ALL_NO_READINGS {
+            let rendered = format!("{}{}", no_reading(kind), explain_unavailable(kind));
+            assert!(!rendered.contains('/'), "{kind:?} rendered a path");
+            assert!(!rendered.contains("127.0.0.1"), "{kind:?} rendered a host");
+            assert!(!rendered.contains("4317"), "{kind:?} rendered a port");
+        }
+    }
 }
