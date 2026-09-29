@@ -106,3 +106,18 @@ fn the_provider_creates_nothing_and_modifies_nothing() {
     assert_eq!(before, 0);
     assert!(after.is_empty(), "created {after:?}");
 }
+
+#[test]
+fn the_explain_surface_names_a_next_step_when_there_is_nothing_to_read() {
+    // A diagnostic that reports a state without reporting what to do about it
+    // sends the user looking for a bug in the wrong place.
+    let home = temp_home("explain");
+    let run = run("explain", &home, closed_port());
+    assert!(run.status.success());
+    assert!(
+        run.stdout.contains("No Fornax daemon answered"),
+        "{}",
+        run.stdout
+    );
+    assert!(run.stdout.contains("Start it"), "{}", run.stdout);
+}
