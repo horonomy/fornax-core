@@ -16,6 +16,7 @@
 
 use std::net::TcpListener;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
@@ -29,6 +30,26 @@ fn fornax_bin() -> &'static str {
 fn closed_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.local_addr().unwrap().port()
+}
+
+/// A port where something is listening but will never answer: a daemon that
+/// is up and hung, rather than stopped.
+///
+/// The accepted connection is held open on purpose. Dropping it would close
+/// the socket, and a closed socket is a refusal — which is the other case
+/// entirely, and already covered.
+fn hung_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(30));
+                drop(stream);
+            });
+        }
+    });
+    port
 }
 
 fn temp_home(label: &str) -> std::path::PathBuf {
@@ -142,4 +163,30 @@ fn no_failure_output_reveals_the_home_directory_or_the_port() {
             "{subcommand} leaked the port"
         );
     }
+}
+
+#[test]
+fn a_hung_daemon_is_bounded_and_is_not_reported_as_a_stopped_one() {
+    // The provider runs on every statusline refresh. Without its own budget
+    // it would wait here until the host killed it, contributing nothing at
+    // all -- and calling a listening daemon "Not running" would send the
+    // reader to start one that is already up.
+    let home = temp_home("hung");
+    let started = Instant::now();
+    let run = run("provider", &home, hung_port());
+    let elapsed = started.elapsed();
+
+    assert!(run.status.success(), "exit {:?}", run.status.code());
+    assert_eq!(run.stderr, "");
+    let payload: serde_json::Value = serde_json::from_str(run.stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout was not a payload: {e}\n{}", run.stdout));
+    assert_eq!(payload["availability"], "unknown");
+    let segments = payload["segments"].as_array().unwrap();
+    assert_eq!(segments[0]["reason_code"], "daemon_too_slow");
+    assert_ne!(segments[0]["state"], "ok");
+
+    // The socket holds the connection for 30s. Returning at all proves the
+    // budget bit; the generous bound leaves room for macOS's one-time
+    // first-exec cost on a freshly built binary.
+    assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
 }
