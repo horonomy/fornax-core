@@ -40,6 +40,7 @@ fn temp_home(label: &str) -> std::path::PathBuf {
 
 struct Run {
     stdout: String,
+    stderr: String,
     status: std::process::ExitStatus,
 }
 
@@ -52,6 +53,7 @@ fn run(subcommand: &str, home: &std::path::Path, port: u16) -> Run {
         .unwrap();
     Run {
         stdout: String::from_utf8(out.stdout).unwrap(),
+        stderr: String::from_utf8(out.stderr).unwrap(),
         status: out.status,
     }
 }
@@ -76,4 +78,14 @@ fn the_provider_exits_zero_with_a_payload_when_no_daemon_is_running() {
     assert_eq!(segments.len(), 1);
     assert_eq!(segments[0]["reason_code"], "daemon_unreachable");
     assert_ne!(segments[0]["state"], "ok");
+}
+
+#[test]
+fn the_provider_writes_nothing_to_stderr() {
+    // Claude Code runs the slot command with its stderr inherited, so noise
+    // here can land in the user's terminal — including, on a bad day, an
+    // error string carrying a $FORNAX_HOME path.
+    let home = temp_home("stderr");
+    let run = run("provider", &home, closed_port());
+    assert_eq!(run.stderr, "", "provider wrote to stderr");
 }
