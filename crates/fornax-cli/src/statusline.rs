@@ -587,3 +587,131 @@ pub fn explain_unavailable(kind: NoReading) -> String {
         detail
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fixed clock, so an age assertion is an assertion about arithmetic and
+    /// not about how long the test took to run.
+    fn now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-09-29T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    /// The free-text fields, carrying the kind of interpolated user content
+    /// the verifiers really write into them. Every privacy assertion in this
+    /// module searches rendered output for these markers.
+    const RATIONALE: &str =
+        "no test-result evidence for claimed command \"pytest /Users/someone/private/repo\"";
+    const CLAIM_TEXT: &str = "I ran the tests in /Users/someone/private/repo and they all passed";
+
+    /// An `/api/status` body with one finding, shaped as `FindingRow`'s
+    /// `Serialize` really produces it — every field present, including the
+    /// two that may never be rendered. A fixture that omitted them could not
+    /// prove they are not rendered.
+    fn status_with(verdict: &str) -> Value {
+        json!({"latest": {
+            "id": "62d3a1f0-0000-4000-8000-000000000001",
+            "claim_id": "62d3a1f0-0000-4000-8000-000000000002",
+            "session_id": "62d3a1f0-0000-4000-8000-000000000003",
+            "verdict": verdict,
+            "evidence_ids": "[]",
+            "verifier_name": "test_result_verifier_v1",
+            "rationale": RATIONALE,
+            "claim_text": CLAIM_TEXT,
+            "computed_at": "2026-09-29T11:59:00.123456789+00:00",
+        }})
+    }
+
+    fn segment(payload: &Value) -> Value {
+        payload["segments"][0].clone()
+    }
+
+    #[test]
+    fn verified_is_the_only_verdict_that_renders_as_ok() {
+        let seg = segment(&reading(&status_with("verified"), now()));
+        assert_eq!(seg["state"], "ok");
+        assert_eq!(seg["label"], "Verified");
+        // A pass needs no reason clause, and inventing one would put a
+        // qualifier on the one verdict that does not want one.
+        assert!(seg.get("reason_code").is_none());
+    }
+
+    #[test]
+    fn the_other_four_verdicts_stay_distinct_and_none_of_them_is_ok() {
+        // ADR-0001's five-state vocabulary, never collapsed: `Unverified` is
+        // not a failure and emphatically not a pass, `Unavailable` means
+        // Fornax could not obtain evidence rather than that it found the
+        // claim wanting, and `Review` asks for a human rather than reporting
+        // a defect.
+        let cases = [
+            ("unverified", "attention", "Unverified"),
+            ("contradicted", "critical", "Contradicted"),
+            ("review", "warn", "Needs review"),
+            ("unavailable", "unknown", "Evidence unavailable"),
+        ];
+        let mut states = Vec::new();
+        for (verdict, state, label) in cases {
+            let seg = segment(&reading(&status_with(verdict), now()));
+            assert_eq!(seg["state"], state, "state for {verdict}");
+            assert_eq!(seg["label"], label, "label for {verdict}");
+            assert_ne!(seg["state"], "ok", "{verdict} must never read as a pass");
+            states.push(seg["state"].clone());
+        }
+        states.dedup();
+        assert_eq!(states.len(), 4, "two verdicts collapsed onto one state");
+    }
+
+    #[test]
+    fn unverified_states_its_missing_reason_explicitly() {
+        // Omitting the field would render as *no reason clause*, which reads
+        // as "there was nothing to say". An explicit code renders as "the
+        // reason is not recorded". Only this provider can tell them apart.
+        let seg = segment(&reading(&status_with("unverified"), now()));
+        assert_eq!(seg["reason_code"], "reason_not_recorded");
+        // No label: the host's prettifier produces the same words, and a
+        // second copy would only drift.
+        assert!(seg.get("reason_label").is_none());
+    }
+
+    #[test]
+    fn a_verdict_this_client_does_not_know_is_reported_as_a_version_gap() {
+        let seg = segment(&reading(&status_with("some_future_verdict"), now()));
+        assert_eq!(seg["state"], "unknown");
+        assert_eq!(seg["reason_code"], "client_older_than_daemon");
+        // The raw name is not passed through as a label: the verdict set is
+        // closed in `fornax-types`, so an unrecognised string is unbounded
+        // product output as far as this client can prove.
+        assert!(!seg["label"]
+            .as_str()
+            .unwrap()
+            .contains("some_future_verdict"));
+    }
+
+    #[test]
+    fn no_findings_yet_is_neutral_and_carries_no_count() {
+        let payload = reading(&json!({"latest": null}), now());
+        let seg = segment(&payload);
+        assert_eq!(seg["state"], "neutral");
+        assert_ne!(seg["state"], "ok", "nothing checked is not everything fine");
+        // A zero here would render as a clean bill of health.
+        assert!(seg.get("count").is_none());
+        assert!(seg.get("total").is_none());
+        // Nothing was observed, so there is nothing to be fresh or stale.
+        assert!(seg.get("age_seconds").is_none());
+        assert!(payload.get("observed_at").is_none());
+    }
+
+    #[test]
+    fn availability_is_still_available_when_there_are_no_findings() {
+        // The daemon answered. "Running and has verified nothing" is a live
+        // reading, not an absence of one, and reporting it as unavailable
+        // would blame the wrong thing.
+        assert_eq!(
+            reading(&json!({"latest": null}), now())["availability"],
+            "available"
+        );
+    }
+}
