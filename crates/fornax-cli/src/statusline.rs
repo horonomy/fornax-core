@@ -181,6 +181,8 @@ pub fn no_reading(kind: NoReading) -> Value {
 struct VerdictRendering {
     state: &'static str,
     label: &'static str,
+    /// Bounded reason clause, where this verdict has one worth stating.
+    reason_code: Option<&'static str>,
 }
 
 /// Map a `fornax_types::Verdict` wire name onto the shared semantic states.
@@ -197,31 +199,76 @@ struct VerdictRendering {
 /// means the daemon is newer than the CLI, which is a fact about versions
 /// worth saying plainly — and rendering an unknown string would put
 /// unbounded product output on the user's line.
+///
+/// # Why `unverified` carries `reason_not_recorded`
+///
+/// HORO-1567 asks for a bounded, privacy-safe reason category beside an
+/// UNVERIFIED verdict, *where the authoritative model can supply one*. It
+/// cannot, and that was established by elimination against this codebase
+/// rather than assumed:
+///
+/// - `Finding::rationale` is free prose into which the verifiers interpolate
+///   claimed command strings, claimed file paths and claimed branch names. It
+///   is the one field that would answer the question and the one field that
+///   may never be rendered.
+/// - An empty `Finding::evidence_ids` does not mean "no evidence was found".
+///   `file_modified_verifier_v1` returns exactly that list for the case where
+///   a file diff *was* observed and its diff was empty, so emptiness cannot
+///   be read as an evidence gap.
+/// - The FORNX-89 evidence graph would carry `MissingEvidence` with a typed
+///   `SignalAvailability`, but nothing populates it in production: every
+///   insert site in `fornax-store` and `fornax-daemon` is inside a test
+///   module, and its only production producer, `fusion::project_graph`,
+///   matches `Verdict::Unverified` with an empty arm. Its missing-evidence
+///   rows exist solely for `Verdict::Unavailable`.
+/// - `fusion`'s `UncertaintyBand` and `FusionRule` *are* a closed,
+///   privacy-safe vocabulary, but `compute_fusion` loads a whole session's
+///   claims, findings and evidence pool, which is not a hot-path operation;
+///   and over an unverified finding the projected graph is empty, so the only
+///   band it can report is `Undetermined`. That is not a reason either. It
+///   belongs to the explain surface, where the cost is affordable.
+///
+/// So the honest answer is an explicit code saying the reason is not
+/// recorded. It is emitted rather than omitted, because the host draws that
+/// distinction deliberately: with no reason field at all the rendered line
+/// carries no reason clause, which reads as "there was nothing to say",
+/// whereas an explicit code renders as "the reason is not recorded". Those
+/// are different claims and only this provider can tell them apart.
+///
+/// No `reason_label` accompanies it. The host's own prettifier turns the code
+/// into the same words, so supplying them here would only create a second
+/// place for the phrasing to drift.
 fn verdict_rendering(verdict: &str) -> VerdictRendering {
     match verdict {
         "verified" => VerdictRendering {
             state: "ok",
             label: "Verified",
+            reason_code: None,
         },
         "unverified" => VerdictRendering {
             state: "attention",
             label: "Unverified",
+            reason_code: Some("reason_not_recorded"),
         },
         "contradicted" => VerdictRendering {
             state: "critical",
             label: "Contradicted",
+            reason_code: None,
         },
         "review" => VerdictRendering {
             state: "warn",
             label: "Needs review",
+            reason_code: None,
         },
         "unavailable" => VerdictRendering {
             state: "unknown",
             label: "Evidence unavailable",
+            reason_code: None,
         },
         _ => VerdictRendering {
             state: "unknown",
             label: "Verdict this client does not know",
+            reason_code: Some("client_older_than_daemon"),
         },
     }
 }
@@ -287,6 +334,9 @@ pub fn reading(body: &Value, now: DateTime<Utc>) -> Value {
                 "label": rendering.label,
                 "explain_key": "fornax.latest_finding",
             });
+            if let Some(code) = rendering.reason_code {
+                segment["reason_code"] = json!(code);
+            }
             // A finding whose timestamp will not parse simply has no
             // freshness cue. The alternative — substituting "now" — would
             // present an unreadable timestamp as a fresh reading, which is
