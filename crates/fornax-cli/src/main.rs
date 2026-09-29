@@ -504,7 +504,7 @@ async fn main() -> anyhow::Result<()> {
             // exit would make a stopped daemon indistinguishable from a
             // broken provider, and the payload already says which it is.
             StatuslineCommand::Provider => {
-                let payload = match statusline::probe().await {
+                let payload = match statusline::probe(statusline::HOT_PATH_BUDGET).await {
                     Ok(body) => statusline::reading(&body, chrono::Utc::now()),
                     Err(kind) => statusline::no_reading(kind),
                 };
@@ -512,7 +512,8 @@ async fn main() -> anyhow::Result<()> {
             }
             // Not on the hot path, so this one may make the second, heavier
             // call the provider refuses to make.
-            StatuslineCommand::Explain => match statusline::probe().await {
+            StatuslineCommand::Explain => match statusline::probe(statusline::EXPLAIN_BUDGET).await
+            {
                 Ok(body) => {
                     let fused = match body.get("latest").filter(|l| !l.is_null()) {
                         Some(latest) => statusline::probe_fusion(latest).await,

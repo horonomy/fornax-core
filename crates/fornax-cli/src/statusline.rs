@@ -28,6 +28,8 @@
 //! Code settings patcher; enabling and disabling this provider is the shared
 //! lifecycle tool's job (HORO-1566). This module reads one HTTP endpoint.
 
+use std::time::Duration;
+
 use chrono::{DateTime, SubsecRound, Utc};
 use serde_json::{json, Value};
 
@@ -56,9 +58,23 @@ pub const SCOPE: &str = "host";
 /// reordered without renegotiating.
 pub const ORDER_HINT: u32 = 300;
 
+/// How long the hot-path probe may wait for the daemon.
+///
+/// Under the host's own default per-provider budget (250 ms), so that a slow
+/// daemon produces a truthful payload rather than getting killed mid-write
+/// and contributing nothing. A loopback `GET` against `/api/status` measures
+/// about 18 ms warm; anything an order of magnitude past that is a fact worth
+/// reporting, not worth waiting for.
+pub const HOT_PATH_BUDGET: Duration = Duration::from_millis(200);
+
+/// How long the `explain` surface may wait. Larger on purpose: the user asked
+/// a question and is waiting for the answer, so a slow daemon is worth
+/// waiting out rather than reporting as a timeout.
+pub const EXPLAIN_BUDGET: Duration = Duration::from_secs(3);
+
 /// Why the provider has no live reading to report.
 ///
-/// These are five distinct facts and the contract refuses to collapse them:
+/// These are six distinct facts and the contract refuses to collapse them:
 /// a stopped daemon is not a daemon reporting nothing, and a probe that
 /// failed is not silence. Each maps to its own availability and its own
 /// bounded reason code, so a `doctor` surface can tell the user what to
@@ -67,6 +83,10 @@ pub const ORDER_HINT: u32 = 300;
 pub enum NoReading {
     /// Nothing answered on the daemon port.
     DaemonUnreachable,
+    /// Something is listening, but did not answer inside the render budget.
+    /// A separate fact from a stopped daemon: reporting a slow daemon as
+    /// "not running" would send the user to start one that is already up.
+    DaemonTooSlow,
     /// Something answered, but it is serving a different `$FORNAX_HOME`
     /// (FORNX-339). Fornax fails closed here rather than showing another
     /// home's evidence, so the honest reading is that we did not find out.
@@ -94,7 +114,9 @@ impl NoReading {
     fn availability(self) -> &'static str {
         match self {
             NoReading::DaemonUnreachable => "unavailable",
-            NoReading::DaemonIdentityMismatch | NoReading::DaemonIdentityNotReported => "unknown",
+            NoReading::DaemonTooSlow
+            | NoReading::DaemonIdentityMismatch
+            | NoReading::DaemonIdentityNotReported => "unknown",
             NoReading::StoreReadFailed | NoReading::ResponseNotUnderstood => "error",
         }
     }
@@ -103,6 +125,7 @@ impl NoReading {
     fn reason_code(self) -> &'static str {
         match self {
             NoReading::DaemonUnreachable => "daemon_unreachable",
+            NoReading::DaemonTooSlow => "daemon_too_slow",
             NoReading::DaemonIdentityMismatch => "daemon_identity_mismatch",
             NoReading::DaemonIdentityNotReported => "daemon_identity_not_reported",
             NoReading::StoreReadFailed => "store_read_failed",
@@ -125,6 +148,7 @@ impl NoReading {
     fn label(self) -> &'static str {
         match self {
             NoReading::DaemonUnreachable => "Not running",
+            NoReading::DaemonTooSlow => "No answer in time",
             NoReading::DaemonIdentityMismatch | NoReading::DaemonIdentityNotReported => {
                 "State not observed"
             }
@@ -505,11 +529,19 @@ fn explain_fused(fused: Option<&Value>) -> String {
 /// serves is refused — but the outcome is returned as a typed [`NoReading`]
 /// rather than an error string, because the two refusal cases must render as
 /// two different reason codes.
-pub async fn probe() -> Result<Value, NoReading> {
+pub async fn probe(budget: Duration) -> Result<Value, NoReading> {
     let url = format!("{}/api/status", crate::base_url());
-    let response = reqwest::get(&url)
-        .await
+    let client = reqwest::Client::builder()
+        .timeout(budget)
+        .build()
         .map_err(|_| NoReading::DaemonUnreachable)?;
+    let response = client.get(&url).send().await.map_err(|e| {
+        if e.is_timeout() {
+            NoReading::DaemonTooSlow
+        } else {
+            NoReading::DaemonUnreachable
+        }
+    })?;
     let expected = fornax_types::home_identity(&crate::fornax_home());
     match crate::read_daemon_identity(&response) {
         Some(actual) if actual == expected => {}
@@ -546,7 +578,11 @@ pub async fn probe_fusion(latest: &Value) -> Option<Value> {
         claim,
         session
     );
-    let response = reqwest::get(&url).await.ok()?;
+    let client = reqwest::Client::builder()
+        .timeout(EXPLAIN_BUDGET)
+        .build()
+        .ok()?;
+    let response = client.get(&url).send().await.ok()?;
     let expected = fornax_types::home_identity(&crate::fornax_home());
     if crate::read_daemon_identity(&response) != Some(expected.as_str()) {
         return None;
@@ -565,6 +601,11 @@ pub fn explain_unavailable(kind: NoReading) -> String {
         NoReading::DaemonUnreachable => {
             "No Fornax daemon answered on this machine. Start it, or set \
              FORNAX_HTTP_PORT if it listens somewhere else."
+        }
+        NoReading::DaemonTooSlow => {
+            "Something is listening on the Fornax port but did not answer \
+             inside the render budget, so the daemon is up and its state is \
+             simply unread. If this persists, check the daemon's load."
         }
         NoReading::DaemonIdentityMismatch => {
             "A daemon answered but serves a different FORNAX_HOME than this \
@@ -770,8 +811,9 @@ mod tests {
     /// Every way the probe can come back empty-handed. Kept as one list so
     /// that adding a sixth variant without deciding what it means is a
     /// compile error here rather than a silent `unknown` on someone's line.
-    const ALL_NO_READINGS: [NoReading; 5] = [
+    const ALL_NO_READINGS: [NoReading; 6] = [
         NoReading::DaemonUnreachable,
+        NoReading::DaemonTooSlow,
         NoReading::DaemonIdentityMismatch,
         NoReading::DaemonIdentityNotReported,
         NoReading::StoreReadFailed,
