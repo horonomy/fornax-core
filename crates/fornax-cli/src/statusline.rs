@@ -766,4 +766,59 @@ mod tests {
             "available"
         );
     }
+
+    /// Every way the probe can come back empty-handed. Kept as one list so
+    /// that adding a sixth variant without deciding what it means is a
+    /// compile error here rather than a silent `unknown` on someone's line.
+    const ALL_NO_READINGS: [NoReading; 5] = [
+        NoReading::DaemonUnreachable,
+        NoReading::DaemonIdentityMismatch,
+        NoReading::DaemonIdentityNotReported,
+        NoReading::StoreReadFailed,
+        NoReading::ResponseNotUnderstood,
+    ];
+
+    #[test]
+    fn each_no_reading_outcome_keeps_its_own_availability_and_reason() {
+        let expected = [
+            (NoReading::DaemonUnreachable, "unavailable", "neutral"),
+            // Not `unavailable`: Fornax declined to trust the peer, which
+            // leaves the real state unobserved rather than absent.
+            (NoReading::DaemonIdentityMismatch, "unknown", "unknown"),
+            (NoReading::DaemonIdentityNotReported, "unknown", "unknown"),
+            // A failed probe may need the user to act, so it warns.
+            (NoReading::StoreReadFailed, "error", "warn"),
+            (NoReading::ResponseNotUnderstood, "error", "warn"),
+        ];
+        let mut codes = Vec::new();
+        for (kind, availability, state) in expected {
+            let payload = no_reading(kind);
+            assert_eq!(payload["availability"], availability, "{kind:?}");
+            let seg = segment(&payload);
+            assert_eq!(seg["state"], state, "{kind:?}");
+            codes.push(seg["reason_code"].as_str().unwrap().to_string());
+        }
+        codes.sort();
+        codes.dedup();
+        assert_eq!(codes.len(), 5, "two outcomes share one reason code");
+    }
+
+    #[test]
+    fn no_outcome_without_a_reading_can_be_mistaken_for_a_healthy_one() {
+        for kind in ALL_NO_READINGS {
+            let payload = no_reading(kind);
+            let segments = payload["segments"].as_array().unwrap();
+            // An empty answer renders as silence, and silence reads as "all
+            // clear". This is the failure this shape exists to prevent.
+            assert_eq!(segments.len(), 1, "{kind:?} must still say something");
+            let seg = &segments[0];
+            assert_ne!(seg["state"], "ok", "{kind:?}");
+            // A count would be a measurement, and nothing was measured. Zero
+            // in particular would read as a clean bill of health.
+            assert!(seg.get("count").is_none(), "{kind:?}");
+            assert!(seg.get("total").is_none(), "{kind:?}");
+            assert!(seg.get("confidence").is_none(), "{kind:?}");
+            assert_ne!(payload["availability"], "available", "{kind:?}");
+        }
+    }
 }
