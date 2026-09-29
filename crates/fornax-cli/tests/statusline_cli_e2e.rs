@@ -121,3 +121,25 @@ fn the_explain_surface_names_a_next_step_when_there_is_nothing_to_read() {
     );
     assert!(run.stdout.contains("Start it"), "{}", run.stdout);
 }
+
+#[test]
+fn no_failure_output_reveals_the_home_directory_or_the_port() {
+    // Both are in the environment of every invocation, both appear in this
+    // codebase's error strings, and both are rendered straight into the
+    // user's terminal.
+    let home = temp_home("no-leak");
+    let port = closed_port();
+    let home_name = home.file_name().unwrap().to_str().unwrap().to_string();
+    for subcommand in ["provider", "explain"] {
+        let run = run(subcommand, &home, port);
+        let all = format!("{}{}", run.stdout, run.stderr);
+        assert!(
+            !all.contains(&home_name),
+            "{subcommand} leaked the home path"
+        );
+        assert!(
+            !all.contains(&port.to_string()),
+            "{subcommand} leaked the port"
+        );
+    }
+}
