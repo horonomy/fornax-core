@@ -63,8 +63,8 @@ pub const ORDER_HINT: u32 = 300;
 /// Under the host's own default per-provider budget (250 ms), so that a slow
 /// daemon produces a truthful payload rather than getting killed mid-write
 /// and contributing nothing. A loopback `GET` against `/api/status` measures
-/// about 18 ms warm; anything an order of magnitude past that is a fact worth
-/// reporting, not worth waiting for.
+/// about 30 ms warm end to end; anything an order of magnitude past that is
+/// a fact worth reporting, not worth waiting for.
 pub const HOT_PATH_BUDGET: Duration = Duration::from_millis(200);
 
 /// How long the `explain` surface may wait. Larger on purpose: the user asked
@@ -522,7 +522,8 @@ fn explain_fused(fused: Option<&Value>) -> String {
 /// Exactly one local HTTP `GET`, no retry and no fallback to a heavier
 /// endpoint: this runs on every statusline refresh, so a second request is a
 /// second chance to be the reason the user's line is late. `/api/status` is
-/// `recent_findings(1)`, measured at about 18 ms against a warm daemon.
+/// `recent_findings(1)`; the whole subcommand measures 22-82 ms warm in a
+/// debug build, median about 30 ms.
 ///
 /// The FORNX-339 identity check is applied here exactly as every other
 /// client applies it — a peer that cannot prove which `$FORNAX_HOME` it

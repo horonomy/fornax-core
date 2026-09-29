@@ -114,7 +114,7 @@ answer and composes them. Fornax's answer is `fornax statusline provider`.
 
 | Surface | What it is |
 |---|---|
-| `fornax statusline provider` | One JSON payload per render, for the host to compose. Read-only, one local HTTP call, about 18 ms warm. |
+| `fornax statusline provider` | One JSON payload per render, for the host to compose. Read-only, one local HTTP call, 22-82 ms warm in a debug build. |
 | `fornax statusline explain` | Read-only, off the hot path. Everything bounded that Fornax knows about the latest finding, including what it does *not* know. |
 
 Neither writes anything. Fornax deliberately has no second Claude Code
