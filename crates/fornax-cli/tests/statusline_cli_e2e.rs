@@ -89,3 +89,20 @@ fn the_provider_writes_nothing_to_stderr() {
     let run = run("provider", &home, closed_port());
     assert_eq!(run.stderr, "", "provider wrote to stderr");
 }
+
+#[test]
+fn the_provider_creates_nothing_and_modifies_nothing() {
+    // This is a read-only surface, on the hot path, in someone's home
+    // directory. Creating a cache or a lock file here would be a write per
+    // statusline refresh.
+    let home = temp_home("read-only");
+    let before = std::fs::read_dir(&home).unwrap().count();
+    run("provider", &home, closed_port());
+    run("explain", &home, closed_port());
+    let after: Vec<_> = std::fs::read_dir(&home)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(before, 0);
+    assert!(after.is_empty(), "created {after:?}");
+}
