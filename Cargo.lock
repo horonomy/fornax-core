@@ -872,7 +872,7 @@ dependencies = [
 
 [[package]]
 name = "fornax-acquire"
-version = "0.0.1"
+version = "0.0.8"
 dependencies = [
  "chrono",
  "fornax-experiment-runner",
@@ -890,7 +890,7 @@ dependencies = [
 
 [[package]]
 name = "fornax-acquire-exec"
-version = "0.0.1"
+version = "0.0.8"
 dependencies = [
  "anyhow",
  "chrono",
@@ -912,7 +912,7 @@ dependencies = [
 
 [[package]]
 name = "fornax-adapter-claude"
-version = "0.0.1"
+version = "0.0.8"
 dependencies = [
  "anyhow",
  "chrono",
@@ -927,7 +927,7 @@ dependencies = [
 
 [[package]]
 name = "fornax-adapter-codex"
-version = "0.0.1"
+version = "0.0.8"
 dependencies = [
  "anyhow",
  "chrono",
@@ -940,7 +940,7 @@ dependencies = [
 
 [[package]]
 name = "fornax-adapter-conformance"
-version = "0.0.1"
+version = "0.0.8"
 dependencies = [
  "chrono",
  "fornax-adapter-claude",
@@ -955,7 +955,7 @@ dependencies = [
 
 [[package]]
 name = "fornax-adapter-opencode"
-version = "0.0.1"
+version = "0.0.8"
 dependencies = [
  "anyhow",
  "chrono",
@@ -969,7 +969,7 @@ dependencies = [
 
 [[package]]
 name = "fornax-bench"
-version = "0.0.1"
+version = "0.0.8"
 dependencies = [
  "anyhow",
  "chrono",
@@ -984,7 +984,7 @@ dependencies = [
 
 [[package]]
 name = "fornax-ci"
-version = "0.0.1"
+version = "0.0.8"
 dependencies = [
  "chrono",
  "fornax-types",
@@ -997,7 +997,7 @@ dependencies = [
 
 [[package]]
 name = "fornax-cli"
-version = "0.0.1"
+version = "0.0.8"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1022,7 +1022,7 @@ dependencies = [
 
 [[package]]
 name = "fornax-corpus"
-version = "0.0.1"
+version = "0.0.8"
 dependencies = [
  "chrono",
  "fornax-bench",
@@ -1039,7 +1039,7 @@ dependencies = [
 
 [[package]]
 name = "fornax-daemon"
-version = "0.0.1"
+version = "0.0.8"
 dependencies = [
  "anyhow",
  "axum",
@@ -1065,7 +1065,7 @@ dependencies = [
 
 [[package]]
 name = "fornax-experiment-runner"
-version = "0.0.1"
+version = "0.0.8"
 dependencies = [
  "chrono",
  "fornax-types",
@@ -1079,7 +1079,7 @@ dependencies = [
 
 [[package]]
 name = "fornax-protocol"
-version = "0.0.1"
+version = "0.0.8"
 dependencies = [
  "chrono",
  "fornax-protocol-refclient",
@@ -1096,7 +1096,7 @@ dependencies = [
 
 [[package]]
 name = "fornax-protocol-refclient"
-version = "0.0.1"
+version = "0.0.8"
 dependencies = [
  "hex",
  "serde",
@@ -1106,7 +1106,7 @@ dependencies = [
 
 [[package]]
 name = "fornax-receipt"
-version = "0.0.1"
+version = "0.0.8"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -1123,7 +1123,7 @@ dependencies = [
 
 [[package]]
 name = "fornax-replay"
-version = "0.0.1"
+version = "0.0.8"
 dependencies = [
  "clap",
  "fornax-adapter-claude",
@@ -1139,7 +1139,7 @@ dependencies = [
 
 [[package]]
 name = "fornax-store"
-version = "0.0.1"
+version = "0.0.8"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -1157,7 +1157,7 @@ dependencies = [
 
 [[package]]
 name = "fornax-types"
-version = "0.0.1"
+version = "0.0.8"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -1173,7 +1173,7 @@ dependencies = [
 
 [[package]]
 name = "fornax-vcs"
-version = "0.0.1"
+version = "0.0.8"
 dependencies = [
  "gix",
  "thiserror",
@@ -1182,7 +1182,7 @@ dependencies = [
 
 [[package]]
 name = "fornax-verify"
-version = "0.0.1"
+version = "0.0.8"
 dependencies = [
  "chrono",
  "fornax-types",
