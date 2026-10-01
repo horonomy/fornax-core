@@ -480,6 +480,53 @@ mod tests {
         assert!(matches!(result, Err(VcsError::Open(_))), "{result:?}");
     }
 
+    /// Writes a real repository, then corrupts its config so the upwards
+    /// search still finds the `.git` directory but opening it fails — the
+    /// exact case [`VcsError::Open`]'s own documentation describes ("found
+    /// *something* ... but could not be opened as a valid repository"), which
+    /// is distinct from every other failure shape the tests below cover.
+    fn repo_with_an_unopenable_git_dir() -> std::path::PathBuf {
+        let dir = temp_dir();
+        gix::init(&dir).expect("gix::init");
+        std::fs::write(dir.join(".git/config"), b"[[[not a valid config header\n")
+            .expect("corrupt the repository config");
+        dir
+    }
+
+    #[test]
+    fn reports_open_failure_for_a_discovered_repository_that_cannot_be_opened() {
+        // The half of `VcsError::Open`'s contract that had no test at all.
+        // It is also the half that pins `classify_discover_failure`: an open
+        // failure classifies `Corruption`/`Validation` rather than
+        // `NotFound`, and mapping every discovery error to `not_a_repo()`
+        // would report a corrupt repository as "no repository here".
+        let dir = repo_with_an_unopenable_git_dir();
+
+        let result = working_tree_status(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(matches!(result, Err(VcsError::Open(_))), "{result:?}");
+    }
+
+    #[test]
+    fn reports_not_a_repo_when_a_dot_git_exists_but_is_not_a_valid_git_directory() {
+        // The other side of that boundary, so the pair brackets it: a `.git`
+        // that is present but structurally not a git directory is rejected
+        // *during* the upwards search, which then completes having found no
+        // repository. That is a genuine `is_repo: false`, not an open
+        // failure — the same answer this crate gave before gix 0.88, kept
+        // asserted so the two cases can never collapse into one another.
+        let dir = temp_dir();
+        std::fs::create_dir_all(dir.join(".git")).expect("create an empty .git directory");
+
+        let status = working_tree_status(&dir).expect("query should not error");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(!status.is_repo);
+        assert_eq!(status.head_commit, None);
+        assert!(status.dirty_paths.is_empty());
+    }
+
     // --- path_status ---------------------------------------------------
 
     #[test]
@@ -568,5 +615,39 @@ mod tests {
 
         assert!(status.is_repo);
         assert!(!status.is_dirty);
+    }
+
+    // `path_status` is the second, independent `gix::discover` call site, and
+    // every failure-shape test above exercises only the first. These two give
+    // it the same bracket, so a regression confined to one call site cannot
+    // hide behind the other's coverage.
+
+    #[test]
+    fn path_status_reports_open_failure_for_a_repository_that_cannot_be_opened() {
+        let dir = repo_with_an_unopenable_git_dir();
+        let file = dir.join("claimed.txt");
+        std::fs::write(&file, "hello\n").expect("write file");
+
+        let result = path_status(&file);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(matches!(result, Err(VcsError::Open(_))), "{result:?}");
+    }
+
+    #[test]
+    fn path_status_reports_open_failure_when_the_search_cannot_even_start() {
+        // The claimed path's parent does not exist, so there is no directory
+        // to search upward from — a real failure, not "searched and found no
+        // repository". gix 0.88 reports this with the same `NotFound` class
+        // as a completed, empty search, which is why
+        // `classify_discover_failure` decides it before consulting the class.
+        let bogus_dir = std::env::temp_dir().join(format!(
+            "fornax-vcs-test-does-not-exist-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let result = path_status(&bogus_dir.join("claimed.txt"));
+
+        assert!(matches!(result, Err(VcsError::Open(_))), "{result:?}");
     }
 }
