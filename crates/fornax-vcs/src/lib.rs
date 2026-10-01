@@ -101,6 +101,43 @@ pub enum VcsError {
     Status(String),
 }
 
+/// Decide what a [`gix::discover`] failure means: `None` for the honest
+/// "searched and found no git repository" outcome (the caller reports
+/// `is_repo: false`), `Some` for a real query failure.
+///
+/// This is the distinction [`VcsError::Open`] documents, and it used to be
+/// drawn by matching `gix::discover::upwards::Error`'s variants. gix 0.88
+/// removed that enum in favor of `gix_error`'s erased classification model,
+/// which draws the same line in all but one place:
+///
+/// * a permission-denied directory on the search path classifies
+///   `Io(PermissionDenied)`,
+/// * a `.git` that was found but could not be opened (an unparseable config,
+///   an unsupported `core.repositoryformatversion`) classifies `Corruption`
+///   and `Validation`,
+///
+/// so neither is mistaken for "found nothing". The exception is a
+/// `start_dir` that does not exist at all: gix 0.87 reported that as
+/// `InaccessibleDirectory` and this crate treated it as a real failure, but
+/// gix 0.88 classifies it `NotFound` — indistinguishable from a completed
+/// search that found no repository. It is therefore decided here, before the
+/// class is consulted at all; `start_dir`'s own existence is a more direct
+/// question than any classification of the error, and asking it keeps this
+/// crate's contract stable across that upstream change.
+fn classify_discover_failure(start_dir: &Path, err: &gix::Error) -> Option<VcsError> {
+    if !start_dir.is_dir() {
+        return Some(VcsError::Open(format!(
+            "{} is not an accessible directory to search from: {err}",
+            start_dir.display()
+        )));
+    }
+    if err.classify().is_not_found() {
+        None
+    } else {
+        Some(VcsError::Open(err.to_string()))
+    }
+}
+
 /// Query `repo_path`'s working-tree status: whether it is (or is inside) a
 /// git repository, its `HEAD` commit, and every path considered dirty
 /// (uncommitted, unstaged, or untracked) by this git implementation's own
@@ -111,20 +148,17 @@ pub enum VcsError {
 /// directory, matching `git status`'s own behavior when run from a
 /// subdirectory of a working tree.
 pub fn working_tree_status(repo_path: &Path) -> Result<WorkingTreeStatus, VcsError> {
+    // Only a search that genuinely found nothing means "not a repo" — a
+    // permission-denied directory on the search path, a non-existent
+    // `repo_path`, or a `.git` that was found but could not be opened are all
+    // real query failures and must not be silently folded into
+    // `is_repo: false`. See `classify_discover_failure`.
     let repo = match gix::discover(repo_path) {
         Ok(repo) => repo,
-        // Only the "genuinely searched and found nothing" shapes of
-        // `discover::upwards::Error` mean "not a repo" — `InaccessibleDirectory`,
-        // `CurrentDir`, `CheckTrust`, etc. are real query failures (e.g. a
-        // permission-denied directory on the search path) and must not be
-        // silently folded into `is_repo: false`.
-        Err(gix::discover::Error::Discover(
-            gix::discover::upwards::Error::NoGitRepository { .. }
-            | gix::discover::upwards::Error::NoGitRepositoryWithinCeiling { .. }
-            | gix::discover::upwards::Error::NoGitRepositoryWithinFs { .. }
-            | gix::discover::upwards::Error::NoMatchingCeilingDir,
-        )) => return Ok(WorkingTreeStatus::not_a_repo()),
-        Err(e) => return Err(VcsError::Open(e.to_string())),
+        Err(e) => match classify_discover_failure(repo_path, &e) {
+            Some(failure) => return Err(failure),
+            None => return Ok(WorkingTreeStatus::not_a_repo()),
+        },
     };
 
     // An unborn `HEAD` (a real repository with zero commits) is a legitimate
@@ -223,13 +257,10 @@ pub fn path_status(claimed_path: &Path) -> Result<PathStatus, VcsError> {
 
     let repo = match gix::discover(start_dir) {
         Ok(repo) => repo,
-        Err(gix::discover::Error::Discover(
-            gix::discover::upwards::Error::NoGitRepository { .. }
-            | gix::discover::upwards::Error::NoGitRepositoryWithinCeiling { .. }
-            | gix::discover::upwards::Error::NoGitRepositoryWithinFs { .. }
-            | gix::discover::upwards::Error::NoMatchingCeilingDir,
-        )) => return Ok(PathStatus::not_a_repo()),
-        Err(e) => return Err(VcsError::Open(e.to_string())),
+        Err(e) => match classify_discover_failure(start_dir, &e) {
+            Some(failure) => return Err(failure),
+            None => return Ok(PathStatus::not_a_repo()),
+        },
     };
 
     let head_commit = repo.head_id().ok().map(|id| id.to_string());
