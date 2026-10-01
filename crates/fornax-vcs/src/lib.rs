@@ -101,6 +101,43 @@ pub enum VcsError {
     Status(String),
 }
 
+/// Decide what a [`gix::discover`] failure means: `None` for the honest
+/// "searched and found no git repository" outcome (the caller reports
+/// `is_repo: false`), `Some` for a real query failure.
+///
+/// This is the distinction [`VcsError::Open`] documents, and it used to be
+/// drawn by matching `gix::discover::upwards::Error`'s variants. gix 0.88
+/// removed that enum in favor of `gix_error`'s erased classification model,
+/// which draws the same line in all but one place:
+///
+/// * a permission-denied directory on the search path classifies
+///   `Io(PermissionDenied)`,
+/// * a `.git` that was found but could not be opened (an unparseable config,
+///   an unsupported `core.repositoryformatversion`) classifies `Corruption`
+///   and `Validation`,
+///
+/// so neither is mistaken for "found nothing". The exception is a
+/// `start_dir` that does not exist at all: gix 0.87 reported that as
+/// `InaccessibleDirectory` and this crate treated it as a real failure, but
+/// gix 0.88 classifies it `NotFound` — indistinguishable from a completed
+/// search that found no repository. It is therefore decided here, before the
+/// class is consulted at all; `start_dir`'s own existence is a more direct
+/// question than any classification of the error, and asking it keeps this
+/// crate's contract stable across that upstream change.
+fn classify_discover_failure(start_dir: &Path, err: &gix::Error) -> Option<VcsError> {
+    if !start_dir.is_dir() {
+        return Some(VcsError::Open(format!(
+            "{} is not an accessible directory to search from: {err}",
+            start_dir.display()
+        )));
+    }
+    if err.classify().is_not_found() {
+        None
+    } else {
+        Some(VcsError::Open(err.to_string()))
+    }
+}
+
 /// Query `repo_path`'s working-tree status: whether it is (or is inside) a
 /// git repository, its `HEAD` commit, and every path considered dirty
 /// (uncommitted, unstaged, or untracked) by this git implementation's own
@@ -111,20 +148,17 @@ pub enum VcsError {
 /// directory, matching `git status`'s own behavior when run from a
 /// subdirectory of a working tree.
 pub fn working_tree_status(repo_path: &Path) -> Result<WorkingTreeStatus, VcsError> {
+    // Only a search that genuinely found nothing means "not a repo" — a
+    // permission-denied directory on the search path, a non-existent
+    // `repo_path`, or a `.git` that was found but could not be opened are all
+    // real query failures and must not be silently folded into
+    // `is_repo: false`. See `classify_discover_failure`.
     let repo = match gix::discover(repo_path) {
         Ok(repo) => repo,
-        // Only the "genuinely searched and found nothing" shapes of
-        // `discover::upwards::Error` mean "not a repo" — `InaccessibleDirectory`,
-        // `CurrentDir`, `CheckTrust`, etc. are real query failures (e.g. a
-        // permission-denied directory on the search path) and must not be
-        // silently folded into `is_repo: false`.
-        Err(gix::discover::Error::Discover(
-            gix::discover::upwards::Error::NoGitRepository { .. }
-            | gix::discover::upwards::Error::NoGitRepositoryWithinCeiling { .. }
-            | gix::discover::upwards::Error::NoGitRepositoryWithinFs { .. }
-            | gix::discover::upwards::Error::NoMatchingCeilingDir,
-        )) => return Ok(WorkingTreeStatus::not_a_repo()),
-        Err(e) => return Err(VcsError::Open(e.to_string())),
+        Err(e) => match classify_discover_failure(repo_path, &e) {
+            Some(failure) => return Err(failure),
+            None => return Ok(WorkingTreeStatus::not_a_repo()),
+        },
     };
 
     // An unborn `HEAD` (a real repository with zero commits) is a legitimate
@@ -223,13 +257,10 @@ pub fn path_status(claimed_path: &Path) -> Result<PathStatus, VcsError> {
 
     let repo = match gix::discover(start_dir) {
         Ok(repo) => repo,
-        Err(gix::discover::Error::Discover(
-            gix::discover::upwards::Error::NoGitRepository { .. }
-            | gix::discover::upwards::Error::NoGitRepositoryWithinCeiling { .. }
-            | gix::discover::upwards::Error::NoGitRepositoryWithinFs { .. }
-            | gix::discover::upwards::Error::NoMatchingCeilingDir,
-        )) => return Ok(PathStatus::not_a_repo()),
-        Err(e) => return Err(VcsError::Open(e.to_string())),
+        Err(e) => match classify_discover_failure(start_dir, &e) {
+            Some(failure) => return Err(failure),
+            None => return Ok(PathStatus::not_a_repo()),
+        },
     };
 
     let head_commit = repo.head_id().ok().map(|id| id.to_string());
@@ -449,6 +480,53 @@ mod tests {
         assert!(matches!(result, Err(VcsError::Open(_))), "{result:?}");
     }
 
+    /// Writes a real repository, then corrupts its config so the upwards
+    /// search still finds the `.git` directory but opening it fails — the
+    /// exact case [`VcsError::Open`]'s own documentation describes ("found
+    /// *something* ... but could not be opened as a valid repository"), which
+    /// is distinct from every other failure shape the tests below cover.
+    fn repo_with_an_unopenable_git_dir() -> std::path::PathBuf {
+        let dir = temp_dir();
+        gix::init(&dir).expect("gix::init");
+        std::fs::write(dir.join(".git/config"), b"[[[not a valid config header\n")
+            .expect("corrupt the repository config");
+        dir
+    }
+
+    #[test]
+    fn reports_open_failure_for_a_discovered_repository_that_cannot_be_opened() {
+        // The half of `VcsError::Open`'s contract that had no test at all.
+        // It is also the half that pins `classify_discover_failure`: an open
+        // failure classifies `Corruption`/`Validation` rather than
+        // `NotFound`, and mapping every discovery error to `not_a_repo()`
+        // would report a corrupt repository as "no repository here".
+        let dir = repo_with_an_unopenable_git_dir();
+
+        let result = working_tree_status(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(matches!(result, Err(VcsError::Open(_))), "{result:?}");
+    }
+
+    #[test]
+    fn reports_not_a_repo_when_a_dot_git_exists_but_is_not_a_valid_git_directory() {
+        // The other side of that boundary, so the pair brackets it: a `.git`
+        // that is present but structurally not a git directory is rejected
+        // *during* the upwards search, which then completes having found no
+        // repository. That is a genuine `is_repo: false`, not an open
+        // failure — the same answer this crate gave before gix 0.88, kept
+        // asserted so the two cases can never collapse into one another.
+        let dir = temp_dir();
+        std::fs::create_dir_all(dir.join(".git")).expect("create an empty .git directory");
+
+        let status = working_tree_status(&dir).expect("query should not error");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(!status.is_repo);
+        assert_eq!(status.head_commit, None);
+        assert!(status.dirty_paths.is_empty());
+    }
+
     // --- path_status ---------------------------------------------------
 
     #[test]
@@ -537,5 +615,39 @@ mod tests {
 
         assert!(status.is_repo);
         assert!(!status.is_dirty);
+    }
+
+    // `path_status` is the second, independent `gix::discover` call site, and
+    // every failure-shape test above exercises only the first. These two give
+    // it the same bracket, so a regression confined to one call site cannot
+    // hide behind the other's coverage.
+
+    #[test]
+    fn path_status_reports_open_failure_for_a_repository_that_cannot_be_opened() {
+        let dir = repo_with_an_unopenable_git_dir();
+        let file = dir.join("claimed.txt");
+        std::fs::write(&file, "hello\n").expect("write file");
+
+        let result = path_status(&file);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(matches!(result, Err(VcsError::Open(_))), "{result:?}");
+    }
+
+    #[test]
+    fn path_status_reports_open_failure_when_the_search_cannot_even_start() {
+        // The claimed path's parent does not exist, so there is no directory
+        // to search upward from — a real failure, not "searched and found no
+        // repository". gix 0.88 reports this with the same `NotFound` class
+        // as a completed, empty search, which is why
+        // `classify_discover_failure` decides it before consulting the class.
+        let bogus_dir = std::env::temp_dir().join(format!(
+            "fornax-vcs-test-does-not-exist-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let result = path_status(&bogus_dir.join("claimed.txt"));
+
+        assert!(matches!(result, Err(VcsError::Open(_))), "{result:?}");
     }
 }
