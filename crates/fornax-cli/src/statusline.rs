@@ -58,6 +58,56 @@ pub const SCOPE: &str = "host";
 /// reordered without renegotiating.
 pub const ORDER_HINT: u32 = 300;
 
+/// Fornax decides its own Clear-mode projection rather than leaving the host
+/// to infer one (HORO-1632).
+///
+/// The host has a documented fallback ladder that ranks segments by severity
+/// and position, and for a provider that has not spoken it is a reasonable
+/// guess. For Fornax it is the wrong question. Clear mode asks "what is the
+/// one thing a glance should tell me", and Fornax's answer is fixed by the
+/// product's own semantics: **the verification state, and nothing else.**
+/// Verified, Unverified, Needs review, Contradicted, Evidence unavailable and
+/// "nothing verified yet" are six readings of one fact, and which of them is
+/// current is never a severity judgement the host should be making — a
+/// `Contradicted` finding is not an outage, and inferring `exception` from its
+/// `critical` state says Fornax is broken when what it means is that Fornax
+/// worked and the claim did not hold.
+///
+/// Every payload this module emits carries exactly one segment, so declaring
+/// authority does not change today's rendering. That is the point of doing it
+/// now rather than later: the host's inference and Fornax's intent currently
+/// agree by arithmetic, and a declaration is what keeps them agreeing when
+/// Fornax grows a second segment. Nothing then has to be renegotiated, and no
+/// host-side product conditional ever has to exist.
+///
+/// The host validates the claim instead of trusting it — under `provider` it
+/// requires at least one segment, a `clear_role` on every segment, at most one
+/// `posture`, and at least one `posture` or `exception` — and refuses a payload
+/// that does not hold up rather than silently re-inferring. Both shapes below
+/// are built to satisfy that, and the tests check each outcome individually.
+pub const CLEAR_AUTHORITY: &str = "provider";
+
+/// The Clear-mode part the verification segment plays: Fornax's posture.
+///
+/// `posture` is "the standing reading of this product", which is exactly what a
+/// verdict is — it remains true until the next verification changes it, and it
+/// is the one fact worth a glance. Not `vital`, which is a live measurement
+/// qualifying a posture, and emphatically not `exception` for the unhappy
+/// verdicts: `Contradicted` and `Evidence unavailable` are Fornax reporting
+/// successfully, so routing them to the host's stop-work rung would borrow the
+/// vocabulary of a broken product to describe a working one.
+const CLEAR_ROLE_VERDICT: &str = "posture";
+
+/// The Clear-mode part the availability segment plays: an exception.
+///
+/// This is the one case where Fornax genuinely cannot answer — no daemon, no
+/// answer in time, an untrusted peer, an unreadable store. There is no
+/// verification state to show, so the absence *is* the reading, and `exception`
+/// is the host's rung for "this product cannot tell you". It also satisfies the
+/// host's "a posture or an exception" rule without inventing a posture Fornax
+/// does not have.
+const CLEAR_ROLE_AVAILABILITY: &str = "exception";
+
 /// How long the hot-path probe may wait for the daemon.
 ///
 /// Under the host's own default per-provider budget (250 ms), so that a slow
@@ -187,12 +237,14 @@ pub fn no_reading(kind: NoReading) -> Value {
         "scope": SCOPE,
         "availability": availability,
         "order_hint": ORDER_HINT,
+        "clear_authority": CLEAR_AUTHORITY,
         "segments": [{
             "key": "availability",
             "state": state_for(availability),
             "label": kind.label(),
             "reason_code": kind.reason_code(),
             "explain_key": "fornax.availability",
+            "clear_role": CLEAR_ROLE_AVAILABILITY,
         }],
     })
 }
@@ -349,6 +401,11 @@ pub fn reading(body: &Value, now: DateTime<Utc>) -> Value {
             "state": "neutral",
             "label": "No findings yet",
             "explain_key": "fornax.latest_finding",
+            // Still the verification state, and still Fornax's posture. "Nothing
+            // verified yet" is a reading of the same fact as "Verified" — the
+            // daemon is up and has an answer about how much it has established —
+            // so it is not an exception and the host must not infer one.
+            "clear_role": CLEAR_ROLE_VERDICT,
         }),
         Some(latest) => {
             let verdict = latest
@@ -361,6 +418,12 @@ pub fn reading(body: &Value, now: DateTime<Utc>) -> Value {
                 "state": rendering.state,
                 "label": rendering.label,
                 "explain_key": "fornax.latest_finding",
+                // Declared from the segment's *meaning*, not from its state, so
+                // every verdict — including `critical` for Contradicted and
+                // `unknown` for a verdict newer than this client — projects to
+                // the same Clear role. A state-dependent role here would be the
+                // host's severity ladder rebuilt inside the provider.
+                "clear_role": CLEAR_ROLE_VERDICT,
             });
             if let Some(code) = rendering.reason_code {
                 segment["reason_code"] = json!(code);
@@ -387,6 +450,7 @@ pub fn reading(body: &Value, now: DateTime<Utc>) -> Value {
         "scope": SCOPE,
         "availability": "available",
         "order_hint": ORDER_HINT,
+        "clear_authority": CLEAR_AUTHORITY,
         "segments": [segment],
     });
     if let Some(stamp) = observed_at {
