@@ -29,6 +29,15 @@
 #                            API: "identical"|"behind" => sha is an ancestor of
 #                            main (PASS); "ahead"|"diverged"|"error" => FAIL.
 #
+# --cargo-toml <path>        Path to the workspace Cargo.toml checked against
+#                             the candidate version (FORNX anti-drift gate,
+#                             HORO-1609). Default "Cargo.toml" (repo root of
+#                             the checkout this script runs from). Only
+#                             consulted for the manifest repo entry whose
+#                             owner/name matches this checkout's own
+#                             `origin` remote — release-execute.sh already
+#                             treats "build from this checkout" the same way.
+#
 # Output: one compact JSON object on stdout:
 #   {"ready":bool,"version":"...","checks":[{"name":...,"status":"pass"|"fail","detail":...}],"candidate":{...}}
 # Exit code: 0 if ready, 1 otherwise (including usage/input errors).
@@ -45,6 +54,9 @@ usage() {
 MANIFEST=""
 EVIDENCE_DIR=""
 REPO_FIXTURE_DIR=""
+CARGO_TOML="Cargo.toml"
+THIS_REPO_OWNER=""
+THIS_REPO_NAME=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -54,6 +66,18 @@ while [ $# -gt 0 ]; do
       ;;
     --repo-fixture-dir)
       REPO_FIXTURE_DIR="${2:-}"
+      shift 2
+      ;;
+    --cargo-toml)
+      CARGO_TOML="${2:-}"
+      shift 2
+      ;;
+    --this-repo-owner)
+      THIS_REPO_OWNER="${2:-}"
+      shift 2
+      ;;
+    --this-repo-name)
+      THIS_REPO_NAME="${2:-}"
       shift 2
       ;;
     -h|--help)
@@ -75,6 +99,16 @@ done
 [ -n "$EVIDENCE_DIR" ] || usage
 
 command -v jq >/dev/null 2>&1 || { echo "jq is required" >&2; exit 2; }
+
+# Resolve which manifest repo entry is "this checkout" for the workspace-
+# version anti-drift check, unless the caller already pinned it explicitly
+# (tests do this to stay independent of the ambient git remote).
+if [ -z "$THIS_REPO_OWNER" ] || [ -z "$THIS_REPO_NAME" ]; then
+  if origin_url="$(git config --get remote.origin.url 2>/dev/null)" && [ -n "$origin_url" ]; then
+    [ -n "$THIS_REPO_OWNER" ] || THIS_REPO_OWNER="$(echo "$origin_url" | sed -E 's#.*[:/]([^/]+)/([^/.]+)(\.git)?$#\1#')"
+    [ -n "$THIS_REPO_NAME" ] || THIS_REPO_NAME="$(echo "$origin_url" | sed -E 's#.*[:/]([^/]+)/([^/.]+)(\.git)?$#\2#')"
+  fi
+fi
 
 CHECKS_FILE="$(mktemp)"
 trap 'rm -f "$CHECKS_FILE"' EXIT
@@ -248,6 +282,28 @@ while IFS= read -r repo_json; do
       add_check "repo.${owner}/${name}.sha_on_main" "fail" "could not confirm sha ${sha} is on main (compare status: ${cmp_status})"
       ;;
   esac
+
+  # Anti-drift (HORO-1609): the checked-out workspace version must equal the
+  # candidate version for the repo this checkout actually builds from.
+  # publishes_artifact repos we don't build from here (a multi-repo manifest
+  # entry for a sibling repo) are out of scope — their tag/SHA is already
+  # verified above; their own version file lives in their own checkout.
+  publishes_artifact="$(jq -r '.publishes_artifact' <<<"$repo_json")"
+  if [ "$publishes_artifact" = "true" ] && [ "$owner" = "$THIS_REPO_OWNER" ] && [ "$name" = "$THIS_REPO_NAME" ]; then
+    if [ ! -f "$CARGO_TOML" ]; then
+      add_check "repo.${owner}/${name}.workspace_version_matches_candidate" "fail" "Cargo.toml not found at ${CARGO_TOML}"
+    else
+      workspace_version="$(awk '/^\[workspace\.package\]/{f=1;next} /^\[/{f=0} f && /^version[[:space:]]*=/{print; exit}' "$CARGO_TOML" | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/')"
+      candidate_version="${VERSION#v}"
+      if [ -z "$workspace_version" ]; then
+        add_check "repo.${owner}/${name}.workspace_version_matches_candidate" "fail" "no [workspace.package] version found in ${CARGO_TOML}"
+      elif [ "$workspace_version" = "$candidate_version" ]; then
+        add_check "repo.${owner}/${name}.workspace_version_matches_candidate" "pass" "workspace version ${workspace_version} matches candidate ${VERSION}"
+      else
+        add_check "repo.${owner}/${name}.workspace_version_matches_candidate" "fail" "workspace version ${workspace_version} in ${CARGO_TOML} does not match candidate ${VERSION} — bump [workspace.package].version before tagging"
+      fi
+    fi
+  fi
 done < "$REPO_SHA_MAP"
 
 # ---------------------------------------------------------------------------

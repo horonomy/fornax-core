@@ -16,6 +16,19 @@ run_case() {
     --repo-fixture-dir "${FIXTURES}/${case_name}/repos"
 }
 
+# Like run_case, but also pins this-repo identity and a fixture Cargo.toml so
+# the workspace-version anti-drift check (HORO-1609) is exercised
+# deterministically, independent of the ambient git remote / real Cargo.toml.
+run_case_version() {
+  local case_name="$1"
+  run bash "$SCRIPT" "${FIXTURES}/${case_name}/manifest.json" \
+    --evidence-dir "${FIXTURES}/${case_name}/evidence" \
+    --repo-fixture-dir "${FIXTURES}/${case_name}/repos" \
+    --cargo-toml "${FIXTURES}/${case_name}/workspace-cargo.toml" \
+    --this-repo-owner horonomy \
+    --this-repo-name fornax-core
+}
+
 @test "happy path: all real, all Done, all consistent -> ready true, exit 0" {
   run_case happy
   [ "$status" -eq 0 ]
@@ -109,4 +122,20 @@ run_case() {
   # manifest's docs jira_key, so the script has no reason to touch it.
   epic_checks="$(echo "$output" | jq '[.checks[] | select(.name | test("PROJ-9"))] | length')"
   [ "$epic_checks" -eq 0 ]
+}
+
+@test "workspace version matches candidate -> ready true (HORO-1609 anti-drift)" {
+  run_case_version version_match
+  [ "$status" -eq 0 ]
+  ready="$(echo "$output" | jq -r '.ready')"
+  [ "$ready" = "true" ]
+  echo "$output" | jq -e '.checks[] | select(.name=="repo.horonomy/fornax-core.workspace_version_matches_candidate" and .status=="pass")'
+}
+
+@test "workspace version drifted from candidate -> fails closed, exit 1 (HORO-1609 anti-drift)" {
+  run_case_version version_mismatch
+  [ "$status" -eq 1 ]
+  ready="$(echo "$output" | jq -r '.ready')"
+  [ "$ready" = "false" ]
+  echo "$output" | jq -e '.checks[] | select(.name=="repo.horonomy/fornax-core.workspace_version_matches_candidate" and .status=="fail" and (.detail | test("0.0.1")) and (.detail | test("v0.0.8")))'
 }
