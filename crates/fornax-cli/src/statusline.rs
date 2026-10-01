@@ -929,6 +929,172 @@ mod tests {
         }
     }
 
+    /// Every verdict name the daemon can send, plus one it cannot.
+    ///
+    /// The last entry is deliberately not a real verdict: a client older than
+    /// the daemon is a live case, and its Clear role must come out the same as
+    /// every other verdict's. Listing it here means a future change that routes
+    /// the unknown case somewhere else fails this test rather than shipping.
+    const ALL_VERDICTS: [&str; 6] = [
+        "verified",
+        "unverified",
+        "contradicted",
+        "review",
+        "unavailable",
+        "a_verdict_from_a_newer_daemon",
+    ];
+
+    #[test]
+    fn every_verdict_declares_the_verification_state_as_fornaxs_clear_posture() {
+        // The whole product claim of HORO-1632 in one assertion: Clear mode
+        // shows the verification state and nothing else, for all six readings,
+        // and that is a fact the payload states rather than one the host infers.
+        for verdict in ALL_VERDICTS {
+            let payload = reading(&status_with(verdict), now());
+            assert_eq!(payload["clear_authority"], "provider", "{verdict}");
+            assert_eq!(segment(&payload)["clear_role"], "posture", "{verdict}");
+        }
+    }
+
+    #[test]
+    fn the_clear_role_does_not_track_the_segment_state() {
+        // The guard against the thing this ticket exists to stop: a severity
+        // ladder rebuilt inside the provider. These four verdicts span `ok`,
+        // `critical`, `warn` and `unknown`, so if the role were derived from
+        // state in any way, these would not all be equal.
+        let roles: Vec<String> = ["verified", "contradicted", "review", "unavailable"]
+            .iter()
+            .map(|v| {
+                let payload = reading(&status_with(v), now());
+                let seg = segment(&payload);
+                // Guard the guard: a test over four identical states would
+                // pass vacuously, so assert the states really do differ.
+                format!("{}:{}", seg["state"].as_str().unwrap(), seg["clear_role"])
+            })
+            .collect();
+        let mut states: Vec<&str> = roles.iter().map(|r| r.split(':').next().unwrap()).collect();
+        states.sort();
+        states.dedup();
+        assert_eq!(states.len(), 4, "the fixture no longer spans four states");
+        for role in &roles {
+            assert!(role.ends_with(":\"posture\""), "{role}");
+        }
+    }
+
+    #[test]
+    fn nothing_verified_yet_is_a_posture_and_not_an_exception() {
+        // "The daemon is up and has established nothing" is a reading of the
+        // verification state, so it belongs on the same rung as a verdict. An
+        // exception here would say Fornax cannot answer, when it just has.
+        let payload = reading(&json!({"latest": null}), now());
+        assert_eq!(payload["clear_authority"], "provider");
+        assert_eq!(segment(&payload)["clear_role"], "posture");
+    }
+
+    #[test]
+    fn every_no_reading_outcome_declares_its_availability_as_the_exception() {
+        // The mirror image: here Fornax genuinely cannot report a verification
+        // state, so the absence is the reading and `exception` is its rung.
+        for kind in ALL_NO_READINGS {
+            let payload = no_reading(kind);
+            assert_eq!(payload["clear_authority"], "provider", "{kind:?}");
+            assert_eq!(segment(&payload)["clear_role"], "exception", "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn every_payload_satisfies_the_hosts_rules_for_a_declared_projection() {
+        // Declaring authority is a claim the host *validates*: at least one
+        // segment, a role on every segment, at most one posture, and at least
+        // one posture or exception. A payload that declares and then fails any
+        // of those is refused outright — it renders as nothing at all, not as a
+        // fallback — so every shape this module can emit is checked here rather
+        // than trusting that two call sites got it right.
+        let mut payloads: Vec<Value> = ALL_VERDICTS
+            .iter()
+            .map(|v| reading(&status_with(v), now()))
+            .collect();
+        payloads.push(reading(&json!({"latest": null}), now()));
+        payloads.extend(ALL_NO_READINGS.iter().map(|k| no_reading(*k)));
+        assert_eq!(payloads.len(), 13, "a shape stopped being covered");
+        for payload in &payloads {
+            assert_eq!(payload["clear_authority"], "provider");
+            let segments = payload["segments"].as_array().unwrap();
+            assert!(!segments.is_empty());
+            let roles: Vec<&str> = segments
+                .iter()
+                .map(|s| {
+                    s["clear_role"]
+                        .as_str()
+                        .expect("every segment must declare a role")
+                })
+                .collect();
+            assert!(roles.iter().filter(|r| **r == "posture").count() <= 1);
+            assert!(roles.iter().any(|r| *r == "posture" || *r == "exception"));
+        }
+    }
+
+    #[test]
+    fn declaring_a_clear_projection_adds_two_keys_and_changes_nothing_else() {
+        // Detail mode must be untouched, and the honest form of that claim is
+        // not "the payload is byte-identical" — it gained two keys — but "every
+        // key that existed before is unchanged, and the only new ones are the
+        // declaration itself". Anything else moving means Detail moved too,
+        // because Detail renders the same snapshot.
+        let strip = |mut payload: Value| -> Value {
+            assert_eq!(payload["clear_authority"], "provider");
+            payload
+                .as_object_mut()
+                .unwrap()
+                .remove("clear_authority")
+                .unwrap();
+            for seg in payload["segments"].as_array_mut().unwrap() {
+                assert!(seg.as_object_mut().unwrap().remove("clear_role").is_some());
+            }
+            payload
+        };
+        // The expected values are written out rather than recomputed, so this
+        // is a comparison against the pre-HORO-1632 payload and not against
+        // whatever the code happens to produce now.
+        assert_eq!(
+            strip(reading(&status_with("contradicted"), now())),
+            json!({
+                "contract_version": 1,
+                "provider": "fornax",
+                "provider_version": env!("CARGO_PKG_VERSION"),
+                "scope": "host",
+                "availability": "available",
+                "order_hint": 300,
+                "observed_at": "2026-09-29T11:59:00Z",
+                "segments": [{
+                    "key": "latest_finding",
+                    "state": "critical",
+                    "label": "Contradicted",
+                    "explain_key": "fornax.latest_finding",
+                    "age_seconds": 60,
+                }],
+            })
+        );
+        assert_eq!(
+            strip(no_reading(NoReading::DaemonUnreachable)),
+            json!({
+                "contract_version": 1,
+                "provider": "fornax",
+                "provider_version": env!("CARGO_PKG_VERSION"),
+                "scope": "host",
+                "availability": "unavailable",
+                "order_hint": 300,
+                "segments": [{
+                    "key": "availability",
+                    "state": "neutral",
+                    "label": "Not running",
+                    "reason_code": "daemon_unreachable",
+                    "explain_key": "fornax.availability",
+                }],
+            })
+        );
+    }
+
     /// Substrings that must never appear in anything either surface prints.
     ///
     /// The first three are the free-text fields themselves. `sk-`, `ghp_` and
