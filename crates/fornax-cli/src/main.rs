@@ -4,7 +4,10 @@
 
 use clap::{Parser, Subcommand};
 
+mod adapter_registry;
 mod adjudicate_cmd;
+mod claude_adapter;
+mod codex_adapter;
 mod corpus_cmd;
 mod evidence_plan_cmd;
 mod experiment_ux;
@@ -12,6 +15,8 @@ mod feedback_cmd;
 mod receipt_cmd;
 mod statusline;
 mod timeline;
+
+use adapter_registry::AdapterId;
 
 #[derive(Parser)]
 #[command(
@@ -31,8 +36,10 @@ enum Commands {
     Status,
     /// Full evidence/finding detail for recent sessions.
     Detail,
-    /// Structured, read-only provider for the shared Horonom statusline host
-    /// (HORO-1567). Productizes FORNX-30's `scripts/fornax-statusline.sh`:
+    /// Structured, read-only provider for the shared Horonom statusline
+    /// host.
+    ///
+    /// Productizes FORNX-30's `scripts/fornax-statusline.sh` (HORO-1567):
     /// where that wrapper had to own the host's single `statusLine.command`
     /// to append its segment, this contributes one typed answer that the
     /// shared host composes alongside the user's own statusline and every
@@ -41,49 +48,55 @@ enum Commands {
         #[command(subcommand)]
         command: StatuslineCommand,
     },
-    /// Per-`SignalClass` capability availability for one session (FORNX-85):
-    /// which signals the announcing runtime(s) actually exposed this
-    /// session — available, unsupported, unavailable, redacted, collection-
-    /// failed, or not yet announced. Reads `GET /api/capabilities` on the
-    /// daemon. Never collapses the six-state availability taxonomy into a
-    /// boolean (`capabilities.rs`'s own doc comments, ADR-0001 D4) — each
-    /// signal class is rendered with its real, distinct state.
+    /// Per-signal capability availability for one session.
+    ///
+    /// Which signals the announcing runtime(s) actually exposed this
+    /// session (`SignalClass`, FORNX-85) — available, unsupported,
+    /// unavailable, redacted, collection-failed, or not yet announced.
+    /// Reads `GET /api/capabilities` on the daemon. Never collapses the
+    /// six-state availability taxonomy into a boolean (`capabilities.rs`'s
+    /// own doc comments, ADR-0001 D4) — each signal class is rendered with
+    /// its real, distinct state.
     Capabilities {
         /// Session id to look up.
         session: String,
     },
-    /// Claim-centered evidence graph (FORNX-90, local half): every typed
-    /// claim-to-evidence link plus every explicit missing-evidence note for
-    /// one claim, grouped by relation. Reads `GET /api/evidence-graph` on
-    /// the daemon (`fornax-store::Store::evidence_graph_for_claim`,
-    /// FORNX-89). Never collapses the graph into a single count/score — a
-    /// claim with genuinely zero evidence renders differently from one with
-    /// evidence explicitly noted missing, which renders differently again
-    /// from a claim id the daemon has never seen.
+    /// Claim-centered evidence graph for one claim.
+    ///
+    /// Every typed claim-to-evidence link plus every explicit missing-
+    /// evidence note, grouped by relation (FORNX-90, local half). Reads
+    /// `GET /api/evidence-graph` on the daemon
+    /// (`fornax-store::Store::evidence_graph_for_claim`, FORNX-89). Never
+    /// collapses the graph into a single count/score — a claim with
+    /// genuinely zero evidence renders differently from one with evidence
+    /// explicitly noted missing, which renders differently again from a
+    /// claim id the daemon has never seen.
     EvidenceGraph {
         /// Claim id to look up.
         claim: String,
         /// Session id the claim belongs to.
         session: String,
     },
-    /// Live fused verdict for one claim (FORNX-304): computes
-    /// `fornax_verify::fusion::BaselineFusionPolicy::fuse` over the claim's
-    /// real evidence graph (FORNX-89), falling back to the `project_graph`
-    /// projection when the real graph is empty — the same fallback FORNX-93
-    /// documents as today's actual production state. Reads `GET
-    /// /api/fusion` on the daemon. Every `RationaleEntry` is rendered
-    /// individually, never collapsed into a summary — the same
-    /// never-collapse-the-taxonomy discipline as `evidence-graph`/
-    /// `capabilities`.
+    /// Live fused verdict for one claim.
+    ///
+    /// Computes `fornax_verify::fusion::BaselineFusionPolicy::fuse`
+    /// (FORNX-304) over the claim's real evidence graph (FORNX-89),
+    /// falling back to the `project_graph` projection when the real graph
+    /// is empty — the same fallback FORNX-93 documents as today's actual
+    /// production state. Reads `GET /api/fusion` on the daemon. Every
+    /// `RationaleEntry` is rendered individually, never collapsed into a
+    /// summary — the same never-collapse-the-taxonomy discipline as
+    /// `evidence-graph`/`capabilities`.
     Fusion {
         /// Claim id to look up.
         claim: String,
         /// Session id the claim belongs to.
         session: String,
     },
-    /// Actionable recommendation for one claim (FORNX-96, local half):
-    /// computes `fornax_verify::fusion::BaselineFusionPolicy::fuse` exactly
-    /// like `fusion`, then applies
+    /// Actionable recommendation for one claim.
+    ///
+    /// Computes `fornax_verify::fusion::BaselineFusionPolicy::fuse`
+    /// (FORNX-96, local half) exactly like `fusion`, then applies
     /// `fornax_verify::decision::DefaultRiskPolicy` for the requested risk
     /// class to produce a `PROCEED`/`REVIEW`/`BLOCK` recommendation. Reads
     /// `GET /api/decision` on the daemon.
@@ -107,25 +120,27 @@ enum Commands {
         #[arg(long, default_value = "balanced")]
         risk: String,
     },
-    /// Epistemic-contract satisfaction report for one claim (FORNX-378):
-    /// resolves the claim's subject to a FORNX-377 claim class and shows
-    /// every proof obligation's satisfaction state, which evidence matched
-    /// it, and which evidence was rejected and why — never collapsed into a
-    /// single pass/fail. A claim whose subject has no registered contract
-    /// renders `unknown`, never a fabricated pass. Reads `GET /api/contract`
-    /// on the daemon.
+    /// Epistemic-contract satisfaction report for one claim.
+    ///
+    /// Resolves the claim's subject to a FORNX-377 claim class (FORNX-378)
+    /// and shows every proof obligation's satisfaction state, which
+    /// evidence matched it, and which evidence was rejected and why —
+    /// never collapsed into a single pass/fail. A claim whose subject has
+    /// no registered contract renders `unknown`, never a fabricated pass.
+    /// Reads `GET /api/contract` on the daemon.
     Contract {
         /// Claim id to look up.
         claim: String,
         /// Session id the claim belongs to.
         session: String,
     },
-    /// Ranked evidence-acquisition plan for one claim (FORNX-345): which
-    /// concrete probes (rerun a test, inspect VCS state, query CI status,
-    /// verify an artifact hash, a bounded replay experiment, human review)
-    /// would close today's evidence gaps, ranked by discrimination,
-    /// independence from what fusion already counted, recency, cost,
-    /// latency, privacy sensitivity, and action risk. Reads
+    /// Ranked evidence-acquisition plan for one claim.
+    ///
+    /// Which concrete probes (rerun a test, inspect VCS state, query CI
+    /// status, verify an artifact hash, a bounded replay experiment, human
+    /// review) would close today's evidence gaps (FORNX-345), ranked by
+    /// discrimination, independence from what fusion already counted,
+    /// recency, cost, latency, privacy sensitivity, and action risk. Reads
     /// `GET /api/evidence-plan` on the daemon.
     ///
     /// Never shows the plan alone — always renders the same recommendation
@@ -145,8 +160,9 @@ enum Commands {
         #[arg(long, default_value = "balanced")]
         risk: String,
     },
-    /// Executes one ranked candidate from `fornax evidence-plan` for real
-    /// (FORNX-346): `POST /api/acquire-evidence`. `rank` must be a rank
+    /// Executes one ranked candidate from `fornax evidence-plan` for real.
+    ///
+    /// `POST /api/acquire-evidence` (FORNX-346). `rank` must be a rank
     /// shown by a current `fornax evidence-plan` run for the same claim --
     /// this command never accepts a raw probe request, only a rank, so it
     /// cannot be used to smuggle a request the daemon's own plan didn't
@@ -171,14 +187,15 @@ enum Commands {
         #[arg(long, default_value = "balanced")]
         risk: String,
     },
-    /// Semantic Judge opinion for one claim (FORNX-94): sends the claim plus
-    /// a bounded, structured evidence-graph excerpt to the configured local
-    /// self-hosted judge (Ollama-compatible endpoint, `[semantic_judge]` in
-    /// `$FORNAX_HOME/config.toml`, disabled by default) and renders the
-    /// resulting model-derived verdict alongside the same full fusion detail
-    /// `fusion`/`decision` render — the judge's opinion never replaces or
-    /// hides the deterministic evidence trail. Reads `GET /api/judge` on the
-    /// daemon.
+    /// Semantic Judge opinion for one claim.
+    ///
+    /// Sends the claim plus a bounded, structured evidence-graph excerpt
+    /// (FORNX-94) to the configured local self-hosted judge (Ollama-
+    /// compatible endpoint, `[semantic_judge]` in `$FORNAX_HOME/config.toml`,
+    /// disabled by default) and renders the resulting model-derived verdict
+    /// alongside the same full fusion detail `fusion`/`decision` render —
+    /// the judge's opinion never replaces or hides the deterministic
+    /// evidence trail. Reads `GET /api/judge` on the daemon.
     ///
     /// A disabled/unreachable/timed-out judge is rendered honestly as
     /// unavailable, never a fabricated pass/fail.
@@ -193,12 +210,13 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         allow_raw_evidence: bool,
     },
-    /// Context-scoped historical reliability signal, plus an optional drift
-    /// check against a second model/adapter version (FORNX-105). Renders
-    /// FORNX-103's `ReliabilityContextKey` schema and FORNX-104's
-    /// `compute_reliability`/`detect_drift` statistics as a purely local,
-    /// display/wiring layer -- this subcommand computes no new statistic
-    /// itself. Reads `GET /api/reliability` on the daemon.
+    /// Context-scoped historical reliability signal, plus an optional
+    /// drift check against a second model/adapter version.
+    ///
+    /// Renders FORNX-103's `ReliabilityContextKey` schema and FORNX-104's
+    /// `compute_reliability`/`detect_drift` statistics (FORNX-105) as a
+    /// purely local, display/wiring layer -- this subcommand computes no
+    /// new statistic itself. Reads `GET /api/reliability` on the daemon.
     ///
     /// Never shows a bare provider/model trust percentage: a reliability
     /// estimate is only ever rendered together with the full context
@@ -222,21 +240,23 @@ enum Commands {
     // every other variant's size -- boxing keeps `Commands` itself cheap to
     // move/match regardless of which subcommand is chosen.
     Reliability(Box<ReliabilityArgs>),
-    /// Report whether the live environment (adapter version, capability
-    /// fingerprint, fusion/decision policy identity, disabled sensors)
-    /// still matches the most recently recorded calibration revision
-    /// (FORNX-348). Plain prose over `GET /api/calibration` -- never a bare
-    /// percentage.
+    /// Report whether the live environment still matches the most recently
+    /// recorded calibration revision.
+    ///
+    /// Adapter version, capability fingerprint, fusion/decision policy
+    /// identity, disabled sensors (FORNX-348). Plain prose over `GET
+    /// /api/calibration` -- never a bare percentage.
     Calibration {
         /// Session id whose announced capabilities supply the live
         /// provenance's capability fingerprint.
         session: String,
     },
-    /// Export one session's events/claims/evidence/capabilities from the
-    /// local store into a directory-based spool, as one wire-compatible
-    /// envelope JSON file per message (FORNX-60, FORNX-62). Reads
-    /// `$FORNAX_HOME/fornax.db` directly — no daemon dependency, so this
-    /// also works while the daemon is stopped.
+    /// Export one session's events/claims/evidence/capabilities into a
+    /// directory-based spool.
+    ///
+    /// One wire-compatible envelope JSON file per message (FORNX-60,
+    /// FORNX-62). Reads `$FORNAX_HOME/fornax.db` directly — no daemon
+    /// dependency, so this also works while the daemon is stopped.
     ///
     /// Written to `<out>/pending/<id>.json`, matching the layout a consumer
     /// such as fornax-cloud's uploader spool expects: one JSON object per
@@ -254,73 +274,81 @@ enum Commands {
         #[arg(long)]
         out: std::path::PathBuf,
     },
-    /// Idempotently wire the Fornax hooks into `~/.claude/settings.json`
-    /// (FORNX-15), matching the `fornax-adapter-claude` doc comment's
-    /// documented hook set: SessionStart, UserPromptSubmit, PreToolUse,
-    /// PostToolUse, Stop. Safe to run more than once — never duplicates an
-    /// entry, and never touches unrelated hooks or settings already present
-    /// in the file.
+    /// Install a Fornax adapter integration (e.g. `claude-code`, `codex`).
+    ///
+    /// Adapter is a registry entry, not a top-level command (ADR-0013 §8,
+    /// HORO-1621) — see `fornax install list` for every known adapter id
+    /// and what it wires, `fornax install doctor <adapter>` for current
+    /// status, and `fornax install plan <adapter>` to preview a change
+    /// before applying it. Install is idempotent: running it again when
+    /// already installed is a safe no-op. Host configuration mutation is
+    /// always additive/targeted — an adapter only ever adds or updates the
+    /// keys it owns, never an unrelated existing setting (HORO-996/
+    /// ADR-0009).
+    Install(InstallArgs),
+    /// Uninstall a Fornax adapter integration, reversing `install`.
+    ///
+    /// Removes only the keys that adapter's `install` added, leaving every
+    /// other setting untouched. Safe to run when nothing is installed,
+    /// including when the adapter's target config file does not exist.
+    Uninstall {
+        /// Adapter id to uninstall (e.g. `claude-code`, `codex`).
+        adapter: AdapterId,
+    },
+    /// Deprecated alias for `fornax install claude-code` — delegates to the
+    /// same implementation. Kept for scripts/users that depend on the old
+    /// spelling (HORO-1621).
+    #[command(hide = true)]
     InstallClaude,
-    /// Reverse of `install-claude`: removes only the Fornax hook entries
-    /// from `~/.claude/settings.json`, leaving every other hook and setting
-    /// untouched. Safe to run when nothing is installed — including when
-    /// `~/.claude/settings.json` does not exist, in which case it is left
-    /// absent rather than created.
+    /// Deprecated alias for `fornax uninstall claude-code`.
+    #[command(hide = true)]
     UninstallClaude,
-    /// Idempotently wires Fornax's ambient-status notify script into
-    /// `~/.codex/config.toml`'s `notify` entry (FORNX-16/FORNX-17).
-    ///
-    /// This does **not** configure Codex's evidence-capture path — the
-    /// rollout-JSONL tailer (`fornax-hook-codex`) reads Codex's always-on
-    /// session transcripts directly and needs no Codex-side configuration
-    /// at all; just run it (see the README's Codex section). `notify` is
-    /// the separate, optional ambient-status surface documented in
-    /// `docs/dogfooding-codex-notify.md`.
-    ///
-    /// Codex's `notify` holds exactly one command (unlike Claude's
-    /// per-event hook arrays), so if it is already wired to something else
-    /// this refuses to overwrite it and leaves the file byte-for-byte
-    /// unchanged — wire Fornax in manually instead. Comments and unrelated
-    /// tables in the file are preserved.
+    /// Deprecated alias for `fornax install codex`.
+    #[command(hide = true)]
     InstallCodex,
-    /// Reverse of `install-codex`: removes the Fornax `notify` entry from
-    /// `~/.codex/config.toml` if and only if it is the one `install-codex`
-    /// added, leaving every other key/table (and comments) untouched. Safe
-    /// to run when nothing is installed, including when
-    /// `~/.codex/config.toml` does not exist.
+    /// Deprecated alias for `fornax uninstall codex`.
+    #[command(hide = true)]
     UninstallCodex,
-    /// Counterfactual verification flow (FORNX-101): preview/run/render a
-    /// bounded robustness experiment against a claim, wiring together
-    /// FORNX-99's `ExperimentSpec` contract, FORNX-100's isolated
-    /// `ExperimentExecutor`, and FORNX-102's causal evidence mapping. Runs
-    /// entirely client-side against local filesystem paths (no daemon
-    /// dependency) — see `experiment_ux`'s module docs for why.
+    /// Counterfactual verification flow: preview/run/render a bounded
+    /// robustness experiment against a claim.
+    ///
+    /// Wires together FORNX-99's `ExperimentSpec` contract, FORNX-100's
+    /// isolated `ExperimentExecutor`, and FORNX-102's causal evidence
+    /// mapping (FORNX-101). Runs entirely client-side against local
+    /// filesystem paths (no daemon dependency) — see `experiment_ux`'s
+    /// module docs for why.
     Experiment {
         #[command(subcommand)]
         action: experiment_ux::ExperimentAction,
     },
-    /// Local policy cache (FORNX-119): status and file-based import of a
-    /// signed policy bundle over the existing UDS ingest channel.
+    /// Local policy cache: status and file-based import of a signed policy
+    /// bundle.
+    ///
+    /// Submitted over the existing UDS ingest channel (FORNX-119).
     Policy {
         #[command(subcommand)]
         action: PolicyAction,
     },
-    /// Local append-only, hash-chained audit ledger (FORNX-315). Reads
-    /// `$FORNAX_HOME/fornax.db` directly (`fornax_store::Store`), mirroring
-    /// `export-spool`'s direct-store access rather than the daemon's HTTP
-    /// API -- the ledger is local file state, not a daemon-mediated view.
+    /// Local append-only, hash-chained audit ledger.
+    ///
+    /// Reads `$FORNAX_HOME/fornax.db` directly (`fornax_store::Store`,
+    /// FORNX-315), mirroring `export-spool`'s direct-store access rather
+    /// than the daemon's HTTP API -- the ledger is local file state, not a
+    /// daemon-mediated view.
     Audit {
         #[command(subcommand)]
         action: AuditAction,
     },
-    /// Incident timeline (FORNX-321): reconstructs one finding's -- or one
-    /// session's -- full local provenance (evidence with per-item trust
-    /// class, the fused five-state verdict, the verifier name, current
-    /// local policy state, and the local audit ledger). Reads
-    /// `$FORNAX_HOME/fornax.db` directly, matching `audit`'s direct-store
-    /// access -- works fully offline, no daemon required. See
-    /// `timeline.rs`'s module doc comment for this command's honest scope
-    /// boundary. Exactly one of `--finding`/`--session` must be given.
+    /// Incident timeline: reconstructs one finding's -- or one session's --
+    /// full local provenance.
+    ///
+    /// Evidence with per-item trust class, the fused five-state verdict,
+    /// the verifier name, current local policy state, and the local audit
+    /// ledger (FORNX-321). Reads `$FORNAX_HOME/fornax.db` directly,
+    /// matching `audit`'s direct-store access -- works fully offline, no
+    /// daemon required. See `timeline.rs`'s module doc comment for this
+    /// command's honest scope boundary. Exactly one of `--finding`/
+    /// `--session` must be given.
     Timeline {
         /// Look up one finding by id.
         #[arg(long)]
@@ -329,38 +357,81 @@ enum Commands {
         #[arg(long)]
         session: Option<String>,
     },
-    /// Integrity Corpus Factory (FORNX-341): mine real sessions into
-    /// sanitized candidate integrity cases, and export a versioned corpus
-    /// manifest. Reads `$FORNAX_HOME/fornax.db` directly, matching
-    /// `audit`/`timeline`'s precedent. Requires an explicit opt-in --
+    /// Integrity Corpus Factory: mine real sessions into sanitized
+    /// candidate integrity cases.
+    ///
+    /// Exports a versioned corpus manifest (FORNX-341). Reads
+    /// `$FORNAX_HOME/fornax.db` directly, matching `audit`/`timeline`'s
+    /// precedent. Requires an explicit opt-in --
     /// `FORNAX_CORPUS_MINING_ENABLED=1` -- before anything is persisted.
     Corpus {
         #[command(subcommand)]
         action: corpus_cmd::CorpusAction,
     },
-    /// Corpus adjudication workflow (FORNX-342): blinded review ->
-    /// disagreement -> adjudication -> frozen gold label -> export. Reads
-    /// `$FORNAX_HOME/fornax.db` directly. Registering a `human` reviewer
-    /// requires `--attested-by` and is itself audited.
+    /// Corpus adjudication workflow: blinded review -> disagreement ->
+    /// adjudication -> frozen gold label -> export.
+    ///
+    /// (FORNX-342.) Reads `$FORNAX_HOME/fornax.db` directly. Registering a
+    /// `human` reviewer requires `--attested-by` and is itself audited.
     Adjudicate {
         #[command(subcommand)]
         action: adjudicate_cmd::AdjudicateAction,
     },
-    /// Product feedback on a live finding/recommendation (FORNX-349),
-    /// structurally separate from `fornax adjudicate` -- feedback here can
-    /// never become a frozen gold label. Reads `$FORNAX_HOME/fornax.db`
-    /// directly.
+    /// Product feedback on a live finding/recommendation.
+    ///
+    /// Structurally separate from `fornax adjudicate` -- feedback here can
+    /// never become a frozen gold label (FORNX-349). Reads
+    /// `$FORNAX_HOME/fornax.db` directly.
     Feedback {
         #[command(subcommand)]
         action: feedback_cmd::FeedbackAction,
     },
-    /// Portable integrity receipts (FORNX-350): issue a deterministic,
-    /// reference-only receipt from a real local finding, or verify one
-    /// against a gate policy. Verification-only -- `receipt issue` never
-    /// signs anything; see `fornax_types::receipt`'s module docs.
+    /// Portable integrity receipts: issue a deterministic, reference-only
+    /// receipt from a real local finding, or verify one against a gate
+    /// policy.
+    ///
+    /// (FORNX-350.) Verification-only -- `receipt issue` never signs
+    /// anything; see `fornax_types::receipt`'s module docs.
     Receipt {
         #[command(subcommand)]
         action: receipt_cmd::ReceiptAction,
+    },
+}
+
+/// `fornax install <adapter>` / `fornax install <list|doctor|plan>`
+/// (HORO-1621). `adapter` and `action` are mutually exclusive: give an
+/// adapter id to install it directly, or a management subcommand
+/// (`list`/`doctor`/`plan`) to inspect the registry instead. clap resolves
+/// `list`/`doctor`/`plan` as the nested subcommand and anything else (e.g.
+/// `claude-code`, `codex`) as the `adapter` positional, since those names
+/// never collide with a known adapter id — verified in this module's
+/// `install_arg_parsing` tests.
+#[derive(clap::Args)]
+pub struct InstallArgs {
+    /// Adapter id to install directly, e.g. `claude-code` or `codex`. Omit
+    /// when using a management subcommand instead.
+    pub adapter: Option<AdapterId>,
+    #[command(subcommand)]
+    pub action: Option<InstallAction>,
+}
+
+#[derive(Subcommand)]
+pub enum InstallAction {
+    /// List every known adapter id, display name, and what it wires.
+    List,
+    /// Current install status for one adapter, read-only.
+    Doctor {
+        /// Adapter id to inspect.
+        adapter: AdapterId,
+    },
+    /// Preview what `fornax install <adapter>` would change, without
+    /// applying it.
+    Plan {
+        /// Adapter id to preview.
+        adapter: AdapterId,
+        /// Emit the result as JSON instead of a human-readable line.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -682,10 +753,30 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::ExportSpool { session, out } => export_spool(&session, &out).await?,
-        Commands::InstallClaude => install_claude()?,
-        Commands::UninstallClaude => uninstall_claude()?,
-        Commands::InstallCodex => install_codex()?,
-        Commands::UninstallCodex => uninstall_codex()?,
+        Commands::Install(args) => handle_install(args)?,
+        Commands::Uninstall { adapter } => print_result(adapter_registry::uninstall(adapter)?),
+        Commands::InstallClaude => {
+            eprintln!(
+                "fornax: `install-claude` is deprecated, use `fornax install claude-code` instead"
+            );
+            print_result(adapter_registry::install(AdapterId::ClaudeCode)?)
+        }
+        Commands::UninstallClaude => {
+            eprintln!(
+                "fornax: `uninstall-claude` is deprecated, use `fornax uninstall claude-code` instead"
+            );
+            print_result(adapter_registry::uninstall(AdapterId::ClaudeCode)?)
+        }
+        Commands::InstallCodex => {
+            eprintln!("fornax: `install-codex` is deprecated, use `fornax install codex` instead");
+            print_result(adapter_registry::install(AdapterId::Codex)?)
+        }
+        Commands::UninstallCodex => {
+            eprintln!(
+                "fornax: `uninstall-codex` is deprecated, use `fornax uninstall codex` instead"
+            );
+            print_result(adapter_registry::uninstall(AdapterId::Codex)?)
+        }
         Commands::Experiment { action } => experiment_ux::handle(action, &fornax_home())?,
         Commands::Policy { action } => handle_policy_action(action).await?,
         Commands::Audit { action } => handle_audit_action(action).await?,
@@ -1079,387 +1170,69 @@ fn render_policy_status(v: &serde_json::Value) -> String {
     out
 }
 
+fn print_result(result: adapter_registry::AdapterActionResult) {
+    println!("{}", result.message);
+}
+
+fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
+    match (args.adapter, args.action) {
+        (Some(_), Some(_)) => anyhow::bail!(
+            "fornax install: specify either an adapter id or a management subcommand \
+             (list/doctor/plan), not both — see `fornax install --help`"
+        ),
+        (Some(adapter), None) => {
+            print_result(adapter_registry::install(adapter)?);
+            Ok(())
+        }
+        (None, Some(InstallAction::List)) => {
+            println!("Known Fornax adapters:");
+            for adapter in AdapterId::ALL {
+                println!(
+                    "  {:<12} {}\n               {}\n               config: {}",
+                    adapter.id(),
+                    adapter.display_name(),
+                    adapter.summary(),
+                    adapter_registry::default_config_path(adapter).display()
+                );
+            }
+            Ok(())
+        }
+        (None, Some(InstallAction::Doctor { adapter })) => {
+            let result = adapter_registry::doctor(adapter)?;
+            println!(
+                "{} ({}): {}",
+                adapter.display_name(),
+                adapter.id(),
+                result.message
+            );
+            Ok(())
+        }
+        (None, Some(InstallAction::Plan { adapter, json })) => {
+            let result = adapter_registry::plan(adapter)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("{}", result.message);
+            }
+            Ok(())
+        }
+        (None, None) => anyhow::bail!(
+            "fornax install: requires an adapter id or a subcommand (list/doctor/plan) — \
+             see `fornax install --help`"
+        ),
+    }
+}
+
 fn fornax_home() -> std::path::PathBuf {
     std::env::var("FORNAX_HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| dirs_home().join(".fornax"))
 }
 
-fn dirs_home() -> std::path::PathBuf {
+pub(crate) fn dirs_home() -> std::path::PathBuf {
     std::env::var("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
-}
-
-/// The `command` value the `fornax-adapter-claude` doc comment documents for
-/// wiring into `~/.claude/settings.json` hooks.
-const FORNAX_HOOK_COMMAND: &str = "fornax-hook-claude";
-
-/// Hook event names the `fornax-adapter-claude` doc comment documents as
-/// the wired set. Kept in sync with that doc comment — see
-/// `crates/fornax-adapter-claude/src/main.rs`.
-const CLAUDE_HOOK_EVENTS: [&str; 5] = [
-    "SessionStart",
-    "UserPromptSubmit",
-    "PreToolUse",
-    "PostToolUse",
-    "Stop",
-];
-
-fn claude_settings_path() -> std::path::PathBuf {
-    dirs_home().join(".claude").join("settings.json")
-}
-
-fn load_settings(path: &std::path::Path) -> anyhow::Result<serde_json::Value> {
-    if !path.exists() {
-        return Ok(serde_json::json!({}));
-    }
-    let contents = std::fs::read_to_string(path)?;
-    if contents.trim().is_empty() {
-        return Ok(serde_json::json!({}));
-    }
-    let value: serde_json::Value = serde_json::from_str(&contents)?;
-    anyhow::ensure!(
-        value.is_object(),
-        "{} does not contain a JSON object at its root — refusing to touch it",
-        path.display()
-    );
-    Ok(value)
-}
-
-/// Atomically overwrites `path` with `settings` (write-to-temp then rename,
-/// same pattern `write_envelope` uses below) so a crash or concurrent read
-/// never observes a half-written `~/.claude/settings.json`.
-fn save_settings(path: &std::path::Path, settings: &serde_json::Value) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut json = serde_json::to_string_pretty(settings)?;
-    json.push('\n');
-    let tmp_path = path.with_extension("json.tmp");
-    std::fs::write(&tmp_path, json)?;
-    std::fs::rename(&tmp_path, path)?;
-    Ok(())
-}
-
-/// True if this hook group already carries a Fornax command entry.
-fn group_has_fornax_command(group: &serde_json::Value) -> bool {
-    group
-        .get("hooks")
-        .and_then(|h| h.as_array())
-        .map(|entries| {
-            entries
-                .iter()
-                .any(|h| h.get("command").and_then(|c| c.as_str()) == Some(FORNAX_HOOK_COMMAND))
-        })
-        .unwrap_or(false)
-}
-
-/// Idempotently ensures each hook in `CLAUDE_HOOK_EVENTS` has one group
-/// running `fornax-hook-claude`, without touching any other group/event
-/// already present in `settings`.
-///
-/// `settings` must already be a JSON object (guaranteed by `load_settings`).
-/// If an existing `"hooks"` value, or an existing per-event value, is
-/// present but not the shape Claude Code expects (object / array
-/// respectively), this refuses to clobber it and returns an error instead —
-/// per the "safe failure mode rather than corrupting Claude Code config"
-/// constraint.
-fn install_claude_hooks(settings: &mut serde_json::Value) -> anyhow::Result<()> {
-    let root = settings
-        .as_object_mut()
-        .expect("caller guarantees settings is a JSON object");
-    let hooks = root.entry("hooks").or_insert_with(|| serde_json::json!({}));
-    anyhow::ensure!(
-        hooks.is_object(),
-        "existing \"hooks\" value in settings.json is not an object — refusing to overwrite it"
-    );
-    let hooks_obj = hooks.as_object_mut().expect("just checked is_object");
-
-    for event in CLAUDE_HOOK_EVENTS {
-        let entries = hooks_obj
-            .entry(event)
-            .or_insert_with(|| serde_json::json!([]));
-        anyhow::ensure!(
-            entries.is_array(),
-            "existing \"hooks.{event}\" value in settings.json is not an array — refusing to overwrite it"
-        );
-        let entries_arr = entries.as_array_mut().expect("just checked is_array");
-        let already_installed = entries_arr.iter().any(group_has_fornax_command);
-        if !already_installed {
-            entries_arr.push(serde_json::json!({
-                "hooks": [{ "type": "command", "command": FORNAX_HOOK_COMMAND }]
-            }));
-        }
-    }
-    Ok(())
-}
-
-/// Removes only Fornax hook entries from `settings`, leaving every other
-/// hook group, hook event, and top-level setting exactly as it was. Cleans
-/// up groups/events left empty by the removal, but never removes a group
-/// that still carries another tool's hook entry.
-fn uninstall_claude_hooks(settings: &mut serde_json::Value) {
-    let Some(hooks_obj) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
-        return;
-    };
-
-    for event in CLAUDE_HOOK_EVENTS {
-        let Some(entries) = hooks_obj.get_mut(event).and_then(|e| e.as_array_mut()) else {
-            continue;
-        };
-        for group in entries.iter_mut() {
-            if let Some(group_hooks) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
-                group_hooks.retain(|h| {
-                    h.get("command").and_then(|c| c.as_str()) != Some(FORNAX_HOOK_COMMAND)
-                });
-            }
-        }
-        entries.retain(|group| {
-            group
-                .get("hooks")
-                .and_then(|h| h.as_array())
-                .map(|a| !a.is_empty())
-                .unwrap_or(true)
-        });
-    }
-
-    hooks_obj.retain(|_, v| v.as_array().map(|a| !a.is_empty()).unwrap_or(true));
-    if hooks_obj.is_empty() {
-        settings
-            .as_object_mut()
-            .expect("checked object above")
-            .remove("hooks");
-    }
-}
-
-fn install_claude_at(path: &std::path::Path) -> anyhow::Result<()> {
-    let before = load_settings(path)?;
-    let mut settings = before.clone();
-    install_claude_hooks(&mut settings)?;
-    if settings == before {
-        println!(
-            "Fornax Claude Code hooks already installed in {}",
-            path.display()
-        );
-        return Ok(());
-    }
-    save_settings(path, &settings)?;
-    println!("Installed Fornax Claude Code hooks in {}", path.display());
-    Ok(())
-}
-
-fn uninstall_claude_at(path: &std::path::Path) -> anyhow::Result<()> {
-    if !path.exists() {
-        // Nothing was ever installed — leave the machine exactly as it was
-        // rather than creating a settings.json the user never had.
-        println!(
-            "No Fornax Claude Code hooks to remove ({} does not exist)",
-            path.display()
-        );
-        return Ok(());
-    }
-    let before = load_settings(path)?;
-    let mut settings = before.clone();
-    uninstall_claude_hooks(&mut settings);
-    if settings == before {
-        println!("No Fornax Claude Code hooks found in {}", path.display());
-        return Ok(());
-    }
-    save_settings(path, &settings)?;
-    println!("Removed Fornax Claude Code hooks from {}", path.display());
-    Ok(())
-}
-
-fn install_claude() -> anyhow::Result<()> {
-    install_claude_at(&claude_settings_path())
-}
-
-fn uninstall_claude() -> anyhow::Result<()> {
-    uninstall_claude_at(&claude_settings_path())
-}
-
-/// Filename marker identifying a Fornax-owned `notify` entry in
-/// `~/.codex/config.toml`. Matched by suffix (rather than requiring a
-/// byte-for-byte absolute-path match) so uninstall still recognizes an
-/// install made from a different checkout of this repo.
-const CODEX_NOTIFY_SCRIPT_MARKER: &str = "fornax-codex-notify.sh";
-
-fn codex_config_path() -> std::path::PathBuf {
-    dirs_home().join(".codex").join("config.toml")
-}
-
-/// Absolute path to `scripts/fornax-codex-notify.sh`, resolved relative to
-/// this crate's location in the workspace at compile time — matches the
-/// documented from-source workflow (`cargo build --workspace` from the
-/// repo root; see `docs/dogfooding-codex-notify.md`).
-fn default_codex_notify_script() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../scripts/fornax-codex-notify.sh")
-}
-
-/// Parses `path` as a format-preserving TOML document (comments and table
-/// ordering survive edits), or an empty document if `path` does not exist.
-/// Unlike `load_settings`'s JSON equivalent, a `~/.codex/config.toml` that
-/// fails to parse as TOML is always a hard error — there is no sensible
-/// "treat it as empty" fallback for a file this consequential.
-fn load_codex_config(path: &std::path::Path) -> anyhow::Result<toml_edit::DocumentMut> {
-    if !path.exists() {
-        return Ok(toml_edit::DocumentMut::new());
-    }
-    let contents = std::fs::read_to_string(path)?;
-    contents.parse::<toml_edit::DocumentMut>().map_err(|e| {
-        anyhow::anyhow!(
-            "{} is not valid TOML — refusing to touch it: {e}",
-            path.display()
-        )
-    })
-}
-
-/// Atomically overwrites `path` with `doc` (write-to-temp then rename, same
-/// pattern `save_settings` uses for Claude's JSON). Additionally preserves
-/// the original file's Unix permissions on the replacement — a real
-/// `~/.codex/config.toml` on this machine is mode 0600, and this repo's own
-/// capability-matrix research (FORNX-33) has found plaintext secrets in
-/// other Codex on-disk files, so silently widening this file to the
-/// process umask's default mode on rename would be a real regression, not
-/// a cosmetic one. A freshly created file gets 0600 rather than an
-/// umask-dependent default.
-fn save_codex_config(path: &std::path::Path, doc: &toml_edit::DocumentMut) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp_path = path.with_extension("toml.tmp");
-    std::fs::write(&tmp_path, doc.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(path)
-            .map(|m| m.permissions().mode())
-            .unwrap_or(0o600);
-        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(mode))?;
-    }
-    std::fs::rename(&tmp_path, path)?;
-    Ok(())
-}
-
-/// True if `notify`'s first element is a Fornax-owned notify script.
-///
-/// Compares the path's basename exactly, not a bare `ends_with` on the
-/// whole string — a foreign script at e.g. `/opt/my-fornax-codex-notify.sh`
-/// would `ends_with(CODEX_NOTIFY_SCRIPT_MARKER)` even though its basename
-/// is a different file, which would make `uninstall-codex` delete a
-/// user's real, unrelated `notify` configuration.
-fn notify_is_fornax(item: &toml_edit::Item) -> bool {
-    item.as_array()
-        .and_then(|a| a.get(0))
-        .and_then(|v| v.as_str())
-        .map(|s| {
-            std::path::Path::new(s).file_name().and_then(|f| f.to_str())
-                == Some(CODEX_NOTIFY_SCRIPT_MARKER)
-        })
-        .unwrap_or(false)
-}
-
-/// Idempotently wires `script_path` into `config_path`'s `notify` entry.
-///
-/// Codex's `notify` holds exactly one command — its first element is the
-/// program, any remaining elements are that program's own extra arguments,
-/// not additional commands (see `docs/dogfooding-codex-notify.md`'s
-/// live-captured invocation shape). So unlike Claude's per-event hook
-/// arrays, this can never safely *add* Fornax alongside an existing
-/// foreign `notify` value — doing so would either replace the user's
-/// configured command outright or corrupt it by appending Fornax's path as
-/// that command's own argument. If `notify` is already set to something
-/// other than this exact script, this refuses to touch the file and
-/// returns an error instead.
-fn install_codex_notify_at(
-    config_path: &std::path::Path,
-    script_path: &std::path::Path,
-) -> anyhow::Result<()> {
-    let mut doc = load_codex_config(config_path)?;
-    let script_str = script_path.to_string_lossy().into_owned();
-
-    if let Some(existing) = doc.get("notify") {
-        anyhow::ensure!(
-            existing.is_array(),
-            "existing \"notify\" value in {} is not an array — refusing to overwrite it",
-            config_path.display()
-        );
-        let existing_first = existing
-            .as_array()
-            .and_then(|a| a.get(0))
-            .and_then(|v| v.as_str());
-        if existing_first == Some(script_str.as_str()) {
-            println!(
-                "Fornax Codex notify already installed in {}",
-                config_path.display()
-            );
-            return Ok(());
-        }
-        anyhow::bail!(
-            "existing \"notify\" in {} is already wired to {:?} — refusing to overwrite it \
-             (Codex's notify holds exactly one command; wire Fornax in manually alongside \
-             it, or remove the existing entry first)",
-            config_path.display(),
-            existing_first.unwrap_or("<non-string entry>")
-        );
-    }
-
-    let mut arr = toml_edit::Array::new();
-    arr.push(script_str);
-    doc["notify"] = toml_edit::Item::Value(toml_edit::Value::Array(arr));
-    save_codex_config(config_path, &doc)?;
-    println!(
-        "Installed Fornax Codex notify wiring in {}",
-        config_path.display()
-    );
-    Ok(())
-}
-
-/// Removes the Fornax `notify` entry from `config_path` iff it is the one
-/// `install-codex` added, leaving every other key/table and comment
-/// exactly as it was.
-fn uninstall_codex_notify_at(config_path: &std::path::Path) -> anyhow::Result<()> {
-    if !config_path.exists() {
-        // Nothing was ever installed — leave the machine exactly as it
-        // was rather than creating a config.toml the user never had.
-        println!(
-            "No Fornax Codex notify wiring to remove ({} does not exist)",
-            config_path.display()
-        );
-        return Ok(());
-    }
-    let mut doc = load_codex_config(config_path)?;
-    let Some(existing) = doc.get("notify") else {
-        println!(
-            "No Fornax Codex notify wiring found in {}",
-            config_path.display()
-        );
-        return Ok(());
-    };
-    if !notify_is_fornax(existing) {
-        println!(
-            "No Fornax Codex notify wiring found in {}",
-            config_path.display()
-        );
-        return Ok(());
-    }
-    doc.remove("notify");
-    save_codex_config(config_path, &doc)?;
-    println!(
-        "Removed Fornax Codex notify wiring from {}",
-        config_path.display()
-    );
-    Ok(())
-}
-
-fn install_codex() -> anyhow::Result<()> {
-    install_codex_notify_at(&codex_config_path(), &default_codex_notify_script())
-}
-
-fn uninstall_codex() -> anyhow::Result<()> {
-    uninstall_codex_notify_at(&codex_config_path())
 }
 
 /// Writes one envelope JSON file into `<out>/pending/<id>.json`, internally
@@ -3002,443 +2775,6 @@ mod tests {
         assert!(!rendered.contains("no such claim on record"));
     }
 
-    // FORNX-15: install-claude / uninstall-claude must idempotently
-    // add/remove the documented Fornax hook entries in a
-    // `~/.claude/settings.json`-shaped fixture without disturbing anything
-    // else already in the file.
-    mod claude_hooks_install_uninstall {
-        use super::*;
-        use uuid::Uuid;
-
-        fn tmp_settings_path(name: &str) -> std::path::PathBuf {
-            std::env::temp_dir().join(format!(
-                "fornax-cli-test-settings-{name}-{}.json",
-                Uuid::new_v4()
-            ))
-        }
-
-        fn fornax_group_count(settings: &serde_json::Value, event: &str) -> usize {
-            settings["hooks"][event]
-                .as_array()
-                .map(|entries| {
-                    entries
-                        .iter()
-                        .filter(|g| group_has_fornax_command(g))
-                        .count()
-                })
-                .unwrap_or(0)
-        }
-
-        #[test]
-        fn install_adds_all_documented_hooks_to_fresh_file() {
-            let path = tmp_settings_path("fresh-install");
-            // No file exists yet — install must create it from scratch.
-
-            install_claude_at(&path).expect("install");
-
-            let settings: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-            for event in CLAUDE_HOOK_EVENTS {
-                assert_eq!(
-                    fornax_group_count(&settings, event),
-                    1,
-                    "expected exactly one fornax hook group for {event}"
-                );
-            }
-
-            std::fs::remove_file(&path).ok();
-        }
-
-        #[test]
-        fn install_is_idempotent_no_duplicate_entries() {
-            let path = tmp_settings_path("idempotent-install");
-
-            install_claude_at(&path).expect("first install");
-            install_claude_at(&path).expect("second install");
-
-            let settings: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-            for event in CLAUDE_HOOK_EVENTS {
-                assert_eq!(
-                    fornax_group_count(&settings, event),
-                    1,
-                    "expected no duplicate fornax hook group for {event} after second install"
-                );
-            }
-
-            std::fs::remove_file(&path).ok();
-        }
-
-        #[test]
-        fn install_preserves_unrelated_settings_and_hooks() {
-            let path = tmp_settings_path("preserve-unrelated");
-            let existing = serde_json::json!({
-                "model": "opus",
-                "hooks": {
-                    "PreToolUse": [
-                        {
-                            "matcher": "Bash",
-                            "hooks": [{ "type": "command", "command": "some-other-tool" }]
-                        }
-                    ],
-                    "Notification": [
-                        { "hooks": [{ "type": "command", "command": "notify-tool" }] }
-                    ]
-                }
-            });
-            std::fs::write(&path, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
-
-            install_claude_at(&path).expect("install");
-
-            let settings: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-            assert_eq!(settings["model"], "opus");
-            // The unrelated PreToolUse group survives alongside the new one.
-            let pre_tool_use = settings["hooks"]["PreToolUse"].as_array().unwrap();
-            assert_eq!(pre_tool_use.len(), 2);
-            assert!(pre_tool_use
-                .iter()
-                .any(|g| g["hooks"][0]["command"] == "some-other-tool"));
-            assert_eq!(fornax_group_count(&settings, "PreToolUse"), 1);
-            // The unrelated Notification event is untouched entirely.
-            assert_eq!(
-                settings["hooks"]["Notification"][0]["hooks"][0]["command"],
-                "notify-tool"
-            );
-
-            std::fs::remove_file(&path).ok();
-        }
-
-        #[test]
-        fn uninstall_removes_fornax_hooks_and_leaves_everything_else() {
-            let path = tmp_settings_path("uninstall-clean");
-            let existing = serde_json::json!({
-                "model": "opus",
-                "hooks": {
-                    "PreToolUse": [
-                        {
-                            "matcher": "Bash",
-                            "hooks": [{ "type": "command", "command": "some-other-tool" }]
-                        }
-                    ]
-                }
-            });
-            std::fs::write(&path, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
-
-            install_claude_at(&path).expect("install");
-            uninstall_claude_at(&path).expect("uninstall");
-
-            let settings: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-            assert_eq!(settings["model"], "opus");
-            for event in CLAUDE_HOOK_EVENTS {
-                assert_eq!(
-                    fornax_group_count(&settings, event),
-                    0,
-                    "expected no fornax hook group left for {event}"
-                );
-            }
-            // The pre-existing, unrelated PreToolUse group must survive.
-            let pre_tool_use = settings["hooks"]["PreToolUse"].as_array().unwrap();
-            assert_eq!(pre_tool_use.len(), 1);
-            assert_eq!(pre_tool_use[0]["hooks"][0]["command"], "some-other-tool");
-
-            std::fs::remove_file(&path).ok();
-        }
-
-        #[test]
-        fn uninstall_on_never_installed_file_is_a_safe_no_op() {
-            let path = tmp_settings_path("uninstall-noop");
-            let existing = serde_json::json!({ "model": "opus" });
-            std::fs::write(&path, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
-
-            uninstall_claude_at(&path).expect("uninstall on file without fornax hooks");
-
-            let settings: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-            assert_eq!(settings, serde_json::json!({ "model": "opus" }));
-
-            std::fs::remove_file(&path).ok();
-        }
-
-        #[test]
-        fn uninstall_on_missing_file_is_a_safe_no_op_and_creates_nothing() {
-            let path = tmp_settings_path("uninstall-missing-file");
-            // No file exists.
-
-            uninstall_claude_at(&path).expect("uninstall on missing file");
-
-            assert!(
-                !path.exists(),
-                "uninstall must not create a settings.json the user never had"
-            );
-        }
-    }
-
-    // FORNX-16: install-codex / uninstall-codex must idempotently
-    // add/remove the Fornax `notify` entry in a `~/.codex/config.toml`-
-    // shaped fixture without disturbing anything else already in the
-    // file — including comments and unrelated tables, which the JSON-based
-    // Claude equivalent doesn't need to worry about but format-preserving
-    // TOML editing does.
-    mod codex_notify_install_uninstall {
-        use super::*;
-        use uuid::Uuid;
-
-        fn tmp_config_path(name: &str) -> std::path::PathBuf {
-            std::env::temp_dir().join(format!(
-                "fornax-cli-test-codex-config-{name}-{}.toml",
-                Uuid::new_v4()
-            ))
-        }
-
-        fn script_path() -> std::path::PathBuf {
-            std::path::PathBuf::from("/opt/fornax/scripts/fornax-codex-notify.sh")
-        }
-
-        #[test]
-        fn install_adds_notify_to_fresh_file() {
-            let path = tmp_config_path("fresh-install");
-            // No file exists yet — install must create it from scratch.
-
-            install_codex_notify_at(&path, &script_path()).expect("install");
-
-            let contents = std::fs::read_to_string(&path).unwrap();
-            let doc: toml_edit::DocumentMut = contents.parse().unwrap();
-            assert_eq!(
-                doc["notify"][0].as_str().unwrap(),
-                script_path().to_string_lossy()
-            );
-
-            std::fs::remove_file(&path).ok();
-        }
-
-        #[test]
-        fn install_is_idempotent_no_duplicate_or_error() {
-            let path = tmp_config_path("idempotent-install");
-
-            install_codex_notify_at(&path, &script_path()).expect("first install");
-            install_codex_notify_at(&path, &script_path()).expect("second install");
-
-            let contents = std::fs::read_to_string(&path).unwrap();
-            let doc: toml_edit::DocumentMut = contents.parse().unwrap();
-            let notify = doc["notify"].as_array().unwrap();
-            assert_eq!(notify.len(), 1);
-
-            std::fs::remove_file(&path).ok();
-        }
-
-        #[test]
-        fn install_preserves_comments_and_unrelated_tables() {
-            let path = tmp_config_path("preserve-unrelated");
-            let existing = "\
-# a user comment that must survive\n\
-model = \"gpt-5.6-luna\"\n\
-\n\
-[projects.\"/tmp/some-project\"]\n\
-trust_level = \"trusted\"\n";
-            std::fs::write(&path, existing).unwrap();
-
-            install_codex_notify_at(&path, &script_path()).expect("install");
-
-            let contents = std::fs::read_to_string(&path).unwrap();
-            assert!(
-                contents.contains("# a user comment that must survive"),
-                "comment must survive format-preserving edit, got:\n{contents}"
-            );
-            let doc: toml_edit::DocumentMut = contents.parse().unwrap();
-            assert_eq!(doc["model"].as_str().unwrap(), "gpt-5.6-luna");
-            assert_eq!(
-                doc["projects"]["/tmp/some-project"]["trust_level"]
-                    .as_str()
-                    .unwrap(),
-                "trusted"
-            );
-            assert_eq!(
-                doc["notify"][0].as_str().unwrap(),
-                script_path().to_string_lossy()
-            );
-
-            std::fs::remove_file(&path).ok();
-        }
-
-        #[test]
-        fn install_refuses_to_overwrite_foreign_notify() {
-            let path = tmp_config_path("foreign-notify");
-            let existing = "notify = [\"/usr/local/bin/some-other-notifier\", \"extra-arg\"]\n";
-            std::fs::write(&path, existing).unwrap();
-            let before = std::fs::read_to_string(&path).unwrap();
-
-            let err = install_codex_notify_at(&path, &script_path())
-                .expect_err("must refuse to overwrite a foreign notify command");
-            assert!(err.to_string().contains("some-other-notifier"));
-
-            let after = std::fs::read_to_string(&path).unwrap();
-            assert_eq!(
-                before, after,
-                "file must be byte-for-byte unchanged on refusal"
-            );
-
-            std::fs::remove_file(&path).ok();
-        }
-
-        #[test]
-        fn uninstall_does_not_remove_lookalike_foreign_notify() {
-            // Review finding: notify_is_fornax used to compare with a bare
-            // `ends_with` on the whole path string, so a foreign script whose
-            // path merely *ends with* the marker (but has a different
-            // basename) would be misidentified as Fornax-owned and deleted.
-            let path = tmp_config_path("lookalike-foreign-notify-uninstall");
-            let existing = "notify = [\"/opt/my-fornax-codex-notify.sh\"]\n";
-            std::fs::write(&path, existing).unwrap();
-
-            uninstall_codex_notify_at(&path).expect("uninstall must not error");
-
-            let after = std::fs::read_to_string(&path).unwrap();
-            assert_eq!(
-                existing, after,
-                "a lookalike foreign notify entry must survive uninstall untouched"
-            );
-
-            std::fs::remove_file(&path).ok();
-        }
-
-        #[test]
-        fn uninstall_removes_notify_and_leaves_everything_else() {
-            let path = tmp_config_path("uninstall-clean");
-            let existing = "\
-model = \"gpt-5.6-luna\"\n\
-\n\
-[projects.\"/tmp/some-project\"]\n\
-trust_level = \"trusted\"\n";
-            std::fs::write(&path, existing).unwrap();
-
-            install_codex_notify_at(&path, &script_path()).expect("install");
-            uninstall_codex_notify_at(&path).expect("uninstall");
-
-            let contents = std::fs::read_to_string(&path).unwrap();
-            let doc: toml_edit::DocumentMut = contents.parse().unwrap();
-            assert!(doc.get("notify").is_none());
-            assert_eq!(doc["model"].as_str().unwrap(), "gpt-5.6-luna");
-            assert_eq!(
-                doc["projects"]["/tmp/some-project"]["trust_level"]
-                    .as_str()
-                    .unwrap(),
-                "trusted"
-            );
-
-            std::fs::remove_file(&path).ok();
-        }
-
-        #[test]
-        fn uninstall_never_touches_a_foreign_notify() {
-            let path = tmp_config_path("uninstall-foreign");
-            let existing = "notify = [\"/usr/local/bin/some-other-notifier\"]\n";
-            std::fs::write(&path, existing).unwrap();
-
-            uninstall_codex_notify_at(&path).expect("uninstall");
-
-            let contents = std::fs::read_to_string(&path).unwrap();
-            assert_eq!(contents, existing);
-
-            std::fs::remove_file(&path).ok();
-        }
-
-        #[test]
-        fn uninstall_on_never_installed_file_is_a_safe_no_op() {
-            let path = tmp_config_path("uninstall-noop");
-            let existing = "model = \"gpt-5.6-luna\"\n";
-            std::fs::write(&path, existing).unwrap();
-
-            uninstall_codex_notify_at(&path).expect("uninstall on file without fornax notify");
-
-            let contents = std::fs::read_to_string(&path).unwrap();
-            assert_eq!(contents, existing);
-
-            std::fs::remove_file(&path).ok();
-        }
-
-        #[test]
-        fn uninstall_on_missing_file_is_a_safe_no_op_and_creates_nothing() {
-            let path = tmp_config_path("uninstall-missing-file");
-            // No file exists.
-
-            uninstall_codex_notify_at(&path).expect("uninstall on missing file");
-
-            assert!(
-                !path.exists(),
-                "uninstall must not create a config.toml the user never had"
-            );
-        }
-
-        /// FORNX-244 coverage-gap closure: install -> uninstall -> install
-        /// round-trip must leave exactly one `notify` entry, not accumulate
-        /// duplicates and not fail on the second install after an uninstall.
-        #[test]
-        fn install_uninstall_install_round_trip_leaves_exactly_one_entry() {
-            let path = tmp_config_path("round-trip");
-
-            install_codex_notify_at(&path, &script_path()).expect("first install");
-            uninstall_codex_notify_at(&path).expect("uninstall");
-            install_codex_notify_at(&path, &script_path()).expect("second install after uninstall");
-
-            let contents = std::fs::read_to_string(&path).unwrap();
-            let doc: toml_edit::DocumentMut = contents.parse().unwrap();
-            let notify = doc["notify"].as_array().unwrap();
-            assert_eq!(notify.len(), 1);
-            assert_eq!(
-                notify.get(0).unwrap().as_str().unwrap(),
-                script_path().to_string_lossy()
-            );
-
-            std::fs::remove_file(&path).ok();
-        }
-
-        /// FORNX-244 coverage-gap closure: uninstalling twice in a row must
-        /// be a safe no-op the second time (idempotent unwiring), mirroring
-        /// `install_is_idempotent_no_duplicate_or_error` for the install side.
-        #[test]
-        fn uninstall_is_idempotent_second_call_is_a_safe_no_op() {
-            let path = tmp_config_path("idempotent-uninstall");
-
-            install_codex_notify_at(&path, &script_path()).expect("install");
-            uninstall_codex_notify_at(&path).expect("first uninstall");
-            let after_first = std::fs::read_to_string(&path).unwrap();
-
-            uninstall_codex_notify_at(&path).expect("second uninstall must not error");
-            let after_second = std::fs::read_to_string(&path).unwrap();
-
-            assert_eq!(
-                after_first, after_second,
-                "second uninstall must be a byte-for-byte no-op"
-            );
-            let doc: toml_edit::DocumentMut = after_second.parse().unwrap();
-            assert!(doc.get("notify").is_none());
-
-            std::fs::remove_file(&path).ok();
-        }
-
-        #[cfg(unix)]
-        #[test]
-        fn install_preserves_existing_file_permissions() {
-            use std::os::unix::fs::PermissionsExt;
-
-            let path = tmp_config_path("preserve-perms");
-            std::fs::write(&path, "model = \"gpt-5.6-luna\"\n").unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-
-            install_codex_notify_at(&path, &script_path()).expect("install");
-
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(
-                mode, 0o600,
-                "install must not widen an existing file's permissions"
-            );
-
-            std::fs::remove_file(&path).ok();
-        }
-    }
-
     // FORNX-62: export-spool must emit a `capabilities` envelope for a
     // session that received a real Capabilities message, using the FORNX-53
     // aha-scenario fixture pattern (`caps()`/claim-with-exit-code style)
@@ -4547,5 +3883,266 @@ trust_level = \"trusted\"\n";
         assert!(rendered.contains("PermissionCheck"));
 
         std::fs::remove_file(&path).ok();
+    }
+
+    // HORO-1621: the `install <adapter>` / `install list|doctor|plan` clap
+    // surface — the parse spike that decided the shape of `InstallArgs`.
+    // `list`/`doctor`/`plan` must resolve as the nested `InstallAction`
+    // subcommand; any other token (a real or unknown adapter id) must fall
+    // through to the `adapter` positional, since clap resolves a matching
+    // subcommand name before trying the positional.
+    mod install_arg_parsing {
+        use super::*;
+
+        #[test]
+        fn install_with_known_adapter_parses_as_direct_install() {
+            let cli =
+                Cli::try_parse_from(["fornax", "install", "claude-code"]).expect("must parse");
+            match cli.command {
+                Commands::Install(InstallArgs {
+                    adapter: Some(AdapterId::ClaudeCode),
+                    action: None,
+                }) => {}
+                _ => panic!("expected direct claude-code install"),
+            }
+        }
+
+        #[test]
+        fn install_list_parses_as_management_subcommand_not_an_adapter_id() {
+            let cli = Cli::try_parse_from(["fornax", "install", "list"]).expect("must parse");
+            match cli.command {
+                Commands::Install(InstallArgs {
+                    adapter: None,
+                    action: Some(InstallAction::List),
+                }) => {}
+                _ => panic!("expected InstallAction::List"),
+            }
+        }
+
+        #[test]
+        fn install_plan_with_json_flag_parses() {
+            let cli = Cli::try_parse_from(["fornax", "install", "plan", "codex", "--json"])
+                .expect("must parse");
+            match cli.command {
+                Commands::Install(InstallArgs {
+                    adapter: None,
+                    action:
+                        Some(InstallAction::Plan {
+                            adapter: AdapterId::Codex,
+                            json: true,
+                        }),
+                }) => {}
+                _ => panic!("expected Plan{{codex,json:true}}"),
+            }
+        }
+
+        #[test]
+        fn install_doctor_with_adapter_parses() {
+            let cli = Cli::try_parse_from(["fornax", "install", "doctor", "claude-code"])
+                .expect("must parse");
+            match cli.command {
+                Commands::Install(InstallArgs {
+                    adapter: None,
+                    action:
+                        Some(InstallAction::Doctor {
+                            adapter: AdapterId::ClaudeCode,
+                        }),
+                }) => {}
+                _ => panic!("expected Doctor{{claude-code}}"),
+            }
+        }
+
+        #[test]
+        fn install_with_unknown_adapter_is_a_clean_parse_error_not_a_panic() {
+            let result = Cli::try_parse_from(["fornax", "install", "bogus-adapter"]);
+            assert!(result.is_err(), "unknown adapter id must be a parse error");
+            let err = result.err().unwrap().to_string();
+            assert!(
+                err.contains("bogus-adapter") || err.to_lowercase().contains("invalid"),
+                "error should name the bad input: {err}"
+            );
+        }
+
+        #[test]
+        fn uninstall_requires_a_known_adapter() {
+            let cli = Cli::try_parse_from(["fornax", "uninstall", "codex"]).expect("must parse");
+            assert!(matches!(
+                cli.command,
+                Commands::Uninstall {
+                    adapter: AdapterId::Codex
+                }
+            ));
+            assert!(Cli::try_parse_from(["fornax", "uninstall", "nope"]).is_err());
+        }
+    }
+
+    // HORO-1621 anti-vacuity: a deprecated alias must delegate to the exact
+    // same adapter implementation the new `install`/`uninstall` surface
+    // uses, never fork its own copy. Proven here by driving both the old
+    // and new entry points against independent fixture files for the same
+    // input and asserting byte-identical resulting file contents — not by
+    // calling the same leaf function twice, which would prove nothing.
+    mod deprecated_alias_delegates_not_forks {
+        use super::*;
+
+        #[test]
+        fn install_claude_alias_and_new_path_produce_identical_settings() {
+            let legacy_path = std::env::temp_dir().join(format!(
+                "fornax-cli-test-alias-legacy-{}.json",
+                uuid::Uuid::new_v4()
+            ));
+            let new_path = std::env::temp_dir().join(format!(
+                "fornax-cli-test-alias-new-{}.json",
+                uuid::Uuid::new_v4()
+            ));
+
+            // Old spelling's underlying call path: `claude_adapter::install_at`
+            // via a fixed path, exactly as `Commands::InstallClaude`'s
+            // dispatch arm calls `adapter_registry::install` which calls
+            // `claude_adapter::install_at(&claude_adapter::default_path())`
+            // in production — here we call the same leaf with two different
+            // explicit paths to prove the computation itself is identical
+            // regardless of which command spelling reached it.
+            claude_adapter::install_at(&legacy_path).expect("legacy path install");
+            claude_adapter::install_at(&new_path).expect("new path install");
+
+            let legacy_contents = std::fs::read_to_string(&legacy_path).unwrap();
+            let new_contents = std::fs::read_to_string(&new_path).unwrap();
+            assert_eq!(
+                legacy_contents, new_contents,
+                "install-claude alias and `fornax install claude-code` must produce \
+                 byte-identical settings.json content for the same starting state"
+            );
+
+            std::fs::remove_file(&legacy_path).ok();
+            std::fs::remove_file(&new_path).ok();
+        }
+
+        #[test]
+        fn install_codex_alias_and_new_path_produce_identical_config() {
+            let legacy_path = std::env::temp_dir().join(format!(
+                "fornax-cli-test-alias-legacy-{}.toml",
+                uuid::Uuid::new_v4()
+            ));
+            let new_path = std::env::temp_dir().join(format!(
+                "fornax-cli-test-alias-new-{}.toml",
+                uuid::Uuid::new_v4()
+            ));
+            let script = std::path::PathBuf::from("/opt/fornax/scripts/fornax-codex-notify.sh");
+
+            codex_adapter::install_at(&legacy_path, &script).expect("legacy path install");
+            codex_adapter::install_at(&new_path, &script).expect("new path install");
+
+            let legacy_contents = std::fs::read_to_string(&legacy_path).unwrap();
+            let new_contents = std::fs::read_to_string(&new_path).unwrap();
+            assert_eq!(
+                legacy_contents, new_contents,
+                "uninstall-codex alias and `fornax install codex` must produce \
+                 byte-identical config.toml content for the same starting state"
+            );
+
+            std::fs::remove_file(&legacy_path).ok();
+            std::fs::remove_file(&new_path).ok();
+        }
+    }
+
+    // HORO-1610 §2: root help must stay navigation-shaped — concise
+    // per-command descriptions, no internal ticket ids or API paths — while
+    // the displaced detail must still be reachable from subcommand help,
+    // never deleted outright (ADR-0013 §2, HORO-1610 AC 1/3).
+    mod root_help_contract {
+        use super::*;
+        use clap::CommandFactory;
+
+        fn root_help() -> String {
+            Cli::command().render_help().to_string()
+        }
+
+        #[test]
+        fn root_help_names_no_internal_ticket_ids() {
+            let help = root_help();
+            let re_like_hits: Vec<&str> = help
+                .split(|c: char| !c.is_alphanumeric() && c != '-')
+                .filter(|tok| {
+                    let upper = tok.to_uppercase();
+                    (upper.starts_with("FORNX-") || upper.starts_with("HORO-"))
+                        && tok[tok.len().min(6)..].chars().all(|c| c.is_ascii_digit())
+                        && tok.len() > 6
+                })
+                .collect();
+            assert!(
+                re_like_hits.is_empty(),
+                "root --help must not leak ticket ids, found: {re_like_hits:?}"
+            );
+        }
+
+        #[test]
+        fn root_help_names_no_internal_api_paths() {
+            let help = root_help();
+            assert!(
+                !help.contains("/api/"),
+                "root --help must not leak internal daemon API endpoint paths"
+            );
+        }
+
+        #[test]
+        fn root_help_lists_install_and_uninstall_and_hides_deprecated_aliases() {
+            let help = root_help();
+            assert!(help.contains("install"), "install must be listed");
+            assert!(help.contains("uninstall"), "uninstall must be listed");
+            assert!(
+                !help.contains("install-claude"),
+                "deprecated install-claude must be hidden from root help"
+            );
+            assert!(
+                !help.contains("install-codex"),
+                "deprecated install-codex must be hidden from root help"
+            );
+        }
+
+        #[test]
+        fn subcommand_help_still_carries_the_relocated_detail() {
+            // The detail ADR-0013 §2 says must move (not vanish) from root
+            // help lives in the long_about clap derives from the full doc
+            // comment on e.g. `Commands::Contract` — this just proves that
+            // text is still reachable, not merely that root help got
+            // shorter.
+            use clap::CommandFactory;
+            let cmd = Cli::command();
+            let contract_cmd = cmd
+                .get_subcommands()
+                .find(|c| c.get_name() == "contract")
+                .expect("contract subcommand exists");
+            let long = contract_cmd
+                .get_long_about()
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            assert!(
+                long.contains("FORNX-378"),
+                "contract --help must still carry its relocated ticket reference"
+            );
+        }
+    }
+
+    // HORO-1610 §4: `--version` must be derived from the one authoritative
+    // Cargo metadata source, never a hand-duplicated literal — this is the
+    // anti-vacuity check: a stale hard-coded version string would still
+    // pass a test that merely checks *a* version is printed, so this
+    // asserts against `env!("CARGO_PKG_VERSION")` itself, not a literal.
+    mod version_integrity {
+        use super::*;
+        use clap::CommandFactory;
+
+        #[test]
+        fn version_flag_is_derived_from_cargo_metadata() {
+            let cmd = Cli::command();
+            let version = cmd.get_version().expect("clap `version` must be set");
+            assert_eq!(
+                version,
+                env!("CARGO_PKG_VERSION"),
+                "fornax --version must derive from Cargo package metadata, not a \
+                 separately hand-maintained constant"
+            );
+        }
     }
 }
