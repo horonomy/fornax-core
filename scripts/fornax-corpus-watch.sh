@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # FORNX-343 batch-readiness watcher.
 #
-# Real capture is live (Claude Code hooks installed via `fornax install-claude`
+# Real capture is live (Claude Code hooks installed via `fornax install claude-code`
 # against the real $FORNAX_HOME, 2026-09-11). This script automates every step
 # up to, but never including, the human labeling judgment itself:
 #

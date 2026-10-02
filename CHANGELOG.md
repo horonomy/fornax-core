@@ -7,7 +7,17 @@ Jira epic FORNX-20.
 
 ## [Unreleased]
 
-Nothing yet.
+### Removed
+
+Intentional breaking cleanup during DogFooding (FORNX-428 S3), before any
+external compatibility commitment exists — no deprecated aliases kept:
+
+- The legacy top-level commands `install-claude`, `uninstall-claude`,
+  `install-codex`, `uninstall-codex`. Use `fornax install claude-code`,
+  `fornax uninstall claude-code`, `fornax install codex`,
+  `fornax uninstall codex`.
+- `fornax install list|doctor|plan` as nested subcommands of `install`.
+  Use `fornax adapter list|doctor|plan` instead.
 
 ## [v0.0.8] — Agent Epistemic Trust Kernel
 

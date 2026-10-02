@@ -1,7 +1,7 @@
 //! Codex adapter install/uninstall (FORNX-16/FORNX-17), routed through the
 //! `adapter_registry` (HORO-1621). Straight extraction of the original
 //! `install-codex`/`uninstall-codex` implementation, plus `plan_install_at`
-//! so `install_at` and `fornax install plan codex` share one computation.
+//! so `install_at` and `fornax adapter plan codex` share one computation.
 
 use crate::adapter_registry::AdapterActionResult;
 
