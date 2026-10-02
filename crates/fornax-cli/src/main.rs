@@ -16,7 +16,9 @@ mod receipt_cmd;
 mod statusline;
 mod timeline;
 
-use adapter_registry::AdapterId;
+use std::str::FromStr;
+
+use adapter_registry::AdapterArg;
 
 #[derive(Parser)]
 #[command(
@@ -293,7 +295,7 @@ enum Commands {
     /// including when the adapter's target config file does not exist.
     Uninstall {
         /// Adapter id to uninstall (e.g. `claude-code`, `codex`).
-        adapter: AdapterId,
+        adapter: AdapterArg,
     },
     /// Deprecated alias for `fornax install claude-code` — delegates to the
     /// same implementation. Kept for scripts/users that depend on the old
@@ -410,7 +412,7 @@ enum Commands {
 pub struct InstallArgs {
     /// Adapter id to install directly, e.g. `claude-code` or `codex`. Omit
     /// when using a management subcommand instead.
-    pub adapter: Option<AdapterId>,
+    pub adapter: Option<AdapterArg>,
     #[command(subcommand)]
     pub action: Option<InstallAction>,
 }
@@ -422,13 +424,13 @@ pub enum InstallAction {
     /// Current install status for one adapter, read-only.
     Doctor {
         /// Adapter id to inspect.
-        adapter: AdapterId,
+        adapter: AdapterArg,
     },
     /// Preview what `fornax install <adapter>` would change, without
     /// applying it.
     Plan {
         /// Adapter id to preview.
-        adapter: AdapterId,
+        adapter: AdapterArg,
         /// Emit the result as JSON instead of a human-readable line.
         #[arg(long)]
         json: bool,
@@ -759,23 +761,23 @@ async fn main() -> anyhow::Result<()> {
             eprintln!(
                 "fornax: `install-claude` is deprecated, use `fornax install claude-code` instead"
             );
-            print_result(adapter_registry::install(AdapterId::ClaudeCode)?)
+            print_result(adapter_registry::install(builtin_adapter("claude-code"))?)
         }
         Commands::UninstallClaude => {
             eprintln!(
                 "fornax: `uninstall-claude` is deprecated, use `fornax uninstall claude-code` instead"
             );
-            print_result(adapter_registry::uninstall(AdapterId::ClaudeCode)?)
+            print_result(adapter_registry::uninstall(builtin_adapter("claude-code"))?)
         }
         Commands::InstallCodex => {
             eprintln!("fornax: `install-codex` is deprecated, use `fornax install codex` instead");
-            print_result(adapter_registry::install(AdapterId::Codex)?)
+            print_result(adapter_registry::install(builtin_adapter("codex"))?)
         }
         Commands::UninstallCodex => {
             eprintln!(
                 "fornax: `uninstall-codex` is deprecated, use `fornax uninstall codex` instead"
             );
-            print_result(adapter_registry::uninstall(AdapterId::Codex)?)
+            print_result(adapter_registry::uninstall(builtin_adapter("codex"))?)
         }
         Commands::Experiment { action } => experiment_ux::handle(action, &fornax_home())?,
         Commands::Policy { action } => handle_policy_action(action).await?,
@@ -1174,6 +1176,14 @@ fn print_result(result: adapter_registry::AdapterActionResult) {
     println!("{}", result.message);
 }
 
+/// Resolves a known built-in adapter id for the deprecated alias commands.
+/// Infallible by construction (`id` is a literal this module controls) --
+/// panics only if a built-in id were ever removed from `registry()` without
+/// updating its caller, which is a programmer error worth a loud failure.
+fn builtin_adapter(id: &str) -> AdapterArg {
+    AdapterArg::from_str(id).unwrap_or_else(|e| panic!("builtin_adapter({id:?}): {e}"))
+}
+
 fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
     match (args.adapter, args.action) {
         (Some(_), Some(_)) => anyhow::bail!(
@@ -1186,13 +1196,13 @@ fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
         }
         (None, Some(InstallAction::List)) => {
             println!("Known Fornax adapters:");
-            for adapter in AdapterId::ALL {
+            for adapter in adapter_registry::registry() {
                 println!(
                     "  {:<12} {}\n               {}\n               config: {}",
                     adapter.id(),
                     adapter.display_name(),
                     adapter.summary(),
-                    adapter_registry::default_config_path(adapter).display()
+                    adapter.target_path().display()
                 );
             }
             Ok(())
@@ -3900,9 +3910,9 @@ mod tests {
                 Cli::try_parse_from(["fornax", "install", "claude-code"]).expect("must parse");
             match cli.command {
                 Commands::Install(InstallArgs {
-                    adapter: Some(AdapterId::ClaudeCode),
+                    adapter: Some(adapter),
                     action: None,
-                }) => {}
+                }) => assert_eq!(adapter.id(), "claude-code"),
                 _ => panic!("expected direct claude-code install"),
             }
         }
@@ -3928,10 +3938,10 @@ mod tests {
                     adapter: None,
                     action:
                         Some(InstallAction::Plan {
-                            adapter: AdapterId::Codex,
+                            adapter,
                             json: true,
                         }),
-                }) => {}
+                }) => assert_eq!(adapter.id(), "codex"),
                 _ => panic!("expected Plan{{codex,json:true}}"),
             }
         }
@@ -3943,11 +3953,8 @@ mod tests {
             match cli.command {
                 Commands::Install(InstallArgs {
                     adapter: None,
-                    action:
-                        Some(InstallAction::Doctor {
-                            adapter: AdapterId::ClaudeCode,
-                        }),
-                }) => {}
+                    action: Some(InstallAction::Doctor { adapter }),
+                }) => assert_eq!(adapter.id(), "claude-code"),
                 _ => panic!("expected Doctor{{claude-code}}"),
             }
         }
@@ -3966,12 +3973,10 @@ mod tests {
         #[test]
         fn uninstall_requires_a_known_adapter() {
             let cli = Cli::try_parse_from(["fornax", "uninstall", "codex"]).expect("must parse");
-            assert!(matches!(
-                cli.command,
-                Commands::Uninstall {
-                    adapter: AdapterId::Codex
-                }
-            ));
+            match cli.command {
+                Commands::Uninstall { adapter } => assert_eq!(adapter.id(), "codex"),
+                _ => panic!("expected Uninstall{{codex}}"),
+            }
             assert!(Cli::try_parse_from(["fornax", "uninstall", "nope"]).is_err());
         }
     }
