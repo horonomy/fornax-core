@@ -17,9 +17,10 @@
 //! completeness test below) never a partially-wired adapter that compiles
 //! with a wrong or missing method.
 //!
-//! `AdapterId` (the `clap::ValueEnum` the CLI parses) is unchanged by this
-//! slice — see FORNX-428's S2 for retiring it in favor of a table-driven
-//! `value_parser`. This slice only changes what happens *after* parsing.
+//! FORNX-428 S2 retires `AdapterId`'s closed `clap::ValueEnum` in favor of
+//! [`AdapterArg`], a table-driven value type that parses straight through
+//! [`resolve`] — the CLI's argument surface no longer hardcodes which ids
+//! exist.
 
 use std::path::PathBuf;
 
@@ -32,9 +33,8 @@ use std::path::PathBuf;
 /// merely to register itself — every method here is scoped to exactly the
 /// one host-config surface this adapter owns.
 pub trait AdapterPlugin: Send + Sync {
-    /// Stable registry key, matching the `clap::ValueEnum` name in
-    /// `AdapterId` for every built-in adapter (checked by the
-    /// registry-completeness test below).
+    /// Stable registry key, matching the id string clap parses via
+    /// `AdapterArg` (checked by the registry-completeness test below).
     fn id(&self) -> &'static str;
 
     /// Human display name, e.g. "Claude Code".
@@ -144,47 +144,53 @@ pub fn resolve(id: &str) -> Option<&'static dyn AdapterPlugin> {
     registry().iter().copied().find(|a| a.id() == id)
 }
 
-/// Stable adapter id. This is the registry key referenced by `fornax
-/// install <adapter>` et al. — never a free-form string internally, so an
-/// unknown adapter is a clap parse error (clean, non-zero exit, no stack
-/// trace) rather than a silently-ignored no-op.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-pub enum AdapterId {
-    #[value(name = "claude-code")]
-    ClaudeCode,
-    #[value(name = "codex")]
-    Codex,
+/// A clap value type wrapping an already-resolved [`AdapterPlugin`] —
+/// FORNX-428 S2's replacement for the closed `AdapterId` enum. Parsing goes
+/// straight through [`resolve`] against [`registry`], so the CLI's argument
+/// surface (`InstallArgs`, `InstallAction`, `Commands::Uninstall`) never
+/// hardcodes which ids exist: adding a built-in adapter is one struct plus
+/// one `registry()` entry, never a change here.
+///
+/// An unknown id is a clean clap parse error (non-zero exit, no stack
+/// trace, every known id named) — never a silently-ignored no-op.
+#[derive(Clone, Copy)]
+pub struct AdapterArg(&'static dyn AdapterPlugin);
+
+impl std::fmt::Debug for AdapterArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("AdapterArg").field(&self.0.id()).finish()
+    }
 }
 
-impl AdapterId {
-    /// Every adapter currently registered, in display order.
-    pub const ALL: [AdapterId; 2] = [AdapterId::ClaudeCode, AdapterId::Codex];
-
-    /// Stable id string, matching the `clap::ValueEnum` name above.
+impl AdapterArg {
     pub fn id(self) -> &'static str {
-        match self {
-            AdapterId::ClaudeCode => "claude-code",
-            AdapterId::Codex => "codex",
-        }
+        self.0.id()
     }
 
-    /// Human display name.
     pub fn display_name(self) -> &'static str {
-        self.plugin().display_name()
+        self.0.display_name()
     }
 
-    /// One-line description of what this adapter's install/uninstall
-    /// actually wires, for `fornax install list`.
     pub fn summary(self) -> &'static str {
-        self.plugin().summary()
+        self.0.summary()
     }
 
-    /// Resolves this id against [`registry`]. Always succeeds for a
-    /// built-in `AdapterId` — see `adapter_id_resolves_against_the_registry`
-    /// below.
-    fn plugin(self) -> &'static dyn AdapterPlugin {
-        resolve(self.id())
-            .unwrap_or_else(|| unreachable!("every AdapterId variant must have a registry() entry"))
+    pub fn plugin(self) -> &'static dyn AdapterPlugin {
+        self.0
+    }
+}
+
+impl std::str::FromStr for AdapterArg {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        resolve(s).map(AdapterArg).ok_or_else(|| {
+            let known: Vec<&str> = registry().iter().map(|a| a.id()).collect();
+            format!(
+                "unknown adapter {s:?}; known adapters: {}",
+                known.join(", ")
+            )
+        })
     }
 }
 
@@ -209,62 +215,107 @@ pub struct AdapterActionResult {
 /// `crate::claude_adapter`/`crate::codex_adapter` doc comments for why
 /// there is exactly one implementation per adapter, never a forked one for
 /// the new vs. old command spelling.
-pub fn install(adapter: AdapterId) -> anyhow::Result<AdapterActionResult> {
+pub fn install(adapter: AdapterArg) -> anyhow::Result<AdapterActionResult> {
     adapter.plugin().install()
 }
 
 /// `fornax uninstall <adapter>`.
-pub fn uninstall(adapter: AdapterId) -> anyhow::Result<AdapterActionResult> {
+pub fn uninstall(adapter: AdapterArg) -> anyhow::Result<AdapterActionResult> {
     adapter.plugin().uninstall()
 }
 
 /// `fornax install plan <adapter>` — computes, without writing anything,
 /// what `install` would do right now.
-pub fn plan(adapter: AdapterId) -> anyhow::Result<AdapterActionResult> {
+pub fn plan(adapter: AdapterArg) -> anyhow::Result<AdapterActionResult> {
     adapter.plugin().plan()
 }
 
 /// `fornax install doctor <adapter>` — current install status, read-only.
 /// Reuses the same plan computation `plan` uses; doctor and plan differ
 /// only in rendering/action label, not in what they compute.
-pub fn doctor(adapter: AdapterId) -> anyhow::Result<AdapterActionResult> {
+pub fn doctor(adapter: AdapterArg) -> anyhow::Result<AdapterActionResult> {
     let mut outcome = plan(adapter)?;
     outcome.action = "doctor".to_string();
     Ok(outcome)
 }
 
-/// Default on-disk path an adapter's install/uninstall mutates — used by
-/// `fornax install list`'s rendering and by tests.
-pub fn default_config_path(adapter: AdapterId) -> PathBuf {
-    adapter.plugin().target_path()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::ValueEnum;
+    use std::str::FromStr;
 
     #[test]
-    fn adapter_id_round_trips_stable_ids() {
-        for &a in AdapterId::ALL.iter() {
-            let v = a.to_possible_value().expect("every AdapterId has a value");
-            assert_eq!(v.get_name(), a.id());
+    fn adapter_arg_parses_every_known_id() {
+        for adapter in registry() {
+            let parsed = AdapterArg::from_str(adapter.id())
+                .unwrap_or_else(|e| panic!("{} should parse: {e}", adapter.id()));
+            assert_eq!(parsed.id(), adapter.id());
         }
+    }
+
+    #[test]
+    fn adapter_arg_rejects_an_unknown_id_with_every_known_id_named() {
+        let err = AdapterArg::from_str("not-a-real-adapter").unwrap_err();
+        assert!(err.contains("not-a-real-adapter"));
+        for adapter in registry() {
+            assert!(
+                err.contains(adapter.id()),
+                "error should name {}: {err}",
+                adapter.id()
+            );
+        }
+    }
+
+    /// Anti-vacuity (FORNX-428 S2): a fixture adapter not in the real
+    /// `registry()` proves the parser is a plain function of whatever
+    /// `resolve()` returns, not a hardcoded id list -- adding a built-in
+    /// adapter never requires touching `AdapterArg`, `InstallArgs`,
+    /// `InstallAction`, or `Commands` in `main.rs`, only one `registry()`
+    /// entry.
+    #[test]
+    fn adapter_arg_parsing_is_a_plain_function_of_resolve_not_a_hardcoded_list() {
+        struct FixtureAdapter;
+        impl AdapterPlugin for FixtureAdapter {
+            fn id(&self) -> &'static str {
+                "fixture-only-for-this-test"
+            }
+            fn display_name(&self) -> &'static str {
+                "Fixture"
+            }
+            fn summary(&self) -> &'static str {
+                "test-only adapter, never in the real registry()"
+            }
+            fn target_path(&self) -> PathBuf {
+                PathBuf::from("/dev/null/fixture")
+            }
+            fn plan(&self) -> anyhow::Result<AdapterActionResult> {
+                unreachable!("not exercised by this test")
+            }
+            fn install(&self) -> anyhow::Result<AdapterActionResult> {
+                unreachable!("not exercised by this test")
+            }
+            fn uninstall(&self) -> anyhow::Result<AdapterActionResult> {
+                unreachable!("not exercised by this test")
+            }
+        }
+
+        assert!(resolve("fixture-only-for-this-test").is_none());
+        assert!(AdapterArg::from_str("fixture-only-for-this-test").is_err());
+
+        let fixture: &dyn AdapterPlugin = &FixtureAdapter;
+        let extended: Vec<&dyn AdapterPlugin> =
+            registry().iter().copied().chain([fixture]).collect();
+        let found = extended
+            .iter()
+            .find(|a| a.id() == "fixture-only-for-this-test")
+            .expect("fixture resolves against an extended registry with zero changes to AdapterArg/InstallArgs/Commands");
+        assert_eq!(found.id(), "fixture-only-for-this-test");
     }
 
     #[test]
     fn all_lists_exactly_the_two_known_adapters() {
-        let ids: Vec<&str> = AdapterId::ALL.iter().map(|a| a.id()).collect();
+        let ids: Vec<&str> = registry().iter().map(|a| a.id()).collect();
         assert_eq!(ids, vec!["claude-code", "codex"]);
-    }
-
-    #[test]
-    fn adapter_id_resolves_against_the_registry() {
-        for &a in AdapterId::ALL.iter() {
-            let plugin = resolve(a.id())
-                .unwrap_or_else(|| panic!("AdapterId::{a:?} ({}) has no registry() entry", a.id()));
-            assert_eq!(plugin.id(), a.id());
-        }
     }
 
     /// Registry-completeness: every registered adapter answers every
