@@ -117,8 +117,8 @@ fn unknown_command_is_a_clean_non_zero_exit_naming_the_input() {
 }
 
 #[test]
-fn install_help_is_pure_and_lists_the_management_subcommands() {
-    let (stdout, _stderr, code) = run(&["install", "--help"], None, false);
+fn adapter_help_lists_the_management_subcommands() {
+    let (stdout, _stderr, code) = run(&["adapter", "--help"], None, false);
     assert_eq!(code, 0);
     assert!(stdout.contains("list"));
     assert!(stdout.contains("doctor"));
@@ -126,11 +126,11 @@ fn install_help_is_pure_and_lists_the_management_subcommands() {
 }
 
 #[test]
-fn install_list_prints_known_adapters_and_touches_no_filesystem_state() {
+fn adapter_list_prints_known_adapters_and_touches_no_filesystem_state() {
     let home = std::env::temp_dir().join(format!("fornax-e2e-home-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&home).unwrap();
     let mut cmd = Command::new(fornax_bin());
-    cmd.args(["install", "list"]).env("HOME", &home);
+    cmd.args(["adapter", "list"]).env("HOME", &home);
     let out = cmd.output().expect("spawn");
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -138,21 +138,21 @@ fn install_list_prints_known_adapters_and_touches_no_filesystem_state() {
     assert!(stdout.contains("codex"));
     assert!(
         !home.join(".claude").exists(),
-        "install list must be read-only — must not create ~/.claude"
+        "adapter list must be read-only — must not create ~/.claude"
     );
     assert!(
         !home.join(".codex").exists(),
-        "install list must be read-only — must not create ~/.codex"
+        "adapter list must be read-only — must not create ~/.codex"
     );
     std::fs::remove_dir_all(&home).ok();
 }
 
 #[test]
-fn install_plan_json_round_trips_adapter_field() {
+fn adapter_plan_json_round_trips_adapter_field() {
     let home = std::env::temp_dir().join(format!("fornax-e2e-home-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&home).unwrap();
     let mut cmd = Command::new(fornax_bin());
-    cmd.args(["install", "plan", "claude-code", "--json"])
+    cmd.args(["adapter", "plan", "claude-code", "--json"])
         .env("HOME", &home);
     let out = cmd.output().expect("spawn");
     assert!(out.status.success());
@@ -175,24 +175,37 @@ fn install_unknown_adapter_is_a_clean_error_not_a_stack_trace() {
 }
 
 #[test]
-fn deprecated_install_claude_alias_still_works_and_warns_on_stderr() {
-    let home = std::env::temp_dir().join(format!("fornax-e2e-home-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&home).unwrap();
-    let mut cmd = Command::new(fornax_bin());
-    cmd.args(["install-claude"]).env("HOME", &home);
-    let out = cmd.output().expect("spawn");
-    assert!(out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("deprecated"),
-        "deprecated alias must print a deprecation hint to stderr, got: {stderr}"
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        !stdout.contains("deprecated"),
-        "the deprecation hint must go to stderr, not stdout (stdout is the \
-         compatibility surface scripts may parse)"
-    );
-    assert!(home.join(".claude").join("settings.json").exists());
-    std::fs::remove_dir_all(&home).ok();
+fn legacy_adapter_commands_are_gone_and_write_nothing() {
+    for legacy in [
+        "install-claude",
+        "uninstall-claude",
+        "install-codex",
+        "uninstall-codex",
+    ] {
+        let home = std::env::temp_dir().join(format!("fornax-e2e-home-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).unwrap();
+        let mut cmd = Command::new(fornax_bin());
+        cmd.args([legacy]).env("HOME", &home);
+        let out = cmd.output().expect("spawn");
+        let code = out.status.code().unwrap_or(-1);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            code, 2,
+            "`{legacy}` must be clap's usage-error exit for an unrecognized \
+             subcommand, got {code} (stderr: {stderr})"
+        );
+        assert!(
+            !stderr.contains("panicked"),
+            "`{legacy}` must not panic: {stderr}"
+        );
+        assert!(
+            stderr.contains(legacy) || stderr.to_lowercase().contains("unrecognized"),
+            "`{legacy}` error must name the unrecognized input: {stderr}"
+        );
+        assert!(
+            !home.join(".claude").exists() && !home.join(".codex").exists(),
+            "`{legacy}` must not silently still install anything"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
