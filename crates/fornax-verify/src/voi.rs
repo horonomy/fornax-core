@@ -692,7 +692,8 @@ fn classify_availability(
     capabilities: &[RuntimeCapabilities],
     policy: &AcquisitionPolicy,
 ) -> CandidateAvailability {
-    for class in [SideEffectClass::FilesystemWriteOutsideWorktree] {
+    {
+        let class = SideEffectClass::FilesystemWriteOutsideWorktree;
         if request_requires(request, class) {
             return CandidateAvailability::Forbidden {
                 reason: format!("{class:?} is never approvable through this planner"),
