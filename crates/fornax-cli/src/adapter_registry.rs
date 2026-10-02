@@ -21,6 +21,13 @@
 //! [`AdapterArg`], a table-driven value type that parses straight through
 //! [`resolve`] — the CLI's argument surface no longer hardcodes which ids
 //! exist.
+//!
+//! FORNX-428 S3 moves the registry-inspection verbs (`list`/`doctor`/`plan`)
+//! out of `install`'s own subcommand namespace into a dedicated
+//! `fornax adapter <verb>` command, and removes the `install-claude`/
+//! `uninstall-claude`/`install-codex`/`uninstall-codex` legacy top-level
+//! commands entirely — an intentional breaking cleanup performed during
+//! DogFooding, before any external compatibility commitment exists.
 
 use std::path::PathBuf;
 
@@ -41,10 +48,10 @@ pub trait AdapterPlugin: Send + Sync {
     fn display_name(&self) -> &'static str;
 
     /// One-line description of what this adapter's install/uninstall
-    /// actually wires, for `fornax install list`.
+    /// actually wires, for `fornax adapter list`.
     fn summary(&self) -> &'static str;
 
-    /// The one config path `install list`'s rendering and tests use to
+    /// The one config path `adapter list`'s rendering and tests use to
     /// describe this adapter. Adapters with more than one owned path (e.g.
     /// Codex's config file plus its notify script) report the primary one
     /// mutated by `settings.json`/`config.toml`-shaped install/uninstall.
@@ -147,9 +154,9 @@ pub fn resolve(id: &str) -> Option<&'static dyn AdapterPlugin> {
 /// A clap value type wrapping an already-resolved [`AdapterPlugin`] —
 /// FORNX-428 S2's replacement for the closed `AdapterId` enum. Parsing goes
 /// straight through [`resolve`] against [`registry`], so the CLI's argument
-/// surface (`InstallArgs`, `InstallAction`, `Commands::Uninstall`) never
-/// hardcodes which ids exist: adding a built-in adapter is one struct plus
-/// one `registry()` entry, never a change here.
+/// surface (`Commands::Install`, `AdapterAction`, `Commands::Uninstall`)
+/// never hardcodes which ids exist: adding a built-in adapter is one struct
+/// plus one `registry()` entry, never a change here.
 ///
 /// An unknown id is a clean clap parse error (non-zero exit, no stack
 /// trace, every known id named) — never a silently-ignored no-op.
@@ -210,11 +217,7 @@ pub struct AdapterActionResult {
     pub path: String,
 }
 
-/// `fornax install <adapter>` — routes to the same install logic the
-/// deprecated `install-claude`/`install-codex` aliases call; see
-/// `crate::claude_adapter`/`crate::codex_adapter` doc comments for why
-/// there is exactly one implementation per adapter, never a forked one for
-/// the new vs. old command spelling.
+/// `fornax install <adapter>`.
 pub fn install(adapter: AdapterArg) -> anyhow::Result<AdapterActionResult> {
     adapter.plugin().install()
 }
@@ -224,13 +227,13 @@ pub fn uninstall(adapter: AdapterArg) -> anyhow::Result<AdapterActionResult> {
     adapter.plugin().uninstall()
 }
 
-/// `fornax install plan <adapter>` — computes, without writing anything,
+/// `fornax adapter plan <adapter>` — computes, without writing anything,
 /// what `install` would do right now.
 pub fn plan(adapter: AdapterArg) -> anyhow::Result<AdapterActionResult> {
     adapter.plugin().plan()
 }
 
-/// `fornax install doctor <adapter>` — current install status, read-only.
+/// `fornax adapter doctor <adapter>` — current install status, read-only.
 /// Reuses the same plan computation `plan` uses; doctor and plan differ
 /// only in rendering/action label, not in what they compute.
 pub fn doctor(adapter: AdapterArg) -> anyhow::Result<AdapterActionResult> {
@@ -269,9 +272,8 @@ mod tests {
     /// Anti-vacuity (FORNX-428 S2): a fixture adapter not in the real
     /// `registry()` proves the parser is a plain function of whatever
     /// `resolve()` returns, not a hardcoded id list -- adding a built-in
-    /// adapter never requires touching `AdapterArg`, `InstallArgs`,
-    /// `InstallAction`, or `Commands` in `main.rs`, only one `registry()`
-    /// entry.
+    /// adapter never requires touching `AdapterArg`, `AdapterAction`, or
+    /// `Commands` in `main.rs`, only one `registry()` entry.
     #[test]
     fn adapter_arg_parsing_is_a_plain_function_of_resolve_not_a_hardcoded_list() {
         struct FixtureAdapter;
@@ -308,7 +310,7 @@ mod tests {
         let found = extended
             .iter()
             .find(|a| a.id() == "fixture-only-for-this-test")
-            .expect("fixture resolves against an extended registry with zero changes to AdapterArg/InstallArgs/Commands");
+            .expect("fixture resolves against an extended registry with zero changes to AdapterArg/AdapterAction/Commands");
         assert_eq!(found.id(), "fixture-only-for-this-test");
     }
 

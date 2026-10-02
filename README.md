@@ -64,11 +64,14 @@ echo '{"hook_event_name":"Stop","session_id":"'"$SESSION"'","transcript_path":"/
 
 ### Installing the Claude Code integration (FORNX-15)
 
+Run `./target/debug/fornax adapter list` to see every known adapter id,
+what it wires, and its config path before installing one.
+
 The Quick Start above feeds hook events by hand. For a real Claude Code
 session, wire the hooks into `~/.claude/settings.json` with:
 
 ```bash
-./target/debug/fornax install-claude
+./target/debug/fornax install claude-code
 ```
 
 This idempotently adds `SessionStart`, `UserPromptSubmit`, `PreToolUse`,
@@ -79,7 +82,7 @@ to find it. To stop Fornax observing Claude Code sessions and return the
 file to a clean state:
 
 ```bash
-./target/debug/fornax uninstall-claude
+./target/debug/fornax uninstall claude-code
 ```
 
 ### Installing the Codex integration (FORNX-16)
@@ -89,7 +92,7 @@ reads Codex's own always-on rollout JSONL transcripts directly — just run
 it (see `docs/research/adapter-capability-matrix.md` for the payload shape
 and `crates/fornax-adapter-codex` for the translation logic).
 
-`install-codex`/`uninstall-codex` wire only the separate, optional
+`install codex`/`uninstall codex` wire only the separate, optional
 ambient-status surface (FORNX-17) — a `notify` entry in
 `~/.codex/config.toml` pointing at `scripts/fornax-codex-notify.sh`, so
 Codex writes its own turn-status to `$FORNAX_HOME/last-status` (Codex
@@ -97,20 +100,20 @@ discards `notify`'s stdout, so the script must write to a file — see
 `docs/dogfooding-codex-notify.md`):
 
 ```bash
-./target/debug/fornax install-codex
+./target/debug/fornax install codex
 ```
 
 Codex's `notify` holds exactly one command, unlike Claude's per-event hook
 arrays — so if `notify` is already wired to something else (e.g. a
-different tool your session already uses), `install-codex` refuses to
+different tool your session already uses), `install codex` refuses to
 overwrite it and leaves the file byte-for-byte unchanged, rather than
 silently replacing or corrupting an unrelated integration. Wire Fornax in
 manually in that case. Running it again when Fornax is already installed
-is a no-op. To remove exactly the entry `install-codex` added (never a
+is a no-op. To remove exactly the entry `install codex` added (never a
 foreign `notify` value), leaving every other key/table/comment untouched:
 
 ```bash
-./target/debug/fornax uninstall-codex
+./target/debug/fornax uninstall codex
 ```
 
 The dashboard at `/dashboard` on the daemon's HTTP port works the same way

@@ -16,8 +16,6 @@ mod receipt_cmd;
 mod statusline;
 mod timeline;
 
-use std::str::FromStr;
-
 use adapter_registry::AdapterArg;
 
 #[derive(Parser)]
@@ -276,18 +274,29 @@ enum Commands {
         #[arg(long)]
         out: std::path::PathBuf,
     },
-    /// Install a Fornax adapter integration (e.g. `claude-code`, `codex`).
+    /// Inspect the Fornax adapter registry: list known adapters, check
+    /// current install status, or preview a change before applying it.
     ///
     /// Adapter is a registry entry, not a top-level command (ADR-0013 §8,
-    /// HORO-1621) — see `fornax install list` for every known adapter id
-    /// and what it wires, `fornax install doctor <adapter>` for current
-    /// status, and `fornax install plan <adapter>` to preview a change
-    /// before applying it. Install is idempotent: running it again when
-    /// already installed is a safe no-op. Host configuration mutation is
-    /// always additive/targeted — an adapter only ever adds or updates the
-    /// keys it owns, never an unrelated existing setting (HORO-996/
-    /// ADR-0009).
-    Install(InstallArgs),
+    /// HORO-1621) — `fornax adapter list` lists every known adapter id and
+    /// what it wires, `fornax adapter doctor <adapter>` reports current
+    /// status, and `fornax adapter plan <adapter>` previews a change before
+    /// applying it with `fornax install <adapter>`.
+    Adapter {
+        #[command(subcommand)]
+        action: AdapterAction,
+    },
+    /// Install a Fornax adapter integration (e.g. `claude-code`, `codex`).
+    ///
+    /// Install is idempotent: running it again when already installed is a
+    /// safe no-op. Host configuration mutation is always additive/targeted
+    /// — an adapter only ever adds or updates the keys it owns, never an
+    /// unrelated existing setting (HORO-996/ADR-0009). See `fornax adapter`
+    /// to inspect the registry before installing.
+    Install {
+        /// Adapter id to install (e.g. `claude-code`, `codex`).
+        adapter: AdapterArg,
+    },
     /// Uninstall a Fornax adapter integration, reversing `install`.
     ///
     /// Removes only the keys that adapter's `install` added, leaving every
@@ -297,20 +306,6 @@ enum Commands {
         /// Adapter id to uninstall (e.g. `claude-code`, `codex`).
         adapter: AdapterArg,
     },
-    /// Deprecated alias for `fornax install claude-code` — delegates to the
-    /// same implementation. Kept for scripts/users that depend on the old
-    /// spelling (HORO-1621).
-    #[command(hide = true)]
-    InstallClaude,
-    /// Deprecated alias for `fornax uninstall claude-code`.
-    #[command(hide = true)]
-    UninstallClaude,
-    /// Deprecated alias for `fornax install codex`.
-    #[command(hide = true)]
-    InstallCodex,
-    /// Deprecated alias for `fornax uninstall codex`.
-    #[command(hide = true)]
-    UninstallCodex,
     /// Counterfactual verification flow: preview/run/render a bounded
     /// robustness experiment against a claim.
     ///
@@ -400,25 +395,15 @@ enum Commands {
     },
 }
 
-/// `fornax install <adapter>` / `fornax install <list|doctor|plan>`
-/// (HORO-1621). `adapter` and `action` are mutually exclusive: give an
-/// adapter id to install it directly, or a management subcommand
-/// (`list`/`doctor`/`plan`) to inspect the registry instead. clap resolves
-/// `list`/`doctor`/`plan` as the nested subcommand and anything else (e.g.
-/// `claude-code`, `codex`) as the `adapter` positional, since those names
-/// never collide with a known adapter id — verified in this module's
-/// `install_arg_parsing` tests.
-#[derive(clap::Args)]
-pub struct InstallArgs {
-    /// Adapter id to install directly, e.g. `claude-code` or `codex`. Omit
-    /// when using a management subcommand instead.
-    pub adapter: Option<AdapterArg>,
-    #[command(subcommand)]
-    pub action: Option<InstallAction>,
-}
-
+/// `fornax adapter <list|doctor|plan>` (HORO-1621, FORNX-428 S3). A
+/// dedicated registry-inspection namespace, separate from `install`/
+/// `uninstall` — an adapter id only ever appears as the positional
+/// immediately after `install`/`uninstall`, and a management verb only ever
+/// appears as the subcommand immediately after `adapter`, so no adapter id
+/// can ever collide with a management verb (verified in this module's
+/// `adapter_cli_surface` tests).
 #[derive(Subcommand)]
-pub enum InstallAction {
+pub enum AdapterAction {
     /// List every known adapter id, display name, and what it wires.
     List,
     /// Current install status for one adapter, read-only.
@@ -755,30 +740,9 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::ExportSpool { session, out } => export_spool(&session, &out).await?,
-        Commands::Install(args) => handle_install(args)?,
+        Commands::Adapter { action } => handle_adapter_action(action)?,
+        Commands::Install { adapter } => print_result(adapter_registry::install(adapter)?),
         Commands::Uninstall { adapter } => print_result(adapter_registry::uninstall(adapter)?),
-        Commands::InstallClaude => {
-            eprintln!(
-                "fornax: `install-claude` is deprecated, use `fornax install claude-code` instead"
-            );
-            print_result(adapter_registry::install(builtin_adapter("claude-code"))?)
-        }
-        Commands::UninstallClaude => {
-            eprintln!(
-                "fornax: `uninstall-claude` is deprecated, use `fornax uninstall claude-code` instead"
-            );
-            print_result(adapter_registry::uninstall(builtin_adapter("claude-code"))?)
-        }
-        Commands::InstallCodex => {
-            eprintln!("fornax: `install-codex` is deprecated, use `fornax install codex` instead");
-            print_result(adapter_registry::install(builtin_adapter("codex"))?)
-        }
-        Commands::UninstallCodex => {
-            eprintln!(
-                "fornax: `uninstall-codex` is deprecated, use `fornax uninstall codex` instead"
-            );
-            print_result(adapter_registry::uninstall(builtin_adapter("codex"))?)
-        }
         Commands::Experiment { action } => experiment_ux::handle(action, &fornax_home())?,
         Commands::Policy { action } => handle_policy_action(action).await?,
         Commands::Audit { action } => handle_audit_action(action).await?,
@@ -1176,25 +1140,9 @@ fn print_result(result: adapter_registry::AdapterActionResult) {
     println!("{}", result.message);
 }
 
-/// Resolves a known built-in adapter id for the deprecated alias commands.
-/// Infallible by construction (`id` is a literal this module controls) --
-/// panics only if a built-in id were ever removed from `registry()` without
-/// updating its caller, which is a programmer error worth a loud failure.
-fn builtin_adapter(id: &str) -> AdapterArg {
-    AdapterArg::from_str(id).unwrap_or_else(|e| panic!("builtin_adapter({id:?}): {e}"))
-}
-
-fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
-    match (args.adapter, args.action) {
-        (Some(_), Some(_)) => anyhow::bail!(
-            "fornax install: specify either an adapter id or a management subcommand \
-             (list/doctor/plan), not both — see `fornax install --help`"
-        ),
-        (Some(adapter), None) => {
-            print_result(adapter_registry::install(adapter)?);
-            Ok(())
-        }
-        (None, Some(InstallAction::List)) => {
+fn handle_adapter_action(action: AdapterAction) -> anyhow::Result<()> {
+    match action {
+        AdapterAction::List => {
             println!("Known Fornax adapters:");
             for adapter in adapter_registry::registry() {
                 println!(
@@ -1207,7 +1155,7 @@ fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        (None, Some(InstallAction::Doctor { adapter })) => {
+        AdapterAction::Doctor { adapter } => {
             let result = adapter_registry::doctor(adapter)?;
             println!(
                 "{} ({}): {}",
@@ -1217,7 +1165,7 @@ fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
             );
             Ok(())
         }
-        (None, Some(InstallAction::Plan { adapter, json })) => {
+        AdapterAction::Plan { adapter, json } => {
             let result = adapter_registry::plan(adapter)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
@@ -1226,10 +1174,6 @@ fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        (None, None) => anyhow::bail!(
-            "fornax install: requires an adapter id or a subcommand (list/doctor/plan) — \
-             see `fornax install --help`"
-        ),
     }
 }
 
@@ -3895,67 +3839,24 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    // HORO-1621: the `install <adapter>` / `install list|doctor|plan` clap
-    // surface — the parse spike that decided the shape of `InstallArgs`.
-    // `list`/`doctor`/`plan` must resolve as the nested `InstallAction`
-    // subcommand; any other token (a real or unknown adapter id) must fall
-    // through to the `adapter` positional, since clap resolves a matching
-    // subcommand name before trying the positional.
-    mod install_arg_parsing {
+    // FORNX-428 S3: `install <adapter>`/`uninstall <adapter>` and
+    // `adapter <list|doctor|plan>` live in disjoint token positions — an
+    // adapter id only ever appears as the positional immediately after
+    // `install`/`uninstall`, and `install`/`uninstall` carry no nested
+    // subcommand at all, so no adapter id can ever be shadowed by a
+    // management verb (see `adapter_registry.rs`'s anti-vacuity test for
+    // the registry-decoupling half of this guarantee).
+    mod adapter_cli_surface {
         use super::*;
+        use clap::CommandFactory;
 
         #[test]
         fn install_with_known_adapter_parses_as_direct_install() {
             let cli =
                 Cli::try_parse_from(["fornax", "install", "claude-code"]).expect("must parse");
             match cli.command {
-                Commands::Install(InstallArgs {
-                    adapter: Some(adapter),
-                    action: None,
-                }) => assert_eq!(adapter.id(), "claude-code"),
+                Commands::Install { adapter } => assert_eq!(adapter.id(), "claude-code"),
                 _ => panic!("expected direct claude-code install"),
-            }
-        }
-
-        #[test]
-        fn install_list_parses_as_management_subcommand_not_an_adapter_id() {
-            let cli = Cli::try_parse_from(["fornax", "install", "list"]).expect("must parse");
-            match cli.command {
-                Commands::Install(InstallArgs {
-                    adapter: None,
-                    action: Some(InstallAction::List),
-                }) => {}
-                _ => panic!("expected InstallAction::List"),
-            }
-        }
-
-        #[test]
-        fn install_plan_with_json_flag_parses() {
-            let cli = Cli::try_parse_from(["fornax", "install", "plan", "codex", "--json"])
-                .expect("must parse");
-            match cli.command {
-                Commands::Install(InstallArgs {
-                    adapter: None,
-                    action:
-                        Some(InstallAction::Plan {
-                            adapter,
-                            json: true,
-                        }),
-                }) => assert_eq!(adapter.id(), "codex"),
-                _ => panic!("expected Plan{{codex,json:true}}"),
-            }
-        }
-
-        #[test]
-        fn install_doctor_with_adapter_parses() {
-            let cli = Cli::try_parse_from(["fornax", "install", "doctor", "claude-code"])
-                .expect("must parse");
-            match cli.command {
-                Commands::Install(InstallArgs {
-                    adapter: None,
-                    action: Some(InstallAction::Doctor { adapter }),
-                }) => assert_eq!(adapter.id(), "claude-code"),
-                _ => panic!("expected Doctor{{claude-code}}"),
             }
         }
 
@@ -3979,75 +3880,115 @@ mod tests {
             }
             assert!(Cli::try_parse_from(["fornax", "uninstall", "nope"]).is_err());
         }
-    }
-
-    // HORO-1621 anti-vacuity: a deprecated alias must delegate to the exact
-    // same adapter implementation the new `install`/`uninstall` surface
-    // uses, never fork its own copy. Proven here by driving both the old
-    // and new entry points against independent fixture files for the same
-    // input and asserting byte-identical resulting file contents — not by
-    // calling the same leaf function twice, which would prove nothing.
-    mod deprecated_alias_delegates_not_forks {
-        use super::*;
 
         #[test]
-        fn install_claude_alias_and_new_path_produce_identical_settings() {
-            let legacy_path = std::env::temp_dir().join(format!(
-                "fornax-cli-test-alias-legacy-{}.json",
-                uuid::Uuid::new_v4()
-            ));
-            let new_path = std::env::temp_dir().join(format!(
-                "fornax-cli-test-alias-new-{}.json",
-                uuid::Uuid::new_v4()
-            ));
-
-            // Old spelling's underlying call path: `claude_adapter::install_at`
-            // via a fixed path, exactly as `Commands::InstallClaude`'s
-            // dispatch arm calls `adapter_registry::install` which calls
-            // `claude_adapter::install_at(&claude_adapter::default_path())`
-            // in production — here we call the same leaf with two different
-            // explicit paths to prove the computation itself is identical
-            // regardless of which command spelling reached it.
-            claude_adapter::install_at(&legacy_path).expect("legacy path install");
-            claude_adapter::install_at(&new_path).expect("new path install");
-
-            let legacy_contents = std::fs::read_to_string(&legacy_path).unwrap();
-            let new_contents = std::fs::read_to_string(&new_path).unwrap();
-            assert_eq!(
-                legacy_contents, new_contents,
-                "install-claude alias and `fornax install claude-code` must produce \
-                 byte-identical settings.json content for the same starting state"
-            );
-
-            std::fs::remove_file(&legacy_path).ok();
-            std::fs::remove_file(&new_path).ok();
+        fn adapter_list_parses() {
+            let cli = Cli::try_parse_from(["fornax", "adapter", "list"]).expect("must parse");
+            match cli.command {
+                Commands::Adapter {
+                    action: AdapterAction::List,
+                } => {}
+                _ => panic!("expected AdapterAction::List"),
+            }
         }
 
         #[test]
-        fn install_codex_alias_and_new_path_produce_identical_config() {
-            let legacy_path = std::env::temp_dir().join(format!(
-                "fornax-cli-test-alias-legacy-{}.toml",
-                uuid::Uuid::new_v4()
-            ));
-            let new_path = std::env::temp_dir().join(format!(
-                "fornax-cli-test-alias-new-{}.toml",
-                uuid::Uuid::new_v4()
-            ));
-            let script = std::path::PathBuf::from("/opt/fornax/scripts/fornax-codex-notify.sh");
+        fn adapter_plan_with_json_flag_parses() {
+            let cli = Cli::try_parse_from(["fornax", "adapter", "plan", "codex", "--json"])
+                .expect("must parse");
+            match cli.command {
+                Commands::Adapter {
+                    action:
+                        AdapterAction::Plan {
+                            adapter,
+                            json: true,
+                        },
+                } => assert_eq!(adapter.id(), "codex"),
+                _ => panic!("expected Plan{{codex,json:true}}"),
+            }
+        }
 
-            codex_adapter::install_at(&legacy_path, &script).expect("legacy path install");
-            codex_adapter::install_at(&new_path, &script).expect("new path install");
+        #[test]
+        fn adapter_doctor_with_adapter_parses() {
+            let cli = Cli::try_parse_from(["fornax", "adapter", "doctor", "claude-code"])
+                .expect("must parse");
+            match cli.command {
+                Commands::Adapter {
+                    action: AdapterAction::Doctor { adapter },
+                } => assert_eq!(adapter.id(), "claude-code"),
+                _ => panic!("expected Doctor{{claude-code}}"),
+            }
+        }
 
-            let legacy_contents = std::fs::read_to_string(&legacy_path).unwrap();
-            let new_contents = std::fs::read_to_string(&new_path).unwrap();
-            assert_eq!(
-                legacy_contents, new_contents,
-                "uninstall-codex alias and `fornax install codex` must produce \
-                 byte-identical config.toml content for the same starting state"
+        #[test]
+        fn install_has_no_nested_subcommands_so_no_adapter_id_can_ever_be_shadowed() {
+            let cmd = Cli::command();
+            let install = cmd.find_subcommand("install").expect("install must exist");
+            assert!(
+                install.get_subcommands().next().is_none(),
+                "install must carry zero nested subcommands — that is what makes an \
+                 adapter-id/management-verb collision structurally impossible"
             );
+        }
 
-            std::fs::remove_file(&legacy_path).ok();
-            std::fs::remove_file(&new_path).ok();
+        #[test]
+        fn install_treats_every_management_verb_as_a_plain_adapter_id() {
+            for verb in ["list", "doctor", "plan"] {
+                let result = Cli::try_parse_from(["fornax", "install", verb]);
+                let err = result
+                    .err()
+                    .unwrap_or_else(|| panic!("`install {verb}` must be a parse error"))
+                    .to_string();
+                assert!(
+                    err.contains(verb) && err.contains("claude-code"),
+                    "`install {verb}` must fail as an unknown adapter id (naming every \
+                     known id, including claude-code), not resolve as a subcommand: {err}"
+                );
+            }
+        }
+
+        #[test]
+        fn every_registered_adapter_id_parses_as_a_direct_install_target() {
+            for adapter in adapter_registry::registry() {
+                let cli = Cli::try_parse_from(["fornax", "install", adapter.id()])
+                    .unwrap_or_else(|e| panic!("install {} must parse: {e}", adapter.id()));
+                match cli.command {
+                    Commands::Install { adapter: parsed } => {
+                        assert_eq!(parsed.id(), adapter.id())
+                    }
+                    _ => panic!("expected direct install of {}", adapter.id()),
+                }
+            }
+        }
+    }
+
+    // FORNX-428 S3: the legacy `install-claude`/`uninstall-claude`/
+    // `install-codex`/`uninstall-codex` top-level commands are removed
+    // outright (intentional breaking cleanup during DogFooding, before any
+    // external compatibility commitment exists) — proven against the real
+    // command tree, not help text, so a re-addition under `hide = true`
+    // would still fail this test.
+    mod legacy_commands_removed {
+        use super::*;
+        use clap::CommandFactory;
+
+        #[test]
+        fn legacy_adapter_alias_commands_do_not_exist_as_subcommands() {
+            let names: Vec<String> = Cli::command()
+                .get_subcommands()
+                .map(|c| c.get_name().to_string())
+                .collect();
+            for legacy in [
+                "install-claude",
+                "uninstall-claude",
+                "install-codex",
+                "uninstall-codex",
+            ] {
+                assert!(
+                    !names.iter().any(|n| n == legacy),
+                    "{legacy} must not exist as a subcommand at all"
+                );
+            }
         }
     }
 
@@ -4091,18 +4032,11 @@ mod tests {
         }
 
         #[test]
-        fn root_help_lists_install_and_uninstall_and_hides_deprecated_aliases() {
+        fn root_help_lists_install_uninstall_and_adapter() {
             let help = root_help();
             assert!(help.contains("install"), "install must be listed");
             assert!(help.contains("uninstall"), "uninstall must be listed");
-            assert!(
-                !help.contains("install-claude"),
-                "deprecated install-claude must be hidden from root help"
-            );
-            assert!(
-                !help.contains("install-codex"),
-                "deprecated install-codex must be hidden from root help"
-            );
+            assert!(help.contains("adapter"), "adapter must be listed");
         }
 
         #[test]

@@ -4,11 +4,11 @@
 //! result to the daemon over the Unix Domain Socket. This binary is
 //! transport plumbing only — no translation logic lives here (D5, ADR 0001).
 //!
-//! Wire into `~/.claude/settings.json` by running `fornax install-claude`
+//! Wire into `~/.claude/settings.json` by running `fornax install claude-code`
 //! (FORNX-15) — it idempotently adds the hook entries below without
 //! touching any other hook or setting already in that file. Run
-//! `fornax uninstall-claude` to remove them again and return Claude Code to
-//! a clean state. The resulting shape:
+//! `fornax uninstall claude-code` to remove them again and return Claude Code
+//! to a clean state. The resulting shape:
 //! ```json
 //! "PreToolUse":       [{ "hooks": [{ "type": "command", "command": "fornax-hook-claude" }] }],
 //! "PostToolUse":      [{ "hooks": [{ "type": "command", "command": "fornax-hook-claude" }] }],
