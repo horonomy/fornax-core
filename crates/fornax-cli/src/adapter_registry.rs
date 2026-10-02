@@ -1,4 +1,4 @@
-//! Adapter install/integration registry (HORO-1621, FORNX-428, ADR-0013 §8).
+//! Adapter install/integration registry (HORO-1621, FORNX-428, ADR-0023).
 //!
 //! Before HORO-1621, each coding-agent adapter Fornax could wire into a host
 //! tool's own configuration (`~/.claude/settings.json`,
