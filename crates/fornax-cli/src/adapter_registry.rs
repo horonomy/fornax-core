@@ -1,57 +1,148 @@
-//! Adapter install/integration registry (HORO-1621, ADR-0013 §8).
+//! Adapter install/integration registry (HORO-1621, FORNX-428, ADR-0013 §8).
 //!
-//! Before this ticket, each coding-agent adapter Fornax could wire into a
-//! host tool's own configuration (`~/.claude/settings.json`,
+//! Before HORO-1621, each coding-agent adapter Fornax could wire into a host
+//! tool's own configuration (`~/.claude/settings.json`,
 //! `~/.codex/config.toml`) got its own pair of top-level CLI commands
 //! (`install-claude`/`uninstall-claude`, `install-codex`/`uninstall-codex`).
-//! That means the root command list grows by two for every new adapter, and
-//! a product engineer has to edit the root `Commands` enum just to add one.
-//! ADR-0013 §8 calls this out directly: "a product introducing its second
-//! adapter-shaped top-level command is the trigger to make this move."
+//! HORO-1621 replaced that with one coherent `install <adapter>`/
+//! `uninstall <adapter>` entry point, but still dispatched through
+//! `AdapterId`'s closed enum and 7 hand-maintained `match` tables — adding a
+//! third adapter meant editing all 7.
 //!
-//! This module is that move: `AdapterId` is a small, closed enum (a stable
-//! registry key, not a free-form string) and [`install`]/[`uninstall`]/
-//! [`plan`]/[`doctor`] are the one coherent entry point every adapter target
-//! routes through. Adding a third known adapter means adding one more
-//! `AdapterId` variant and one more arm in each `match` below — never a new
-//! top-level `Commands` variant, and never a new CLI surface to document.
+//! FORNX-428 replaces those match tables with [`AdapterPlugin`]: one trait
+//! every adapter implements, and [`registry`]/[`resolve`] as the single
+//! runtime-resolved lookup. Adding a built-in adapter now means one struct
+//! implementing the trait plus one entry in [`registry`]'s array — never a
+//! new top-level `Commands` variant, and (per FORNX-428's registry-
+//! completeness test below) never a partially-wired adapter that compiles
+//! with a wrong or missing method.
 //!
-//! ## Why a static match table, not dynamic plugin/manifest loading
-//!
-//! HORO-1621 asks us to consider dynamic discovery/registration (a product-
-//! owned adapter manifest or plugin directory) so a third-party or future
-//! adapter could register without a Fornax rebuild at all. We deliberately
-//! do not build that here:
-//!
-//! - Only two adapters exist today (`claude-code`, `codex`), and both mutate
-//!   security-sensitive host configuration (HORO-996/ADR-0009's non-
-//!   destructive invariant). A manifest-loaded adapter would need its own
-//!   trust boundary (who signs it, what it's allowed to touch, how a
-//!   malicious manifest is prevented from running arbitrary code merely by
-//!   being present on disk) — that is a meaningfully larger design surface
-//!   than this ticket's scope, and HORO-1621 itself says to document the
-//!   deferral rather than silently skip it if dynamic loading isn't safe to
-//!   build now.
-//! - A fixed, closed `AdapterId` enum is exhaustively matched by the
-//!   compiler (`match` without a wildcard arm fails to build if a variant is
-//!   unhandled), which is a stronger safety property for code that mutates
-//!   `~/.claude/settings.json`/`~/.codex/config.toml` than a dynamically
-//!   registered table would give us for free.
-//!
-//! The extension point this leaves for a future dynamic registry: every
-//! operation below is a plain function of `AdapterId` with no dependency on
-//! the root `Commands` enum. A future manifest-backed adapter would plug in
-//! by adding a non-exhaustive `AdapterId::External(String)` variant (or a
-//! parallel lookup keyed by manifest id) whose operations are dispatched
-//! through a constrained, reviewed manifest schema — not by restructuring
-//! this module's shape. `fornax-adapter-opencode` (FORNX-161) is the
-//! concrete candidate for the next registry entry: it already exists as a
-//! long-lived transport adapter, but has no CLI-driven install flow yet
-//! today (its wiring is a manual `opencode.json` `"plugin"` entry, not a
-//! settings file this CLI mutates) — registering it is future work, not
-//! this ticket's.
+//! `AdapterId` (the `clap::ValueEnum` the CLI parses) is unchanged by this
+//! slice — see FORNX-428's S2 for retiring it in favor of a table-driven
+//! `value_parser`. This slice only changes what happens *after* parsing.
 
 use std::path::PathBuf;
+
+/// One coding-agent integration Fornax can wire into a host tool's own
+/// config. Implementors own their target path(s) — this is what absorbs the
+/// real asymmetry between adapters (Codex's `install`/`plan` need a second
+/// path, the notify script; Claude Code's need only one).
+///
+/// An adapter must not gain unrestricted access to arbitrary CLI internals
+/// merely to register itself — every method here is scoped to exactly the
+/// one host-config surface this adapter owns.
+pub trait AdapterPlugin: Send + Sync {
+    /// Stable registry key, matching the `clap::ValueEnum` name in
+    /// `AdapterId` for every built-in adapter (checked by the
+    /// registry-completeness test below).
+    fn id(&self) -> &'static str;
+
+    /// Human display name, e.g. "Claude Code".
+    fn display_name(&self) -> &'static str;
+
+    /// One-line description of what this adapter's install/uninstall
+    /// actually wires, for `fornax install list`.
+    fn summary(&self) -> &'static str;
+
+    /// The one config path `install list`'s rendering and tests use to
+    /// describe this adapter. Adapters with more than one owned path (e.g.
+    /// Codex's config file plus its notify script) report the primary one
+    /// mutated by `settings.json`/`config.toml`-shaped install/uninstall.
+    fn target_path(&self) -> PathBuf;
+
+    /// Computes, without writing anything, what `install` would do right
+    /// now.
+    fn plan(&self) -> anyhow::Result<AdapterActionResult>;
+
+    /// Wires this adapter into its host tool's configuration.
+    fn install(&self) -> anyhow::Result<AdapterActionResult>;
+
+    /// Removes exactly what `install` added.
+    fn uninstall(&self) -> anyhow::Result<AdapterActionResult>;
+}
+
+struct ClaudeCodeAdapter;
+
+impl AdapterPlugin for ClaudeCodeAdapter {
+    fn id(&self) -> &'static str {
+        "claude-code"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Claude Code"
+    }
+
+    fn summary(&self) -> &'static str {
+        "Wires Fornax hooks into ~/.claude/settings.json (SessionStart, \
+         UserPromptSubmit, PreToolUse, PostToolUse, Stop)."
+    }
+
+    fn target_path(&self) -> PathBuf {
+        crate::claude_adapter::default_path()
+    }
+
+    fn plan(&self) -> anyhow::Result<AdapterActionResult> {
+        crate::claude_adapter::plan_install_at(&self.target_path())
+    }
+
+    fn install(&self) -> anyhow::Result<AdapterActionResult> {
+        crate::claude_adapter::install_at(&self.target_path())
+    }
+
+    fn uninstall(&self) -> anyhow::Result<AdapterActionResult> {
+        crate::claude_adapter::uninstall_at(&self.target_path())
+    }
+}
+
+struct CodexAdapter;
+
+impl AdapterPlugin for CodexAdapter {
+    fn id(&self) -> &'static str {
+        "codex"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Codex"
+    }
+
+    fn summary(&self) -> &'static str {
+        "Wires Fornax's ambient-status notify script into \
+         ~/.codex/config.toml's `notify` entry."
+    }
+
+    fn target_path(&self) -> PathBuf {
+        crate::codex_adapter::default_path()
+    }
+
+    fn plan(&self) -> anyhow::Result<AdapterActionResult> {
+        crate::codex_adapter::plan_install_at(
+            &self.target_path(),
+            &crate::codex_adapter::default_notify_script(),
+        )
+    }
+
+    fn install(&self) -> anyhow::Result<AdapterActionResult> {
+        crate::codex_adapter::install_at(
+            &self.target_path(),
+            &crate::codex_adapter::default_notify_script(),
+        )
+    }
+
+    fn uninstall(&self) -> anyhow::Result<AdapterActionResult> {
+        crate::codex_adapter::uninstall_at(&self.target_path())
+    }
+}
+
+/// Every built-in adapter, in display order. The single registration point
+/// FORNX-428's S2 extends with runtime-registered external adapters.
+pub fn registry() -> &'static [&'static dyn AdapterPlugin] {
+    &[&ClaudeCodeAdapter, &CodexAdapter]
+}
+
+/// Looks up a registered adapter by its stable id string.
+pub fn resolve(id: &str) -> Option<&'static dyn AdapterPlugin> {
+    registry().iter().copied().find(|a| a.id() == id)
+}
 
 /// Stable adapter id. This is the registry key referenced by `fornax
 /// install <adapter>` et al. — never a free-form string internally, so an
@@ -79,25 +170,21 @@ impl AdapterId {
 
     /// Human display name.
     pub fn display_name(self) -> &'static str {
-        match self {
-            AdapterId::ClaudeCode => "Claude Code",
-            AdapterId::Codex => "Codex",
-        }
+        self.plugin().display_name()
     }
 
     /// One-line description of what this adapter's install/uninstall
     /// actually wires, for `fornax install list`.
     pub fn summary(self) -> &'static str {
-        match self {
-            AdapterId::ClaudeCode => {
-                "Wires Fornax hooks into ~/.claude/settings.json (SessionStart, \
-                 UserPromptSubmit, PreToolUse, PostToolUse, Stop)."
-            }
-            AdapterId::Codex => {
-                "Wires Fornax's ambient-status notify script into \
-                 ~/.codex/config.toml's `notify` entry."
-            }
-        }
+        self.plugin().summary()
+    }
+
+    /// Resolves this id against [`registry`]. Always succeeds for a
+    /// built-in `AdapterId` — see `adapter_id_resolves_against_the_registry`
+    /// below.
+    fn plugin(self) -> &'static dyn AdapterPlugin {
+        resolve(self.id())
+            .unwrap_or_else(|| unreachable!("every AdapterId variant must have a registry() entry"))
     }
 }
 
@@ -123,44 +210,18 @@ pub struct AdapterActionResult {
 /// there is exactly one implementation per adapter, never a forked one for
 /// the new vs. old command spelling.
 pub fn install(adapter: AdapterId) -> anyhow::Result<AdapterActionResult> {
-    match adapter {
-        AdapterId::ClaudeCode => {
-            crate::claude_adapter::install_at(&crate::claude_adapter::default_path())
-        }
-        AdapterId::Codex => crate::codex_adapter::install_at(
-            &crate::codex_adapter::default_path(),
-            &crate::codex_adapter::default_notify_script(),
-        ),
-    }
+    adapter.plugin().install()
 }
 
 /// `fornax uninstall <adapter>`.
 pub fn uninstall(adapter: AdapterId) -> anyhow::Result<AdapterActionResult> {
-    match adapter {
-        AdapterId::ClaudeCode => {
-            crate::claude_adapter::uninstall_at(&crate::claude_adapter::default_path())
-        }
-        AdapterId::Codex => {
-            crate::codex_adapter::uninstall_at(&crate::codex_adapter::default_path())
-        }
-    }
+    adapter.plugin().uninstall()
 }
 
 /// `fornax install plan <adapter>` — computes, without writing anything,
-/// what `install` would do right now. Built by reusing the exact same
-/// plan-computation function `install` itself calls before saving (see
-/// `claude_adapter::plan_install_at`/`codex_adapter::plan_install_at`), so
-/// this can never silently disagree with what `install` actually does.
+/// what `install` would do right now.
 pub fn plan(adapter: AdapterId) -> anyhow::Result<AdapterActionResult> {
-    match adapter {
-        AdapterId::ClaudeCode => {
-            crate::claude_adapter::plan_install_at(&crate::claude_adapter::default_path())
-        }
-        AdapterId::Codex => crate::codex_adapter::plan_install_at(
-            &crate::codex_adapter::default_path(),
-            &crate::codex_adapter::default_notify_script(),
-        ),
-    }
+    adapter.plugin().plan()
 }
 
 /// `fornax install doctor <adapter>` — current install status, read-only.
@@ -175,10 +236,7 @@ pub fn doctor(adapter: AdapterId) -> anyhow::Result<AdapterActionResult> {
 /// Default on-disk path an adapter's install/uninstall mutates — used by
 /// `fornax install list`'s rendering and by tests.
 pub fn default_config_path(adapter: AdapterId) -> PathBuf {
-    match adapter {
-        AdapterId::ClaudeCode => crate::claude_adapter::default_path(),
-        AdapterId::Codex => crate::codex_adapter::default_path(),
-    }
+    adapter.plugin().target_path()
 }
 
 #[cfg(test)]
