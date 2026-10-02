@@ -257,4 +257,51 @@ mod tests {
         let ids: Vec<&str> = AdapterId::ALL.iter().map(|a| a.id()).collect();
         assert_eq!(ids, vec!["claude-code", "codex"]);
     }
+
+    #[test]
+    fn adapter_id_resolves_against_the_registry() {
+        for &a in AdapterId::ALL.iter() {
+            let plugin = resolve(a.id())
+                .unwrap_or_else(|| panic!("AdapterId::{a:?} ({}) has no registry() entry", a.id()));
+            assert_eq!(plugin.id(), a.id());
+        }
+    }
+
+    /// Registry-completeness: every registered adapter answers every
+    /// method non-trivially, and no two adapters share an id. Guards
+    /// against the mis-wiring class a copy-pasted match arm (the old
+    /// 7-site version of this module) made easy — e.g. pointing Codex's
+    /// struct at Claude Code's path.
+    #[test]
+    fn every_registered_adapter_is_fully_and_uniquely_wired() {
+        let adapters = registry();
+        assert!(!adapters.is_empty(), "registry() must not be empty");
+
+        let mut seen_ids = std::collections::HashSet::new();
+        for adapter in adapters {
+            assert!(
+                seen_ids.insert(adapter.id()),
+                "duplicate adapter id {:?} in registry()",
+                adapter.id()
+            );
+            assert!(!adapter.id().is_empty());
+            assert!(!adapter.display_name().is_empty());
+            assert!(!adapter.summary().is_empty());
+            assert!(
+                !adapter.target_path().as_os_str().is_empty(),
+                "{} must report a non-empty target_path()",
+                adapter.id()
+            );
+        }
+    }
+
+    /// The two built-in adapters must not end up wired to each other's
+    /// path — the specific mis-wiring class this trait is meant to make
+    /// structurally harder than a copy-pasted match arm.
+    #[test]
+    fn claude_code_and_codex_report_distinct_target_paths() {
+        let claude = resolve("claude-code").expect("claude-code is registered");
+        let codex = resolve("codex").expect("codex is registered");
+        assert_ne!(claude.target_path(), codex.target_path());
+    }
 }
