@@ -13,6 +13,12 @@ use fornax_types::{
 use std::path::PathBuf;
 use uuid::Uuid;
 
+pub mod host_binding;
+pub use host_binding::{
+    bind_host_event, BoundHostObservation, HostBindingGap, HostBindingGapReason,
+    HostBindingOutcome, HostObservationProvenance,
+};
+
 /// This adapter implementation's own version — independent of the Claude
 /// Code runtime version, which belongs in a `CapabilitySignal::detail`
 /// string (see `ClaudeAdapter::probe`). Attached to every capability
@@ -288,6 +294,16 @@ impl EvidenceSensor for ClaudeBashExitCodeSensor {
             evidence_purged: false,
         }])
     }
+}
+
+fn collect_claude_bash_exit_code(
+    event: &AgentEvent,
+    adapter_version: &'static str,
+    caps: &RuntimeCapabilities,
+    sensor_config: &SensorDisableConfig,
+) -> SensorOutcome {
+    let sensor = ClaudeBashExitCodeSensor { adapter_version };
+    collect_with_disable_check(&sensor, event, caps, sensor_config)
 }
 
 /// FORNX-14 "file changed" claim class: reconstructs a diff-shaped string
@@ -1279,10 +1295,8 @@ fn translate(
     // existing exit-code tests, whose assertions were not touched by this
     // change).
     if kind == EventKind::PostToolUse && tool_name.as_deref() == Some("Bash") {
-        let sensor = ClaudeBashExitCodeSensor {
-            adapter_version: adapter.adapter_version(),
-        };
-        let outcome = collect_with_disable_check(&sensor, &event, &caps, &sensor_config);
+        let outcome =
+            collect_claude_bash_exit_code(&event, adapter.adapter_version(), &caps, &sensor_config);
         out.extend(outcome.evidence.into_iter().map(IngestMessage::Evidence));
     }
 
