@@ -22,6 +22,7 @@ pub mod epistemic_contract;
 pub mod experiment;
 pub mod extension;
 pub mod graph;
+pub mod host_event;
 pub mod policy;
 pub mod privacy;
 pub mod provenance_guard;
