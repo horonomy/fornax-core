@@ -30,6 +30,7 @@
 //! DogFooding, before any external compatibility commitment exists.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 /// One coding-agent integration Fornax can wire into a host tool's own
 /// config. Implementors own their target path(s) — this is what absorbs the
@@ -42,14 +43,23 @@ use std::path::PathBuf;
 pub trait AdapterPlugin: Send + Sync {
     /// Stable registry key, matching the id string clap parses via
     /// `AdapterArg` (checked by the registry-completeness test below).
-    fn id(&self) -> &'static str;
+    ///
+    /// `&str`, not `&'static str` (FORNX-428 S6): a manifest-backed
+    /// [`ExternalAdapter`](crate::adapter_external::ExternalAdapter) owns
+    /// a `String` it borrows from, not a string literal. Every adapter
+    /// actually reachable through [`registry`] lives behind a
+    /// `&'static dyn AdapterPlugin` (built-ins are literals; externals are
+    /// `Box::leak`-ed), so calling these through `registry()`/`resolve()`
+    /// still yields a `&'static str` in practice -- only the trait
+    /// signature itself had to widen.
+    fn id(&self) -> &str;
 
     /// Human display name, e.g. "Claude Code".
-    fn display_name(&self) -> &'static str;
+    fn display_name(&self) -> &str;
 
     /// One-line description of what this adapter's install/uninstall
     /// actually wires, for `fornax adapter list`.
-    fn summary(&self) -> &'static str;
+    fn summary(&self) -> &str;
 
     /// The one config path `adapter list`'s rendering and tests use to
     /// describe this adapter. Adapters with more than one owned path (e.g.
@@ -71,15 +81,15 @@ pub trait AdapterPlugin: Send + Sync {
 struct ClaudeCodeAdapter;
 
 impl AdapterPlugin for ClaudeCodeAdapter {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "claude-code"
     }
 
-    fn display_name(&self) -> &'static str {
+    fn display_name(&self) -> &str {
         "Claude Code"
     }
 
-    fn summary(&self) -> &'static str {
+    fn summary(&self) -> &str {
         "Wires Fornax hooks into ~/.claude/settings.json (SessionStart, \
          UserPromptSubmit, PreToolUse, PostToolUse, Stop)."
     }
@@ -104,15 +114,15 @@ impl AdapterPlugin for ClaudeCodeAdapter {
 struct CodexAdapter;
 
 impl AdapterPlugin for CodexAdapter {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "codex"
     }
 
-    fn display_name(&self) -> &'static str {
+    fn display_name(&self) -> &str {
         "Codex"
     }
 
-    fn summary(&self) -> &'static str {
+    fn summary(&self) -> &str {
         "Wires Fornax's ambient-status notify script into \
          ~/.codex/config.toml's `notify` entry."
     }
@@ -140,10 +150,65 @@ impl AdapterPlugin for CodexAdapter {
     }
 }
 
-/// Every built-in adapter, in display order. The single registration point
-/// FORNX-428's S2 extends with runtime-registered external adapters.
+/// Every built-in adapter, in display order.
+const BUILT_INS: &[&dyn AdapterPlugin] = &[&ClaudeCodeAdapter, &CodexAdapter];
+
+/// Built-in ids only -- bypasses the lazily-initialized [`registry`]/
+/// [`loaded`] entirely. `adapter_store::load_external` calls this (not
+/// `registry()`) to check built-in/external id collisions, because
+/// `load_external` itself runs *inside* `loaded()`'s `OnceLock::get_or_init`
+/// closure: calling back into `registry()`/`loaded()` from there would
+/// reenter the same `OnceLock` mid-initialization, which
+/// `OnceLock::get_or_init` documents as a deadlock, not a panic -- this
+/// bit the first version of this module (every test touching `registry()`
+/// hung indefinitely).
+pub(crate) fn built_in_ids() -> impl Iterator<Item = &'static str> {
+    BUILT_INS.iter().map(|a| a.id())
+}
+
+struct Loaded {
+    adapters: Vec<&'static dyn AdapterPlugin>,
+    rejections: Vec<crate::adapter_store::Rejection>,
+}
+
+/// Built-ins plus every successfully-loaded external adapter from
+/// `$FORNAX_HOME/adapters/` (ADR-0023, FORNX-428 S6), assembled once per
+/// process. Read-only: loading an external adapter never executes
+/// anything and the directory is never created by this path (only
+/// `fornax adapter register` creates it) -- a missing directory is simply
+/// zero external adapters.
+fn loaded() -> &'static Loaded {
+    static LOADED: OnceLock<Loaded> = OnceLock::new();
+    LOADED.get_or_init(|| {
+        let (externals, rejections) = crate::adapter_store::load_external(&crate::fornax_home());
+        let mut adapters: Vec<&'static dyn AdapterPlugin> = BUILT_INS.to_vec();
+        for external in externals {
+            let leaked_mut: &'static mut crate::adapter_external::ExternalAdapter =
+                Box::leak(Box::new(external));
+            let leaked: &'static dyn AdapterPlugin = &*leaked_mut;
+            adapters.push(leaked);
+        }
+        Loaded {
+            adapters,
+            rejections,
+        }
+    })
+}
+
+/// Every registered adapter -- built-in plus successfully-loaded external
+/// (ADR-0023 D9). The single registration point every CLI surface
+/// (`AdapterArg`, `AdapterAction`, `Commands::Install`/`Uninstall`) reads
+/// through; adding an external adapter never requires a change here, only
+/// a call to `fornax adapter register`.
 pub fn registry() -> &'static [&'static dyn AdapterPlugin] {
-    &[&ClaudeCodeAdapter, &CodexAdapter]
+    &loaded().adapters
+}
+
+/// Every external adapter that did not load, with a named reason --
+/// surfaced by `adapter list`/`adapter info`, never silently dropped
+/// (ADR-0023 D8).
+pub fn rejections() -> &'static [crate::adapter_store::Rejection] {
+    &loaded().rejections
 }
 
 /// Looks up a registered adapter by its stable id string.
@@ -191,13 +256,20 @@ impl std::str::FromStr for AdapterArg {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        resolve(s).map(AdapterArg).ok_or_else(|| {
-            let known: Vec<&str> = registry().iter().map(|a| a.id()).collect();
-            format!(
-                "unknown adapter {s:?}; known adapters: {}",
-                known.join(", ")
-            )
-        })
+        if let Some(adapter) = resolve(s) {
+            return Ok(AdapterArg(adapter));
+        }
+        if let Some(rejection) = rejections().iter().find(|r| r.id == s) {
+            return Err(format!(
+                "adapter {s:?} is registered but did not load: {}",
+                rejection.reason
+            ));
+        }
+        let known: Vec<&str> = registry().iter().map(|a| a.id()).collect();
+        Err(format!(
+            "unknown adapter {s:?}; known adapters: {}",
+            known.join(", ")
+        ))
     }
 }
 
@@ -314,9 +386,14 @@ mod tests {
         assert_eq!(found.id(), "fixture-only-for-this-test");
     }
 
+    /// FORNX-428 S6: asserts over `BUILT_INS` directly, not `registry()` --
+    /// `registry()` now also reflects whatever is registered under the
+    /// real `$FORNAX_HOME` on the machine running this test, so asserting
+    /// over it here would make this test fail on any developer machine
+    /// that has registered an external adapter.
     #[test]
-    fn all_lists_exactly_the_two_known_adapters() {
-        let ids: Vec<&str> = registry().iter().map(|a| a.id()).collect();
+    fn built_in_registry_is_exactly_the_two_known_adapters() {
+        let ids: Vec<&str> = BUILT_INS.iter().map(|a| a.id()).collect();
         assert_eq!(ids, vec!["claude-code", "codex"]);
     }
 
@@ -327,8 +404,8 @@ mod tests {
     /// struct at Claude Code's path.
     #[test]
     fn every_registered_adapter_is_fully_and_uniquely_wired() {
-        let adapters = registry();
-        assert!(!adapters.is_empty(), "registry() must not be empty");
+        let adapters = BUILT_INS;
+        assert!(!adapters.is_empty(), "BUILT_INS must not be empty");
 
         let mut seen_ids = std::collections::HashSet::new();
         for adapter in adapters {
