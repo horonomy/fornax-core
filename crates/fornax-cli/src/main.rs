@@ -4,7 +4,11 @@
 
 use clap::{Parser, Subcommand};
 
+mod adapter_external;
+mod adapter_manifest;
+mod adapter_mutate;
 mod adapter_registry;
+mod adapter_store;
 mod adjudicate_cmd;
 mod claude_adapter;
 mod codex_adapter;
@@ -420,6 +424,34 @@ pub enum AdapterAction {
         #[arg(long)]
         json: bool,
     },
+    /// Review (and, with `--confirm-digest`, register) an external adapter
+    /// manifest (ADR-0023, FORNX-428 S6). Two steps: run once to review,
+    /// then re-run with the `--confirm-digest` value it prints.
+    Register {
+        /// Path to the manifest file to review/register.
+        #[arg(long, value_name = "PATH")]
+        manifest: std::path::PathBuf,
+        /// The `sha256:<hex>` digest printed by the review step. Required
+        /// to actually register -- its absence is the review step.
+        #[arg(long, value_name = "SHA256")]
+        confirm_digest: Option<String>,
+        /// Emit the review step's output as JSON instead of human-readable
+        /// lines. Has no effect on the confirm step's output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Provenance and trust state for one adapter id -- including a
+    /// disabled or rejected one, which `AdapterArg` cannot parse (that is
+    /// the point: explaining *why* an id is not loadable).
+    Info { id: String },
+    /// Re-enables a previously disabled external adapter.
+    Enable { id: String },
+    /// Disables an external adapter without removing its registration --
+    /// excluded from `registry()`, still visible to `list`/`info`.
+    Disable { id: String },
+    /// Removes an external adapter's registration and its owned manifest
+    /// copy.
+    Remove { id: String },
 }
 
 /// `fornax audit <action>` (FORNX-315).
@@ -1153,6 +1185,13 @@ fn handle_adapter_action(action: AdapterAction) -> anyhow::Result<()> {
                     adapter.target_path().display()
                 );
             }
+            let rejections = adapter_registry::rejections();
+            if !rejections.is_empty() {
+                println!("\nRejected entries (not loaded):");
+                for r in rejections {
+                    println!("  {:<12} {}", r.id, r.reason);
+                }
+            }
             Ok(())
         }
         AdapterAction::Doctor { adapter } => {
@@ -1174,10 +1213,87 @@ fn handle_adapter_action(action: AdapterAction) -> anyhow::Result<()> {
             }
             Ok(())
         }
+        AdapterAction::Register {
+            manifest,
+            confirm_digest,
+            json,
+        } => {
+            let outcome =
+                adapter_store::register(&fornax_home(), &manifest, confirm_digest.as_deref())?;
+            match outcome {
+                adapter_store::RegisterOutcome::Reviewed {
+                    manifest: m,
+                    digest,
+                } => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "status": "reviewed",
+                                "id": m.id,
+                                "display_name": m.display_name,
+                                "digest": digest,
+                            }))?
+                        );
+                    } else {
+                        println!(
+                            "Adapter manifest reviewed -- NOT registered.\n\n  id              {}\n  display name    {}\n  summary         {}\n  target file     {} ({:?})\n  provenance      {}  (unverified, declared by the manifest)\n  digest          {}\n\nRegistering grants Fornax permission to add and remove exactly the\noperations declared above, in exactly that one file. Fornax never\nexecutes anything from a manifest.\n\nTo register, re-run with the digest shown above:\n\n  fornax adapter register --manifest {} --confirm-digest {}",
+                            m.id,
+                            m.display_name,
+                            m.summary,
+                            m.target_path.display(),
+                            m.target_format,
+                            m.provenance,
+                            digest,
+                            manifest.display(),
+                            digest
+                        );
+                    }
+                    Ok(())
+                }
+                adapter_store::RegisterOutcome::Registered { id } => {
+                    println!(
+                        "Registered {id}. Run 'fornax adapter plan {id}' to preview its install."
+                    );
+                    Ok(())
+                }
+            }
+        }
+        AdapterAction::Info { id } => {
+            if let Some(adapter) = adapter_registry::resolve(&id) {
+                println!(
+                    "{} ({})\n  {}\n  config: {}",
+                    adapter.display_name(),
+                    adapter.id(),
+                    adapter.summary(),
+                    adapter.target_path().display()
+                );
+            } else if let Some(r) = adapter_registry::rejections().iter().find(|r| r.id == id) {
+                println!("{} is registered but did not load: {}", r.id, r.reason);
+            } else {
+                anyhow::bail!("no known or registered adapter with id {id:?}");
+            }
+            Ok(())
+        }
+        AdapterAction::Enable { id } => {
+            adapter_store::set_enabled(&fornax_home(), &id, true)?;
+            println!("Enabled {id}.");
+            Ok(())
+        }
+        AdapterAction::Disable { id } => {
+            adapter_store::set_enabled(&fornax_home(), &id, false)?;
+            println!("Disabled {id}.");
+            Ok(())
+        }
+        AdapterAction::Remove { id } => {
+            adapter_store::remove(&fornax_home(), &id)?;
+            println!("Removed {id}.");
+            Ok(())
+        }
     }
 }
 
-fn fornax_home() -> std::path::PathBuf {
+pub(crate) fn fornax_home() -> std::path::PathBuf {
     std::env::var("FORNAX_HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| dirs_home().join(".fornax"))
