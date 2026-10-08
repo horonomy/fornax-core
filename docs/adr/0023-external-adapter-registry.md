@@ -254,6 +254,15 @@ a trust boundary it is not.
 unix, set at creation — matching `codex_adapter::save_codex_config`'s
 existing reasoning about not widening a sensitive file to the umask default.
 
+**Source-path permission check.** `register` additionally refuses a source
+manifest whose file, or whose containing directory, is group- or
+world-writable (`mode & 0o022 != 0`), checked before the source is ever
+read. This is a precondition on *who may plausibly have written the
+file being registered*, not a replacement for the digest pin above:
+the digest proves the bytes didn't change between the review and
+confirm invocations; this check narrows who could have written those
+bytes in the first place.
+
 ### D6. `target.path` containment
 
 `target.path` is the one genuinely dangerous field: it is a file-write
@@ -364,7 +373,7 @@ Mapped to HORO-1619's Security section, mechanism by mechanism.
 
 | Requirement | Mechanism |
 |---|---|
-| Explicit registration or trusted discovery location | D4: one Fornax-owned directory; only `registry.json` entries load; presence of a file registers nothing. D5: registration requires `--confirm-digest`. |
+| Explicit registration or trusted discovery location | D4: one Fornax-owned directory; only `registry.json` entries load; presence of a file registers nothing. D5: registration requires `--confirm-digest` and refuses a group-/world-writable source file or directory. |
 | No silent PATH-wide plugin execution | D1 (nothing is executed, ever) + D4 (`PATH` is never consulted) + the `subprocess_surface_is_still_zero_in_production_code` invariant as the standing proof. |
 | No execution during `--help`/`adapter list` | D1: no execution surface exists at any time. `--help`/`--version` additionally never reach `registry()`; `adapter list` reads data and creates nothing (asserted by test). |
 | Bounded subprocess execution/timeouts | **N/A by construction, with proof, not by assertion.** There is no subprocess to bound and no call that can hang; the FORNX-238 invariant test guarantees none can be introduced without failing CI. D7 bounds the surface that *does* exist: parse size and write amplification. |

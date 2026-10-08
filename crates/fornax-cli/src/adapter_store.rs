@@ -52,6 +52,50 @@ fn adapters_dir(fornax_home: &Path) -> PathBuf {
     fornax_home.join("adapters")
 }
 
+/// FORNX-428 S6 (ticket text, "Refuse manifests from world-writable
+/// paths"): refuses to register a manifest whose source file, or whose
+/// containing directory, is writable by users other than its owner. A
+/// manifest the registering user doesn't exclusively control could be
+/// swapped out by another local account between review and confirm even
+/// with the digest pin in place (the pin only proves the bytes didn't
+/// change across the two invocations, not that nobody else could have
+/// written them in the first place) -- checked before the source is ever
+/// read. Unix-only; a no-op on platforms with no POSIX permission bits.
+fn refuse_if_world_writable(source: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let is_group_or_world_writable = |p: &Path| -> anyhow::Result<bool> {
+            let mode = std::fs::symlink_metadata(p)
+                .map_err(|e| anyhow::anyhow!("failed to stat {}: {e}", p.display()))?
+                .permissions()
+                .mode();
+            Ok(mode & 0o022 != 0)
+        };
+
+        if is_group_or_world_writable(source)? {
+            anyhow::bail!(
+                "refusing to register {}: it is group- or world-writable",
+                source.display()
+            );
+        }
+        let parent = source
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        if is_group_or_world_writable(parent)? {
+            anyhow::bail!(
+                "refusing to register {}: its containing directory {} is group- or \
+                 world-writable",
+                source.display(),
+                parent.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn index_path(fornax_home: &Path) -> PathBuf {
     adapters_dir(fornax_home).join(REGISTRY_INDEX_FILE)
 }
@@ -124,6 +168,7 @@ pub fn register(
     source: &Path,
     confirm_digest: Option<&str>,
 ) -> anyhow::Result<RegisterOutcome> {
+    refuse_if_world_writable(source)?;
     let bytes = std::fs::read(source)
         .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", source.display()))?;
     let digest = digest_of(&bytes);
@@ -338,6 +383,40 @@ mod tests {
         });
         std::fs::write(&path, serde_json::to_vec_pretty(&body).unwrap()).unwrap();
         path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn register_refuses_a_world_writable_manifest_source() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = scratch_dir();
+        let fornax_home = tmp.join("fornax-home");
+        let src = write_manifest(&tmp, "fixture-ww");
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        let err = register(&fornax_home, &src, None).unwrap_err();
+        assert!(err.to_string().contains("world-writable"));
+        assert!(!adapters_dir(&fornax_home).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn register_refuses_a_manifest_in_a_world_writable_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = scratch_dir();
+        let fornax_home = tmp.join("fornax-home");
+        let src = write_manifest(&tmp, "fixture-wwd");
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let err = register(&fornax_home, &src, None).unwrap_err();
+        assert!(err.to_string().contains("world-writable"));
+        assert!(!adapters_dir(&fornax_home).exists());
+
+        // Restore so the scratch dir can still be cleaned up / reused by
+        // later tests sharing the OS temp root.
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]
