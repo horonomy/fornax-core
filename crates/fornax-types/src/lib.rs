@@ -22,7 +22,12 @@ pub mod epistemic_contract;
 pub mod experiment;
 pub mod extension;
 pub mod graph;
+pub mod host_adapter_manifest;
 pub mod host_event;
+pub use host_adapter_manifest::{
+    decode_host_adapter_manifest, HostAdapterManifest, HostManifestRejection,
+    MAX_HOST_ADAPTER_MANIFEST_BYTES,
+};
 pub mod policy;
 pub mod privacy;
 pub mod provenance_guard;
