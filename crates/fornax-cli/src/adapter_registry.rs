@@ -82,7 +82,7 @@ struct ClaudeCodeAdapter;
 
 impl AdapterPlugin for ClaudeCodeAdapter {
     fn id(&self) -> &str {
-        "claude-code"
+        fornax_store::adapter_registry::BUILTIN_ADAPTER_IDS[0]
     }
 
     fn display_name(&self) -> &str {
@@ -115,7 +115,7 @@ struct CodexAdapter;
 
 impl AdapterPlugin for CodexAdapter {
     fn id(&self) -> &str {
-        "codex"
+        fornax_store::adapter_registry::BUILTIN_ADAPTER_IDS[1]
     }
 
     fn display_name(&self) -> &str {
@@ -152,19 +152,6 @@ impl AdapterPlugin for CodexAdapter {
 
 /// Every built-in adapter, in display order.
 const BUILT_INS: &[&dyn AdapterPlugin] = &[&ClaudeCodeAdapter, &CodexAdapter];
-
-/// Built-in ids only -- bypasses the lazily-initialized [`registry`]/
-/// [`loaded`] entirely. `adapter_store::load_external` calls this (not
-/// `registry()`) to check built-in/external id collisions, because
-/// `load_external` itself runs *inside* `loaded()`'s `OnceLock::get_or_init`
-/// closure: calling back into `registry()`/`loaded()` from there would
-/// reenter the same `OnceLock` mid-initialization, which
-/// `OnceLock::get_or_init` documents as a deadlock, not a panic -- this
-/// bit the first version of this module (every test touching `registry()`
-/// hung indefinitely).
-pub(crate) fn built_in_ids() -> impl Iterator<Item = &'static str> {
-    BUILT_INS.iter().map(|a| a.id())
-}
 
 /// Resolves only the canonical built-in array without initializing external
 /// registration state.
@@ -270,6 +257,15 @@ impl std::str::FromStr for AdapterArg {
                 "adapter {s:?} is registered but did not load: {}",
                 rejection.reason
             ));
+        }
+        if let Ok(snapshot) = fornax_store::adapter_registry::read_registry(&crate::fornax_home()) {
+            if snapshot.entries().iter().any(|entry| {
+                entry.id() == s
+                    && entry.kind()
+                        == fornax_store::adapter_registry::RegistrationKind::HostAdapterV1
+            }) {
+                return Err(format!("adapter {s:?} is a host descriptor; configuration_dispatch_unavailable (execution_boundary_unavailable)"));
+            }
         }
         let known: Vec<&str> = registry().iter().map(|a| a.id()).collect();
         Err(format!(

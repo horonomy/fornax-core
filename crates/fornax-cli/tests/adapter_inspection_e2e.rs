@@ -219,13 +219,9 @@ fn disabled_registration_remains_inspectable_from_public_binary() {
     );
     assert_eq!(
         info_json["result"]["registration"]["registry_schema_version"],
-        0
+        1
     );
-    assert!(info_json["reasons"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|reason| reason == "legacy_registry_schema_version_zero"));
+    assert!(info_json["reasons"].as_array().unwrap().is_empty());
     assert_eq!(info_json["result"]["host"]["installation"], "unknown");
     assert_eq!(info_json["result"]["host"]["trust"], "unknown");
     assert_eq!(
@@ -289,13 +285,13 @@ fn digit_leading_config_id_is_preserved_without_host_spi_adapter_id() {
 }
 
 #[test]
-fn schema_one_record_is_inspected_without_rewrite() {
+fn historical_schema_zero_record_is_inspected_without_rewrite() {
     let scratch = Scratch::new();
-    let id = "schema-one-fixture";
+    let id = "schema-zero-fixture";
     let (source, _) = register(&scratch, id);
     fs::remove_file(source).unwrap();
     let (registry_path, mut index) = load_index(&scratch);
-    index["schema_version"] = serde_json::json!(1);
+    index["schema_version"] = serde_json::json!(0);
     save_index(&registry_path, &index);
     let before = fs::read(&registry_path).unwrap();
 
@@ -308,10 +304,43 @@ fn schema_one_record_is_inspected_without_rewrite() {
     let envelope: Value = serde_json::from_slice(&inspected.stdout).unwrap();
     assert_eq!(
         envelope["result"]["registration"]["registry_schema_version"],
-        1
+        0
     );
     assert_eq!(envelope["result"]["load_state"], "enabled_valid");
-    assert!(envelope["reasons"].as_array().unwrap().is_empty());
+    assert_eq!(
+        envelope["reasons"],
+        serde_json::json!(["legacy_registry_schema_version_zero"])
+    );
+    assert_eq!(fs::read(registry_path).unwrap(), before);
+}
+
+#[test]
+fn omitted_registry_version_is_legacy_one_and_remains_omitted() {
+    let scratch = Scratch::new();
+    let id = "omitted-version-fixture";
+    let (source, _) = register(&scratch, id);
+    fs::remove_file(source).unwrap();
+    let (registry_path, mut index) = load_index(&scratch);
+    index.as_object_mut().unwrap().remove("schema_version");
+    save_index(&registry_path, &index);
+    let before = fs::read(&registry_path).unwrap();
+
+    let inspected = scratch.run(&["adapter", "inspect", id, "--json"]);
+    assert!(
+        inspected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspected.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    assert_eq!(
+        envelope["result"]["registration"]["registry_schema_version"],
+        Value::Null
+    );
+    assert_eq!(envelope["result"]["load_state"], "enabled_valid");
+    assert_eq!(
+        envelope["reasons"],
+        serde_json::json!(["legacy_registry_schema_version_omitted"])
+    );
     assert_eq!(fs::read(registry_path).unwrap(), before);
 }
 
@@ -343,7 +372,7 @@ fn malformed_and_oversized_indexes_fail_with_stable_codes() {
     let cases: Vec<(Vec<u8>, &str)> = vec![
         (br#"{"schema_version":0,"entries":[}"#.to_vec(), "registry_index_malformed"),
         (br#"{"schema_version":0,"entries":[],"future_field":"hidden"}"#.to_vec(), "registry_index_malformed"),
-        (br#"{"entries":[]}"#.to_vec(), "registry_index_malformed"),
+        (br#"{}"#.to_vec(), "registry_index_malformed"),
         (br#"{"schema_version":0}"#.to_vec(), "registry_index_malformed"),
         (br#"{"schema_version":99,"entries":[]}"#.to_vec(), "registry_index_unsupported_version"),
         (
@@ -397,16 +426,11 @@ fn escaped_owned_filename_is_rejected_without_path_traversal() {
     });
     save_index(&adapters.join("registry.json"), &index);
     let inspected = scratch.run(&["adapter", "info", "path-fixture", "--json"]);
-    assert!(
-        inspected.status.success(),
-        "{}",
-        String::from_utf8_lossy(&inspected.stderr)
-    );
+    assert!(!inspected.status.success());
     let envelope: Value = serde_json::from_slice(&inspected.stdout).unwrap();
-    assert_eq!(envelope["result"]["load_state"], "rejected");
     assert_eq!(
         envelope["reasons"],
-        serde_json::json!(["invalid_owned_filename"])
+        serde_json::json!(["invalid_registration_record"])
     );
 }
 
@@ -506,7 +530,7 @@ fn an_unregistered_manifest_file_alone_does_not_create_a_registration() {
 }
 
 #[test]
-fn long_invalid_manifest_filename_is_rejected_with_bounded_json() {
+fn long_invalid_manifest_filename_fails_closed_with_bounded_json() {
     let scratch = Scratch::new();
     let adapters = scratch.fornax_home.join("adapters");
     fs::create_dir_all(&adapters).unwrap();
@@ -518,11 +542,7 @@ fn long_invalid_manifest_filename_is_rejected_with_bounded_json() {
     save_index(&adapters.join("registry.json"), &index);
 
     let inspected = scratch.run(&["adapter", "inspect", "long-name-fixture", "--json"]);
-    assert!(
-        inspected.status.success(),
-        "{}",
-        String::from_utf8_lossy(&inspected.stderr)
-    );
+    assert!(!inspected.status.success());
     let output = stdout(&inspected);
     assert!(
         output.len() < 8 * 1024,
@@ -531,10 +551,10 @@ fn long_invalid_manifest_filename_is_rejected_with_bounded_json() {
     );
     assert!(!output.contains("CANARY"));
     let envelope: Value = serde_json::from_slice(&inspected.stdout).unwrap();
-    assert_eq!(envelope["result"]["load_state"], "rejected");
+    assert_eq!(envelope["outcome"], "failed");
     assert_eq!(
-        envelope["result"]["registration"]["owned_manifest_file"],
-        Value::Null
+        envelope["reasons"],
+        serde_json::json!(["invalid_registration_record"])
     );
 }
 
