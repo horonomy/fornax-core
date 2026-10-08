@@ -30,7 +30,10 @@ Jira epic FORNX-20.
   for the guarantee that cleanup can never delete the wrong file. A removal
   now reports `outcome: "partial"` / `cleanup_failed` with the index change
   confirmed committed; re-registering the same id afterward refuses with
-  `EEXIST` until the retained file is removed by hand.
+  the new `owned_destination_occupied` code (the underlying OS cause is
+  `EEXIST`) until the retained file is removed by hand. Applies uniformly
+  to configuration and host-adapter registrations alike -- there is no
+  special case for either kind.
 
 ### Removed
 

@@ -134,6 +134,15 @@ pub enum RegistryErrorCode {
     CleanupFailed,
     CommittedUnverified,
     Io,
+    /// A file already exists at this id's exact owned-destination filename,
+    /// and a new registration cannot create its own owned copy there.
+    /// Distinct from `InvalidRecord`: the new registration's own bytes are
+    /// not malformed. `create_owned` cannot tell whether the occupying file
+    /// is a prior removal's retained orphan (Strict Retention, HORO-1745)
+    /// or something placed there outside the registry entirely -- both
+    /// reach this same refusal, since neither is this registration's to
+    /// overwrite.
+    OwnedDestinationOccupied,
 }
 
 impl RegistryErrorCode {
@@ -164,6 +173,7 @@ impl RegistryErrorCode {
             Self::CleanupFailed => "cleanup_failed",
             Self::CommittedUnverified => "registration_committed_unverified",
             Self::Io => "registry_io",
+            Self::OwnedDestinationOccupied => "owned_destination_occupied",
         }
     }
 }
@@ -1312,9 +1322,17 @@ impl InspectionDirectory {
             )
             .map_err(|e| {
                 if e == rustix::io::Errno::EXIST {
+                    // This is not a malformed registration -- the new bytes
+                    // are fine. Something already occupies this exact
+                    // destination name; most often a prior removal's
+                    // retained owned file (Strict Retention, HORO-1745,
+                    // never deleted by design), but this call site cannot
+                    // tell that apart from a file placed there outside the
+                    // registry. Either way it must be cleared by hand
+                    // before this id can be registered again.
                     fail(
-                        RegistryErrorCode::InvalidRecord,
-                        "owned destination already exists",
+                        RegistryErrorCode::OwnedDestinationOccupied,
+                        "a file already occupies this id's owned destination",
                     )
                 } else {
                     fail(RegistryErrorCode::Io, "owned file creation failed")

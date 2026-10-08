@@ -184,6 +184,34 @@ fn v2_marker_survives_removal_of_last_host_record_and_owned_descriptor_is_retain
 }
 
 #[test]
+fn reregistering_a_removed_id_refuses_on_the_retained_file_not_as_malformed() {
+    let home = scratch();
+    let id = "fixture-retained";
+    let raw = format!(r#"{{"schema_version":1,"id":"{id}"}}"#);
+    let request = || ConfigRegistration {
+        id,
+        source_path: "/tmp/source.json",
+        registered_at: "2026-10-08T00:00:00Z",
+        raw_bytes: raw.as_bytes(),
+    };
+    register_config(&home, request()).unwrap();
+    set_registration_enabled(&home, id, false).unwrap();
+
+    // Strict Retention: removal retains the owned file, so a fresh
+    // registration under the same id must refuse on that retained file --
+    // never as a malformed new registration, since the new bytes are fine.
+    let removal = remove_registration(&home, id).unwrap_err();
+    assert_eq!(removal.code(), RegistryErrorCode::CleanupFailed);
+    assert!(read_registry(&home).unwrap().entries().is_empty());
+
+    let retry = register_config(&home, request()).unwrap_err();
+    assert_eq!(retry.code(), RegistryErrorCode::OwnedDestinationOccupied);
+    assert!(!retry.index_published());
+    assert!(read_registry(&home).unwrap().entries().is_empty());
+    std::fs::remove_dir_all(home).ok();
+}
+
+#[test]
 fn enabled_host_record_cannot_be_removed_before_disable() {
     let home = scratch();
     let directory = adapters(&home);
@@ -389,7 +417,10 @@ fn unindexed_destination_is_never_replaced() {
         },
     )
     .unwrap_err();
-    assert_eq!(err.code(), RegistryErrorCode::InvalidRecord);
+    // Not InvalidRecord: the new bytes are fine, the destination is simply
+    // occupied -- create_owned cannot tell a foreign file from a retained
+    // orphan apart, and refuses either the same way.
+    assert_eq!(err.code(), RegistryErrorCode::OwnedDestinationOccupied);
     assert_eq!(
         std::fs::read(destination).unwrap(),
         b"owned by someone else"

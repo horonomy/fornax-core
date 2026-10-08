@@ -439,9 +439,15 @@ descriptor file this function would otherwise have deleted is left on disk,
 inert and unreferenced by the index once the index mutation has committed.
 The accepted cost is that a removed id's filename is not released until
 something clears the orphan by hand: re-registering the same id refuses at
-`create_owned` (`EEXIST`) rather than silently reusing or overwriting it.
-This applies uniformly -- there is no "ordinary, uncontested case" exception,
-because any such exception would reintroduce the same unproven assumption.
+`create_owned` with `RegistryErrorCode::OwnedDestinationOccupied` (the
+underlying OS cause is `EEXIST`) rather than silently reusing or
+overwriting it -- distinct from `InvalidRecord`, since the new
+registration's own bytes are not malformed; `create_owned` simply cannot
+tell a retained orphan apart from a file placed at that path outside the
+registry, and refuses either the same way. This applies uniformly to
+configuration and host-adapter registrations alike -- there is no
+"ordinary, uncontested case" exception, because any such exception would
+reintroduce the same unproven assumption.
 
 Bound regular-file reads before allocation, holding directory descriptors
 and refusing symlinks or special files. Manifest validation covers the whole
