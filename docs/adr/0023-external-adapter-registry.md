@@ -1,8 +1,8 @@
-# ADR 0023: External adapter registry — declarative manifests, no executable plugin boundary
+# ADR 0023: Configuration adapters and separate host descriptor registration
 
 Status: Accepted
 Date: 2026-10-02
-Jira: HORO-1619, FORNX-428 (S4 design, S6 implementation)
+Jira: HORO-1619, FORNX-428 (S4 design, S6 implementation), HORO-1745 (descriptor registration amendment)
 
 ## Context
 
@@ -22,7 +22,15 @@ Two unrelated traits, both historically called "adapter". ADR-0004 is
 unchanged by this ADR; `docs/contributing/adding-an-adapter.md` continues to
 document that other concept.
 
-### Three candidate plugin boundaries
+The original S6 decision below governs configuration manifests. HORO-1745
+extends the same registry with the separately versioned shared host-adapter
+manifest; it does not change configuration manifest v1 or authorize core
+process execution. Host descriptors are passive metadata in this delivery.
+Execution belongs to the founder-approved, separately invoked
+`exec/fornax-host-adapter-exec`; no core crate may depend on or spawn it.
+ADR-0004 observation semantics and ADR-0022 acquisition remain unchanged.
+
+### Three candidate configuration plugin boundaries
 
 1. **In-process dynamic library loading** (`dlopen`/`libloading`). Rejected.
    It grants arbitrary native code the full address space of a process that
@@ -61,18 +69,23 @@ adapter needs no code — and therefore no code-execution boundary.
 
 ## Decision
 
-### D1. External adapters are data. Nothing in a manifest is ever executed.
+### D1. Configuration manifests are data; host descriptors do not grant execution.
 
 There is **no** `executable`, `entrypoint`, `command`, or `script` field in
-the manifest schema, at any version, by design. This is a deliberate
+the configuration manifest v1 schema, by design. This is a deliberate
 omission from HORO-1619's "fields to consider" list: a field named
 `executable` that is never executed is a trap for the next maintainer, and
 the first bug report asking "why doesn't my entrypoint run" would be
-answered by adding execution. The schema is `deny_unknown_fields`, so a
+answered by adding execution in the configuration interpreter. Its schema is `deny_unknown_fields`, so a
 manifest carrying such a field is a parse failure naming the field, not a
 silently-ignored key.
 
-Consequence: every HORO-1619 security requirement phrased in terms of
+A host descriptor instead carries the existing shared executable declaration.
+Registration and inspection never resolve, hash or execute that code, probe a
+host, grant implementation trust, or produce a runtime capability snapshot.
+These require the separate execution boundary and its own acceptance gates.
+
+Consequence for configuration manifest v1: every HORO-1619 security requirement phrased in terms of
 execution ("bounded subprocess execution/timeouts", "sanitized
 environment", "no silent PATH-wide plugin execution", "no execution during
 --help") is satisfied by the absence of an execution surface, not by a
@@ -124,7 +137,7 @@ The wire struct and every nested struct are `#[serde(deny_unknown_fields)]`.
 
 **Deliberately absent fields**, against HORO-1619's "fields to consider":
 
-- `executable`/`entrypoint` — see D1. Never.
+- `executable`/`entrypoint` — absent from configuration manifest v1; see D1.
 - `aliases` — deferred. An alias namespace is a second place ids can collide
   with built-ins and with each other, for zero current demand. `resolve()`
   stays a single-key lookup.
@@ -176,7 +189,9 @@ accretion.
 `$FORNAX_HOME/adapters/` (default `~/.fornax/adapters/`), containing:
 
 - `registry.json` — the Fornax-owned index (below)
-- `<id>.manifest.json` — Fornax's own copy of each registered manifest
+- `<id>.manifest.json` — owned configuration manifest copy
+- `<id>.host-adapter.json` — owned shared host descriptor copy
+- `registry.lock` — stable advisory lock inode for cooperating registry mutators
 
 **No** `PATH` scan, **no** XDG directory chain, **no** CWD, **no**
 environment variable listing extra directories, **no** recursion. A manifest
@@ -203,6 +218,26 @@ no `$FORNAX_HOME/adapters/` reports only built-ins and creates nothing. Only
   ]
 }
 ```
+
+The legacy closed index shapes (stored version0, version1 or an omitted
+version with effective legacy1) contain configuration records only. Fresh
+configuration indexes explicitly default to1. Passive reads preserve the
+stored version; historical0 is explained without rewriting the index.
+
+Confirmed host registration migrates the sole index to a closed v2 root:
+`{"schema_version":2,"registry_kind":"fornax-adapter-registry-v2","entries":[...]}`.
+Each v2 record retains the six legacy fields and adds required `kind`, either
+`config-v1` or `host-adapter-v1`. IDs remain one global namespace: no second
+facet, automatic association or kind precedence. Configuration IDs keep their
+original grammar; host IDs follow the shared manifest contract.
+
+The mandatory root marker remains after the final host record is removed,
+including an empty index. Old S6 readers reject that marker rather than
+mistaking an empty v2 index for legacy state. Quiesce old mutators for initial
+migration: an old process that already read v1 does not participate in the
+new lock and can still overwrite a migration. Locking is not universal CAS.
+Review does not migrate; it must disclose this compatibility change before
+confirmation. Unsupported future index versions refuse every mutation.
 
 `source_path` is recorded for provenance display only. **It is never read
 after registration.** All loading reads `manifest_file` inside
@@ -308,7 +343,7 @@ have parse and write amplification, and an unbounded `element` written into
 a user's real `settings.json` is a real denial-of-service against their
 coding agent.
 
-### D8. Duplicate and collision resolution — built-in always wins
+### D8. Duplicate and collision resolution — one namespace, built-in wins
 
 - `register` rejects an `id` equal to any built-in id, or to any existing
   entry's id, before writing anything.
@@ -325,7 +360,7 @@ coding agent.
 ### D9. Registry assembly keeps `registry()`'s signature
 
 `registry()` continues to return `&'static [&'static dyn AdapterPlugin]`,
-now backed by a `OnceLock` populated once per process: the two built-in
+for configuration dispatch, backed by a `OnceLock` populated once per process: the two built-in
 statics first, in display order, then successfully-loaded external adapters
 (`Box::leak`-ed — process-lifetime by construction in a short-lived CLI).
 `resolve()`, `AdapterArg`, `install`, `uninstall`, `plan`, `doctor`, and
@@ -336,7 +371,14 @@ only trait change is `&'static str` → `&str` on `id`/`display_name`/
 `&'static dyn AdapterPlugin` these still yield `&'static str`, so
 `AdapterArg`'s accessors keep their signatures too.
 
-This is the concrete answer to AC#11: adding an external adapter touches no
+Authoritative index decoding, storage transactions and passive host descriptor
+lookup belong to the existing `fornax-store::adapter_registry` module. The
+CLI uses that owner rather than maintaining a second index codec. Host
+records never become `AdapterPlugin` configuration drivers by registration;
+install/uninstall/plan/doctor refuse that kind explicitly until an owning
+configuration surface exists. Help parses without reading the registry.
+
+This is the concrete configuration answer to AC#11: adding an external adapter touches no
 enum, no parser, and no `match`.
 
 ### D10. Lifecycle verbs
@@ -344,13 +386,79 @@ enum, no parser, and no `match`.
 `register`, `info`, `enable`, `disable`, `remove` operate on
 `registry.json` only. `disable` sets `enabled: false` (entry and owned copy
 retained, excluded from `registry()`, still visible to `list` and `info`);
-`remove` deletes the entry and its owned copy. Independent per entry, so
-AC's "enabled/disabled/removed independently" is a property of the index
-shape rather than a special case.
+`remove` deletes the index entry but, as of HORO-1745 (Strict Retention),
+never deletes its owned copy -- see D10.1. Independent per entry, so AC's
+"enabled/disabled/removed independently" is a property of the index shape
+rather than a special case.
+
+Host descriptor registration uses the same digest-confirmation ceremony,
+with exact `manifest_kind:"host-adapter"` selecting the pinned shared validator.
+Absent marker selects the unchanged configuration validator; unknown markers
+are refused. Declared future protocol or contract ranges are inspectable
+incompatibility, not activation. New host records are disabled; enable refuses
+`execution_boundary_unavailable` without changing the record. Disable/remove
+remain available. Registration, installation and activation stay distinct.
+
+All upgraded mutators share a kernel advisory lock on the stable
+`registry.lock` inode, using bounded nonblocking contention. Never unlink,
+replace, truncate, reclaim or change permissions on an existing lock file.
+Passive reads create nothing. Lock acquisition may create its directory and
+sidecar, disclosed separately from whether an index mutation occurred.
+
+Under the held lock, reread authoritative state and detect drift before
+publication. Publish an owned copy with create-new semantics; an unindexed
+existing destination is a refusal. Use invocation-owned index staging and
+atomic index rename. The index rename is the commit point, not a claim of
+crash atomicity across both files. Before publication, an invocation-owned
+staging file is retained, not deleted (D10.1); its random name is single-use
+and never looked up again, so this is inert disk litter, never a
+re-registration hazard. After publication, sync/readback failure reports
+committed with verification unverified and never retries, rolls back or
+deletes the registered copy. Removal publishes the updated index first; its
+owned copy is likewise retained, not deleted, and the operation reports a
+partial/`cleanup_failed` outcome with the index change confirmed committed.
+
+#### D10.1. Strict Retention: owned-copy deletion is never attempted (HORO-1745)
+
+`remove_owned`'s `fstat`-verify-identity step cannot be followed by a
+race-free pathname `unlinkat`: POSIX has no atomic "unlink this exact
+already-open inode by name" primitive, so a same-user noncooperating writer
+can replace the file in the window between the identity check and any
+subsequent unlink, causing deletion of a different inode than the one
+verified. Narrowing the window (fewer syscalls between check and unlink, a
+directory-replacement guard, a cooperating-writer assumption) only shrinks
+it; independent review found no technique that closes it, and a
+cooperating-writer assumption is exactly the assumption that finding showed
+is not load-bearing here.
+
+The accepted trade: `remove_owned` always retains the file (returns an
+error whose caller takes the existing "could not be safely cleaned" /
+`CleanupFailed` path) rather than ever attempting the unlink, whether or not
+the identity check above it succeeds. An invocation-owned staging or
+descriptor file this function would otherwise have deleted is left on disk,
+inert and unreferenced by the index once the index mutation has committed.
+The accepted cost is that a removed id's filename is not released until
+something clears the orphan by hand: re-registering the same id refuses at
+`create_owned` with `RegistryErrorCode::OwnedDestinationOccupied` (the
+underlying OS cause is `EEXIST`) rather than silently reusing or
+overwriting it -- distinct from `InvalidRecord`, since the new
+registration's own bytes are not malformed; `create_owned` simply cannot
+tell a retained orphan apart from a file placed at that path outside the
+registry, and refuses either the same way. This applies uniformly to
+configuration and host-adapter registrations alike -- there is no
+"ordinary, uncontested case" exception, because any such exception would
+reintroduce the same unproven assumption.
+
+Bound regular-file reads before allocation, holding directory descriptors
+and refusing symlinks or special files. Manifest validation covers the whole
+pinned executable schema, its bounded configuration-schema profile, duplicate
+keys, numeric bounds and declared version ranges. Source paths remain display
+metadata after registration. Owned descriptor integrity never implies code
+trust, installed state or native observation.
 
 ## Consequences
 
-- An external adapter can wire a marker-bearing entry into one JSON config
+- An external configuration adapter can wire a marker-bearing entry into one JSON config
   file under `$HOME` and remove it again. It cannot run code, read
   credentials, touch a second file, write outside `$HOME`, or mutate a TOML
   file. A TOML host tool needs a built-in adapter until a future amendment
@@ -369,20 +477,22 @@ shape rather than a special case.
 
 ## Security considerations
 
-Mapped to HORO-1619's Security section, mechanism by mechanism.
+The table records configuration manifest v1 acceptance. Its execution N/A
+claims do not discharge any future runner requirement. Host descriptor
+registration adds no execution surface and no implementation trust.
 
 | Requirement | Mechanism |
 |---|---|
 | Explicit registration or trusted discovery location | D4: one Fornax-owned directory; only `registry.json` entries load; presence of a file registers nothing. D5: registration requires `--confirm-digest` and refuses a group-/world-writable source file or directory. |
-| No silent PATH-wide plugin execution | D1 (nothing is executed, ever) + D4 (`PATH` is never consulted) + the `subprocess_surface_is_still_zero_in_production_code` invariant as the standing proof. |
-| No execution during `--help`/`adapter list` | D1: no execution surface exists at any time. `--help`/`--version` additionally never reach `registry()`; `adapter list` reads data and creates nothing (asserted by test). |
+| No silent PATH-wide plugin execution | D1 (configuration interpretation never executes code) + D4 (`PATH` is never consulted) + the `subprocess_surface_is_still_zero_in_production_code` invariant as the standing proof. |
+| No execution during `--help`/`adapter list` | D1: passive configuration and descriptor operations have no execution surface. `--help`/`--version` additionally never reach `registry()`; `adapter list` reads data and creates nothing (asserted by test). |
 | Bounded subprocess execution/timeouts | **N/A by construction, with proof, not by assertion.** There is no subprocess to bound and no call that can hang; the FORNX-238 invariant test guarantees none can be introduced without failing CI. D7 bounds the surface that *does* exist: parse size and write amplification. |
 | Sanitized environment | **N/A by construction** — no child process inherits an environment. Manifest path handling performs no environment interpolation at all beyond a single leading `~/` → `$HOME` (D6.1), so a manifest cannot reference `$ANYTHING`. |
 | Non-destructive ownership-aware config mutation | D3: marker-based, additive, idempotent, refuses to overwrite a value of unexpected shape, uninstall removes only marker-bearing elements and prunes only what it emptied — the same rules `uninstall_claude_hooks` already enforces. D6.5/6/7: no directory creation, no symlink follow, contained atomic temp+rename. |
 | Clear provenance in adapter info | D10/`adapter info`: source path, registered-at, pinned digest, enabled state, declared capabilities, compat range, and the `provenance` string explicitly labelled unverified. |
-| No credential values in registry/help output | Structural: `deny_unknown_fields` on every manifest struct means a manifest carrying a `token`/`api_key` field **fails to parse** — there is no field a credential can be stored in, so none can be echoed. All displayed strings are length-capped and control-char-rejected (D2). `AdapterActionResult.message` never includes config file contents. |
+| No credential values in registry/help output | Structural: `deny_unknown_fields` on every manifest struct means a manifest carrying a `token`/`api_key` field **fails to parse** — undeclared credential fields are refused; free-text metadata must not be treated as credential-free proof. All displayed strings are length-capped and control-char-rejected (D2). `AdapterActionResult.message` never includes config file contents. |
 | Reject duplicate/conflicting IDs | D8: rejected at register time and re-checked at load time; built-in always wins; rejections surfaced in `list`, `info`, and `AdapterArg::from_str`. |
-| Fail closed on malformed/untrusted descriptors | Every validation failure (schema version, regex, bounds, path containment, digest mismatch, missing owned copy, unsupported `target.format`) yields a `Rejection` carrying a reason; the entry does not load, no partial registration is written, and `register` writes nothing on any error. |
+| Fail closed on malformed/untrusted descriptors | Every validation failure (schema version, regex, bounds, path containment, digest mismatch, missing owned copy, unsupported `target.format`) yields a `Rejection` carrying a reason; the entry does not load, malformed input grants no dispatch authority. D10 distinguishes pre-publication failure, inert cleanup residue and committed-but-unverified outcomes. |
 
 ### Acceptance criteria coverage
 

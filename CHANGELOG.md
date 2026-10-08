@@ -9,10 +9,31 @@ Jira epic FORNX-20.
 
 ### Added
 
+- `fornax adapter register` accepts shared host-adapter descriptors into the
+  existing registry, with explicit digest confirmation and disabled registration.
+  List/inspect report declarations and retained-byte integrity without granting
+  implementation trust or executing code. The first confirmed host descriptor
+  upgrades the index to v2; older mutators must be stopped before that upgrade.
+
 - `fornax adapter info|inspect <id>` now reports the retained registration,
   owned-manifest integrity, and unverified source provenance. `--json` emits
   the shared CLI operation-envelope v1 shape; these facts do not establish
   host installation, trust, or native observation.
+
+### Changed
+
+- `fornax adapter unregister` (and the underlying registry `remove`) adopts
+  Strict Retention (HORO-1745): the index entry is still removed, but the
+  owned descriptor/config copy and any orphaned staging file are never
+  deleted. No `fstat`-then-pathname-`unlink` sequence can prove it still
+  targets the exact inode it just verified, so this trades disk cleanliness
+  for the guarantee that cleanup can never delete the wrong file. A removal
+  now reports `outcome: "partial"` / `cleanup_failed` with the index change
+  confirmed committed; re-registering the same id afterward refuses with
+  the new `owned_destination_occupied` code (the underlying OS cause is
+  `EEXIST`) until the retained file is removed by hand. Applies uniformly
+  to configuration and host-adapter registrations alike -- there is no
+  special case for either kind.
 
 ### Removed
 

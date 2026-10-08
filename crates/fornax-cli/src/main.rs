@@ -409,7 +409,10 @@ enum Commands {
 #[derive(Subcommand)]
 pub enum AdapterAction {
     /// List every known adapter id, display name, and what it wires.
-    List,
+    List {
+        #[arg(long)]
+        json: bool,
+    },
     /// Current install status for one adapter, read-only.
     Doctor {
         /// Adapter id to inspect.
@@ -435,8 +438,8 @@ pub enum AdapterAction {
         /// to actually register -- its absence is the review step.
         #[arg(long, value_name = "SHA256")]
         confirm_digest: Option<String>,
-        /// Emit the review step's output as JSON instead of human-readable
-        /// lines. Has no effect on the confirm step's output.
+        /// Emit JSON review or mutation results. Configuration review keeps
+        /// its existing wire shape; host descriptors use the shared envelope.
         #[arg(long)]
         json: bool,
     },
@@ -451,13 +454,27 @@ pub enum AdapterAction {
         json: bool,
     },
     /// Re-enables a previously disabled external adapter.
-    Enable { id: String },
+    Enable {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Disables an external adapter without removing its registration --
     /// excluded from `registry()`, still visible to `list`/`info`.
-    Disable { id: String },
-    /// Removes an external adapter's registration and its owned manifest
-    /// copy.
-    Remove { id: String },
+    Disable {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Removes an external adapter's registration. The owned manifest copy
+    /// is retained on disk, not deleted (Strict Retention, HORO-1745) --
+    /// re-registering the same id will refuse until it is removed by hand.
+    #[command(alias = "unregister")]
+    Remove {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// `fornax audit <action>` (FORNX-315).
@@ -1304,10 +1321,16 @@ fn print_registration_inspection(
     inspection: adapter_store::RegistrationInspection,
     json: bool,
 ) -> anyhow::Result<()> {
+    if inspection.entry.kind == fornax_store::adapter_registry::RegistrationKind::HostAdapterV1 {
+        return print_host_registration_inspection(id, inspection, json);
+    }
     let adapter = inspection.manifest.as_ref();
     let mut reasons = inspection.reason.into_iter().collect::<Vec<_>>();
-    if inspection.registry_schema_version == 0 {
+    if inspection.registry_schema_version == Some(0) {
         reasons.push("legacy_registry_schema_version_zero");
+    }
+    if inspection.registry_schema_version.is_none() {
+        reasons.push("legacy_registry_schema_version_omitted");
     }
     if !host_spi_id(id) {
         reasons.push("config_id_outside_host_spi_namespace");
@@ -1401,8 +1424,8 @@ fn print_registration_inspection(
         println!(
             "  registration origin: external data-only\n  registration state: {}\n  registry schema version: {}{}\n  configuration dispatch registration: {}\n  enabled: {}\n  registered at: {}\n  pinned digest: {}\n  recorded source path: {} (unverified; display only; never re-read)\n  {}\n  declared configuration operations: {}\n  host installation: unknown\n  host trust: unknown\n  native observation: not observed\n  executable driver/code trust: not applicable to this data-only descriptor",
             inspection.load_state,
-            inspection.registry_schema_version,
-            if inspection.registry_schema_version == 0 { " (legacy S6 record; preserved)" } else { "" },
+            inspection.registry_schema_version.map(|version| version.to_string()).unwrap_or_else(|| "omitted (effective legacy1)".to_owned()),
+            if inspection.registry_schema_version == Some(0) { " (legacy S6 record; preserved)" } else { "" },
             if entry.enabled && inspection.reason.is_none() { "enabled" } else { "unavailable" },
             entry.enabled,
             bounded_text(&entry.registered_at, 128),
@@ -1419,6 +1442,127 @@ fn print_registration_inspection(
         }
     }
     Ok(())
+}
+
+fn host_compatibility(declarations: &serde_json::Value) -> serde_json::Value {
+    // These fields are schema-bounded to signed32-bit positive integers;
+    // their numeric forms (including1.0/1e0) are exactly representable here.
+    let protocols = declarations["protocol_versions"]
+        .as_array()
+        .is_some_and(|versions| versions.iter().any(|version| version.as_f64() == Some(1.0)));
+    let minimum = declarations["contract_version_range"]["minimum"].as_f64();
+    let maximum = declarations["contract_version_range"]["maximum"].as_f64();
+    serde_json::json!({"protocol_v1_declared": protocols, "contract_v1_declared": minimum.zip(maximum).is_some_and(|(minimum, maximum)| minimum <= 1.0 && maximum >= 1.0), "runtime_negotiation": "not_observed"})
+}
+
+fn print_host_registration_inspection(
+    id: &str,
+    inspection: adapter_store::RegistrationInspection,
+    json: bool,
+) -> anyhow::Result<()> {
+    let declarations = inspection
+        .host_manifest
+        .as_ref()
+        .map(adapter_store::host_declaration_view)
+        .transpose()?;
+    let mut reasons: Vec<&str> = inspection.reason.into_iter().collect();
+    reasons.push("execution_boundary_unavailable");
+    let entry = &inspection.entry;
+    if json {
+        let (source_path, source_path_truncated) = bounded_value(&entry.source_path, 512);
+        let (registered_at, registered_at_truncated) = bounded_value(&entry.registered_at, 128);
+        let result = serde_json::json!({
+            "origin":"external_host_descriptor", "registration":{"id":entry.id,"kind":"host-adapter-v1","enabled":entry.enabled,"registry_schema_version":inspection.registry_schema_version,"manifest_digest":entry.digest,"owned_manifest_file":entry.manifest_file,"source_path":source_path,"source_path_truncated":source_path_truncated,"source_path_verification":"unverified_display_only","registered_at":registered_at,"registered_at_truncated":registered_at_truncated},
+            "load_state":inspection.load_state, "declared_manifest":declarations,
+            "compatibility":declarations.as_ref().map(host_compatibility),
+            "host":host_observation_json(),
+            "executable_driver":{"implementation_trust":"not_granted","execution_observation":"not_observed","availability":"execution_boundary_unavailable"},
+            "configuration_dispatch_registration":"not_applicable_host_descriptor"
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&inspection_envelope(
+                id,
+                "success",
+                reasons,
+                if inspection.reason.is_some() {
+                    "failed"
+                } else {
+                    "unverified"
+                },
+                result
+            ))?
+        );
+    } else {
+        println!("{} host descriptor\n  registration kind: host-adapter-v1\n  desired enabled state: {}\n  pinned digest: {}\n  recorded source path: {} (unverified; display only)\n  load state: {}\n  implementation trust: not granted\n  host installation: unknown\n  native observation: not observed\n  execution availability: execution_boundary_unavailable", bounded_text(id,64),entry.enabled,bounded_text(&entry.digest,80),bounded_text(&entry.source_path,512),inspection.load_state);
+        if let Some(reason) = inspection.reason {
+            println!("  reason: {reason}");
+        }
+        if let Some(declarations) = declarations {
+            println!(
+                "  declared metadata (partial; configuration schema omitted): {}",
+                serde_json::to_string(&declarations)?
+            );
+        }
+    }
+    Ok(())
+}
+
+fn operation_envelope(
+    operation: &str,
+    id: &str,
+    outcome: &str,
+    reasons: Vec<&str>,
+    verification: &str,
+    result: serde_json::Value,
+) -> serde_json::Value {
+    let mut envelope = inspection_envelope(id, outcome, reasons, verification, result);
+    envelope["operation"] = serde_json::json!(operation);
+    envelope
+}
+
+fn report_mutation_error(
+    operation: &str,
+    id: &str,
+    error: anyhow::Error,
+    json: bool,
+) -> anyhow::Result<()> {
+    if json {
+        let mutating = matches!(operation, "register" | "unregister" | "enable" | "disable");
+        let owner = error.downcast_ref::<fornax_store::adapter_registry::RegistryError>();
+        let code = owner
+            .map(|error| error.code_str())
+            .or_else(|| {
+                error
+                    .downcast_ref::<fornax_types::HostManifestRejection>()
+                    .map(|error| error.reason_code())
+            })
+            .unwrap_or("registration_refused");
+        let committed = owner.is_some_and(|error| error.index_published());
+        let cleanup = owner.is_some_and(|error| {
+            error.code() == fornax_store::adapter_registry::RegistryErrorCode::CleanupFailed
+        });
+        let envelope = operation_envelope(
+            operation,
+            id,
+            if committed || cleanup {
+                "partial"
+            } else if mutating {
+                "refused"
+            } else {
+                "failed"
+            },
+            vec![code],
+            if committed || cleanup {
+                "unverified"
+            } else {
+                "failed"
+            },
+            serde_json::json!({"publication":if committed {"committed"} else if cleanup {"not_committed_inert_orphan_possible"} else {"not_confirmed"},"lock_or_directory_creation_possible":mutating,"automatic_retry":false}),
+        );
+        println!("{}", serde_json::to_string_pretty(&envelope)?);
+    }
+    Err(error)
 }
 
 fn handle_adapter_info(id: String, json: bool) -> anyhow::Result<()> {
@@ -1455,9 +1599,83 @@ fn print_inspection_failure(
     anyhow::bail!("adapter inspection failed ({})", failure.reason)
 }
 
+fn handle_registry_mutation(operation: &str, id: String, json: bool) -> anyhow::Result<()> {
+    let result = match operation {
+        "enable" => adapter_store::set_enabled(&fornax_home(), &id, true),
+        "disable" => adapter_store::set_enabled(&fornax_home(), &id, false),
+        _ => adapter_store::remove(&fornax_home(), &id),
+    };
+    if let Err(error) = result {
+        return report_mutation_error(operation, &id, error, json);
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&operation_envelope(
+                operation,
+                &id,
+                "success",
+                Vec::new(),
+                "verified",
+                serde_json::json!({"registry_mutation":"verified","running_execution_stop":"not_claimed","host_configuration_mutation":"not_performed"})
+            ))?
+        );
+    } else {
+        println!(
+            "{} {id} registration.",
+            match operation {
+                "enable" => "Enabled",
+                "disable" => "Disabled",
+                _ => "Removed",
+            }
+        );
+    }
+    Ok(())
+}
+
 fn handle_adapter_action(action: AdapterAction) -> anyhow::Result<()> {
     match action {
-        AdapterAction::List => {
+        AdapterAction::List { json } => {
+            if json {
+                let snapshot = match fornax_store::adapter_registry::read_registry(&fornax_home()) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => return report_mutation_error("list", "", error.into(), true),
+                };
+                let mut entries = Vec::new();
+                for adapter in adapter_registry::registry() {
+                    entries.push(serde_json::json!({"id": adapter.id(), "kind": "config-v1", "dispatch": "available"}));
+                }
+                for entry in snapshot.entries() {
+                    if !entries
+                        .iter()
+                        .any(|existing| existing["id"].as_str() == Some(entry.id()))
+                    {
+                        entries.push(serde_json::json!({"id": entry.id(), "kind": entry.kind(), "enabled": entry.enabled(), "dispatch": "not_granted_by_registration"}));
+                    }
+                }
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&operation_envelope(
+                        "list",
+                        "",
+                        "success",
+                        Vec::new(),
+                        "unverified",
+                        serde_json::json!({"adapters":entries,"host_observation":"not_observed"})
+                    ))?
+                );
+                return Ok(());
+            }
+            let snapshot = fornax_store::adapter_registry::read_registry(&fornax_home())?;
+            for entry in snapshot.entries() {
+                if entry.kind() == fornax_store::adapter_registry::RegistrationKind::HostAdapterV1 {
+                    println!(
+                        "{}  host descriptor; desired enabled: {}; execution_boundary_unavailable",
+                        bounded_text(entry.id(), 64),
+                        entry.enabled()
+                    );
+                }
+            }
             println!("Known Fornax adapters:");
             for adapter in adapter_registry::registry() {
                 println!(
@@ -1502,7 +1720,11 @@ fn handle_adapter_action(action: AdapterAction) -> anyhow::Result<()> {
             json,
         } => {
             let outcome =
-                adapter_store::register(&fornax_home(), &manifest, confirm_digest.as_deref())?;
+                match adapter_store::register(&fornax_home(), &manifest, confirm_digest.as_deref())
+                {
+                    Ok(outcome) => outcome,
+                    Err(error) => return report_mutation_error("register", "", error, json),
+                };
             match outcome {
                 adapter_store::RegisterOutcome::Reviewed {
                     manifest: m,
@@ -1534,30 +1756,74 @@ fn handle_adapter_action(action: AdapterAction) -> anyhow::Result<()> {
                     }
                     Ok(())
                 }
+                adapter_store::RegisterOutcome::HostReviewed {
+                    manifest: descriptor,
+                    digest,
+                    registry_upgrade,
+                } => {
+                    let declarations = adapter_store::host_declaration_view(&descriptor)?;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&operation_envelope(
+                                "register",
+                                descriptor.id(),
+                                "refused",
+                                vec![
+                                    "digest_confirmation_required",
+                                    "execution_boundary_unavailable"
+                                ],
+                                "unverified",
+                                serde_json::json!({"registration":"not_registered","manifest_digest":digest,"compatibility":host_compatibility(&declarations),"declared_manifest":declarations,"registry_upgrade_on_confirmation":registry_upgrade,"older_mutators_must_be_quiesced":registry_upgrade,"implementation_trust":"not_granted","review_does_not_execute":true})
+                            ))?
+                        );
+                    } else {
+                        println!("Host descriptor reviewed -- NOT registered.\n  id: {}\n  digest: {}\n  declarations (partial; configuration schema omitted): {}\n  registry upgrade to v2 on confirmation: {}\n  Quiesce old registry mutators before this upgrade; older readers refuse v2.\n  Confirmation registers descriptor bytes only. No code trust, host installation or native observation is granted.\n  Run: fornax adapter register --manifest {} --confirm-digest {}",descriptor.id(),digest,serde_json::to_string(&declarations)?,registry_upgrade,bounded_text(&manifest.to_string_lossy(), 1024),digest);
+                    }
+                    Ok(())
+                }
+                adapter_store::RegisterOutcome::HostRegistered { id } => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&operation_envelope(
+                                "register",
+                                &id,
+                                "success",
+                                vec!["execution_boundary_unavailable"],
+                                "unverified",
+                                serde_json::json!({"registration":"registered","enabled":false,"implementation_trust":"not_granted","host_installation":"unknown","native_observation":"not_observed"})
+                            ))?
+                        );
+                    } else {
+                        println!("Registered {id} as a disabled host descriptor. Implementation trust is not granted; execution_boundary_unavailable.");
+                    }
+                    Ok(())
+                }
                 adapter_store::RegisterOutcome::Registered { id } => {
-                    println!(
-                        "Registered {id}. Run 'fornax adapter plan {id}' to preview its install."
-                    );
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&operation_envelope(
+                                "register",
+                                &id,
+                                "success",
+                                Vec::new(),
+                                "verified",
+                                serde_json::json!({"registration":"registered","enabled":true,"kind":"config-v1","host_configuration_mutation":"not_performed","implementation_execution":"not_performed"})
+                            ))?
+                        );
+                    } else {
+                        println!("Registered {id}. Run 'fornax adapter plan {id}' to preview its install.");
+                    }
                     Ok(())
                 }
             }
         }
         AdapterAction::Info { id, json } => handle_adapter_info(id, json),
-        AdapterAction::Enable { id } => {
-            adapter_store::set_enabled(&fornax_home(), &id, true)?;
-            println!("Enabled {id}.");
-            Ok(())
-        }
-        AdapterAction::Disable { id } => {
-            adapter_store::set_enabled(&fornax_home(), &id, false)?;
-            println!("Disabled {id}.");
-            Ok(())
-        }
-        AdapterAction::Remove { id } => {
-            adapter_store::remove(&fornax_home(), &id)?;
-            println!("Removed {id}.");
-            Ok(())
-        }
+        AdapterAction::Enable { id, json } => handle_registry_mutation("enable", id, json),
+        AdapterAction::Disable { id, json } => handle_registry_mutation("disable", id, json),
+        AdapterAction::Remove { id, json } => handle_registry_mutation("unregister", id, json),
     }
 }
 
@@ -4270,7 +4536,7 @@ mod tests {
             let cli = Cli::try_parse_from(["fornax", "adapter", "list"]).expect("must parse");
             match cli.command {
                 Commands::Adapter {
-                    action: AdapterAction::List,
+                    action: AdapterAction::List { json: false },
                 } => {}
                 _ => panic!("expected AdapterAction::List"),
             }

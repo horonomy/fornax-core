@@ -13,6 +13,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 pub mod acquisition;
+pub mod adapter_registry;
 pub mod adjudication;
 pub mod audit_checkpoint;
 pub mod audit_ledger;
