@@ -889,11 +889,35 @@ fn default_unknown_caps() -> RuntimeCapabilities {
     }
 }
 
-async fn api_status(State(state): State<AppState>) -> Json<serde_json::Value> {
-    match state.store.recent_findings(1).await {
-        Ok(rows) if !rows.is_empty() => Json(serde_json::json!({ "latest": rows[0] })),
-        Ok(_) => Json(serde_json::json!({ "latest": null })),
-        Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
+/// `session` is optional and additive (HORO-1601/1602): an older CLI, or one
+/// that could not resolve a provider-session identity, omits it entirely and
+/// gets exactly the pre-existing cross-session behavior below. `?session=`
+/// present is how the CLI asks "the latest finding for *this* session" —
+/// answered via [`fornax_store::Store::latest_finding_for_session`], the
+/// bounded counterpart to `recent_findings`. `session_scoped` in the
+/// response is this handler's own confirmation that it actually understood
+/// and honored the query parameter, so the CLI never has to assume an older
+/// daemon (pre-HORO-1601) silently ignored `?session=` and fell back to the
+/// cross-session answer without saying so.
+#[derive(Debug, serde::Deserialize)]
+struct StatusQuery {
+    session: Option<String>,
+}
+
+async fn api_status(
+    State(state): State<AppState>,
+    Query(q): Query<StatusQuery>,
+) -> Json<serde_json::Value> {
+    match q.session {
+        Some(session_id) => match state.store.latest_finding_for_session(&session_id).await {
+            Ok(row) => Json(serde_json::json!({ "latest": row, "session_scoped": true })),
+            Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
+        },
+        None => match state.store.recent_findings(1).await {
+            Ok(rows) if !rows.is_empty() => Json(serde_json::json!({ "latest": rows[0] })),
+            Ok(_) => Json(serde_json::json!({ "latest": null })),
+            Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
+        },
     }
 }
 
@@ -2906,7 +2930,7 @@ mod tests {
             .expect("handle claim");
 
         // Same surfaces `fornax status`/`fornax detail` call.
-        let status = api_status(State(state.clone())).await;
+        let status = api_status(State(state.clone()), Query(StatusQuery { session: None })).await;
         let latest = status
             .0
             .get("latest")
@@ -2935,6 +2959,138 @@ mod tests {
         assert!(
             rationale.contains("exit_code_text"),
             "detail rationale must reference the real Codex evidence provenance: {rationale}"
+        );
+    }
+
+    /// HORO-1601/1602: `/api/status?session=<id>` must confirm it filtered
+    /// by the given session (`session_scoped: true`) and return only that
+    /// session's own latest finding — never a different, more recent
+    /// finding from another session, which is exactly the cross-session
+    /// leak the CLI's `scope: "session"` claim depends on this endpoint
+    /// never committing.
+    #[tokio::test]
+    async fn api_status_with_session_confirms_scoping_and_isolates_sessions() {
+        let state = test_state().await;
+
+        // Inserts directly via `state.store`, never through `handle_message`:
+        // routing a real `Claim` message through the live pipeline runs the
+        // real verifiers, which -- given this helper deliberately supplies
+        // no `Evidence` -- compute their own `unavailable` finding stamped
+        // with the real wall-clock time, outranking (by `computed_at`) the
+        // exact verdict and timestamp this test asks for. This test is
+        // about the `/api/status?session=` HTTP route and its SQL, not the
+        // verification pipeline, so it writes the rows it wants directly.
+        async fn record_finding(
+            state: &AppState,
+            session_id: &str,
+            verdict: fornax_types::Verdict,
+            observed_at: &str,
+        ) {
+            let event_id = Uuid::new_v4();
+            state
+                .store
+                .insert_event(&AgentEvent {
+                    id: event_id,
+                    session_id: session_id.to_string(),
+                    provider: Provider::ClaudeCode,
+                    kind: EventKind::PostToolUse,
+                    observed_at: observed_at.to_string(),
+                    tool_name: Some("exec_command".to_string()),
+                    tool_input: None,
+                    tool_response: None,
+                    raw: serde_json::json!({}),
+                })
+                .await
+                .expect("insert event");
+            let claim_id = Uuid::new_v4();
+            state
+                .store
+                .insert_claim(&Claim {
+                    id: claim_id,
+                    session_id: session_id.to_string(),
+                    source_event_id: event_id,
+                    text: "claim text".to_string(),
+                    subject: "test_result".to_string(),
+                    claimed_at: observed_at.to_string(),
+                })
+                .await
+                .expect("insert claim");
+            state
+                .store
+                .insert_finding(&Finding {
+                    id: Uuid::new_v4(),
+                    claim_id,
+                    verdict,
+                    evidence_ids: vec![],
+                    verifier_name: "test_result_verifier_v1".to_string(),
+                    rationale: "test".to_string(),
+                    computed_at: observed_at.to_string(),
+                })
+                .await
+                .expect("insert finding");
+        }
+
+        record_finding(
+            &state,
+            "sess-a",
+            fornax_types::Verdict::Verified,
+            "2026-01-01T00:00:01Z",
+        )
+        .await;
+        record_finding(
+            &state,
+            "sess-a",
+            fornax_types::Verdict::Contradicted,
+            "2026-01-01T00:00:02Z",
+        )
+        .await;
+        // sess-b's finding is newer than either of sess-a's -- a query that
+        // forgot the session filter would surface this one for sess-a.
+        record_finding(
+            &state,
+            "sess-b",
+            fornax_types::Verdict::Verified,
+            "2026-01-01T00:00:03Z",
+        )
+        .await;
+
+        let scoped = api_status(
+            State(state.clone()),
+            Query(StatusQuery {
+                session: Some("sess-a".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(scoped.0["session_scoped"], true);
+        assert_eq!(
+            scoped.0["latest"]["verdict"].as_str(),
+            Some("contradicted"),
+            "must be sess-a's own newest finding, not sess-b's newer one"
+        );
+
+        let cross_session =
+            api_status(State(state.clone()), Query(StatusQuery { session: None })).await;
+        assert!(
+            cross_session.0.get("session_scoped").is_none(),
+            "no `session` query param -> no session_scoped confirmation at all"
+        );
+        assert_eq!(
+            cross_session.0["latest"]["verdict"].as_str(),
+            Some("verified"),
+            "cross-session default stays recent_findings(1): sess-b's newer finding"
+        );
+
+        let unknown_session = api_status(
+            State(state),
+            Query(StatusQuery {
+                session: Some("sess-never-seen".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(unknown_session.0["session_scoped"], true);
+        assert!(
+            unknown_session.0["latest"].is_null(),
+            "a known-good session query for a session with no findings must not fall back to any other session's finding"
         );
     }
 
