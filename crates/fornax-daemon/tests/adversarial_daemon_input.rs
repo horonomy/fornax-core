@@ -28,6 +28,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use fornax_store::Store;
+use fornax_types::{EventKind, Evidence, EvidenceKind, Provider};
 
 // ---------------------------------------------------------------------
 // Binary + environment plumbing
@@ -252,12 +253,264 @@ async fn assert_no_data_for_session(store: &Store, session_id: &str) {
     );
 }
 
+fn summarize_findings(
+    rows: &[fornax_store::FindingRow],
+) -> Vec<(String, String, String, String, String, String)> {
+    rows.iter()
+        .map(|row| {
+            (
+                row.id.clone(),
+                row.claim_id.clone(),
+                row.session_id.clone(),
+                row.verdict.clone(),
+                row.evidence_ids.clone(),
+                row.rationale.clone(),
+            )
+        })
+        .collect()
+}
+
+async fn wait_for_probe_evidence(
+    store: &Store,
+    session: &str,
+    deadline: tokio::time::Instant,
+) -> Evidence {
+    loop {
+        let events = store
+            .events_for_session(session)
+            .await
+            .unwrap_or_else(|error| panic!("read probe events for {session}: {error}"));
+        assert!(
+            events.len() <= 1,
+            "probe {session} has duplicate events before Stop: count={}, events={events:?}",
+            events.len()
+        );
+        if let Some(event) = events.first() {
+            assert_eq!(event.session_id, session);
+            assert_eq!(event.provider, Provider::ClaudeCode);
+            assert_eq!(event.kind, EventKind::PostToolUse);
+            assert_eq!(event.tool_name.as_deref(), Some("Bash"));
+            assert_eq!(
+                event
+                    .tool_input
+                    .as_ref()
+                    .and_then(|value| value.get("command"))
+                    .and_then(|value| value.as_str()),
+                Some("cargo test --workspace"),
+                "wrong probe event input: {event:?}"
+            );
+            assert_eq!(
+                event
+                    .tool_response
+                    .as_ref()
+                    .and_then(|value| value.get("exit_code"))
+                    .and_then(|value| value.as_i64()),
+                Some(1),
+                "probe event did not carry explicit exit code 1: {event:?}"
+            );
+        }
+
+        let outcome = store
+            .evidence_for_session(session)
+            .await
+            .unwrap_or_else(|error| panic!("read probe evidence for {session}: {error}"));
+        assert!(
+            outcome.failed.is_empty(),
+            "probe {session} evidence decode failures={:?}, decoded_rows={}",
+            outcome.failed,
+            outcome.evidence.len()
+        );
+        assert!(
+            outcome.evidence.len() <= 1,
+            "probe {session} has duplicate evidence rows: {:?}",
+            outcome.evidence
+        );
+        if let (Some(event), Some(evidence)) = (events.first(), outcome.evidence.first()) {
+            assert_eq!(evidence.session_id, session);
+            assert_eq!(evidence.source_event_id, event.id);
+            assert_eq!(evidence.kind, EvidenceKind::ExitCode);
+            assert!(
+                !evidence.evidence_purged,
+                "probe evidence {} is purged",
+                evidence.id
+            );
+            assert_eq!(
+                evidence
+                    .payload
+                    .get("command")
+                    .and_then(|value| value.as_str()),
+                Some("cargo test --workspace")
+            );
+            assert_eq!(
+                evidence
+                    .payload
+                    .get("exit_code")
+                    .and_then(|value| value.as_i64()),
+                Some(1)
+            );
+            assert_eq!(
+                evidence
+                    .payload
+                    .get("heuristic")
+                    .and_then(|value| value.as_bool()),
+                Some(false)
+            );
+            assert!(
+                tokio::time::Instant::now() <= deadline,
+                "probe {session} evidence became visible after its five-second deadline; event={}, evidence={:?}",
+                event.id,
+                evidence
+            );
+            return evidence.clone();
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "probe {session} evidence deadline expired; events={} {:?}, decoded_evidence={} {:?}, decode_failures={:?}",
+                events.len(),
+                events,
+                outcome.evidence.len(),
+                outcome.evidence,
+                outcome.failed
+            );
+        }
+        tokio::time::sleep(
+            Duration::from_millis(20)
+                .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+        )
+        .await;
+    }
+}
+
+async fn wait_for_probe_claim_and_finding(
+    store: &Store,
+    session: &str,
+    evidence_id: uuid::Uuid,
+    deadline: tokio::time::Instant,
+) -> (fornax_types::Claim, fornax_store::FindingRow) {
+    loop {
+        // Read dependents first: later append-only snapshots must include
+        // their committed prerequisites rather than lagging an earlier read.
+        let findings = store
+            .findings_for_session(session)
+            .await
+            .unwrap_or_else(|error| panic!("read probe findings for {session}: {error}"));
+        let claims = store
+            .claims_for_session(session)
+            .await
+            .unwrap_or_else(|error| panic!("read probe claims for {session}: {error}"));
+        let events = store
+            .events_for_session(session)
+            .await
+            .unwrap_or_else(|error| panic!("read probe events for {session}: {error}"));
+        assert!(
+            claims.len() <= 1,
+            "duplicate probe claims for {session}: {claims:?}"
+        );
+        assert!(
+            findings.len() <= 1,
+            "duplicate probe findings for {session}: {:?}",
+            summarize_findings(&findings)
+        );
+        assert!(
+            findings.is_empty() || !claims.is_empty(),
+            "probe {session} has a finding without its own claim: findings={:?}, events={events:?}",
+            summarize_findings(&findings)
+        );
+
+        if let Some(claim) = claims.first() {
+            assert_eq!(claim.session_id, session);
+            assert_eq!(claim.text, "All tests passed.");
+            assert_eq!(claim.subject, "test_result");
+            let session_end_events: Vec<_> = events
+                .iter()
+                .filter(|event| {
+                    event.provider == Provider::ClaudeCode && event.kind == EventKind::SessionEnd
+                })
+                .collect();
+            assert_eq!(
+                session_end_events.len(),
+                1,
+                "probe {session} SessionEnd events: {events:?}"
+            );
+            assert_eq!(claim.source_event_id, session_end_events[0].id);
+            assert_eq!(events.len(), 2, "probe {session} should have exactly its PostToolUse and SessionEnd events: {events:?}");
+        }
+        if let (Some(claim), Some(finding)) = (claims.first(), findings.first()) {
+            assert_eq!(finding.session_id, session);
+            assert_eq!(finding.claim_id, claim.id.to_string());
+            assert_eq!(finding.claim_text, claim.text);
+            assert_eq!(finding.verifier_name, "test_result_verifier_v1");
+            assert_eq!(
+                finding.verdict, "contradicted",
+                "probe {session} finding rationale: {}",
+                finding.rationale
+            );
+            let finding_evidence_ids: Vec<uuid::Uuid> = serde_json::from_str(&finding.evidence_ids)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "decode finding evidence IDs for {session}: {error}; raw={}",
+                        finding.evidence_ids
+                    )
+                });
+            assert_eq!(
+                finding_evidence_ids,
+                vec![evidence_id],
+                "probe {session} finding rationale: {}",
+                finding.rationale
+            );
+            assert!(
+                tokio::time::Instant::now() <= deadline,
+                "probe {session} claim/finding became visible after its shared five-second deadline; claim={claim:?}, finding={:?}",
+                summarize_findings(&findings)
+            );
+            let claim = claim.clone();
+            let finding = findings.into_iter().next().expect("one probe finding");
+            return (claim, finding);
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "probe {session} claim/finding deadline expired; events={} {:?}, claims={} {:?}, findings={} {:?}, expected_evidence_id={evidence_id}",
+                events.len(), events, claims.len(), claims, findings.len(), summarize_findings(&findings)
+            );
+        }
+        tokio::time::sleep(
+            Duration::from_millis(20)
+                .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+        )
+        .await;
+    }
+}
+
 /// Send the README's exact CONTRADICTED aha-scenario pair (PostToolUse with
 /// a failing exit code, then a Stop claiming tests passed) under a fresh
 /// session id, and confirm the daemon still computes CONTRADICTED — the
 /// "did an earlier adversarial case corrupt daemon state" check that must
 /// pass after every corpus case.
-async fn assert_valid_processing_still_works(daemon: &DaemonHandle, probe_session: &str) {
+async fn assert_valid_processing_still_works(
+    daemon: &DaemonHandle,
+    store: &Store,
+    probe_session: &str,
+) {
+    let events = store
+        .events_for_session(probe_session)
+        .await
+        .expect("probe events");
+    let evidence = store
+        .evidence_for_session(probe_session)
+        .await
+        .expect("probe evidence");
+    let claims = store
+        .claims_for_session(probe_session)
+        .await
+        .expect("probe claims");
+    let findings = store
+        .findings_for_session(probe_session)
+        .await
+        .expect("probe findings");
+    assert!(events.is_empty() && evidence.evidence.is_empty() && evidence.failed.is_empty() && claims.is_empty() && findings.is_empty(),
+        "probe session {probe_session} must be unused before submission; events={events:?}, evidence={evidence:?}, claims={claims:?}, findings={:?}", summarize_findings(&findings));
     let transcript_path = daemon
         .home
         .join(format!("{probe_session}-transcript.jsonl"));
@@ -285,18 +538,6 @@ async fn assert_valid_processing_still_works(daemon: &DaemonHandle, probe_sessio
     );
     assert_eq!(post.status, 0, "PostToolUse probe hook must exit 0");
 
-    let stop = send_hook(
-        daemon,
-        serde_json::json!({
-            "hook_event_name": "Stop",
-            "session_id": probe_session,
-            "transcript_path": transcript_path.to_str().unwrap()
-        })
-        .to_string()
-        .as_bytes(),
-    );
-    assert_eq!(stop.status, 0, "Stop probe hook must exit 0");
-
     struct DebugOnFail<'a>(&'a DaemonHandle, &'a str);
     impl<'a> Drop for DebugOnFail<'a> {
         fn drop(&mut self) {
@@ -311,6 +552,48 @@ async fn assert_valid_processing_still_works(daemon: &DaemonHandle, probe_sessio
     }
     let _dbg = DebugOnFail(daemon, probe_session);
 
+    // One monotonic budget covers causal evidence readiness and this probe's
+    // own claim/finding persistence. Client exit alone proves only the write
+    // left the hook process.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let evidence = wait_for_probe_evidence(store, probe_session, deadline).await;
+
+    let stop = send_hook(
+        daemon,
+        serde_json::json!({
+            "hook_event_name": "Stop",
+            "session_id": probe_session,
+            "transcript_path": transcript_path.to_str().unwrap()
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    assert_eq!(stop.status, 0, "Stop probe hook must exit 0");
+
+    let (claim, finding) =
+        wait_for_probe_claim_and_finding(store, probe_session, evidence.id, deadline).await;
+    assert_eq!(claim.text, "All tests passed.");
+    assert_eq!(claim.subject, "test_result");
+    assert_eq!(finding.claim_id, claim.id.to_string());
+    assert_eq!(finding.session_id, probe_session);
+    assert_eq!(finding.claim_text, claim.text);
+    assert_eq!(finding.verifier_name, "test_result_verifier_v1");
+    assert_eq!(
+        finding.verdict, "contradicted",
+        "rationale={}",
+        finding.rationale
+    );
+    let finding_evidence_ids: Vec<uuid::Uuid> = serde_json::from_str(&finding.evidence_ids)
+        .unwrap_or_else(|error| panic!("decode evidence ids for probe {probe_session}: {error}"));
+    assert_eq!(
+        finding_evidence_ids,
+        vec![evidence.id],
+        "rationale={}",
+        finding.rationale
+    );
+
+    // Keep the public surfaces as secondary smoke checks after this probe's
+    // own persisted claim and finding have established processing.
     wait_for(Duration::from_secs(5), || async {
         let out = Command::new(workspace_bin("fornax"))
             .arg("detail")
@@ -340,7 +623,7 @@ async fn adversarial_corpus_against_live_daemon() {
     let store = open_store(&daemon).await;
 
     // Baseline: valid processing works before any adversarial input at all.
-    assert_valid_processing_still_works(&daemon, "probe-00-baseline").await;
+    assert_valid_processing_still_works(&daemon, &store, "probe-00-baseline").await;
     assert!(daemon.is_alive(), "daemon died after baseline probe");
 
     // -- Case 1: malformed / truncated JSON (unparseable) -----------------
@@ -354,7 +637,7 @@ async fn adversarial_corpus_against_live_daemon() {
         assert!(res.stdout.is_empty() && res.stderr.is_empty());
         assert_no_data_for_session(&store, session).await;
         assert!(daemon.is_alive(), "daemon died on truncated JSON");
-        assert_valid_processing_still_works(&daemon, "probe-01").await;
+        assert_valid_processing_still_works(&daemon, &store, "probe-01").await;
     }
 
     // -- Case 2: missing required fields (no session_id, no hook_event_name)
@@ -371,7 +654,7 @@ async fn adversarial_corpus_against_live_daemon() {
         // session, including the "unknown" default.
         assert_no_data_for_session(&store, "unknown").await;
         assert!(daemon.is_alive(), "daemon died on missing required fields");
-        assert_valid_processing_still_works(&daemon, "probe-02").await;
+        assert_valid_processing_still_works(&daemon, &store, "probe-02").await;
     }
 
     // -- Case 3: null values where a field is expected non-null -----------
@@ -392,7 +675,7 @@ async fn adversarial_corpus_against_live_daemon() {
         assert_eq!(res.status, 0);
         assert_no_data_for_session(&store, session).await;
         assert!(daemon.is_alive(), "daemon died on null hook_event_name");
-        assert_valid_processing_still_works(&daemon, "probe-03").await;
+        assert_valid_processing_still_works(&daemon, &store, "probe-03").await;
     }
 
     // -- Case 4: wrong-type fields ------------------------------------------
@@ -442,7 +725,7 @@ async fn adversarial_corpus_against_live_daemon() {
             evidence.is_empty(),
             "a non-numeric exit_code and no heuristic fields must not fabricate Evidence"
         );
-        assert_valid_processing_still_works(&daemon, "probe-04").await;
+        assert_valid_processing_still_works(&daemon, &store, "probe-04").await;
     }
 
     // -- Case 5: unknown/extra fields alongside valid ones -----------------
@@ -480,7 +763,7 @@ async fn adversarial_corpus_against_live_daemon() {
             .evidence;
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].payload["exit_code"], 1);
-        assert_valid_processing_still_works(&daemon, "probe-05").await;
+        assert_valid_processing_still_works(&daemon, &store, "probe-05").await;
     }
 
     // -- Case 6: deeply nested JSON -----------------------------------------
@@ -512,7 +795,7 @@ async fn adversarial_corpus_against_live_daemon() {
                 .is_empty()
         })
         .await;
-        assert_valid_processing_still_works(&daemon, "probe-06a").await;
+        assert_valid_processing_still_works(&daemon, &store, "probe-06a").await;
 
         // 3000 levels: informational stretch beyond the literal ask, only to
         // confirm depth is bounded (by a parser/serializer guard, or simply
@@ -539,7 +822,7 @@ async fn adversarial_corpus_against_live_daemon() {
         let res_deep = send_hook(&daemon, payload_deep.as_bytes());
         assert_eq!(res_deep.status, 0, "hook must still exit 0 at 3000 levels");
         assert!(daemon.is_alive(), "daemon died on 3000-level nesting");
-        assert_valid_processing_still_works(&daemon, "probe-06b").await;
+        assert_valid_processing_still_works(&daemon, &store, "probe-06b").await;
     }
 
     // -- Case 7: unusually large string (5MB) -------------------------------
@@ -569,7 +852,7 @@ async fn adversarial_corpus_against_live_daemon() {
                 .is_empty()
         })
         .await;
-        assert_valid_processing_still_works(&daemon, "probe-07").await;
+        assert_valid_processing_still_works(&daemon, &store, "probe-07").await;
     }
 
     // -- Case 8: control characters and embedded newlines -------------------
@@ -613,7 +896,7 @@ async fn adversarial_corpus_against_live_daemon() {
         // never broke the UDS line-based framing (JSON escaping keeps them
         // out of the wire's newline-delimited protocol).
         assert_eq!(evidence[0].payload["exit_code"], 1);
-        assert_valid_processing_still_works(&daemon, "probe-08").await;
+        assert_valid_processing_still_works(&daemon, &store, "probe-08").await;
     }
 
     // -- Case 9: path-traversal-looking strings ------------------------------
@@ -750,7 +1033,7 @@ async fn adversarial_corpus_against_live_daemon() {
         assert_eq!(claims[0].text, "tests passed via traversal");
         std::fs::remove_dir_all(&outside_dir).ok();
 
-        assert_valid_processing_still_works(&daemon, "probe-09").await;
+        assert_valid_processing_still_works(&daemon, &store, "probe-09").await;
     }
 
     // -- Case 10: shell metacharacters --------------------------------------
@@ -794,7 +1077,7 @@ async fn adversarial_corpus_against_live_daemon() {
             .as_str()
             .unwrap()
             .contains("rm -rf"));
-        assert_valid_processing_still_works(&daemon, "probe-10").await;
+        assert_valid_processing_still_works(&daemon, &store, "probe-10").await;
     }
 
     // -- Case 11: duplicate / replayed valid event -------------------------
@@ -855,11 +1138,41 @@ async fn adversarial_corpus_against_live_daemon() {
 
         // Both claims are identical text under the same session, so both
         // should independently verify — no error, no dedupe, no corruption.
-        wait_for(Duration::from_secs(5), || async {
-            daemon.log_contents().matches("finding computed").count() >= 2
+        wait_for(Duration::from_secs(5), || {
+            let store = &store;
+            async move {
+                let findings = store
+                    .findings_for_session(session)
+                    .await
+                    .expect("case 11 findings");
+                assert!(
+                    findings.len() <= 2,
+                    "case 11 duplicate findings: {:?}",
+                    summarize_findings(&findings)
+                );
+                findings.len() == 2
+            }
         })
         .await;
-        assert_valid_processing_still_works(&daemon, "probe-11").await;
+        let findings = store
+            .findings_for_session(session)
+            .await
+            .expect("case 11 findings");
+        let mut finding_claim_ids: Vec<_> = findings
+            .iter()
+            .map(|finding| finding.claim_id.clone())
+            .collect();
+        let mut expected_claim_ids: Vec<_> =
+            claims.iter().map(|claim| claim.id.to_string()).collect();
+        finding_claim_ids.sort();
+        expected_claim_ids.sort();
+        assert_eq!(
+            finding_claim_ids,
+            expected_claim_ids,
+            "case 11 findings must correspond one-to-one with the two replayed claims: {:?}",
+            summarize_findings(&findings)
+        );
+        assert_valid_processing_still_works(&daemon, &store, "probe-11").await;
     }
 
     // -- Case 12: extreme identifiers ---------------------------------------
@@ -898,7 +1211,7 @@ async fn adversarial_corpus_against_live_daemon() {
             .expect("evidence")
             .evidence;
         assert_eq!(evidence.len(), 1);
-        assert_valid_processing_still_works(&daemon, "probe-12").await;
+        assert_valid_processing_still_works(&daemon, &store, "probe-12").await;
     }
 
     // Final liveness + no-corruption confirmation for the whole run.
@@ -906,7 +1219,7 @@ async fn adversarial_corpus_against_live_daemon() {
         daemon.is_alive(),
         "daemon must still be alive after the full corpus"
     );
-    assert_valid_processing_still_works(&daemon, "probe-final").await;
+    assert_valid_processing_still_works(&daemon, &store, "probe-final").await;
 }
 
 /// FORNX-238 acceptance also asks to re-confirm this repo's zero
