@@ -174,7 +174,7 @@ pub enum ManifestError {
     },
 }
 
-fn validate_id(id: &str) -> Result<(), ManifestError> {
+pub(crate) fn validate_id(id: &str) -> Result<(), ManifestError> {
     let len_ok = (3..=64).contains(&id.len());
     let charset_ok = id
         .bytes()

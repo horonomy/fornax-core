@@ -443,7 +443,13 @@ pub enum AdapterAction {
     /// Provenance and trust state for one adapter id -- including a
     /// disabled or rejected one, which `AdapterArg` cannot parse (that is
     /// the point: explaining *why* an id is not loadable).
-    Info { id: String },
+    #[command(alias = "inspect")]
+    Info {
+        id: String,
+        /// Emit the shared CLI operation-envelope v1 JSON shape.
+        #[arg(long)]
+        json: bool,
+    },
     /// Re-enables a previously disabled external adapter.
     Enable { id: String },
     /// Disables an external adapter without removing its registration --
@@ -1172,6 +1178,266 @@ fn print_result(result: adapter_registry::AdapterActionResult) {
     println!("{}", result.message);
 }
 
+fn host_spi_id(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    (1..=64).contains(&bytes.len())
+        && bytes[0].is_ascii_lowercase()
+        && bytes[1..]
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_' || *b == b'-')
+}
+
+fn bounded_text(value: &str, max_chars: usize) -> String {
+    let mut rendered = String::new();
+    for (index, ch) in value.chars().enumerate() {
+        if index >= max_chars {
+            rendered.push('…');
+            break;
+        }
+        if ch.is_control() {
+            rendered.push_str(&format!("\\u{{{:x}}}", ch as u32));
+        } else {
+            rendered.push(ch);
+        }
+    }
+    rendered
+}
+
+fn bounded_value(value: &str, max_chars: usize) -> (String, bool) {
+    let mut chars = value.chars();
+    let bounded = chars.by_ref().take(max_chars).collect::<String>();
+    let truncated = chars.next().is_some();
+    (bounded, truncated)
+}
+
+fn host_observation_json() -> serde_json::Value {
+    serde_json::json!({
+        "installation": "unknown",
+        "trust": "unknown",
+        "native_observation": "not_observed"
+    })
+}
+
+fn inspection_envelope(
+    id: &str,
+    outcome: &str,
+    reasons: Vec<&str>,
+    verification_state: &str,
+    result: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "operation": "inspect",
+        "adapter_id": if host_spi_id(id) { serde_json::Value::String(id.to_string()) } else { serde_json::Value::Null },
+        "outcome": outcome,
+        "reasons": reasons,
+        "result": result,
+        "verification_state": verification_state
+    })
+}
+
+fn print_builtin_inspection(
+    id: &str,
+    adapter: &'static dyn adapter_registry::AdapterPlugin,
+    json: bool,
+) -> anyhow::Result<()> {
+    let (target, path_truncated) = bounded_value(&adapter.target_path().display().to_string(), 512);
+    if json {
+        let envelope = inspection_envelope(
+            id,
+            "success",
+            Vec::new(),
+            "not_applicable",
+            serde_json::json!({
+                "origin": "builtin",
+                "adapter": {
+                    "id": adapter.id(),
+                    "display_name": adapter.display_name(),
+                    "summary": adapter.summary(),
+                    "target": {
+                        "path": target,
+                        "path_truncated": path_truncated
+                    }
+                },
+                "external_registration": null,
+                "declared_configuration_operations": null,
+                "configuration_dispatch_registration": "enabled",
+                "host": host_observation_json(),
+                "executable_driver": {
+                    "code_trust": "not_applicable_data_only_descriptor",
+                    "availability": "unavailable_through_this_descriptor"
+                }
+            }),
+        );
+        println!("{}", serde_json::to_string_pretty(&envelope)?);
+    } else {
+        println!(
+            "{} ({})\n  {}\n  config: {}\n  registration origin: built-in\n  external registration metadata: not applicable\n  host installation: unknown\n  host trust: unknown\n  native observation: not observed",
+            adapter.display_name(),
+            adapter.id(),
+            adapter.summary(),
+            bounded_text(&adapter.target_path().display().to_string(), 512)
+        );
+    }
+    Ok(())
+}
+
+fn print_registration_inspection(
+    id: &str,
+    inspection: adapter_store::RegistrationInspection,
+    json: bool,
+) -> anyhow::Result<()> {
+    let adapter = inspection.manifest.as_ref();
+    let mut reasons = inspection.reason.into_iter().collect::<Vec<_>>();
+    if inspection.registry_schema_version == 0 {
+        reasons.push("legacy_registry_schema_version_zero");
+    }
+    if !host_spi_id(id) {
+        reasons.push("config_id_outside_host_spi_namespace");
+    }
+    if json {
+        let registration = &inspection.entry;
+        let (target_path, target_path_truncated) = adapter
+            .map(|manifest| bounded_value(&manifest.target_path.display().to_string(), 512))
+            .unwrap_or_default();
+        let adapter_view = adapter.map(|manifest| {
+            serde_json::json!({
+                "id": manifest.id,
+                "display_name": manifest.display_name,
+                "summary": manifest.summary,
+                "target": {
+                    "format": "json",
+                    "path": target_path,
+                    "path_truncated": target_path_truncated
+                },
+                "manifest_provenance": {
+                    "value": manifest.provenance,
+                    "verification": "unverified"
+                }
+            })
+        });
+        let (registered_at, registered_at_truncated) =
+            bounded_value(&registration.registered_at, 128);
+        let (manifest_digest, manifest_digest_truncated) = bounded_value(&registration.digest, 80);
+        let (source_path, source_path_truncated) = bounded_value(&registration.source_path, 512);
+        let result = serde_json::json!({
+            "origin": "external_data_only",
+            "adapter": adapter_view,
+            "registration": {
+                "id": registration.id,
+                "enabled": registration.enabled,
+                "registry_schema_version": inspection.registry_schema_version,
+                "registered_at": registered_at,
+                "registered_at_truncated": registered_at_truncated,
+                "manifest_digest": manifest_digest,
+                "manifest_digest_truncated": manifest_digest_truncated,
+                "source_path": source_path,
+                "source_path_truncated": source_path_truncated,
+                "source_path_verification": "unverified_display_only",
+                "owned_manifest_file": if inspection.reason == Some("invalid_owned_filename")
+                    || inspection.reason == Some("invalid_registration_id") {
+                    None
+                } else {
+                    Some(registration.manifest_file.as_str())
+                }
+            },
+            "load_state": inspection.load_state,
+            "configuration_dispatch_registration": match inspection.load_state {
+                "enabled_valid" => "enabled",
+                "disabled" => "disabled",
+                _ => "rejected",
+            },
+            "declared_configuration_operations": adapter.map(|manifest| {
+                manifest.capabilities.iter().map(|capability| capability.as_str()).collect::<Vec<_>>()
+            }),
+            "host": host_observation_json(),
+            "executable_driver": {
+                "code_trust": "not_applicable_data_only_descriptor",
+                "availability": "unavailable_through_this_descriptor"
+            }
+        });
+        let verification = if inspection.reason.is_some() {
+            "failed"
+        } else {
+            "unverified"
+        };
+        let envelope = inspection_envelope(id, "success", reasons, verification, result);
+        println!("{}", serde_json::to_string_pretty(&envelope)?);
+    } else {
+        let entry = &inspection.entry;
+        let state = match inspection.load_state {
+            "enabled_valid" => "owned-copy integrity: matches recorded digest",
+            "disabled" => "owned-copy integrity: matches recorded digest",
+            _ => "owned-copy integrity: rejected",
+        };
+        if let Some(manifest) = adapter {
+            println!(
+                "{} ({})\n  {}\n  config: {}",
+                bounded_text(&manifest.display_name, 64),
+                bounded_text(&manifest.id, 64),
+                bounded_text(&manifest.summary, 200),
+                bounded_text(&manifest.target_path.display().to_string(), 512)
+            );
+        } else {
+            println!("{} registration", bounded_text(&entry.id, 64));
+        }
+        println!(
+            "  registration origin: external data-only\n  registration state: {}\n  registry schema version: {}{}\n  configuration dispatch registration: {}\n  enabled: {}\n  registered at: {}\n  pinned digest: {}\n  recorded source path: {} (unverified; display only; never re-read)\n  {}\n  declared configuration operations: {}\n  host installation: unknown\n  host trust: unknown\n  native observation: not observed\n  executable driver/code trust: not applicable to this data-only descriptor",
+            inspection.load_state,
+            inspection.registry_schema_version,
+            if inspection.registry_schema_version == 0 { " (legacy S6 record; preserved)" } else { "" },
+            if entry.enabled && inspection.reason.is_none() { "enabled" } else { "unavailable" },
+            entry.enabled,
+            bounded_text(&entry.registered_at, 128),
+            bounded_text(&entry.digest, 80),
+            bounded_text(&entry.source_path, 512),
+            state,
+            adapter.map(|manifest| manifest.capabilities.iter().map(|capability| capability.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_else(|| "unavailable because the owned manifest did not validate".to_string())
+        );
+        if let Some(reason) = inspection.reason {
+            println!("  reason: {reason}");
+        }
+        if !host_spi_id(id) {
+            println!("  host SPI adapter_id: unavailable for this configuration id");
+        }
+    }
+    Ok(())
+}
+
+fn handle_adapter_info(id: String, json: bool) -> anyhow::Result<()> {
+    if id.len() > 64 {
+        let failure = adapter_store::InspectionFailure {
+            reason: "unknown_adapter_id",
+        };
+        return print_inspection_failure(&id, failure, json);
+    }
+    if let Some(adapter) = adapter_registry::built_in(&id) {
+        return print_builtin_inspection(&id, adapter, json);
+    }
+    match adapter_store::inspect_registration(&fornax_home(), &id) {
+        Ok(inspection) => print_registration_inspection(&id, inspection, json),
+        Err(failure) => print_inspection_failure(&id, failure, json),
+    }
+}
+
+fn print_inspection_failure(
+    id: &str,
+    failure: adapter_store::InspectionFailure,
+    json: bool,
+) -> anyhow::Result<()> {
+    if json {
+        let envelope = inspection_envelope(
+            id,
+            "failed",
+            vec![failure.reason],
+            "failed",
+            serde_json::json!({"load_state": "unavailable"}),
+        );
+        println!("{}", serde_json::to_string_pretty(&envelope)?);
+    }
+    anyhow::bail!("adapter inspection failed ({})", failure.reason)
+}
+
 fn handle_adapter_action(action: AdapterAction) -> anyhow::Result<()> {
     match action {
         AdapterAction::List => {
@@ -1259,22 +1525,7 @@ fn handle_adapter_action(action: AdapterAction) -> anyhow::Result<()> {
                 }
             }
         }
-        AdapterAction::Info { id } => {
-            if let Some(adapter) = adapter_registry::resolve(&id) {
-                println!(
-                    "{} ({})\n  {}\n  config: {}",
-                    adapter.display_name(),
-                    adapter.id(),
-                    adapter.summary(),
-                    adapter.target_path().display()
-                );
-            } else if let Some(r) = adapter_registry::rejections().iter().find(|r| r.id == id) {
-                println!("{} is registered but did not load: {}", r.id, r.reason);
-            } else {
-                anyhow::bail!("no known or registered adapter with id {id:?}");
-            }
-            Ok(())
-        }
+        AdapterAction::Info { id, json } => handle_adapter_info(id, json),
         AdapterAction::Enable { id } => {
             adapter_store::set_enabled(&fornax_home(), &id, true)?;
             println!("Enabled {id}.");

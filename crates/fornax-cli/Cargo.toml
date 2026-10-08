@@ -29,3 +29,6 @@ base64.workspace = true
 sha2.workspace = true
 chrono.workspace = true
 thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "=1.1.5", features = ["fs"] }

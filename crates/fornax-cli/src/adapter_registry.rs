@@ -166,6 +166,12 @@ pub(crate) fn built_in_ids() -> impl Iterator<Item = &'static str> {
     BUILT_INS.iter().map(|a| a.id())
 }
 
+/// Resolves only the canonical built-in array without initializing external
+/// registration state.
+pub(crate) fn built_in(id: &str) -> Option<&'static dyn AdapterPlugin> {
+    BUILT_INS.iter().copied().find(|adapter| adapter.id() == id)
+}
+
 struct Loaded {
     adapters: Vec<&'static dyn AdapterPlugin>,
     rejections: Vec<crate::adapter_store::Rejection>,

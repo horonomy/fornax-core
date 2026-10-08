@@ -7,6 +7,13 @@ Jira epic FORNX-20.
 
 ## [Unreleased]
 
+### Added
+
+- `fornax adapter info|inspect <id>` now reports the retained registration,
+  owned-manifest integrity, and unverified source provenance. `--json` emits
+  the shared CLI operation-envelope v1 shape; these facts do not establish
+  host installation, trust, or native observation.
+
 ### Removed
 
 Intentional breaking cleanup during DogFooding (FORNX-428 S3), before any
