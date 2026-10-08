@@ -7,6 +7,7 @@
 //! way to add one is [`register`].
 
 use crate::adapter_manifest::{digest_of, parse_manifest_bytes, AdapterManifest};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 pub const REGISTRY_INDEX_FILE: &str = "registry.json";
@@ -46,6 +47,270 @@ fn default_index_schema_version() -> u32 {
 pub struct Rejection {
     pub id: String,
     pub reason: String,
+}
+
+/// A passive, fresh view of one external registration. This is display
+/// data; it never grants dispatch or host-operation authority.
+pub struct RegistrationInspection {
+    pub entry: RegistryEntry,
+    pub manifest: Option<AdapterManifest>,
+    pub registry_schema_version: u32,
+    pub load_state: &'static str,
+    pub reason: Option<&'static str>,
+}
+
+fn rejected_registration(
+    entry: RegistryEntry,
+    registry_schema_version: u32,
+    reason: &'static str,
+) -> RegistrationInspection {
+    RegistrationInspection {
+        entry,
+        manifest: None,
+        registry_schema_version,
+        load_state: "rejected",
+        reason: Some(reason),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("{reason}")]
+pub struct InspectionFailure {
+    pub reason: &'static str,
+}
+
+fn inspection_failure(reason: &'static str) -> InspectionFailure {
+    InspectionFailure { reason }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InspectionIndex {
+    schema_version: u32,
+    entries: Vec<RegistryEntry>,
+}
+
+// Hold the selected directory throughout inspection, so renaming or
+// replacing its path cannot redirect the index or manifest reads.
+struct InspectionDirectory {
+    #[cfg(unix)]
+    directory: std::fs::File,
+}
+
+#[cfg(unix)]
+fn open_relative(
+    directory: &std::fs::File,
+    name: &str,
+    flags: rustix::fs::OFlags,
+) -> std::io::Result<std::fs::File> {
+    rustix::fs::openat(directory, name, flags, rustix::fs::Mode::empty())
+        .map(std::fs::File::from)
+        .map_err(|error| {
+            if error == rustix::io::Errno::LOOP {
+                std::io::Error::from(std::io::ErrorKind::InvalidInput)
+            } else {
+                error.into()
+            }
+        })
+}
+
+impl InspectionDirectory {
+    #[cfg(unix)]
+    fn open(home: &Path) -> std::io::Result<Self> {
+        use rustix::fs::{Mode, OFlags};
+        // FORNAX_HOME is the caller-selected root, which may intentionally
+        // be an alias. Its adapters child and both leaf files cannot be.
+        let root = std::fs::File::from(rustix::fs::open(
+            home,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?);
+        let directory = open_relative(
+            &root,
+            "adapters",
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK
+                | rustix::fs::OFlags::CLOEXEC,
+        )?;
+        Ok(Self { directory })
+    }
+
+    #[cfg(not(unix))]
+    fn open(_home: &Path) -> std::io::Result<Self> {
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
+
+    #[cfg(unix)]
+    fn read_bounded(&self, name: &str, max_bytes: usize) -> std::io::Result<Vec<u8>> {
+        use std::os::unix::fs::MetadataExt;
+        let file = open_relative(
+            &self.directory,
+            name,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK
+                | rustix::fs::OFlags::CLOEXEC,
+        )?;
+        let before = file.metadata()?;
+        if !before.is_file() {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+        }
+        let mut bytes = Vec::new();
+        (&file).take(max_bytes as u64 + 1).read_to_end(&mut bytes)?;
+        let after = file.metadata()?;
+        if before.len() != after.len()
+            || before.mtime() != after.mtime()
+            || before.mtime_nsec() != after.mtime_nsec()
+            || before.ctime() != after.ctime()
+            || before.ctime_nsec() != after.ctime_nsec()
+        {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+        }
+        Ok(bytes)
+    }
+
+    #[cfg(not(unix))]
+    fn read_bounded(&self, _name: &str, _max_bytes: usize) -> std::io::Result<Vec<u8>> {
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
+}
+
+/// Reads the existing index afresh and validates exactly one selected
+/// owned copy. It never follows `source_path` or opens the declared target.
+pub fn inspect_registration(
+    fornax_home: &Path,
+    id: &str,
+) -> Result<RegistrationInspection, InspectionFailure> {
+    if id.len() > 64 {
+        return Err(inspection_failure("unknown_adapter_id"));
+    }
+    let directory = match InspectionDirectory::open(fornax_home) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(inspection_failure("unknown_adapter_id"));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+            return Err(inspection_failure("inspection_platform_unsupported"));
+        }
+        Err(_) => return Err(inspection_failure("registry_index_unreadable")),
+    };
+    let index_bytes = match directory.read_bounded(REGISTRY_INDEX_FILE, MAX_INDEX_BYTES) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(inspection_failure("unknown_adapter_id"));
+        }
+        Err(_) => return Err(inspection_failure("registry_index_unreadable")),
+    };
+    if index_bytes.len() > MAX_INDEX_BYTES {
+        return Err(inspection_failure("registry_index_oversized"));
+    }
+    let index: InspectionIndex = serde_json::from_slice(&index_bytes)
+        .map_err(|_| inspection_failure("registry_index_malformed"))?;
+    if !matches!(index.schema_version, 0 | 1) {
+        return Err(inspection_failure("registry_index_unsupported_version"));
+    }
+    let registry_schema_version = index.schema_version;
+    if index.entries.len() > MAX_ENTRIES {
+        return Err(inspection_failure("registry_index_too_many_entries"));
+    }
+
+    let mut selected = index.entries.iter().filter(|entry| entry.id == id);
+    let Some(entry) = selected.next() else {
+        return Err(inspection_failure("unknown_adapter_id"));
+    };
+    if selected.next().is_some() {
+        return Err(inspection_failure("duplicate_registration_id"));
+    }
+    let entry = entry.clone();
+    if crate::adapter_manifest::validate_id(&entry.id).is_err() {
+        return Ok(rejected_registration(
+            entry,
+            registry_schema_version,
+            "invalid_registration_id",
+        ));
+    }
+    let expected_file = format!("{}.manifest.json", entry.id);
+    if entry.manifest_file != expected_file {
+        return Ok(rejected_registration(
+            entry,
+            registry_schema_version,
+            "invalid_owned_filename",
+        ));
+    }
+
+    let bytes =
+        match directory.read_bounded(&expected_file, crate::adapter_manifest::MAX_MANIFEST_BYTES) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let reason = match error.kind() {
+                    std::io::ErrorKind::InvalidInput => "invalid_owned_file_type",
+                    std::io::ErrorKind::InvalidData => "owned_manifest_changed",
+                    _ => "owned_manifest_unavailable",
+                };
+                return Ok(rejected_registration(
+                    entry,
+                    registry_schema_version,
+                    reason,
+                ));
+            }
+        };
+    if bytes.len() > crate::adapter_manifest::MAX_MANIFEST_BYTES {
+        return Ok(rejected_registration(
+            entry,
+            registry_schema_version,
+            "owned_manifest_oversized",
+        ));
+    }
+    if digest_of(&bytes) != entry.digest {
+        return Ok(rejected_registration(
+            entry,
+            registry_schema_version,
+            "digest_mismatch",
+        ));
+    }
+    let manifest = match parse_manifest_bytes(&bytes, &crate::dirs_home()) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            let reason = if error
+                .downcast_ref::<crate::adapter_manifest::ManifestError>()
+                .is_some_and(|e| {
+                    matches!(
+                        e,
+                        crate::adapter_manifest::ManifestError::UnsupportedSchemaVersion { .. }
+                    )
+                }) {
+                "unsupported_manifest_version"
+            } else {
+                "malformed_manifest"
+            };
+            return Ok(rejected_registration(
+                entry,
+                registry_schema_version,
+                reason,
+            ));
+        }
+    };
+    if manifest.id != entry.id {
+        return Ok(rejected_registration(
+            entry,
+            registry_schema_version,
+            "manifest_id_mismatch",
+        ));
+    }
+
+    Ok(RegistrationInspection {
+        registry_schema_version,
+        load_state: if entry.enabled {
+            "enabled_valid"
+        } else {
+            "disabled"
+        },
+        entry,
+        manifest: Some(manifest),
+        reason: None,
+    })
 }
 
 fn adapters_dir(fornax_home: &Path) -> PathBuf {
@@ -604,5 +869,31 @@ mod tests {
         let (loaded, _) = load_external(&fornax_home);
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id(), "fixture-h2");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod inspection_directory_tests {
+    use super::InspectionDirectory;
+
+    #[test]
+    fn replacing_adapter_directory_cannot_redirect_held_reads() {
+        let root = std::env::temp_dir().join(format!(
+            "fornax-inspection-directory-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home = root.join("home");
+        let adapters = home.join("adapters");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&adapters).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(adapters.join("registry.json"), b"owned").unwrap();
+        std::fs::write(outside.join("registry.json"), b"outside-canary").unwrap();
+        let held = InspectionDirectory::open(&home).unwrap();
+        std::fs::rename(&adapters, root.join("original-adapters")).unwrap();
+        std::os::unix::fs::symlink(&outside, &adapters).unwrap();
+        assert_eq!(held.read_bounded("registry.json", 64).unwrap(), b"owned");
+        assert!(InspectionDirectory::open(&home).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
