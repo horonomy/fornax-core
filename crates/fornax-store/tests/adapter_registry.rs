@@ -425,7 +425,23 @@ fn lock_contention_is_bounded_and_leaves_the_index_unchanged() {
         )
         .unwrap(),
     );
-    rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+    // This open file description has never been flock'd by anyone, so the
+    // first attempt should always succeed immediately. A transient
+    // WouldBlock here has been observed on a loaded CI runner (not
+    // reproduced locally across repeated runs); retried a few times with a
+    // short backoff rather than treating a scheduling hiccup in this test's
+    // own setup as the product behavior under test, which starts below.
+    let mut attempts = 0;
+    loop {
+        match rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => break,
+            Err(rustix::io::Errno::AGAIN | rustix::io::Errno::WOULDBLOCK) if attempts < 20 => {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => panic!("test setup could not acquire its own fresh lock fd: {error}"),
+        }
+    }
 
     let started = std::time::Instant::now();
     let error = set_registration_enabled(&home, id, false).unwrap_err();
