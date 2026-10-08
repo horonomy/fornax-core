@@ -630,6 +630,27 @@ impl Store {
         Ok(rows)
     }
 
+    /// The single most recent finding for one session (HORO-1601/1602: the
+    /// statusline provider's session-scoped reading) — the `LIMIT 1`
+    /// counterpart to [`Store::findings_for_session`], which returns every
+    /// row and is for the dashboard's session-detail page, not the hot
+    /// path. Uses the same `idx_claims_session` index, so this stays cheap
+    /// at the same cost `findings_for_session` already pays per row
+    /// fetched, just bounded to one.
+    pub async fn latest_finding_for_session(&self, session_id: &str) -> Result<Option<FindingRow>> {
+        let row = sqlx::query_as::<_, FindingRow>(
+            "SELECT f.id, f.claim_id, f.verdict, f.evidence_ids, f.verifier_name, f.rationale, f.computed_at,
+                    c.text as claim_text, c.session_id as session_id
+             FROM findings f JOIN claims c ON c.id = f.claim_id
+             WHERE c.session_id = ?1
+             ORDER BY f.computed_at DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
     /// All findings for one session, newest first (FORNX-18: the
     /// dashboard's session-detail page — distinct from `recent_findings`,
     /// which is cross-session).
@@ -2085,6 +2106,95 @@ mod tests {
             .evidence;
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].source, None);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A finding for one session, with a given verdict and timestamp,
+    /// inserted via its own fresh event+claim (findings never share a claim)
+    /// so `latest_finding_for_session`/`recent_findings` can be exercised
+    /// without an unrelated evidence row.
+    async fn insert_session_finding(
+        store: &Store,
+        session_id: &str,
+        verdict: Verdict,
+        computed_at: &str,
+    ) {
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: session_id.into(),
+            provider: Provider::Codex,
+            kind: EventKind::PostToolUse,
+            observed_at: computed_at.into(),
+            tool_name: Some("exec_command".into()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        store.insert_event(&event).await.expect("insert event");
+        let claim = Claim {
+            id: Uuid::new_v4(),
+            session_id: session_id.into(),
+            source_event_id: event.id,
+            text: "claim text".into(),
+            subject: "test_result".into(),
+            claimed_at: computed_at.into(),
+        };
+        store.insert_claim(&claim).await.expect("insert claim");
+        store
+            .insert_finding(&Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict,
+                evidence_ids: vec![],
+                verifier_name: "test_result_verifier_v1".into(),
+                rationale: "test".into(),
+                computed_at: computed_at.into(),
+            })
+            .await
+            .expect("insert finding");
+    }
+
+    #[tokio::test]
+    async fn latest_finding_for_session_is_the_newest_row_for_that_session_only() {
+        let path = tmp_db_path("latest-finding-for-session");
+        let store = Store::open(&path).await.expect("open db");
+
+        insert_session_finding(&store, "sess-a", Verdict::Verified, "2026-01-01T00:00:01Z").await;
+        insert_session_finding(
+            &store,
+            "sess-a",
+            Verdict::Contradicted,
+            "2026-01-01T00:00:02Z",
+        )
+        .await;
+        // A different session's later finding must never be returned for
+        // "sess-a" -- this is the whole reason this method exists instead
+        // of reusing cross-session `recent_findings`.
+        insert_session_finding(&store, "sess-b", Verdict::Verified, "2026-01-01T00:00:03Z").await;
+
+        let latest = store
+            .latest_finding_for_session("sess-a")
+            .await
+            .expect("query latest finding for session")
+            .expect("sess-a has a finding");
+        assert_eq!(latest.verdict, "contradicted");
+        assert_eq!(latest.session_id, "sess-a");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn latest_finding_for_session_is_none_for_an_unknown_session() {
+        let path = tmp_db_path("latest-finding-for-unknown-session");
+        let store = Store::open(&path).await.expect("open db");
+        insert_session_finding(&store, "sess-a", Verdict::Verified, "2026-01-01T00:00:01Z").await;
+
+        let latest = store
+            .latest_finding_for_session("sess-never-seen")
+            .await
+            .expect("query latest finding for session");
+        assert!(latest.is_none());
 
         std::fs::remove_file(&path).ok();
     }
