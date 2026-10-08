@@ -1,7 +1,10 @@
 # Fornax
 
-Evidence-first agent-integrity system for coding agents (Claude Code, Codex,
-opencode).
+Evidence-first execution-truth infrastructure for AI agents: it checks what
+an agent claims it did against the observable evidence of what actually ran.
+
+Currently supports coding agents (Claude Code, Codex, opencode) — see
+`docs/research/adapter-capability-matrix.md` for the exact adapter surface.
 
 **What should I believe about what this agent is telling me, given the
 evidence currently available?**
