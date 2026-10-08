@@ -37,6 +37,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use fornax_store::Store;
+use fornax_types::{EventKind, Evidence, EvidenceKind, Provider};
 
 fn workspace_bin(name: &str) -> PathBuf {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -191,6 +192,80 @@ fn short_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
 }
 
+/// Wait for a decoded, non-purged ExitCode row linked to this session's real
+/// Claude PostToolUse event and carrying the exact fixture observation.
+async fn wait_for_post_tool_evidence(store: &Store, session: &str) -> Evidence {
+    let session = session.to_owned();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let events = store
+            .events_for_session(&session)
+            .await
+            .unwrap_or_else(|error| panic!("read events for {session}: {error}"));
+        let post_event_ids: std::collections::HashSet<_> = events
+            .iter()
+            .filter(|event| {
+                event.provider == Provider::ClaudeCode && event.kind == EventKind::PostToolUse
+            })
+            .map(|event| event.id)
+            .collect();
+        let outcome = store
+            .evidence_for_session(&session)
+            .await
+            .unwrap_or_else(|error| panic!("read evidence for {session}: {error}"));
+        assert!(
+            outcome.failed.is_empty(),
+            "evidence decode failed for {session}: failed={:?}, decoded_rows={}, post_event_ids={post_event_ids:?}",
+            outcome.failed,
+            outcome.evidence.len()
+        );
+        let matching: Vec<_> = outcome
+            .evidence
+            .iter()
+            .filter(|evidence| {
+                !evidence.evidence_purged
+                    && evidence.kind == EvidenceKind::ExitCode
+                    && evidence.session_id == session
+                    && post_event_ids.contains(&evidence.source_event_id)
+                    && evidence.payload.get("command").and_then(|v| v.as_str())
+                        == Some("cargo test --workspace")
+                    && evidence.payload.get("exit_code").and_then(|v| v.as_i64()) == Some(0)
+                    && evidence.payload.get("heuristic").and_then(|v| v.as_bool()) == Some(false)
+            })
+            .cloned()
+            .collect();
+        assert!(
+            matching.len() <= 1,
+            "duplicate expected evidence for {session}: matching={matching:?}, post_event_ids={post_event_ids:?}"
+        );
+        if let Some(evidence) = matching.into_iter().next() {
+            return evidence;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let evidence_rows: Vec<_> = outcome
+                .evidence
+                .iter()
+                .map(|evidence| {
+                    (
+                        evidence.id,
+                        evidence.source_event_id,
+                        evidence.kind,
+                        evidence.evidence_purged,
+                        &evidence.payload,
+                    )
+                })
+                .collect();
+            panic!(
+                "expected PostToolUse ExitCode evidence before 15s for {session}; events={}, post_event_ids={post_event_ids:?}, decoded_rows={}, evidence_rows={evidence_rows:?}, failed={:?}",
+                events.len(),
+                outcome.evidence.len(),
+                outcome.failed
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 fn post_tool_use_payload(session_id: &str, exit_code: i64) -> Vec<u8> {
     serde_json::json!({
         "hook_event_name": "PostToolUse",
@@ -249,19 +324,35 @@ async fn independent_sessions_submitted_concurrently_are_not_lost_or_mixed_up() 
         .map(|s| write_passed_transcript(&daemon.home, s))
         .collect();
 
+    let mut expected_evidence_by_session = std::collections::HashMap::new();
     let mut tasks = tokio::task::JoinSet::new();
     for (session, transcript_path) in sessions.iter().cloned().zip(transcripts.iter().cloned()) {
         let home = daemon.home.clone();
-        tasks.spawn_blocking(move || {
-            let post = send_hook(&home, &post_tool_use_payload(&session, 0));
-            let stop = send_hook(&home, &stop_payload(&transcript_path, &session));
-            (session, post, stop)
+        let store = store.clone();
+        tasks.spawn(async move {
+            let post_home = home.clone();
+            let post_session = session.clone();
+            let post = tokio::task::spawn_blocking(move || {
+                send_hook(&post_home, &post_tool_use_payload(&post_session, 0))
+            })
+            .await
+            .expect("post task panicked");
+            let evidence = wait_for_post_tool_evidence(&store, &session).await;
+            let stop_session = session.clone();
+            let stop = tokio::task::spawn_blocking(move || {
+                send_hook(&home, &stop_payload(&transcript_path, &stop_session))
+            })
+            .await
+            .expect("stop task panicked");
+            (session, post, stop, evidence)
         });
     }
     while let Some(res) = tasks.join_next().await {
-        let (session, post_status, stop_status) = res.expect("hook task panicked");
+        let (session, post_status, stop_status, expected_evidence) =
+            res.expect("hook task panicked");
         assert_eq!(post_status, 0, "PostToolUse hook failed for {session}");
         assert_eq!(stop_status, 0, "Stop hook failed for {session}");
+        expected_evidence_by_session.insert(session, expected_evidence);
     }
 
     for session in &sessions {
@@ -350,6 +441,14 @@ async fn independent_sessions_submitted_concurrently_are_not_lost_or_mixed_up() 
              should resolve VERIFIED, not {:?}",
             findings[0].verdict
         );
+        let evidence = expected_evidence_by_session
+            .get(session)
+            .expect("session barrier evidence");
+        let finding_evidence_ids: Vec<uuid::Uuid> = serde_json::from_str(&findings[0].evidence_ids)
+            .unwrap_or_else(|error| panic!("decode finding evidence ids for {session}: {error}"));
+        assert!(finding_evidence_ids.contains(&evidence.id),
+            "session {session} finding references {finding_evidence_ids:?}, expected its PostToolUse evidence {}",
+            evidence.id);
     }
 }
 
@@ -397,23 +496,14 @@ async fn many_sessions_evidence_then_claim_phases_stay_serialized_under_contenti
         );
     }
 
-    // Barrier: don't start phase 2 until every session's Evidence is
-    // actually durable — a real synchronization point, not a guess at
-    // timing. This is what makes phase 2's "PostToolUse precedes Stop for
-    // this session" true in substance, not just in dispatch order.
+    // Barrier: don't start phase 2 until every session has a decoded,
+    // non-purged ExitCode row linked to its real PostToolUse event.
+    let mut expected_evidence = std::collections::HashMap::new();
     for session in &sessions {
-        wait_for(Duration::from_secs(15), || {
-            let store = &store;
-            let session = session.clone();
-            async move {
-                !store
-                    .events_for_session(&session)
-                    .await
-                    .expect("events")
-                    .is_empty()
-            }
-        })
-        .await;
+        expected_evidence.insert(
+            session.clone(),
+            wait_for_post_tool_evidence(&store, session).await,
+        );
     }
 
     // Phase 2: N Stop hooks, one per session, all dispatched at once —
@@ -460,10 +550,30 @@ async fn many_sessions_evidence_then_claim_phases_stay_serialized_under_contenti
             findings[0].verdict, "verified",
             "session {session}: concurrent multi-session contention on the processing mutex \
              must still resolve VERIFIED, not {:?} — a regression here means concurrent \
-             Events/Claims from other sessions are corrupting or reordering this session's own \
-             evidence-before-claim guarantee (FORNX-281)",
+             Events/Claims from other sessions are affecting this session's finding despite \
+             its own decoded evidence being present before phase 2 (FORNX-281)",
             findings[0].verdict
         );
+        let claims = store
+            .claims_for_session(session)
+            .await
+            .expect("read phase claims");
+        assert_eq!(
+            claims.len(),
+            1,
+            "session {session}: expected exactly one own claim"
+        );
+        assert_eq!(
+            findings[0].claim_id,
+            claims[0].id.to_string(),
+            "finding belongs to own phase claim"
+        );
+        let evidence = expected_evidence.get(session).expect("barrier evidence");
+        let finding_evidence_ids: Vec<uuid::Uuid> = serde_json::from_str(&findings[0].evidence_ids)
+            .unwrap_or_else(|error| panic!("decode finding evidence ids for {session}: {error}"));
+        assert!(finding_evidence_ids.contains(&evidence.id),
+            "session {session} finding references {finding_evidence_ids:?}, expected its PostToolUse evidence {}",
+            evidence.id);
 
         let events = store
             .events_for_session(session)
@@ -475,4 +585,100 @@ async fn many_sessions_evidence_then_claim_phases_stay_serialized_under_contenti
             "session {session} should have exactly its own two events under contention, got {events:?}"
         );
     }
+}
+
+/// A late PostToolUse observation cannot retroactively change a finding
+/// computed when Stop's claim arrived first. This documents the existing
+/// processing-order limitation without weakening the positive tests.
+#[tokio::test]
+async fn evidence_ingested_after_claim_does_not_rewrite_the_finding() {
+    let daemon = start_daemon().await;
+    let store = open_store(&daemon).await;
+    let session = format!("concurrent-late-evidence-{}", short_id());
+    let transcript = write_passed_transcript(&daemon.home, &session);
+
+    let stop_home = daemon.home.clone();
+    let stop_session = session.clone();
+    let stop_status = tokio::task::spawn_blocking(move || {
+        send_hook(&stop_home, &stop_payload(&transcript, &stop_session))
+    })
+    .await
+    .expect("stop task panicked");
+    assert_eq!(stop_status, 0, "Stop hook failed");
+
+    wait_for(Duration::from_secs(15), || {
+        let store = &store;
+        let session = session.clone();
+        async move {
+            !store
+                .findings_for_session(&session)
+                .await
+                .expect("read own findings before late evidence")
+                .is_empty()
+        }
+    })
+    .await;
+    let mut initial = store
+        .findings_for_session(&session)
+        .await
+        .expect("read initial own findings");
+    assert_eq!(
+        initial.len(),
+        1,
+        "expected exactly one finding before late evidence"
+    );
+    let before = initial.pop().expect("initial own finding");
+    assert_eq!(
+        before.verdict, "unverified",
+        "claim arrived before evidence; rationale={}",
+        before.rationale
+    );
+
+    let post_home = daemon.home.clone();
+    let post_session = session.clone();
+    let post_status = tokio::task::spawn_blocking(move || {
+        send_hook(&post_home, &post_tool_use_payload(&post_session, 0))
+    })
+    .await
+    .expect("post task panicked");
+    assert_eq!(post_status, 0, "late PostToolUse hook failed");
+    let late_evidence = wait_for_post_tool_evidence(&store, &session).await;
+
+    let mut later = store
+        .findings_for_session(&session)
+        .await
+        .expect("read own findings after late evidence");
+    assert_eq!(
+        later.len(),
+        1,
+        "expected exactly one finding after late evidence"
+    );
+    let after = later
+        .pop()
+        .expect("own finding remains present after late evidence");
+    let claims = store
+        .claims_for_session(&session)
+        .await
+        .expect("read late-evidence claims");
+    assert_eq!(claims.len(), 1, "expected exactly one own claim");
+    assert_eq!(after.claim_id, claims[0].id.to_string());
+    let events = store
+        .events_for_session(&session)
+        .await
+        .expect("read late-evidence events");
+    assert_eq!(events.len(), 2, "expected own Stop and PostToolUse events");
+    assert_eq!(after.id, before.id, "late evidence replaced the finding");
+    assert_eq!(
+        after.verdict, "unverified",
+        "late evidence rewrote the verdict; rationale={}",
+        after.rationale
+    );
+    let after_evidence_ids: Vec<uuid::Uuid> =
+        serde_json::from_str(&after.evidence_ids).expect("decode post-ingest finding evidence ids");
+    assert!(
+        !after_evidence_ids.contains(&late_evidence.id),
+        "late evidence {} was retroactively attached to finding {:?}",
+        late_evidence.id,
+        after_evidence_ids
+    );
 }
