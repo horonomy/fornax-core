@@ -594,35 +594,52 @@ async fn main() -> anyhow::Result<()> {
                 Err(e) => println!("fornax: {e}"),
             }
         }
-        Commands::Statusline { command } => match command {
-            // Exits 0 in every case, including every failure. The host runs
-            // this on the statusline hot path and reads stdout; a non-zero
-            // exit would make a stopped daemon indistinguishable from a
-            // broken provider, and the payload already says which it is.
-            StatuslineCommand::Provider => {
-                let payload = match statusline::probe(statusline::HOT_PATH_BUDGET).await {
-                    Ok(body) => statusline::reading(&body, chrono::Utc::now()),
-                    Err(kind) => statusline::no_reading(kind),
-                };
-                println!("{payload}");
-            }
-            // Not on the hot path, so this one may make the second, heavier
-            // call the provider refuses to make.
-            StatuslineCommand::Explain => match statusline::probe(statusline::EXPLAIN_BUDGET).await
-            {
-                Ok(body) => {
-                    let fused = match body.get("latest").filter(|l| !l.is_null()) {
-                        Some(latest) => statusline::probe_fusion(latest).await,
-                        None => None,
-                    };
-                    print!(
-                        "{}",
-                        statusline::explain_text(&body, fused.as_ref(), chrono::Utc::now())
-                    );
+        Commands::Statusline { command } => {
+            match command {
+                // Exits 0 in every case, including every failure. The host runs
+                // this on the statusline hot path and reads stdout; a non-zero
+                // exit would make a stopped daemon indistinguishable from a
+                // broken provider, and the payload already says which it is.
+                StatuslineCommand::Provider => {
+                    // HORO-1601/1602: read once, before probing, so the same
+                    // resolved identity (or its absence) drives both the
+                    // request and the scope this client is honest about
+                    // declaring on the response.
+                    let session = statusline::read_identity_stdin();
+                    let payload =
+                        match statusline::probe(statusline::HOT_PATH_BUDGET, session.as_deref())
+                            .await
+                        {
+                            Ok(body) => statusline::reading(&body, chrono::Utc::now()),
+                            Err(kind) => statusline::no_reading(kind),
+                        };
+                    println!("{payload}");
                 }
-                Err(kind) => print!("{}", statusline::explain_unavailable(kind)),
-            },
-        },
+                // Not on the hot path, so this one may make the second, heavier
+                // call the provider refuses to make.
+                StatuslineCommand::Explain => {
+                    let session = statusline::read_identity_stdin();
+                    match statusline::probe(statusline::EXPLAIN_BUDGET, session.as_deref()).await {
+                        Ok(body) => {
+                            let fused = match body.get("latest").filter(|l| !l.is_null()) {
+                                Some(latest) => statusline::probe_fusion(latest).await,
+                                None => None,
+                            };
+                            print!(
+                                "{}",
+                                statusline::explain_text(
+                                    &body,
+                                    fused.as_ref(),
+                                    chrono::Utc::now(),
+                                    session.as_deref(),
+                                )
+                            );
+                        }
+                        Err(kind) => print!("{}", statusline::explain_unavailable(kind)),
+                    }
+                }
+            }
+        }
         Commands::Capabilities { session } => {
             let url = format!("{}/api/capabilities?session={}", base_url(), session);
             match fetch_json(&url).await {

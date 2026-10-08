@@ -28,10 +28,62 @@
 //! Code settings patcher; enabling and disabling this provider is the shared
 //! lifecycle tool's job (HORO-1566). This module reads one HTTP endpoint.
 
+use std::io::{IsTerminal, Read};
 use std::time::Duration;
 
 use chrono::{DateTime, SubsecRound, Utc};
 use serde_json::{json, Value};
+
+/// Version of the host-compositor identity-stdin document (HORO-1602) this
+/// client understands. An unrecognised version is treated exactly like
+/// absent stdin -- there is no partial-trust reading of a document shape
+/// this client was not built to parse.
+const IDENTITY_STDIN_VERSION: u64 = 1;
+
+/// Read `provider_session_id` from the host's identity-stdin document, per
+/// `governance/product/statusline-host-compositor.md`'s "Provider identity
+/// context" section in `horonomy/.github`.
+///
+/// Every failure mode here -- a TTY, no bytes, unparseable JSON, the wrong
+/// `identity_stdin_version`, a missing or empty `provider_session_id`, or a
+/// raw Claude Code payload piped in directly (it has `session_id`, not this
+/// document's shape, and no version field at all) -- collapses to `None`,
+/// which is byte-identical to "the host sent nothing." This client never
+/// falls back to guessing a session id from any other source (PID, cwd,
+/// environment): absent identity is absent identity.
+///
+/// Guards against blocking on a human-run `fornax statusline provider`
+/// (`docs/dogfooding-status-line.md` tells users to run this by hand) by
+/// skipping the read entirely when stdin is a terminal -- reading from an
+/// interactive TTY would hang waiting for input that is never coming.
+pub fn read_identity_stdin() -> Option<String> {
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        return None;
+    }
+    let mut buf = Vec::with_capacity(256);
+    stdin.lock().take(4096).read_to_end(&mut buf).ok()?;
+    parse_identity_document(&buf)
+}
+
+/// The parsing half of [`read_identity_stdin`], split out so every failure
+/// mode (malformed JSON, wrong version, missing/empty field, a raw Claude
+/// Code payload with no version field at all) is unit-testable without
+/// faking process stdin.
+fn parse_identity_document(buf: &[u8]) -> Option<String> {
+    if buf.is_empty() {
+        return None;
+    }
+    let doc: Value = serde_json::from_slice(buf).ok()?;
+    if doc.get("identity_stdin_version")?.as_u64()? != IDENTITY_STDIN_VERSION {
+        return None;
+    }
+    let session_id = doc.get("provider_session_id")?.as_str()?;
+    if session_id.is_empty() {
+        return None;
+    }
+    Some(session_id.to_string())
+}
 
 /// Version of the cross-product provider contract (HORO-1564) this module
 /// speaks. A host that does not recognise it refuses the whole payload
@@ -42,15 +94,22 @@ pub const CONTRACT_VERSION: u32 = 1;
 /// Provider id, as registered with the host.
 pub const PROVIDER_ID: &str = "fornax";
 
-/// Breadth of the state being reported.
+/// Default breadth of the state being reported, when no provider-session
+/// identity is known or the daemon did not confirm it filtered by one.
 ///
-/// `host`, not `session`, and this is a correctness claim rather than a
-/// convenience. The hot path reads `GET /api/status`, which is
-/// `Store::recent_findings(1)`: a single `ORDER BY computed_at DESC LIMIT 1`
-/// over the findings table with **no session predicate**. The latest finding
-/// on this machine may therefore belong to a different session than the one
-/// the statusline is being rendered for. Declaring `session` would make the
-/// host label it as this session's state, which would be false.
+/// This was unconditionally the right answer before HORO-1601/1602: the hot
+/// path read `GET /api/status`, which was `Store::recent_findings(1)` — a
+/// single `ORDER BY computed_at DESC LIMIT 1` over the findings table with
+/// **no session predicate** — so the latest finding on this machine could
+/// belong to a different session than the one the statusline is being
+/// rendered for, and declaring `session` would have made the host label it
+/// as this session's state, which would have been false. `GET /api/status`
+/// now also accepts `?session=`, and [`reading`] declares `session` instead
+/// of this constant exactly when the daemon's response proves it actually
+/// honored that parameter (`"session_scoped": true`) — never merely because
+/// the CLI asked for it. This constant remains the honest default for every
+/// case that confirmation does not cover: no identity resolved at all, or an
+/// older daemon that does not understand the parameter yet.
 pub const SCOPE: &str = "host";
 
 /// Where Fornax sits relative to other products on the shared line. Lower
@@ -393,7 +452,21 @@ fn freshness(computed_at: &str, now: DateTime<Utc>) -> Option<(String, i64)> {
 /// verified nothing yet — which is `neutral`, never `ok`. "Nothing has been
 /// checked" is not "everything checks out", and no count is reported either,
 /// because a zero here would read as a clean bill of health.
+///
+/// `scope` (HORO-1601/1602) is declared `session` only when `body` itself
+/// carries `"session_scoped": true` — the daemon's own confirmation that it
+/// understood `?session=` and actually filtered by it, not merely that the
+/// CLI *asked* for session scoping. An older daemon that ignores the query
+/// parameter and answers cross-session, or a daemon this client did not ask
+/// for session scoping at all, both leave `session_scoped` absent, and this
+/// falls back to [`SCOPE`] (`host`) — never guessed, never defaulted to the
+/// more specific claim.
 pub fn reading(body: &Value, now: DateTime<Utc>) -> Value {
+    let scope = if body.get("session_scoped").and_then(Value::as_bool) == Some(true) {
+        "session"
+    } else {
+        SCOPE
+    };
     let mut observed_at = None;
     let segment = match body.get("latest").filter(|l| !l.is_null()) {
         None => json!({
@@ -447,7 +520,7 @@ pub fn reading(body: &Value, now: DateTime<Utc>) -> Value {
         "contract_version": CONTRACT_VERSION,
         "provider": PROVIDER_ID,
         "provider_version": env!("CARGO_PKG_VERSION"),
-        "scope": SCOPE,
+        "scope": scope,
         "availability": "available",
         "order_hint": ORDER_HINT,
         "clear_authority": CLEAR_AUTHORITY,
@@ -495,8 +568,29 @@ fn evidence_sought(verifier_name: &str) -> Option<&'static str> {
 /// Claim and session ids are also left out. They are opaque identifiers that
 /// answer no question a reader of this surface is asking, and printing an
 /// identifier by default is how identifiers end up pasted into tickets.
-pub fn explain_text(status: &Value, fused: Option<&Value>, now: DateTime<Utc>) -> String {
-    let mut out = String::from("Fornax — latest finding on this machine (host-wide)\n\n");
+///
+/// `requested_session` (HORO-1601/1602) is whatever identity this client
+/// resolved before probing, independent of whether the daemon confirmed it
+/// — passed through so the header can name *which* of the three cases
+/// applied instead of a single hardcoded claim: scoped to this session,
+/// host-wide because no session identity was available, or host-wide
+/// because this daemon did not confirm it understood `?session=`.
+pub fn explain_text(
+    status: &Value,
+    fused: Option<&Value>,
+    now: DateTime<Utc>,
+    requested_session: Option<&str>,
+) -> String {
+    let confirmed = status.get("session_scoped").and_then(Value::as_bool) == Some(true);
+    let header = match (requested_session, confirmed) {
+        (Some(_), true) => "Fornax — latest finding for this session\n\n",
+        (Some(_), false) => {
+            "Fornax — latest finding on this machine (host-wide — this daemon did not \
+             confirm session-scoped filtering)\n\n"
+        }
+        (None, _) => "Fornax — latest finding on this machine (host-wide — no session identity available)\n\n",
+    };
+    let mut out = String::from(header);
     let Some(latest) = status.get("latest").filter(|l| !l.is_null()) else {
         out.push_str("  No findings recorded yet. The daemon is running and has\n");
         out.push_str("  verified nothing so far, which is not the same as a pass.\n");
@@ -594,13 +688,23 @@ fn explain_fused(fused: Option<&Value>) -> String {
 /// serves is refused — but the outcome is returned as a typed [`NoReading`]
 /// rather than an error string, because the two refusal cases must render as
 /// two different reason codes.
-pub async fn probe(budget: Duration) -> Result<Value, NoReading> {
+///
+/// `session`, when present (HORO-1601/1602), is sent as `?session=` via
+/// `reqwest`'s own query-building (`RequestBuilder::query`), never
+/// hand-formatted into the URL string -- a raw `format!` would need its own
+/// percent-encoding for a session id that happens to contain `&`/`=`/etc.,
+/// which `query` already does correctly.
+pub async fn probe(budget: Duration, session: Option<&str>) -> Result<Value, NoReading> {
     let url = format!("{}/api/status", crate::base_url());
     let client = reqwest::Client::builder()
         .timeout(budget)
         .build()
         .map_err(|_| NoReading::DaemonUnreachable)?;
-    let response = client.get(&url).send().await.map_err(|e| {
+    let mut request = client.get(&url);
+    if let Some(session_id) = session {
+        request = request.query(&[("session", session_id)]);
+    }
+    let response = request.send().await.map_err(|e| {
         if e.is_timeout() {
             NoReading::DaemonTooSlow
         } else {
@@ -1144,7 +1248,7 @@ mod tests {
     fn no_free_text_product_field_reaches_the_explain_surface() {
         // Same guarantee where the temptation is strongest: this surface has
         // room to print the rationale and deliberately does not.
-        let text = explain_text(&status_with("unverified"), None, now());
+        let text = explain_text(&status_with("unverified"), None, now(), None);
         assert_nothing_forbidden("explain", &text);
         // And with a fused view, whose rationale entries carry their own free
         // text in `detail`.
@@ -1159,7 +1263,7 @@ mod tests {
                 }],
             },
         });
-        let text = explain_text(&status_with("unverified"), Some(&fused), now());
+        let text = explain_text(&status_with("unverified"), Some(&fused), now(), None);
         assert_nothing_forbidden("explain with fused view", &text);
         // The closed vocabularies it *is* allowed to print are still printed,
         // so this is not passing by rendering nothing.
@@ -1181,7 +1285,7 @@ mod tests {
         let rendered = format!(
             "{}{}",
             reading(&body, now()),
-            explain_text(&body, None, now())
+            explain_text(&body, None, now(), None)
         );
         for id in ids {
             assert!(!rendered.contains(id), "leaked {id}");
@@ -1205,7 +1309,7 @@ mod tests {
         // The whole point of this surface is that a user arrives asking "why
         // is this unverified". Leaving the absence to be inferred from a
         // missing line is the answer that sends them looking for a bug.
-        let text = explain_text(&status_with("unverified"), None, now());
+        let text = explain_text(&status_with("unverified"), None, now(), None);
         assert!(text.contains("reason         not recorded"));
         assert!(text.contains("does not record a reason category"));
     }
@@ -1215,7 +1319,7 @@ mod tests {
         // `verified` and `contradicted` are decided answers. A "reason: not
         // recorded" line beside them would invent a doubt.
         for verdict in ["verified", "contradicted", "review"] {
-            let text = explain_text(&status_with(verdict), None, now());
+            let text = explain_text(&status_with(verdict), None, now(), None);
             assert!(!text.contains("not recorded"), "{verdict}");
         }
     }
@@ -1224,7 +1328,7 @@ mod tests {
     fn explain_names_the_kind_of_evidence_the_verifier_sought() {
         // The closed five-name set from `fornax-verify`, and the cue this
         // surface exists to carry instead of the statusline.
-        let text = explain_text(&status_with("unverified"), None, now());
+        let text = explain_text(&status_with("unverified"), None, now(), None);
         assert!(text.contains("evidence for   test results"), "{text}");
     }
 
@@ -1234,7 +1338,7 @@ mod tests {
         // can prove, so it is described rather than echoed.
         let mut body = status_with("unverified");
         body["latest"]["verifier_name"] = json!("some_future_verifier_v9");
-        let text = explain_text(&body, None, now());
+        let text = explain_text(&body, None, now(), None);
         assert!(!text.contains("some_future_verifier_v9"), "{text}");
         assert!(
             text.contains("verifier this client does not know"),
@@ -1247,16 +1351,17 @@ mod tests {
         // Three different facts, and a missing section would read as the
         // absence of all three.
         let body = status_with("unverified");
-        let unreachable = explain_text(&body, None, now());
+        let unreachable = explain_text(&body, None, now(), None);
         assert!(unreachable.contains("unavailable"), "{unreachable}");
 
-        let not_found = explain_text(&body, Some(&json!({"found": false})), now());
+        let not_found = explain_text(&body, Some(&json!({"found": false})), now(), None);
         assert!(not_found.contains("no fused view for this claim yet"));
 
         let found = explain_text(
             &body,
             Some(&json!({"found": true, "fused": {"uncertainty": "undetermined"}})),
             now(),
+            None,
         );
         assert!(found.contains("uncertainty  undetermined"));
         // No rationale array at all is "none recorded", not silence.
@@ -1265,7 +1370,7 @@ mod tests {
 
     #[test]
     fn explain_reports_no_findings_without_calling_it_a_pass() {
-        let text = explain_text(&json!({"latest": null}), None, now());
+        let text = explain_text(&json!({"latest": null}), None, now(), None);
         assert!(text.contains("No findings recorded yet"));
         assert!(text.contains("not the same as a pass"));
     }
@@ -1282,6 +1387,112 @@ mod tests {
                 text.len() > kind.label().len() + 60,
                 "{kind:?} explained nothing"
             );
+        }
+    }
+
+    // --- HORO-1601/1602: session-scoped reading and identity-stdin parsing ---
+
+    #[test]
+    fn reading_declares_session_scope_only_when_the_daemon_confirms_it() {
+        let mut body = status_with("verified");
+        body["session_scoped"] = json!(true);
+        assert_eq!(reading(&body, now())["scope"], "session");
+    }
+
+    #[test]
+    fn reading_stays_host_scoped_when_the_daemon_does_not_confirm_session_scoping() {
+        // No `session_scoped` key at all -- an older daemon, or this client
+        // never asked for session scoping.
+        assert_eq!(reading(&status_with("verified"), now())["scope"], "host");
+    }
+
+    #[test]
+    fn reading_stays_host_scoped_when_session_scoped_is_explicitly_false() {
+        let mut body = status_with("verified");
+        body["session_scoped"] = json!(false);
+        assert_eq!(reading(&body, now())["scope"], "host");
+    }
+
+    #[test]
+    fn reading_stays_host_scoped_when_session_scoped_is_the_wrong_type() {
+        // A malformed or forward-incompatible daemon response must never be
+        // interpreted as confirmation by accident -- only a literal JSON
+        // `true` counts.
+        let mut body = status_with("verified");
+        body["session_scoped"] = json!("true");
+        assert_eq!(reading(&body, now())["scope"], "host");
+    }
+
+    #[test]
+    fn a_zero_finding_session_reports_no_findings_yet_under_session_scope() {
+        // The daemon confirmed session scoping and genuinely has nothing for
+        // this session -- this must render as the ordinary "no findings"
+        // posture under `[session]`, never silently fall back to the
+        // cross-session latest finding.
+        let body = json!({"latest": null, "session_scoped": true});
+        let payload = reading(&body, now());
+        assert_eq!(payload["scope"], "session");
+        assert_eq!(segment(&payload)["label"], "No findings yet");
+    }
+
+    #[test]
+    fn explain_text_names_which_of_the_three_scope_cases_applied() {
+        let scoped = json!({"latest": null, "session_scoped": true});
+        assert!(explain_text(&scoped, None, now(), Some("sess-a"))
+            .starts_with("Fornax — latest finding for this session"));
+
+        let unconfirmed = json!({"latest": null});
+        assert!(explain_text(&unconfirmed, None, now(), Some("sess-a"))
+            .contains("host-wide — this daemon did not confirm session-scoped filtering"));
+
+        let no_identity = json!({"latest": null});
+        assert!(explain_text(&no_identity, None, now(), None)
+            .contains("host-wide — no session identity available"));
+    }
+
+    #[test]
+    fn identity_document_with_correct_version_and_session_id_is_accepted() {
+        let doc = json!({"identity_stdin_version": 1, "provider_session_id": "claude-sess-7e21"});
+        assert_eq!(
+            parse_identity_document(doc.to_string().as_bytes()),
+            Some("claude-sess-7e21".to_string())
+        );
+    }
+
+    #[test]
+    fn identity_document_is_rejected_for_every_malformed_or_absent_shape() {
+        let cases: &[(&str, &[u8])] = &[
+            ("empty bytes", b""),
+            ("not json at all", b"not json"),
+            (
+                "version as a bool",
+                br#"{"identity_stdin_version": true, "provider_session_id": "x"}"#,
+            ),
+            (
+                "version 2, not understood by this client",
+                br#"{"identity_stdin_version": 2, "provider_session_id": "x"}"#,
+            ),
+            (
+                "missing provider_session_id",
+                br#"{"identity_stdin_version": 1}"#,
+            ),
+            (
+                "empty provider_session_id",
+                br#"{"identity_stdin_version": 1, "provider_session_id": ""}"#,
+            ),
+            (
+                "provider_session_id wrong type",
+                br#"{"identity_stdin_version": 1, "provider_session_id": 7}"#,
+            ),
+            // A raw Claude Code host payload has `session_id`, not this
+            // document's `provider_session_id`, and no version field at all.
+            (
+                "raw Claude Code payload piped in directly",
+                br#"{"session_id": "claude-sess-7e21", "cwd": "/Users/someone/secret-repo"}"#,
+            ),
+        ];
+        for (name, bytes) in cases {
+            assert_eq!(parse_identity_document(bytes), None, "{name}");
         }
     }
 }
