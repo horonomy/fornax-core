@@ -20,3 +20,12 @@ tokio.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+# HORO-1712: the false-green regression test feeds this adapter's own
+# translated Evidence straight into the real TestResultVerifier -- the
+# whole point of the test is proving the verifier's *existing* exit_code/
+# heuristic logic now resolves Contradicted once this adapter stops
+# suppressing the real per-command exit code, not re-deriving that logic
+# here. No cycle: fornax-verify does not depend on this crate.
+fornax-verify = { path = "../fornax-verify" }

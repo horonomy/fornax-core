@@ -85,6 +85,38 @@ pub enum StoreError {
     /// existing one.
     #[error("gold label revision {case_id}#{revision} is already frozen -- relabeling must use the next revision number, never overwrite one")]
     GoldLabelAlreadyFrozen { case_id: String, revision: u32 },
+    /// HORO-1712: `insert_event`/`insert_evidence` are idempotent on a
+    /// primary-key id collision (see [`InsertOutcome`]) -- a hook and the
+    /// rollout tailer observing the *same* real event compute the same
+    /// deterministic id (`fornax_adapter_codex::dedup_id`) and the second
+    /// insert is a safe no-op. This variant is the *other* case: the
+    /// incoming row's own identifying tuple (`session_id`/`provider`/`kind`,
+    /// plus `source_event_id` for evidence) does not match the row already
+    /// stored under that id -- a genuine id collision, not an idempotent
+    /// replay. Must never be silently resolved by overwriting the existing
+    /// row (rows are immutable by this crate's own convention); the caller
+    /// is expected to quarantine it instead.
+    #[error(
+        "id collision: {table} row {id} already exists with a different session/provider/kind \
+         tuple than this insert attempted -- not a safe idempotent replay"
+    )]
+    IdCollision { table: &'static str, id: String },
+}
+
+/// Outcome of an idempotent insert (`Store::insert_event`/
+/// `Store::insert_evidence`, HORO-1712). `Duplicate` means the exact row id
+/// already existed with a matching core identifying tuple -- the insert was
+/// a safe no-op, e.g. a hook observation and a rollout-tailer observation of
+/// the same real event, or the rollout tailer re-reading from offset 0 after
+/// a restart. Callers that only cared about "did this succeed" (the
+/// overwhelming majority -- see call sites across `fornax-cli`/
+/// `fornax-daemon`) can keep using `?`/`.expect(..)` unchanged; only a
+/// caller that needs to distinguish a fresh insert from a replay (currently
+/// `fornax-daemon::handle_message`) matches on this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertOutcome {
+    Inserted,
+    Duplicate,
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -104,6 +136,47 @@ fn from_tag<T: serde::de::DeserializeOwned>(s: &str) -> Result<T> {
         s.to_string(),
     ))?)
 }
+
+/// HORO-1712: structural JSON equality between an already-persisted
+/// column's raw text and an incoming in-memory value, used by the
+/// `insert_event`/`insert_evidence` idempotent-replay check. Deliberately
+/// not a raw string comparison: `serde_json::Value::to_string()` is not
+/// guaranteed to be byte-identical across two structurally-equal values
+/// (e.g. differing key insertion order if the `preserve_order` feature is
+/// ever enabled upstream) -- parsing both sides back into `Value` and
+/// comparing with `==` is the actual "same content" check. A stored column
+/// that fails to parse is treated as *not* matching (fail closed into
+/// `IdCollision`, never a silent `Duplicate`).
+fn json_str_eq(stored: &str, incoming: &serde_json::Value) -> bool {
+    serde_json::from_str::<serde_json::Value>(stored)
+        .map(|parsed| &parsed == incoming)
+        .unwrap_or(false)
+}
+
+/// Same as [`json_str_eq`], for the nullable JSON columns
+/// (`tool_input`/`tool_response`) where both "column is NULL" and "field is
+/// `None`" must agree, not just the JSON content when both are present.
+fn json_opt_eq(stored: &Option<String>, incoming: Option<&serde_json::Value>) -> bool {
+    match (stored, incoming) {
+        (None, None) => true,
+        (Some(s), Some(v)) => json_str_eq(s, v),
+        _ => false,
+    }
+}
+
+/// HORO-1712: the `(session_id, provider, kind, tool_name, tool_input,
+/// tool_response, raw)` tuple read back by `insert_event`'s idempotent-
+/// replay check (see that method's doc comment) -- named purely to keep
+/// clippy's `type_complexity` lint happy, no behavior of its own.
+type ExistingEventTuple = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+);
 
 /// Shared insert body for a `dataset_lineage_tags` row, generic over
 /// `sqlx::Executor` so it can run against either the pool (`Store::
@@ -232,16 +305,19 @@ impl Store {
     /// local daemon's closest available tenant-scoping key; see
     /// `retention::retention_class_for_table`'s doc comment for the same
     /// choice applied uniformly across all four insert paths.
-    pub async fn insert_event(&self, e: &AgentEvent) -> Result<()> {
+    pub async fn insert_event(&self, e: &AgentEvent) -> Result<InsertOutcome> {
+        let provider_tag = tag(&e.provider)?;
+        let kind_tag = tag(&e.kind)?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        sqlx::query(
+        let outcome = sqlx::query(
             "INSERT INTO agent_events (id, session_id, provider, kind, observed_at, tool_name, tool_input, tool_response, raw)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(id) DO NOTHING",
         )
         .bind(e.id.to_string())
         .bind(&e.session_id)
-        .bind(tag(&e.provider)?)
-        .bind(tag(&e.kind)?)
+        .bind(&provider_tag)
+        .bind(&kind_tag)
         .bind(&e.observed_at)
         .bind(&e.tool_name)
         .bind(e.tool_input.as_ref().map(|v| v.to_string()))
@@ -249,13 +325,67 @@ impl Store {
         .bind(e.raw.to_string())
         .execute(&mut *tx)
         .await?;
+
+        if outcome.rows_affected() == 0 {
+            // HORO-1712: id already present -- either a safe idempotent
+            // replay (same core tuple, including content) or a genuine id
+            // collision. Read back inside the same transaction so this
+            // check sees a consistent snapshot even under concurrent
+            // writers.
+            //
+            // A prior version of this check compared only
+            // (session_id, provider, kind) and treated any id match as a
+            // safe replay. That is a first-writer-wins integrity hole: two
+            // genuinely different events colliding on the same id (a bug
+            // elsewhere, or two sources disagreeing about what happened)
+            // would silently keep whichever arrived first and discard the
+            // second's real content, with no quarantine trail at all. The
+            // content columns (`tool_name`/`tool_input`/`tool_response`/
+            // `raw`) are compared too -- `tool_input`/`tool_response`/`raw`
+            // structurally (via `json_opt_eq`/parse-then-`==`), not by raw
+            // string, since two structurally-equal JSON values are not
+            // always byte-identical once re-serialized. `redact_json`
+            // (`fornax-daemon::handle_message`) is a pure, deterministic
+            // function of its input, so a genuine replay of the same
+            // original event redacts to the same bytes both times -- this
+            // is not excusing an untested claim, it never special-cases
+            // redaction at all. `observed_at` is still excluded: it is a
+            // fresh `Utc::now()` at translate time and legitimately differs
+            // between two observations of the same real event.
+            let existing: Option<ExistingEventTuple> = sqlx::query_as(
+                "SELECT session_id, provider, kind, tool_name, tool_input, tool_response, raw
+                 FROM agent_events WHERE id = ?1",
+            )
+            .bind(e.id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+            return match existing {
+                Some((sid, prov, kind, tool_name, tool_input, tool_response, raw))
+                    if sid == e.session_id
+                        && prov == provider_tag
+                        && kind == kind_tag
+                        && tool_name == e.tool_name
+                        && json_opt_eq(&tool_input, e.tool_input.as_ref())
+                        && json_opt_eq(&tool_response, e.tool_response.as_ref())
+                        && json_str_eq(&raw, &e.raw) =>
+                {
+                    tx.commit().await?;
+                    Ok(InsertOutcome::Duplicate)
+                }
+                _ => Err(StoreError::IdCollision {
+                    table: "agent_events",
+                    id: e.id.to_string(),
+                }),
+            };
+        }
+
         let lineage_tag = DatasetLineageTag::new(
             retention::retention_class_for_table("agent_events"),
             TenantRef(e.session_id.clone()),
         );
         insert_lineage_tag_row(&mut *tx, "agent_events", &e.id.to_string(), &lineage_tag).await?;
         tx.commit().await?;
-        Ok(())
+        Ok(InsertOutcome::Inserted)
     }
 
     /// See [`Store::insert_event`]'s doc comment — same atomic
@@ -307,7 +437,7 @@ impl Store {
     /// insert-plus-lineage-tag shape (FORNX-319 AC1). `ev.evidence_purged`
     /// is always `false` for a freshly-collected row; a purge only ever
     /// happens later, via [`retention::purge_evidence_payload`].
-    pub async fn insert_evidence(&self, ev: &Evidence) -> Result<()> {
+    pub async fn insert_evidence(&self, ev: &Evidence) -> Result<InsertOutcome> {
         self.insert_evidence_with_origin_opt(ev, None).await
     }
 
@@ -327,31 +457,45 @@ impl Store {
         &self,
         ev: &Evidence,
         origin: fornax_types::provenance_guard::EvidenceOrigin,
-    ) -> Result<()> {
+    ) -> Result<InsertOutcome> {
         self.insert_evidence_with_origin_opt(ev, origin.as_column_str())
             .await
     }
 
+    /// HORO-1712 + FORNX-431 slice 3, unioned: shared insert body.
+    /// `ON CONFLICT(id) DO NOTHING` plus the readback-and-compare below
+    /// (see the `rows_affected() == 0` arm) makes a same-id insert
+    /// idempotent on a safe replay and fail-closed into `IdCollision` on a
+    /// genuine content mismatch; `ingress_origin` is bound alongside the
+    /// rest of the row so both concerns share one atomic transaction.
+    /// `ingress_origin` is deliberately not part of the replay-match
+    /// comparison below -- the same real event can legitimately be
+    /// observed via two different transports (e.g. a future hook path vs.
+    /// the rollout tailer), so a differing origin on a replay is expected,
+    /// not a collision; whichever insert won first keeps its stamped
+    /// origin, same treatment as `observed_at`.
     async fn insert_evidence_with_origin_opt(
         &self,
         ev: &Evidence,
         ingress_origin: Option<&'static str>,
-    ) -> Result<()> {
+    ) -> Result<InsertOutcome> {
         let source = ev.source.as_ref().map(serde_json::to_string).transpose()?;
         let extension = ev
             .extension
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
+        let kind_tag = tag(&ev.kind)?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        sqlx::query(
+        let outcome = sqlx::query(
             "INSERT INTO evidence (id, session_id, source_event_id, kind, observed_at, payload, provenance, source, extension, evidence_purged, ingress_origin)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(id) DO NOTHING",
         )
         .bind(ev.id.to_string())
         .bind(&ev.session_id)
         .bind(ev.source_event_id.to_string())
-        .bind(tag(&ev.kind)?)
+        .bind(&kind_tag)
         .bind(&ev.observed_at)
         .bind(ev.payload.to_string())
         .bind(&ev.provenance)
@@ -361,13 +505,62 @@ impl Store {
         .bind(ingress_origin)
         .execute(&mut *tx)
         .await?;
+
+        if outcome.rows_affected() == 0 {
+            // HORO-1712: no `provider` column exists on `evidence` -- the
+            // closest-to-provider-scoping tuple this table actually has is
+            // `(session_id, kind, source_event_id)`.
+            //
+            // `payload` IS compared (structurally, not by raw string --
+            // `json_str_eq` parses both sides first, since two
+            // structurally-equal JSON values are not always byte-identical
+            // once re-serialized). An earlier version of this check
+            // deliberately excluded `payload`, reasoning that "daemon-side
+            // redaction may rewrite it" -- but `redact_json`
+            // (`fornax-daemon::handle_message`, `fornax_types::redact`) is
+            // a pure pattern-based classifier with no randomness or
+            // timestamp input, so a genuine replay of the same original
+            // evidence redacts to the same bytes both times. Skipping the
+            // comparison was a first-writer-wins integrity hole: two
+            // genuinely different payloads colliding on the same id (a bug
+            // elsewhere, or a hook/rollout disagreement about what a
+            // command's exit code actually was) would silently keep
+            // whichever arrived first and discard the second's real
+            // content, with no quarantine trail. Only `observed_at` stays
+            // excluded: it is a fresh `Utc::now()` at translate time and
+            // legitimately differs between two observations of the same
+            // real event.
+            let existing: Option<(String, String, String, String)> = sqlx::query_as(
+                "SELECT session_id, kind, source_event_id, payload FROM evidence WHERE id = ?1",
+            )
+            .bind(ev.id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+            let source_event_id = ev.source_event_id.to_string();
+            return match existing {
+                Some((sid, kind, src_event, payload))
+                    if sid == ev.session_id
+                        && kind == kind_tag
+                        && src_event == source_event_id
+                        && json_str_eq(&payload, &ev.payload) =>
+                {
+                    tx.commit().await?;
+                    Ok(InsertOutcome::Duplicate)
+                }
+                _ => Err(StoreError::IdCollision {
+                    table: "evidence",
+                    id: ev.id.to_string(),
+                }),
+            };
+        }
+
         let lineage_tag = DatasetLineageTag::new(
             retention::retention_class_for_table("evidence"),
             TenantRef(ev.session_id.clone()),
         );
         insert_lineage_tag_row(&mut *tx, "evidence", &ev.id.to_string(), &lineage_tag).await?;
         tx.commit().await?;
-        Ok(())
+        Ok(InsertOutcome::Inserted)
     }
 
     /// See [`Store::insert_event`]'s doc comment — same atomic
@@ -1141,6 +1334,234 @@ mod tests {
         assert_eq!(recent[0].verdict, "contradicted");
         assert_eq!(recent[0].claim_text, "All tests passed.");
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// HORO-1712: re-inserting the exact same event under the same
+    /// (fixed/deterministic) id must be a safe no-op `Duplicate`, not an
+    /// error -- this is the idempotent-replay contract `fornax-adapter-codex`'s
+    /// `dedup_id` scheme and `fornax-daemon`'s hook/rollout dedup both rely
+    /// on.
+    #[tokio::test]
+    async fn insert_event_replay_with_identical_content_is_duplicate_not_error() {
+        let path = tmp_db_path("event-replay-duplicate");
+        let store = Store::open(&path).await.expect("open db");
+
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "s-replay".into(),
+            provider: Provider::Codex,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("exec_command".into()),
+            tool_input: Some(serde_json::json!({"command": ["pytest"]})),
+            tool_response: Some(serde_json::json!({"exit_code": 1})),
+            raw: serde_json::json!({"type": "item_completed"}),
+        };
+        let first = store.insert_event(&event).await.expect("first insert");
+        assert_eq!(first, InsertOutcome::Inserted);
+
+        // Same id, identical content, but observed_at legitimately differs
+        // (a fresh Utc::now() at the replaying translate call) -- must
+        // still be recognized as the same logical row.
+        let mut replay = event.clone();
+        replay.observed_at = "2026-01-01T00:00:05Z".into();
+        let second = store.insert_event(&replay).await.expect("replay insert");
+        assert_eq!(second, InsertOutcome::Duplicate);
+
+        let events = store.events_for_session("s-replay").await.expect("query");
+        assert_eq!(events.len(), 1, "replay must not create a second row");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// HORO-1712 (security-review follow-up on acc3cd7/19f1793): a *real*
+    /// id collision -- same id, same (session_id, provider, kind), but
+    /// genuinely different content (`tool_response`) -- must be rejected
+    /// as `IdCollision`, never silently kept as the first write wins. The
+    /// original row must remain untouched.
+    #[tokio::test]
+    async fn insert_event_same_id_different_content_is_id_collision_not_duplicate() {
+        let path = tmp_db_path("event-id-collision");
+        let store = Store::open(&path).await.expect("open db");
+
+        let id = Uuid::new_v4();
+        let first = AgentEvent {
+            id,
+            session_id: "s-collide".into(),
+            provider: Provider::Codex,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("exec_command".into()),
+            tool_input: Some(serde_json::json!({"command": ["pytest"]})),
+            tool_response: Some(serde_json::json!({"exit_code": 0})),
+            raw: serde_json::json!({"type": "item_completed"}),
+        };
+        assert_eq!(
+            store.insert_event(&first).await.expect("first insert"),
+            InsertOutcome::Inserted
+        );
+
+        let mut colliding = first.clone();
+        // Same id, same session/provider/kind, but a genuinely different
+        // observed exit code -- this must never be mistaken for a replay.
+        colliding.tool_response = Some(serde_json::json!({"exit_code": 1}));
+        let result = store.insert_event(&colliding).await;
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::IdCollision {
+                    table: "agent_events",
+                    ..
+                })
+            ),
+            "expected IdCollision, got {result:?}"
+        );
+
+        let events = store.events_for_session("s-collide").await.expect("query");
+        assert_eq!(events.len(), 1, "the original row must be untouched");
+        assert_eq!(
+            events[0].tool_response,
+            Some(serde_json::json!({"exit_code": 0})),
+            "the first write must survive unmodified, not be silently kept-or-overwritten by chance"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// HORO-1712: the `insert_evidence` counterpart to
+    /// `insert_event_replay_with_identical_content_is_duplicate_not_error`.
+    #[tokio::test]
+    async fn insert_evidence_replay_with_identical_payload_is_duplicate_not_error() {
+        let path = tmp_db_path("evidence-replay-duplicate");
+        let store = Store::open(&path).await.expect("open db");
+
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "s-ev-replay".into(),
+            provider: Provider::Codex,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("exec_command".into()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        store.insert_event(&event).await.expect("insert event");
+
+        let evidence = Evidence {
+            id: Uuid::new_v4(),
+            session_id: "s-ev-replay".into(),
+            source_event_id: event.id,
+            kind: EvidenceKind::ExitCode,
+            observed_at: "2026-01-01T00:00:01Z".into(),
+            payload: serde_json::json!({"command": ["pytest"], "exit_code": 1}),
+            provenance: "test".into(),
+            source: None,
+            extension: None,
+            evidence_purged: false,
+        };
+        assert_eq!(
+            store
+                .insert_evidence(&evidence)
+                .await
+                .expect("first insert"),
+            InsertOutcome::Inserted
+        );
+
+        let mut replay = evidence.clone();
+        replay.observed_at = "2026-01-01T00:00:09Z".into();
+        assert_eq!(
+            store.insert_evidence(&replay).await.expect("replay insert"),
+            InsertOutcome::Duplicate
+        );
+
+        let stored = store
+            .evidence_for_session("s-ev-replay")
+            .await
+            .expect("query")
+            .evidence;
+        assert_eq!(stored.len(), 1, "replay must not create a second row");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// HORO-1712 (security-review follow-up on acc3cd7/19f1793): the
+    /// `insert_evidence` counterpart to
+    /// `insert_event_same_id_different_content_is_id_collision_not_duplicate`.
+    /// Same id, same `(session_id, kind, source_event_id)`, but a
+    /// genuinely different `payload` (a different observed `exit_code`)
+    /// must be rejected as `IdCollision`, never silently resolved by
+    /// keeping whichever write arrived first.
+    #[tokio::test]
+    async fn insert_evidence_same_id_different_payload_is_id_collision_not_duplicate() {
+        let path = tmp_db_path("evidence-id-collision");
+        let store = Store::open(&path).await.expect("open db");
+
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "s-ev-collide".into(),
+            provider: Provider::Codex,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("exec_command".into()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        store.insert_event(&event).await.expect("insert event");
+
+        let id = Uuid::new_v4();
+        let first = Evidence {
+            id,
+            session_id: "s-ev-collide".into(),
+            source_event_id: event.id,
+            kind: EvidenceKind::ExitCode,
+            observed_at: "2026-01-01T00:00:01Z".into(),
+            payload: serde_json::json!({"command": ["pytest"], "exit_code": 0}),
+            provenance: "test".into(),
+            source: None,
+            extension: None,
+            evidence_purged: false,
+        };
+        assert_eq!(
+            store.insert_evidence(&first).await.expect("first insert"),
+            InsertOutcome::Inserted
+        );
+
+        let mut colliding = first.clone();
+        colliding.payload = serde_json::json!({"command": ["pytest"], "exit_code": 1});
+        let result = store.insert_evidence(&colliding).await;
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::IdCollision {
+                    table: "evidence",
+                    ..
+                })
+            ),
+            "expected IdCollision, got {result:?}"
+        );
+
+        let stored = store
+            .evidence_for_session("s-ev-collide")
+            .await
+            .expect("query")
+            .evidence;
+        assert_eq!(stored.len(), 1, "the original row must be untouched");
+        assert_eq!(
+            stored[0].payload,
+            serde_json::json!({"command": ["pytest"], "exit_code": 0}),
+            "the first write must survive unmodified"
+        );
+
+        // HORO-1712: a real id collision must be visibly surfaced by the
+        // caller (fornax-daemon's HandleError quarantine path), never
+        // silently dropped -- this test only proves the store-layer
+        // contract (Err, original row untouched); the daemon-level
+        // quarantine-row assertion lives in fornax-daemon's own tests
+        // (process_line routes any handle_message Err through the
+        // existing HandleError quarantine mechanism unchanged).
         std::fs::remove_file(&path).ok();
     }
 

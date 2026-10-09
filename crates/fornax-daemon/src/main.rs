@@ -979,10 +979,34 @@ async fn process_line(state: &AppState, line: &str, session_hint: &mut Option<St
     };
     if let Err(e) = handle_message(state, msg, session_hint).await {
         tracing::warn!(error = %e, "failed to process ingest message");
+        // HORO-1712 (security-review follow-up on the id-collision fix):
+        // `IdCollision` is the one `handle_message` error that can fire on
+        // a *complete, well-formed* Event/Evidence message whose own
+        // tool_response/payload/raw may carry real tool output (including
+        // whatever `fornax_types::redact::redact_json` didn't recognize as
+        // a secret shape). The ordinary ParseError/HandleError quarantine
+        // path below already stores the full `line` verbatim and un-
+        // retained (`ingest_quarantine` predates and is outside this
+        // ticket's scope) -- that pre-existing exposure is not widened
+        // here, but routing a *second*, structurally different source of
+        // genuine evidence content through the same sink would be a new
+        // one. An operator only needs the table/id/session to look the
+        // row up and decide what to do; the raw content stays out of the
+        // quarantine table entirely for this one error kind.
+        let raw_for_quarantine: std::borrow::Cow<'_, str> =
+            match e.downcast_ref::<fornax_store::StoreError>() {
+                Some(fornax_store::StoreError::IdCollision { table, id }) => {
+                    std::borrow::Cow::Owned(format!(
+                        "id_collision: table={table} id={id} session={}",
+                        session_hint.as_deref().unwrap_or("unknown")
+                    ))
+                }
+                _ => std::borrow::Cow::Borrowed(line),
+            };
         if let Err(store_err) = state
             .store
             .record_quarantine(
-                line,
+                &raw_for_quarantine,
                 &e.to_string(),
                 fornax_store::quarantine::QuarantineReason::HandleError,
             )
@@ -1065,7 +1089,20 @@ async fn handle_message(
             ev.tool_input = ev.tool_input.as_ref().map(redact_json);
             ev.tool_response = ev.tool_response.as_ref().map(redact_json);
             ev.raw = redact_json(&ev.raw);
-            state.store.insert_event(&ev).await?;
+            // HORO-1712: a deterministic-id replay (e.g. a Codex hook and
+            // the rollout tailer observing the same real event, or the
+            // tailer re-reading from offset 0 after a restart) is expected
+            // and benign -- log it, do not quarantine, and do not touch any
+            // downstream state derived from this row (there is none in this
+            // arm). `Err(IdCollision)` is a genuine, unexpected id
+            // collision; it propagates via `?` into `process_line`'s
+            // existing `HandleError` quarantine path unchanged.
+            match state.store.insert_event(&ev).await? {
+                fornax_store::InsertOutcome::Inserted => {}
+                fornax_store::InsertOutcome::Duplicate => {
+                    tracing::debug!(event_id = %ev.id, session_id = %ev.session_id, "duplicate event id -- idempotent replay, not re-inserted");
+                }
+            }
         }
         IngestMessage::Evidence(mut ev) => {
             *session_hint = Some(ev.session_id.clone());
@@ -1094,10 +1131,19 @@ async fn handle_message(
             // trust boundary `EvidenceOrigin`/`admission_decision` (slices
             // 1-2) exist to enforce once slice 4 wires them into the
             // verdict path.
-            state
+            //
+            // HORO-1712: same idempotent-replay handling as the Event arm
+            // above, now threaded through the origin-stamping insert.
+            match state
                 .store
                 .insert_evidence_with_origin(&ev, EvidenceOrigin::UdsIngest)
-                .await?;
+                .await?
+            {
+                fornax_store::InsertOutcome::Inserted => {}
+                fornax_store::InsertOutcome::Duplicate => {
+                    tracing::debug!(evidence_id = %ev.id, session_id = %ev.session_id, "duplicate evidence id -- idempotent replay, not re-inserted");
+                }
+            }
         }
         IngestMessage::PolicyBundle { envelope } => {
             handle_policy_bundle_ingest(state, envelope.into_bytes()).await;
@@ -3099,6 +3145,88 @@ mod tests {
             stored_claims[0].text.contains("REDACTED"),
             "expected a redacted placeholder in stored claim text: {}",
             stored_claims[0].text
+        );
+    }
+
+    /// HORO-1712 (security-review follow-up): a genuine `IdCollision` --
+    /// two different ingest lines sharing one id, which `process_line`
+    /// quarantines via the existing `HandleError` path -- must never carry
+    /// the colliding message's own content (e.g. real tool output) into
+    /// the `ingest_quarantine` table. The marker here is deliberately
+    /// natural-language (has whitespace, no token-shaped prefix) so it
+    /// survives `redact_json` unredacted when inserted normally -- proving
+    /// this is the id-collision quarantine stand-in doing the work, not
+    /// the pre-existing redaction boundary.
+    #[tokio::test]
+    async fn id_collision_quarantine_never_leaks_colliding_message_content() {
+        let state = test_state().await;
+        let mut hint = None;
+        let marker = "the secret passphrase is horse battery staple 2026, HORO-1712 canary";
+        let session_id = "horo-1712-collision-test".to_string();
+        let event_id = Uuid::new_v4();
+
+        let first = AgentEvent {
+            id: event_id,
+            session_id: session_id.clone(),
+            provider: Provider::Codex,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".to_string(),
+            tool_name: Some("exec_command".to_string()),
+            tool_input: None,
+            tool_response: Some(serde_json::json!({"exit_code": 0, "note": marker})),
+            raw: serde_json::json!({}),
+        };
+        let line1 = serde_json::to_string(&IngestMessage::Event(first.clone())).expect("serialize");
+        process_line(&state, &line1, &mut hint).await;
+
+        // Same id, same session/provider/kind, but a genuinely different
+        // tool_response -- a real id collision, not an idempotent replay.
+        let mut colliding = first.clone();
+        colliding.tool_response = Some(serde_json::json!({"exit_code": 1, "note": marker}));
+        let line2 = serde_json::to_string(&IngestMessage::Event(colliding)).expect("serialize");
+        process_line(&state, &line2, &mut hint).await;
+
+        let quarantined = state
+            .store
+            .list_quarantine(10)
+            .await
+            .expect("list quarantine");
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "expected exactly one quarantined row for the collision"
+        );
+        assert!(
+            !quarantined[0].raw_line.contains(marker),
+            "colliding message content leaked into ingest_quarantine.raw_line: {}",
+            quarantined[0].raw_line
+        );
+        assert!(
+            !quarantined[0].reason.contains(marker),
+            "colliding message content leaked into ingest_quarantine.reason: {}",
+            quarantined[0].reason
+        );
+        assert!(
+            quarantined[0].raw_line.contains("id_collision"),
+            "expected the redacted id-collision stand-in, got: {}",
+            quarantined[0].raw_line
+        );
+        assert!(
+            quarantined[0].raw_line.contains(&session_id),
+            "expected the session id in the stand-in for operator lookup: {}",
+            quarantined[0].raw_line
+        );
+
+        let events = state
+            .store
+            .events_for_session(&session_id)
+            .await
+            .expect("read back events");
+        assert_eq!(events.len(), 1, "the original row must be untouched");
+        assert_eq!(
+            events[0].tool_response,
+            Some(serde_json::json!({"exit_code": 0, "note": marker})),
+            "the first write must survive unmodified"
         );
     }
 
@@ -6279,6 +6407,282 @@ mod tests {
             v["assessment"]["overall"],
             serde_json::json!("satisfied"),
             "deployment_healthy must never be satisfied by an agent self-report: {v}"
+        );
+    }
+
+    // ---- HORO-1712: Codex item_completed dedup, end to end -----------
+
+    /// A real `fornax-adapter-codex` translation of one `item_completed`
+    /// CommandExecution, replayed through `process_line` a second time
+    /// (simulating the rollout tailer re-reading from offset 0 after a
+    /// restart) must land as exactly one Event row and one Evidence row,
+    /// zero quarantine rows, and the same verifier verdict both times --
+    /// never a duplicate-primary-key error, never a second row.
+    #[tokio::test]
+    async fn codex_item_completed_replay_dedups_to_one_row_and_same_verdict() {
+        use fornax_adapter_codex::CodexAdapter;
+        use fornax_types::{AgentAdapter, CapabilityProbe, NormalizationOutcome};
+
+        let state = test_state().await;
+        let mut hint = None;
+
+        let mut adapter = CodexAdapter::new();
+        let meta = serde_json::json!({
+            "type": "session_meta",
+            "payload": {"session_id": "sess-dedup", "cli_version": "0.160.1"}
+        });
+        let _ = adapter.normalize("hint", &meta);
+
+        let item_completed = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {"id": "item_dedup_1", "type": "CommandExecution", "status": "failed", "exit_code": 1, "command": ["pytest"], "source": "agent"}
+            }
+        });
+        let NormalizationOutcome::Messages(msgs) = adapter.normalize("hint", &item_completed)
+        else {
+            panic!("expected Messages")
+        };
+        assert_eq!(msgs.len(), 2, "expected one Event and one Evidence");
+
+        for m in &msgs {
+            let line = serde_json::to_string(m).expect("serialize");
+            process_line(&state, &line, &mut hint).await;
+        }
+
+        let events_first = state
+            .store
+            .events_for_session("sess-dedup")
+            .await
+            .expect("events");
+        let evidence_first = state
+            .store
+            .evidence_for_session("sess-dedup")
+            .await
+            .expect("evidence")
+            .evidence;
+        assert_eq!(events_first.len(), 1);
+        assert_eq!(evidence_first.len(), 1);
+
+        let claim = Claim {
+            id: Uuid::new_v4(),
+            session_id: "sess-dedup".to_string(),
+            source_event_id: events_first[0].id,
+            text: "All tests passed.".to_string(),
+            subject: "test_result".to_string(),
+            claimed_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let caps = adapter.probe();
+        let verdict_first = TestResultVerifier
+            .verify(&claim, &evidence_first, &caps)
+            .verdict;
+
+        // Replay: re-send the exact same two messages again.
+        for m in &msgs {
+            let line = serde_json::to_string(m).expect("serialize");
+            process_line(&state, &line, &mut hint).await;
+        }
+
+        let events_second = state
+            .store
+            .events_for_session("sess-dedup")
+            .await
+            .expect("events after replay");
+        let evidence_second = state
+            .store
+            .evidence_for_session("sess-dedup")
+            .await
+            .expect("evidence after replay")
+            .evidence;
+        assert_eq!(
+            events_second.len(),
+            1,
+            "replay must not create a second event row"
+        );
+        assert_eq!(
+            evidence_second.len(),
+            1,
+            "replay must not create a second evidence row"
+        );
+
+        let verdict_second = TestResultVerifier
+            .verify(&claim, &evidence_second, &caps)
+            .verdict;
+        assert_eq!(
+            verdict_first, verdict_second,
+            "the computed verdict must be identical before and after the replay"
+        );
+
+        let quarantined = state.store.list_quarantine(10).await.expect("quarantine");
+        assert_eq!(
+            quarantined.len(),
+            0,
+            "a benign idempotent replay must never be quarantined"
+        );
+    }
+
+    /// Negative case for the same dedup scheme: two `item_completed` lines
+    /// with the *same* command text but genuinely different native ids
+    /// must produce two separate rows -- proves the dedup id is keyed on
+    /// Codex's own native id, never derived from command/content text.
+    #[tokio::test]
+    async fn codex_item_completed_different_native_ids_are_not_content_matched() {
+        use fornax_adapter_codex::CodexAdapter;
+        use fornax_types::{AgentAdapter, NormalizationOutcome};
+
+        let state = test_state().await;
+        let mut hint = None;
+        let mut adapter = CodexAdapter::new();
+        let meta = serde_json::json!({
+            "type": "session_meta",
+            "payload": {"session_id": "sess-distinct", "cli_version": "0.160.1"}
+        });
+        let _ = adapter.normalize("hint", &meta);
+
+        for native_id in ["item_a", "item_b"] {
+            let entry = serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {"id": native_id, "type": "CommandExecution", "status": "failed", "exit_code": 1, "command": ["pytest"], "source": "agent"}
+                }
+            });
+            let NormalizationOutcome::Messages(msgs) = adapter.normalize("hint", &entry) else {
+                panic!("expected Messages")
+            };
+            for m in &msgs {
+                let line = serde_json::to_string(m).expect("serialize");
+                process_line(&state, &line, &mut hint).await;
+            }
+        }
+
+        let events = state
+            .store
+            .events_for_session("sess-distinct")
+            .await
+            .expect("events");
+        let evidence = state
+            .store
+            .evidence_for_session("sess-distinct")
+            .await
+            .expect("evidence")
+            .evidence;
+        assert_eq!(
+            events.len(),
+            2,
+            "two distinct native ids with identical command text must not be merged into one row"
+        );
+        assert_eq!(evidence.len(), 2);
+    }
+
+    /// HORO-1712 (security-review follow-up): `dedup_id` folds `session_id`
+    /// into the key specifically so that two different real sessions
+    /// reusing the same native call/item id (plausible for Codex's
+    /// `call_id`, which has never been confirmed to be more than a small
+    /// per-session counter/string) never collide. Two genuinely different
+    /// sessions, same native id, must land as two separate rows -- no
+    /// `IdCollision`, no quarantine, no suppression of either session's
+    /// real event.
+    #[tokio::test]
+    async fn codex_same_native_id_under_two_different_sessions_does_not_collide() {
+        use fornax_adapter_codex::dedup_id;
+
+        let state = test_state().await;
+        let mut hint = None;
+
+        let native_id = "item_shared_native_id";
+        for session_id in ["sess-a", "sess-b"] {
+            let event = AgentEvent {
+                id: dedup_id(session_id, "tool_after", native_id),
+                session_id: session_id.to_string(),
+                provider: Provider::Codex,
+                kind: EventKind::PostToolUse,
+                observed_at: "2026-01-01T00:00:00Z".to_string(),
+                tool_name: Some("exec_command".to_string()),
+                tool_input: Some(serde_json::json!({"command": ["pytest"]})),
+                tool_response: None,
+                raw: serde_json::json!({}),
+            };
+            let line = serde_json::to_string(&IngestMessage::Event(event)).expect("serialize");
+            process_line(&state, &line, &mut hint).await;
+        }
+
+        let quarantined = state.store.list_quarantine(10).await.expect("quarantine");
+        assert_eq!(
+            quarantined.len(),
+            0,
+            "two different sessions reusing the same native id must never be quarantined"
+        );
+
+        let events_a = state
+            .store
+            .events_for_session("sess-a")
+            .await
+            .expect("events sess-a");
+        assert_eq!(events_a.len(), 1, "sess-a's event must be written");
+
+        let events_b = state
+            .store
+            .events_for_session("sess-b")
+            .await
+            .expect("events sess-b");
+        assert_eq!(
+            events_b.len(),
+            1,
+            "sess-b's event must also be written, not suppressed"
+        );
+
+        assert_ne!(
+            events_a[0].id, events_b[0].id,
+            "the two sessions must compute different dedup ids for the same native_id"
+        );
+    }
+
+    /// Confirms the same-session replay test
+    /// (`codex_item_completed_replay_dedups_to_one_row_and_same_verdict`,
+    /// above) still dedups correctly now that `session_id` is folded into
+    /// the key -- a replay of the *same* session's line must still collapse
+    /// to one row, this isn't just "any two inserts never collide now".
+    #[tokio::test]
+    async fn codex_same_session_replay_still_dedups_with_session_id_in_the_key() {
+        use fornax_adapter_codex::dedup_id;
+
+        let state = test_state().await;
+        let mut hint = None;
+
+        let event = AgentEvent {
+            id: dedup_id("sess-replay-check", "tool_after", "item_replay_check"),
+            session_id: "sess-replay-check".to_string(),
+            provider: Provider::Codex,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".to_string(),
+            tool_name: Some("exec_command".to_string()),
+            tool_input: Some(serde_json::json!({"command": ["pytest"]})),
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        let line = serde_json::to_string(&IngestMessage::Event(event)).expect("serialize");
+        process_line(&state, &line, &mut hint).await;
+        // Replay: the exact same line again.
+        process_line(&state, &line, &mut hint).await;
+
+        let events = state
+            .store
+            .events_for_session("sess-replay-check")
+            .await
+            .expect("events");
+        assert_eq!(
+            events.len(),
+            1,
+            "a same-session replay must still dedup to one row"
+        );
+
+        let quarantined = state.store.list_quarantine(10).await.expect("quarantine");
+        assert_eq!(
+            quarantined.len(),
+            0,
+            "a benign same-session replay must never be quarantined"
         );
     }
 }

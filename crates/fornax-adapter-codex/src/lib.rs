@@ -20,6 +20,82 @@ use uuid::Uuid;
 /// `notes["adapter_version"]`.
 pub const ADAPTER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// HORO-1712: fixed namespace for this adapter's deterministic (UUIDv5)
+/// dedup ids (see [`dedup_id`]). Any observation of the *same* real Codex
+/// event -- whether seen twice by this rollout tailer (e.g. re-reading from
+/// offset 0 after a restart) or once by a future hook-ingestion path and
+/// once here -- computes the same id for the same `(phase, native_id)`
+/// pair, so `fornax_store::Store::insert_event`/`insert_evidence`'s
+/// idempotent-insert mechanism recognizes it as a safe replay
+/// (`InsertOutcome::Duplicate`) instead of writing a second row under a
+/// fresh random id. The exact byte value only needs to be FIXED and
+/// documented, never secret or otherwise meaningful -- chosen here as the
+/// ASCII bytes of a self-describing 16-byte string so it is legible
+/// verbatim in a debugger or hex dump rather than an arbitrary-looking
+/// constant.
+pub const CODEX_NS: Uuid = Uuid::from_bytes(*b"fornax-codex-ns1");
+
+/// Computes a deterministic id for one `(session_id, phase, native_id)`
+/// triple under [`CODEX_NS`] (HORO-1712). `phase` is one of:
+/// - `"tool_before"` -- reserved for the hook-ingestion path's
+///   pre-execution observation; not produced anywhere in this crate yet
+///   (hook ingestion is out of scope here, HORO-1712 part B), but reserved
+///   now so a future caller never has to pick a second, incompatible
+///   scheme.
+/// - `"tool_after"` -- the post-execution `AgentEvent` (`PostToolUse`).
+/// - `"tool_after:exit_code"` -- the post-execution exit-code `Evidence`.
+///
+/// `native_id` is Codex's own call/tool_use id for the command this id
+/// represents (a `response_item` `call_id`, or a rollout `item_completed`
+/// item's own `id`).
+///
+/// `session_id` is deliberately part of the key, not left out. Codex's
+/// `call_id`/item `id` values are this adapter's own process-local
+/// correlation keys, not guaranteed-globally-unique identifiers --
+/// `custom_tool_call`'s `call_id` in particular has never been confirmed to
+/// carry anything beyond a small per-session counter/string in any live
+/// capture (see the `exec_command_end` fallback below). Without
+/// `session_id` in the key, two different real sessions could legitimately
+/// produce the same `(phase, native_id)` pair, and `fornax_store`'s
+/// fail-closed `IdCollision` check (a genuine content mismatch, by
+/// design) would then permanently and silently refuse every future insert
+/// for whichever session lost the race -- not a transient quarantine, a
+/// standing block on that session's real evidence forever. Folding
+/// `session_id` into the key removes that cross-session collision
+/// entirely for the one source (the rollout tailer) that writes these ids
+/// today. A future hook-ingestion path observing the same action under a
+/// *different* session id than the rollout tailer is a real, harder
+/// problem -- deliberately deferred to whichever ticket implements that
+/// path, not solved speculatively here at the cost of the bug above in the
+/// path that exists right now.
+pub fn dedup_id(session_id: &str, phase: &str, native_id: &str) -> Uuid {
+    Uuid::new_v5(
+        &CODEX_NS,
+        format!("codex:v1:{session_id}:{phase}:{native_id}").as_bytes(),
+    )
+}
+
+/// Best-effort `major.minor.patch` parse of a Codex CLI version string
+/// (e.g. `"0.160.1"`, `"0.160.0-beta.2"`). Any pre-release/build suffix
+/// after the first `-` or `+` is dropped for the comparison -- this is used
+/// only to decide whether a stream is new enough to use the 0.160+
+/// `item_completed` item-format shape (see `CodexAdapter::item_format`),
+/// never for exact-version matching, so treating `0.160.0-beta.2` as
+/// `0.160.0` is the conservative (not over-eager) choice: a pre-release of
+/// 0.160 that already emits `item_completed` lines still latches the
+/// format via the `item_completed`-observed path regardless of what this
+/// parse returns. Missing minor/patch components default to `0`
+/// (`"1"` -> `(1, 0, 0)`). `None` if the major component itself doesn't
+/// parse.
+fn parse_cli_version(v: &str) -> Option<(u32, u32, u32)> {
+    let core = v.split(['-', '+']).next().unwrap_or(v);
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().unwrap_or("0").parse().unwrap_or(0);
+    let patch = parts.next().unwrap_or("0").parse().unwrap_or(0);
+    Some((major, minor, patch))
+}
+
 /// Stateful, unlike `fornax-adapter-claude`'s adapter: the rollout-tail
 /// transport is a long-lived process, so `normalize` correlates a
 /// `custom_tool_call`'s `call_id` with its later `custom_tool_call_output`
@@ -29,6 +105,23 @@ pub const ADAPTER_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub struct CodexAdapter {
     pending_calls: HashMap<String, String>,
     session_id: Option<String>,
+    /// HORO-1712: set once this stream's rollout lines are confirmed to use
+    /// the 0.160+ `item_completed` item-format shape -- either this
+    /// stream's own `session_meta` line declares `cli_version >= 0.160.0`,
+    /// or any `item_completed` line has been observed directly (a
+    /// subagent's rollout can start mid-stream with no fresh `session_meta`
+    /// of its own). Sticky for the rest of this stream once set, never
+    /// unset -- one `CodexAdapter` instance tails exactly one rollout file
+    /// for its whole lifetime (see `fornax-hook-codex`'s `main`), so there
+    /// is no cross-stream leak to worry about.
+    item_format: bool,
+    /// The `cli_version` string read from this stream's own `session_meta`
+    /// line, if one was seen before (or regardless of whether it caused)
+    /// `item_format` latching -- stamped into `item_completed`-sourced
+    /// Evidence provenance. `None` (rendered as `"unknown"`) when
+    /// `item_format` latched purely from an observed `item_completed` line
+    /// with no `session_meta` seen yet in this stream.
+    cli_version: Option<String>,
 }
 
 impl CodexAdapter {
@@ -40,6 +133,45 @@ impl CodexAdapter {
     /// `session_meta` line, if any has been seen yet.
     pub fn known_session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
+    }
+
+    /// Whether this stream has latched onto the 0.160+ `item_completed`
+    /// item-format shape (HORO-1712). Exposed so `main.rs`/tests can check
+    /// it without reaching into a private field.
+    pub fn item_format(&self) -> bool {
+        self.item_format
+    }
+
+    /// HORO-1712: updates the `item_format` latch and `cli_version` from
+    /// one native rollout line, called once per line from `normalize`
+    /// before translation. A no-op once `item_format` is already set
+    /// (sticky, never re-evaluated) except that `cli_version` keeps
+    /// tracking the latest `session_meta` seen, for provenance accuracy.
+    fn observe_item_format_signal(&mut self, native: &serde_json::Value) {
+        let Some(top_type) = native.get("type").and_then(|v| v.as_str()) else {
+            return;
+        };
+        if top_type == "session_meta" {
+            let Some(cli_version) = native
+                .pointer("/payload/cli_version")
+                .and_then(|v| v.as_str())
+            else {
+                return;
+            };
+            self.cli_version = Some(cli_version.to_string());
+            if !self.item_format && parse_cli_version(cli_version).is_some_and(|v| v >= (0, 160, 0))
+            {
+                self.item_format = true;
+            }
+            return;
+        }
+
+        if top_type == "event_msg"
+            && !self.item_format
+            && native.pointer("/payload/type").and_then(|v| v.as_str()) == Some("item_completed")
+        {
+            self.item_format = true;
+        }
     }
 }
 
@@ -67,10 +199,23 @@ impl CapabilityProbe for CodexAdapter {
             signals: vec![
                 CapabilitySignal {
                     class: SignalClass::ToolInvocation,
-                    state: SignalAvailability::Unsupported,
+                    // HORO-1712: was `Unsupported` -- that claimed this
+                    // mechanism could never exist for Codex at all. Codex
+                    // hooks (PreToolUse) are a real, if opt-in and
+                    // admin-suppressible, pre-execution interception
+                    // mechanism -- this adapter just doesn't ingest them
+                    // yet (hook-first binding is deferred, pending a live
+                    // `codex exec` capture; see HORO-1712's own scope
+                    // note). `Unavailable` is the honest claim: the
+                    // capability exists in principle but is not observed
+                    // by this binary today, same distinction `ProcessResult`
+                    // already drew below.
+                    state: SignalAvailability::Unavailable,
                     detail: Some(
-                        "Codex hooks (the only pre-execution interception mechanism) are \
-                         opt-in and admin-suppressible, with no input-rewrite support \
+                        "Codex hooks (PreToolUse) exist and would provide pre-execution \
+                         interception, but are opt-in, admin-suppressible, and observed \
+                         per-event rather than declared statically here -- this adapter's \
+                         primary rollout-tail path does not ingest them \
                          (see docs/research/adapter-capability-matrix.md)"
                             .to_string(),
                     ),
@@ -107,19 +252,49 @@ impl CapabilityProbe for CodexAdapter {
                             .to_string(),
                     ),
                 },
-                CapabilitySignal {
-                    class: SignalClass::ProcessResult,
-                    state: SignalAvailability::Unavailable,
-                    detail: Some(
-                        "exec_command_end (literal exit_code) not emitted by codex-cli 0.147.0. \
-                         custom_tool_call_output does carry a real, parseable exit code \
-                         (FORNX-16, live-confirmed) when the session's exec tool is \
-                         tools.shell_command (unified_exec disabled) — but the default \
-                         tools.exec_command (unified_exec) shape still exposes no exit \
-                         status at all, even for a genuinely failing command, so this \
-                         stays Unavailable rather than Available at the provider-wide level"
-                            .to_string(),
-                    ),
+                if self.item_format {
+                    // HORO-1712: codex-cli 0.160+'s `item_completed`
+                    // CommandExecution item is *specified* (this ticket's
+                    // own plan text, not a live capture -- HORO-1712
+                    // deferred the actual `codex exec` capture to a
+                    // separate cost-authorization step) to carry a real,
+                    // always-present `exit_code` field for every
+                    // completed/failed command, unconditionally on which
+                    // exec tool the session uses -- unlike the pre-0.160
+                    // shapes documented in the `else` branch below, which
+                    // *are* confirmed against real captures (FORNX-16).
+                    // `Available` here is this adapter's honest claim about
+                    // what it *translates when the shape matches*, not a
+                    // claim that the shape itself has been independently
+                    // verified against a running codex-cli 0.160+ -- do
+                    // not read this as "verified ground truth" until that
+                    // capture happens.
+                    CapabilitySignal {
+                        class: SignalClass::ProcessResult,
+                        state: SignalAvailability::Available,
+                        detail: Some(
+                            "item_completed CommandExecution.exit_code (codex-cli 0.160+, \
+                             HORO-1712) -- schema inferred from ticket spec text, not yet \
+                             confirmed against a live codex-cli 0.160+ capture (see \
+                             HORO-1712's deferred Step 0)"
+                                .to_string(),
+                        ),
+                    }
+                } else {
+                    CapabilitySignal {
+                        class: SignalClass::ProcessResult,
+                        state: SignalAvailability::Unavailable,
+                        detail: Some(
+                            "exec_command_end (literal exit_code) not emitted by codex-cli 0.147.0. \
+                             custom_tool_call_output does carry a real, parseable exit code \
+                             (FORNX-16, live-confirmed) when the session's exec tool is \
+                             tools.shell_command (unified_exec disabled) — but the default \
+                             tools.exec_command (unified_exec) shape still exposes no exit \
+                             status at all, even for a genuinely failing command, so this \
+                             stays Unavailable rather than Available at the provider-wide level"
+                                .to_string(),
+                        ),
+                    }
                 },
             ],
             notes: [(
@@ -157,11 +332,22 @@ impl AgentAdapter for CodexAdapter {
                 self.session_id = Some(sid.to_string());
             }
         }
+        self.observe_item_format_signal(native);
         let sid = self
             .session_id
             .clone()
             .unwrap_or_else(|| session_hint.to_string());
-        translate_line(native, &sid, &mut self.pending_calls)
+        let cli_version = self
+            .cli_version
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        translate_line(
+            native,
+            &sid,
+            &mut self.pending_calls,
+            self.item_format,
+            &cli_version,
+        )
     }
 }
 
@@ -469,7 +655,12 @@ fn translate_line(
     entry: &serde_json::Value,
     session_id: &str,
     pending_calls: &mut HashMap<String, String>,
+    item_format: bool,
+    cli_version: &str,
 ) -> NormalizationOutcome {
+    // HORO-1712: wired up by the suppression commit that follows this one
+    // (the custom_tool_call_output arm below reads it there).
+    let _ = item_format;
     let Some(top_type) = entry.get("type").and_then(|v| v.as_str()) else {
         return NormalizationOutcome::Unrecognized {
             discriminator: "<missing type>".to_string(),
@@ -523,8 +714,34 @@ fn translate_line(
                 };
                 let command = pending_calls.remove(call_id).unwrap_or_default();
 
+                // HORO-1712: once this stream is confirmed to use the
+                // 0.160+ item-format shape, this "code-mode cell" wrapper
+                // is never trusted for exit-code evidence again -- it is
+                // the actual false-green bug (codex-cli 0.160+ wraps a
+                // nested shell command in this custom_tool_call_output
+                // *and* reports it via a real item_completed
+                // CommandExecution; the cell's own "Script completed" text
+                // carries no real exit code at all and was previously
+                // reported as heuristic:true, exit_code:0 regardless of
+                // whether the nested command actually failed). Suppressed
+                // entirely -- no Event, no Evidence -- once the real
+                // per-command signal is available; `pending_calls.remove`
+                // above already drains the entry either way, so nothing
+                // leaks across lines even while suppressed.
+                if item_format {
+                    return NormalizationOutcome::Ignored {
+                        reason: "code-mode cell; nested commands observed via CommandExecution",
+                    };
+                }
+
                 let now = chrono::Utc::now().to_rfc3339();
-                let event_id = Uuid::new_v4();
+                // HORO-1712: deterministic id when a real call_id is known
+                // (the normal case for this shape) so a replay of this
+                // line (e.g. the rollout tailer re-reading from offset 0
+                // after a restart) is recognized as the same event by
+                // `fornax_store`'s idempotent insert, instead of writing a
+                // second row under a fresh random id.
+                let event_id = dedup_id(session_id, "tool_after", call_id);
                 let event = AgentEvent {
                     id: event_id,
                     session_id: session_id.to_string(),
@@ -544,7 +761,14 @@ fn translate_line(
                 // it.
                 let sensor = CodexCustomToolCallOutputSensor;
                 let outcome = sensor.collect(&event, &CodexAdapter::new().probe());
-                out.extend(outcome.evidence.into_iter().map(IngestMessage::Evidence));
+                out.extend(outcome.evidence.into_iter().map(|mut ev| {
+                    // HORO-1712: the sensor itself always mints a fresh
+                    // `Uuid::new_v4()` -- override with the same
+                    // deterministic scheme as the event above so a replay
+                    // of this evidence dedups too.
+                    ev.id = dedup_id(session_id, "tool_after:exit_code", call_id);
+                    IngestMessage::Evidence(ev)
+                }));
                 NormalizationOutcome::Messages(out)
             }
             other => NormalizationOutcome::Unrecognized {
@@ -575,7 +799,17 @@ fn translate_line(
         };
     };
     let now = chrono::Utc::now().to_rfc3339();
-    let event_id = Uuid::new_v4();
+    // HORO-1712: `exec_command_end` has never been confirmed to carry its
+    // own native call id in any live capture (see this arm's existing
+    // fixtures, none of which include one) -- when one is present, use the
+    // same deterministic scheme as every other path so a replay dedups;
+    // when absent, fall back to the pre-existing random id so every
+    // existing fixture/test here is byte-for-byte unaffected.
+    let event_id = payload
+        .get("call_id")
+        .and_then(|v| v.as_str())
+        .map(|call_id| dedup_id(session_id, "tool_after", call_id))
+        .unwrap_or_else(Uuid::new_v4);
 
     match sub_type {
         "exec_command_end" => {
@@ -595,9 +829,20 @@ fn translate_line(
             // that type for the unchanged literal-exit_code extraction.
             let sensor = CodexExecCommandEndSensor;
             let outcome = sensor.collect(&event, &CodexAdapter::new().probe());
-            out.extend(outcome.evidence.into_iter().map(IngestMessage::Evidence));
+            out.extend(outcome.evidence.into_iter().map(|mut ev| {
+                // HORO-1712: only override with the deterministic id when
+                // a native call_id was actually available above -- when it
+                // wasn't, `event_id` is the same random `Uuid::new_v4()`
+                // already assigned to `event.id`, so this is a no-op for
+                // every existing fixture.
+                if let Some(call_id) = payload.get("call_id").and_then(|v| v.as_str()) {
+                    ev.id = dedup_id(session_id, "tool_after:exit_code", call_id);
+                }
+                IngestMessage::Evidence(ev)
+            }));
             NormalizationOutcome::Messages(out)
         }
+        "item_completed" => translate_item_completed(payload, entry, session_id, &now, cli_version),
         "task_complete" => {
             let event = AgentEvent {
                 id: event_id,
@@ -627,6 +872,163 @@ fn translate_line(
         }
         other => NormalizationOutcome::Unrecognized {
             discriminator: format!("event_msg:{other}"),
+        },
+    }
+}
+
+/// Translates one `event_msg/item_completed` rollout line (codex-cli
+/// 0.160+ item-format shape, HORO-1712). Only `item.type == "CommandExecution"`
+/// produces a canonical mapping of its own; every other known `item.type`
+/// is `Ignored`, and an unknown one is `Unrecognized` (HORO-1712's own
+/// spec, closed list: `UserMessage`/`AgentMessage`/`Reasoning`/
+/// `CollabAgentToolCall`/`Extension`/`FileChange`/`ContextCompaction`).
+///
+/// The field names and shape this function matches on (`item.id`,
+/// `item.type`, `status`, `exit_code`, `item.command`, `item.source`) are
+/// taken from HORO-1712's own plan text, not from a live codex-cli 0.160+
+/// capture -- that capture is deliberately deferred (a separate cost-
+/// authorization decision), so this is an informed schema guess, not a
+/// confirmed one. Re-verify against a real capture before trusting it the
+/// way `docs/research/adapter-capability-matrix.md`'s other rows (backed
+/// by live captures, e.g. FORNX-16/FORNX-55) are trusted.
+fn translate_item_completed(
+    payload: &serde_json::Value,
+    entry: &serde_json::Value,
+    session_id: &str,
+    now: &str,
+    cli_version: &str,
+) -> NormalizationOutcome {
+    let Some(item) = payload.get("item") else {
+        return NormalizationOutcome::Unrecognized {
+            discriminator: "event_msg:item_completed:<missing item>".to_string(),
+        };
+    };
+    let Some(item_type) = item.get("type").and_then(|v| v.as_str()) else {
+        return NormalizationOutcome::Unrecognized {
+            discriminator: "event_msg:item_completed:<missing item.type>".to_string(),
+        };
+    };
+
+    if item_type != "CommandExecution" {
+        return match item_type {
+            "UserMessage"
+            | "AgentMessage"
+            | "Reasoning"
+            | "CollabAgentToolCall"
+            | "Extension"
+            | "FileChange"
+            | "ContextCompaction" => NormalizationOutcome::Ignored {
+                reason: "item_completed: known non-CommandExecution item type, \
+                         no canonical mapping",
+            },
+            other => NormalizationOutcome::Unrecognized {
+                discriminator: format!("event_msg:item_completed:item.type={other}"),
+            },
+        };
+    }
+
+    let native_id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let status = item.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    let source = item.get("source").and_then(|v| v.as_str());
+
+    match status {
+        "declined" | "in_progress" => NormalizationOutcome::Ignored {
+            reason: "item_completed CommandExecution: declined/in-progress, \
+                     no completed result yet",
+        },
+        "completed" | "failed" => {
+            // HORO-1712: `exit_code` must be a genuine JSON integer --
+            // `as_i64()` returns `None` for a string, float, bool, or
+            // missing field, which is exactly the "missing or
+            // non-integer" drift this must catch. The returned reason
+            // names only the field, never its (possibly malformed/
+            // attacker-controlled) value.
+            //
+            // NOT cross-checked here: whether `status` and `exit_code`
+            // are required to agree (e.g. `status: "failed"` with
+            // `exit_code: 0`, or `status: "completed"` with a nonzero
+            // `exit_code`). This function's schema is inferred from
+            // HORO-1712's own plan text, not a live codex-cli 0.160+
+            // capture (see this function's doc comment above), so
+            // whether Codex's real semantics treat `status` (the
+            // execution mechanism's own outcome -- e.g. did the process
+            // get killed/declined vs. run to completion) and `exit_code`
+            // (the command's own return code) as independent facts that
+            // can legitimately disagree, or as a pair that's always
+            // consistent, is unconfirmed either way. Both fields are
+            // passed through into the Evidence payload verbatim
+            // (`"status"`/`"exit_code"`) rather than one being derived
+            // from or validated against the other, so no claim is
+            // fabricated regardless of which relationship turns out to
+            // be true -- but a caller should not assume this path
+            // already rejects an internally-inconsistent pair.
+            let Some(code) = item.get("exit_code").and_then(|v| v.as_i64()) else {
+                return NormalizationOutcome::Unrecognized {
+                    discriminator: format!(
+                        "event_msg:item_completed:CommandExecution:status={status}:\
+                         <missing or non-integer exit_code>"
+                    ),
+                };
+            };
+            let command = item
+                .get("command")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let event_id = dedup_id(session_id, "tool_after", native_id);
+            let event = AgentEvent {
+                id: event_id,
+                session_id: session_id.to_string(),
+                provider: Provider::Codex,
+                kind: EventKind::PostToolUse,
+                observed_at: now.to_string(),
+                tool_name: Some("exec_command".to_string()),
+                tool_input: Some(serde_json::json!({"command": command.clone()})),
+                tool_response: Some(payload.clone()),
+                raw: entry.clone(),
+            };
+
+            // The user's own `!` shell commands aren't agent actions --
+            // observed as an Event (so they still show up in a session's
+            // timeline) but never as Evidence a verifier could use to
+            // (dis)confirm an agent's own claim.
+            if source == Some("user_shell") {
+                return NormalizationOutcome::Messages(vec![IngestMessage::Event(event)]);
+            }
+
+            let evidence = Evidence {
+                id: dedup_id(session_id, "tool_after:exit_code", native_id),
+                session_id: session_id.to_string(),
+                source_event_id: event_id,
+                kind: EvidenceKind::ExitCode,
+                observed_at: now.to_string(),
+                payload: serde_json::json!({
+                    "command": command,
+                    "exit_code": code,
+                    "heuristic": false,
+                    "status": status,
+                    "exec_source": source,
+                    "native_call_id": native_id,
+                }),
+                provenance: format!(
+                    "codex:{cli_version}:rollout:item_completed:CommandExecution#exit_code"
+                ),
+                source: Some(EvidenceSource::now(
+                    "codex_item_completed_command_execution_sensor_v1",
+                    TrustClass::AgentAdjacent,
+                    Some(Provider::Codex),
+                    CollectionMethod::FilePoll,
+                    Some(ADAPTER_VERSION.to_string()),
+                )),
+                extension: None,
+                evidence_purged: false,
+            };
+            NormalizationOutcome::Messages(vec![
+                IngestMessage::Event(event),
+                IngestMessage::Evidence(evidence),
+            ])
+        }
+        other => NormalizationOutcome::Unrecognized {
+            discriminator: format!("event_msg:item_completed:CommandExecution:status={other}"),
         },
     }
 }
@@ -1100,6 +1502,420 @@ mod tests {
         assert_eq!(
             caps.notes.get("session_id").map(String::as_str),
             Some("sess-1")
+        );
+    }
+
+    // ---- HORO-1712: dedup_id / cli_version parsing -------------------
+
+    #[test]
+    fn dedup_id_is_deterministic_and_phase_sensitive() {
+        let a = dedup_id("sess-1", "tool_after", "call_1");
+        let b = dedup_id("sess-1", "tool_after", "call_1");
+        assert_eq!(
+            a, b,
+            "same (session_id, phase, native_id) must always hash to the same id"
+        );
+
+        let different_phase = dedup_id("sess-1", "tool_after:exit_code", "call_1");
+        assert_ne!(a, different_phase, "different phase must change the id");
+
+        let different_native_id = dedup_id("sess-1", "tool_after", "call_2");
+        assert_ne!(
+            a, different_native_id,
+            "different native_id must change the id"
+        );
+    }
+
+    /// `session_id` must be part of the key. Codex's own `call_id`/item
+    /// `id` values are this adapter's process-local correlation keys, not
+    /// guaranteed-globally-unique -- two different real sessions reusing
+    /// the same native id (plausible for a small per-session counter in
+    /// an older rollout format) must never collide into the same dedup
+    /// id, or `fornax_store`'s fail-closed `IdCollision` check would
+    /// permanently block whichever session's event arrived second.
+    #[test]
+    fn dedup_id_is_session_sensitive() {
+        let a = dedup_id("sess-a", "tool_after", "call_1");
+        let b = dedup_id("sess-b", "tool_after", "call_1");
+        assert_ne!(
+            a, b,
+            "the same native_id under two different sessions must never collide"
+        );
+    }
+
+    #[test]
+    fn parse_cli_version_handles_prerelease_suffix_and_missing_components() {
+        assert_eq!(parse_cli_version("0.160.1"), Some((0, 160, 1)));
+        assert_eq!(parse_cli_version("0.160.0-beta.2"), Some((0, 160, 0)));
+        assert_eq!(parse_cli_version("1"), Some((1, 0, 0)));
+        assert_eq!(parse_cli_version("not-a-version"), None);
+    }
+
+    // ---- HORO-1712: item_format latch ---------------------------------
+
+    #[test]
+    fn item_format_latches_from_session_meta_cli_version_0_160_and_above() {
+        let mut adapter = CodexAdapter::new();
+        assert!(!adapter.item_format());
+        let meta = serde_json::json!({
+            "type": "session_meta",
+            "payload": {"session_id": "s", "cli_version": "0.160.0"}
+        });
+        let _ = normalize(&mut adapter, &meta);
+        assert!(adapter.item_format());
+    }
+
+    #[test]
+    fn item_format_stays_unset_for_a_pre_0_160_cli_version() {
+        let mut adapter = CodexAdapter::new();
+        let meta = serde_json::json!({
+            "type": "session_meta",
+            "payload": {"session_id": "s", "cli_version": "0.147.0"}
+        });
+        let _ = normalize(&mut adapter, &meta);
+        assert!(!adapter.item_format());
+    }
+
+    /// A subagent's rollout can start mid-stream with no fresh
+    /// `session_meta` of its own -- the latch must still trip from an
+    /// observed `item_completed` line alone.
+    #[test]
+    fn item_format_latches_from_an_observed_item_completed_line_without_session_meta() {
+        let mut adapter = CodexAdapter::new();
+        assert!(!adapter.item_format());
+        let entry = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {"id": "i1", "type": "CommandExecution", "status": "completed", "exit_code": 0, "command": ["echo", "hi"]}
+            }
+        });
+        let _ = normalize(&mut adapter, &entry);
+        assert!(adapter.item_format());
+    }
+
+    // ---- HORO-1712: item_completed/CommandExecution translation ------
+
+    #[test]
+    fn item_completed_command_execution_with_failing_exit_code_produces_real_evidence() {
+        let mut adapter = CodexAdapter::new();
+        let meta = serde_json::json!({
+            "type": "session_meta",
+            "payload": {"session_id": "sess-160", "cli_version": "0.160.1"}
+        });
+        let _ = normalize(&mut adapter, &meta);
+
+        let entry = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "id": "item_1",
+                    "type": "CommandExecution",
+                    "status": "failed",
+                    "exit_code": 1,
+                    "command": ["cargo", "test"],
+                    "source": "agent"
+                }
+            }
+        });
+        let msgs = normalize(&mut adapter, &entry).into_messages();
+        assert_eq!(msgs.len(), 2);
+        match &msgs[0] {
+            IngestMessage::Event(e) => {
+                assert_eq!(e.provider, Provider::Codex);
+                assert_eq!(e.kind, EventKind::PostToolUse);
+            }
+            other => panic!("expected Event, got {other:?}"),
+        }
+        match &msgs[1] {
+            IngestMessage::Evidence(ev) => {
+                assert_eq!(ev.kind, EvidenceKind::ExitCode);
+                assert_eq!(ev.payload["exit_code"], 1);
+                assert_eq!(ev.payload["heuristic"], false);
+                assert_eq!(ev.payload["native_call_id"], "item_1");
+                assert!(ev
+                    .provenance
+                    .contains("item_completed:CommandExecution#exit_code"));
+                assert!(ev.provenance.contains("0.160.1"));
+            }
+            other => panic!("expected Evidence, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn item_completed_user_shell_command_is_event_only_no_evidence() {
+        let mut adapter = CodexAdapter::new();
+        let entry = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {"id": "i2", "type": "CommandExecution", "status": "completed", "exit_code": 0, "command": ["ls"], "source": "user_shell"}
+            }
+        });
+        let msgs = normalize(&mut adapter, &entry).into_messages();
+        assert_eq!(
+            msgs.len(),
+            1,
+            "a user's own ! shell command is not an agent action -- no Evidence"
+        );
+        assert!(matches!(&msgs[0], IngestMessage::Event(_)));
+    }
+
+    #[test]
+    fn item_completed_declined_or_in_progress_is_ignored() {
+        for status in ["declined", "in_progress"] {
+            let mut adapter = CodexAdapter::new();
+            let entry = serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {"id": "i3", "type": "CommandExecution", "status": status, "command": ["ls"]}
+                }
+            });
+            match normalize(&mut adapter, &entry) {
+                NormalizationOutcome::Ignored { .. } => {}
+                other => panic!("expected Ignored for status={status}, got {other:?}"),
+            }
+        }
+    }
+
+    /// HORO-1712 drift test: `status` is `completed`/`failed` but
+    /// `exit_code` is missing entirely -- must be `Unrecognized`, and the
+    /// reason must name only the field, never leak the item's other
+    /// (possibly attacker/agent-controlled) content.
+    #[test]
+    fn item_completed_completed_without_exit_code_is_unrecognized_without_leaking_values() {
+        let mut adapter = CodexAdapter::new();
+        let entry = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {"id": "i4", "type": "CommandExecution", "status": "completed", "command": ["super-secret-arg"]}
+            }
+        });
+        match normalize(&mut adapter, &entry) {
+            NormalizationOutcome::Unrecognized { discriminator } => {
+                assert!(discriminator.contains("exit_code"));
+                assert!(
+                    !discriminator.contains("super-secret-arg"),
+                    "must not leak item content into the discriminator: {discriminator}"
+                );
+            }
+            other => panic!("expected Unrecognized, got {other:?}"),
+        }
+    }
+
+    /// Same drift test, non-integer `exit_code` (a string) rather than a
+    /// missing field -- `as_i64()` must reject it the same way.
+    #[test]
+    fn item_completed_with_non_integer_exit_code_is_unrecognized() {
+        let mut adapter = CodexAdapter::new();
+        let entry = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {"id": "i5", "type": "CommandExecution", "status": "completed", "exit_code": "0", "command": ["ls"]}
+            }
+        });
+        match normalize(&mut adapter, &entry) {
+            NormalizationOutcome::Unrecognized { discriminator } => {
+                assert!(discriminator.contains("exit_code"));
+            }
+            other => panic!("expected Unrecognized, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn item_completed_known_non_command_execution_item_types_are_ignored() {
+        for item_type in [
+            "UserMessage",
+            "AgentMessage",
+            "Reasoning",
+            "CollabAgentToolCall",
+            "Extension",
+            "FileChange",
+            "ContextCompaction",
+        ] {
+            let mut adapter = CodexAdapter::new();
+            let entry = serde_json::json!({
+                "type": "event_msg",
+                "payload": {"type": "item_completed", "item": {"id": "i6", "type": item_type}}
+            });
+            match normalize(&mut adapter, &entry) {
+                NormalizationOutcome::Ignored { .. } => {}
+                other => panic!("expected Ignored for item.type={item_type}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn item_completed_unknown_item_type_is_unrecognized() {
+        let mut adapter = CodexAdapter::new();
+        let entry = serde_json::json!({
+            "type": "event_msg",
+            "payload": {"type": "item_completed", "item": {"id": "i7", "type": "SomeFutureItemType"}}
+        });
+        match normalize(&mut adapter, &entry) {
+            NormalizationOutcome::Unrecognized { discriminator } => {
+                assert!(discriminator.contains("SomeFutureItemType"));
+            }
+            other => panic!("expected Unrecognized, got {other:?}"),
+        }
+    }
+
+    // ---- HORO-1712: outer code-mode cell suppression -----------------
+
+    /// The actual false-green-bug fix: once `item_format` is latched, the
+    /// pre-0.160 `custom_tool_call_output` "Script completed" heuristic
+    /// path must produce neither Event nor Evidence, and must still drain
+    /// `pending_calls` so nothing leaks across lines.
+    #[test]
+    fn custom_tool_call_output_is_suppressed_once_item_format_latched() {
+        let mut adapter = CodexAdapter::new();
+        let meta = serde_json::json!({
+            "type": "session_meta",
+            "payload": {"session_id": "s", "cli_version": "0.160.0"}
+        });
+        let _ = normalize(&mut adapter, &meta);
+
+        let call = serde_json::json!({
+            "type": "response_item",
+            "payload": {"type": "custom_tool_call", "name": "exec", "call_id": "c1", "input": "echo hi"}
+        });
+        let _ = normalize(&mut adapter, &call);
+        assert_eq!(
+            adapter.pending_calls.get("c1").map(String::as_str),
+            Some("echo hi")
+        );
+
+        let output = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "c1",
+                "output": [{"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"}]
+            }
+        });
+        match normalize(&mut adapter, &output) {
+            NormalizationOutcome::Ignored { reason } => {
+                assert!(reason.contains("CommandExecution"));
+            }
+            other => panic!("expected Ignored (suppressed), got {other:?}"),
+        }
+        assert!(
+            adapter.pending_calls.is_empty(),
+            "pending_calls must be drained even while suppressed"
+        );
+    }
+
+    /// HORO-1712 false-green regression, as a real repro: a 0.160-style
+    /// stream where the outer code-mode cell's `custom_tool_call_output`
+    /// claims "Script completed" (the old heuristic would report
+    /// heuristic:true, exit_code:0) while the real per-command
+    /// `item_completed` CommandExecution for the same logical command
+    /// reports `exit_code: 1`. Fed into the real `TestResultVerifier`
+    /// (not a reimplementation of its logic), the claim "All tests
+    /// passed." must resolve `Contradicted`, never `Verified`.
+    ///
+    /// Mutation-tested by hand during development (not committed): with
+    /// the `if item_format { return Ignored }` suppression check in
+    /// `translate_line`'s `custom_tool_call_output` arm commented out,
+    /// this test fails (`Verified`, from the heuristic's fabricated
+    /// exit_code:0 landing after the real exit_code:1 evidence as the
+    /// verifier's most-recent match) -- restoring the check makes it pass.
+    #[test]
+    fn false_green_regression_item_completed_contradicts_code_mode_heuristic() {
+        use fornax_verify::{TestResultVerifier, Verifier};
+
+        let mut adapter = CodexAdapter::new();
+        let meta = serde_json::json!({
+            "type": "session_meta",
+            "payload": {"session_id": "sess-fg", "cli_version": "0.160.1"}
+        });
+        let _ = normalize(&mut adapter, &meta);
+        assert!(
+            adapter.item_format(),
+            "latch must be set from session_meta cli_version before the rest of this test means anything"
+        );
+
+        let call = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "call_id": "call_fg",
+                "input": "const r = await tools.exec_command({cmd:\"cargo test\",workdir:\"/tmp\"}); text(r.output);\n"
+            }
+        });
+        let _ = normalize(&mut adapter, &call);
+
+        // The nested command's own real result, observed first (realistic
+        // causality: the nested exec finishes before the outer code-mode
+        // cell's own wrapper completion fires).
+        let item_completed = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "id": "item_fg_1",
+                    "type": "CommandExecution",
+                    "status": "failed",
+                    "exit_code": 1,
+                    "command": ["cargo", "test"],
+                    "source": "agent"
+                }
+            }
+        });
+        let mut evidence: Vec<Evidence> = Vec::new();
+        let mut event_count = 0usize;
+        for msg in normalize(&mut adapter, &item_completed).into_messages() {
+            match msg {
+                IngestMessage::Evidence(ev) => evidence.push(ev),
+                IngestMessage::Event(_) => event_count += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(event_count, 1);
+        assert_eq!(
+            evidence.len(),
+            1,
+            "item_completed must produce the real exit_code=1 evidence"
+        );
+
+        // The outer cell's own completion, observed second -- with the
+        // fix, this must be fully suppressed (no second, contradicting
+        // heuristic Evidence appended after the real one).
+        let output = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "call_fg",
+                "output": [{"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"}]
+            }
+        });
+        match normalize(&mut adapter, &output) {
+            NormalizationOutcome::Ignored { .. } => {}
+            other => panic!(
+                "expected the code-mode cell to be suppressed once item_format is latched, got {other:?}"
+            ),
+        }
+
+        let claim = Claim {
+            id: Uuid::new_v4(),
+            session_id: "sess-fg".to_string(),
+            source_event_id: Uuid::new_v4(),
+            text: "All tests passed.".to_string(),
+            subject: "test_result".to_string(),
+            claimed_at: chrono::Utc::now().to_rfc3339(),
+        };
+
+        let caps = adapter.probe();
+        let finding = TestResultVerifier.verify(&claim, &evidence, &caps);
+        assert_eq!(
+            finding.verdict,
+            fornax_types::Verdict::Contradicted,
+            "a failing exit_code must never be verified as passing: {finding:?}"
         );
     }
 }
