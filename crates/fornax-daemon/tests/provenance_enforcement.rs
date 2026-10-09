@@ -244,10 +244,20 @@ fn command_success_claim(session_id: &str, source_event_id: Uuid) -> Claim {
 /// real protocol keys an announcement that may arrive before any Event
 /// sets `session_hint` (see `handle_message`'s `Capabilities` arm).
 fn capability_announcement(session_id: &str) -> IngestMessage {
+    capability_announcement_as(session_id, Provider::ClaudeCode)
+}
+
+/// FORNX-435: same as [`capability_announcement`], but with the announced
+/// owning `provider` parameterized -- needed to test
+/// `Store::session_owner`'s real effect on `admission_decision` (a session
+/// whose only announcement names a DIFFERENT provider than the evidence it
+/// later receives) against the live daemon, not just the pure function in
+/// isolation.
+fn capability_announcement_as(session_id: &str, provider: Provider) -> IngestMessage {
     use fornax_types::{CapabilitySignal, RuntimeCapabilities, SignalAvailability, SignalClass};
     IngestMessage::Capabilities(RuntimeCapabilities {
         schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
-        provider: Provider::ClaudeCode,
+        provider,
         signals: vec![CapabilitySignal {
             class: SignalClass::ToolTrace,
             state: SignalAvailability::Available,
@@ -558,6 +568,244 @@ async fn cross_anchor_replay_is_downgraded_not_verified() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// FORNX-435: live-path proof of the "foreign session/acquisition" case --
+/// `provider_mismatching_the_sessions_single_announced_owner_is_quarantined`
+/// already proves this at the pure `admission_decision` unit level
+/// (`fornax-types::provenance_guard`'s own test module), but FORNX-435
+/// explicitly asks for it against the live request path too: a
+/// *legitimate, correctly-registered* sensor's evidence (same fixture
+/// `legitimate_evidence` uses elsewhere in this file) must still be
+/// quarantined when the session it arrives under has announced a
+/// DIFFERENT owning provider. If this only worked in the pure-function
+/// unit test and not here, that would mean `Store::session_owner`'s real
+/// `capabilities_for_session` wiring -- not exercised by the unit test at
+/// all -- was broken.
+#[tokio::test]
+async fn foreign_session_provider_claim_is_quarantined_not_verified() {
+    let daemon = start_daemon().await;
+    let store = Store::open(daemon.home.join("fornax.db"))
+        .await
+        .expect("open store db");
+    let session_id = format!("fornx435-foreign-session-{}", short_id());
+    let sock_path = daemon.home.join("fornax.sock");
+
+    // Session announces Codex as its sole owner...
+    send_line(
+        &sock_path,
+        &capability_announcement_as(&session_id, Provider::Codex),
+    )
+    .await;
+
+    // ...but the evidence's own EvidenceSource claims ClaudeCode --
+    // `legitimate_evidence` is otherwise a registered sensor with the
+    // correct trust class; the ONLY thing wrong here is the provider/
+    // session-owner mismatch, isolating that one failure mode.
+    let event = command_success_event(&session_id);
+    let event_id = event.id;
+    let claim = command_success_claim(&session_id, event_id);
+    let evidence = legitimate_evidence(&session_id, event_id);
+
+    let verdict = submit_and_await_verdict(&sock_path, &store, event, evidence, claim).await;
+
+    assert_ne!(
+        verdict,
+        Some("verified".to_string()),
+        "evidence claiming provider ClaudeCode under a session whose sole announced \
+         owner is Codex must never promote a claim to Verified; daemon log:\n{}",
+        daemon.log_contents()
+    );
+}
+
+/// FORNX-435: live-path proof that two genuinely CONCURRENT cross-anchor
+/// consumption attempts against the same evidence row are still
+/// serialized correctly -- `cross_anchor_replay_is_downgraded_not_verified`
+/// above only proves the sequential case (claim A fully resolved before
+/// claim B is even sent). `Store::record_consumption`'s doc comment claims
+/// `BEGIN IMMEDIATE` makes two racing callers serialize at the SQLite
+/// level so the second never sees a stale read -- this test is the first
+/// thing in this codebase to actually fire two such claims at once and
+/// check the real outcome, rather than trusting that comment.
+#[tokio::test]
+async fn concurrent_cross_anchor_replay_is_serialized_not_double_verified() {
+    let daemon = start_daemon().await;
+    let store = Store::open(daemon.home.join("fornax.db"))
+        .await
+        .expect("open store db");
+    let session_id = format!("fornx435-concurrent-{}", short_id());
+    let sock_path = daemon.home.join("fornax.sock");
+
+    // One evidence row, established up front (same shape as the existing
+    // cross-anchor test), so both claims below contend over the SAME row.
+    let event_a = command_success_event(&session_id);
+    let event_a_id = event_a.id;
+    let evidence = legitimate_evidence(&session_id, event_a_id);
+    send_line(&sock_path, &capability_announcement(&session_id)).await;
+    send_line(&sock_path, &IngestMessage::Event(event_a)).await;
+    send_line(&sock_path, &IngestMessage::Evidence(evidence)).await;
+
+    // Claim A's own anchor must exist and be known-consumed before the
+    // race: otherwise "concurrent" would just mean "both attempts are
+    // racing to be first," which `classify_consumption_by_anchor` already
+    // treats as fine (either one may legitimately win FreshlyRecorded).
+    // The actual guarantee under test is narrower and stronger: once an
+    // owner anchor exists, a DIFFERENT anchor's concurrent attempt must
+    // never also reach Verified.
+    let claim_a = command_success_claim(&session_id, event_a_id);
+    send_line(&sock_path, &IngestMessage::Claim(claim_a.clone())).await;
+    wait_for(Duration::from_secs(10), || {
+        let store = &store;
+        let session_id = session_id.clone();
+        let claim_id = claim_a.id.to_string();
+        async move {
+            store
+                .findings_for_session(&session_id)
+                .await
+                .unwrap_or_default()
+                .iter()
+                .any(|f| f.claim_id == claim_id && f.verdict == "verified")
+        }
+    })
+    .await;
+
+    // Now fire TWO different-anchor claims, both citing the same
+    // already-owned evidence row, genuinely concurrently -- each gets its
+    // own UDS connection, and the daemon spawns a task per connection (see
+    // `main.rs`'s accept loop), so these two really do race at the
+    // application layer, not just appear sequential.
+    let event_b = command_success_event(&session_id);
+    let claim_b = command_success_claim(&session_id, event_b.id);
+    let event_c = command_success_event(&session_id);
+    let claim_c = command_success_claim(&session_id, event_c.id);
+
+    let (send_b, send_c) = tokio::join!(
+        async {
+            send_line(&sock_path, &IngestMessage::Event(event_b)).await;
+            send_line(&sock_path, &IngestMessage::Claim(claim_b.clone())).await;
+        },
+        async {
+            send_line(&sock_path, &IngestMessage::Event(event_c)).await;
+            send_line(&sock_path, &IngestMessage::Claim(claim_c.clone())).await;
+        }
+    );
+    let _: ((), ()) = (send_b, send_c);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let findings = store
+            .findings_for_session(&session_id)
+            .await
+            .expect("read findings");
+        let b = findings
+            .iter()
+            .find(|f| f.claim_id == claim_b.id.to_string());
+        let c = findings
+            .iter()
+            .find(|f| f.claim_id == claim_c.id.to_string());
+        if let (Some(b), Some(c)) = (b, c) {
+            assert_ne!(
+                b.verdict,
+                "verified",
+                "claim B races claim C over an already-owned evidence row (owned by \
+                 claim A) -- a different anchor must never reach Verified via this \
+                 row even under real concurrency; daemon log:\n{}",
+                daemon.log_contents()
+            );
+            assert_ne!(
+                c.verdict,
+                "verified",
+                "claim C races claim B over an already-owned evidence row (owned by \
+                 claim A) -- a different anchor must never reach Verified via this \
+                 row even under real concurrency; daemon log:\n{}",
+                daemon.log_contents()
+            );
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "findings for both racing claims never appeared; daemon log:\n{}",
+                daemon.log_contents()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// FORNX-435: live-path proof of same-claim retry idempotency -- a client
+/// (hook process) that resends an identical `claim_id` after, say, a
+/// dropped response must not be treated as a hostile replay.
+/// `insert_claim_idempotent_reports_duplicate_without_erroring` already
+/// proves the store-level primitive is idempotent in isolation; this test
+/// proves the live daemon path built on top of it (the `is_new_claim`
+/// check in `handle_message`'s `Claim` arm, which skips re-verification
+/// entirely on a duplicate) actually preserves the original Verified
+/// outcome end-to-end, not just that the second insert doesn't error.
+#[tokio::test]
+async fn identical_claim_retry_over_uds_stays_verified_not_downgraded() {
+    let daemon = start_daemon().await;
+    let store = Store::open(daemon.home.join("fornax.db"))
+        .await
+        .expect("open store db");
+    let session_id = format!("fornx435-retry-{}", short_id());
+    let sock_path = daemon.home.join("fornax.sock");
+
+    let event = command_success_event(&session_id);
+    let event_id = event.id;
+    let evidence = legitimate_evidence(&session_id, event_id);
+    let claim = command_success_claim(&session_id, event_id);
+
+    send_line(&sock_path, &capability_announcement(&session_id)).await;
+    send_line(&sock_path, &IngestMessage::Event(event)).await;
+    send_line(&sock_path, &IngestMessage::Evidence(evidence)).await;
+    send_line(&sock_path, &IngestMessage::Claim(claim.clone())).await;
+
+    wait_for(Duration::from_secs(10), || {
+        let store = &store;
+        let session_id = session_id.clone();
+        let claim_id = claim.id.to_string();
+        async move {
+            store
+                .findings_for_session(&session_id)
+                .await
+                .unwrap_or_default()
+                .iter()
+                .any(|f| f.claim_id == claim_id && f.verdict == "verified")
+        }
+    })
+    .await;
+
+    // Resend the EXACT same claim (identical id) -- simulating a client
+    // retry after an uncertain/dropped response, not a new submission.
+    send_line(&sock_path, &IngestMessage::Claim(claim.clone())).await;
+
+    // Give the daemon a moment to have processed (or, correctly, skipped
+    // re-processing) the retry, then confirm the original Verified finding
+    // is unchanged -- no second/duplicate finding row, no downgrade.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let findings = store
+        .findings_for_session(&session_id)
+        .await
+        .expect("read findings");
+    let matching: Vec<_> = findings
+        .iter()
+        .filter(|f| f.claim_id == claim.id.to_string())
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "a retried identical claim_id must not produce a second finding row; \
+         found {} rows; daemon log:\n{}",
+        matching.len(),
+        daemon.log_contents()
+    );
+    assert_eq!(
+        matching[0].verdict,
+        "verified",
+        "a retried identical claim_id must leave the original Verified finding \
+         intact, not downgrade it; daemon log:\n{}",
+        daemon.log_contents()
+    );
 }
 
 /// Fixture potency (AC4): confirms each negative fixture is not simply
