@@ -372,9 +372,15 @@ impl FusionPolicy for BaselineFusionPolicy {
         // included in the transitive closure, so this is a strict widening.
         let candidate_evidence_ids: HashSet<Uuid> =
             candidates.iter().map(|c| c.link.evidence_id).collect();
+        // FORNX-432 PR 2: built once before the loop below instead of once
+        // per candidate -- `ancestors_of` previously rebuilt this same index
+        // from `input.evidence` on every iteration.
+        let evidence_index: BTreeMap<Uuid, &Evidence> =
+            input.evidence.iter().map(|e| (e.id, e)).collect();
         let mut after_r3: Vec<Candidate<'_>> = Vec::new();
         for c in candidates {
-            let ancestry = crate::independence::ancestors_of(c.evidence.id, input.evidence);
+            let ancestry =
+                crate::independence::ancestors_of_indexed(c.evidence.id, &evidence_index);
             if ancestry.is_empty() {
                 after_r3.push(c);
                 continue;
