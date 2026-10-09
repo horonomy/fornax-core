@@ -22,3 +22,15 @@ thiserror.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
+# FORNX-432 PR 1: `independence_capacity`'s stable per-fixture output hash
+# (sha2) and its hex rendering (hex) -- both already workspace dependencies
+# used the same way by fornax-receipt, not new additions to the workspace.
+sha2.workspace = true
+hex.workspace = true
+
+[features]
+# FORNX-432 PR 1: forwards to `fornax-verify/bench-reference`, enabling
+# `independence_capacity::run_fixture`'s cross-check against the frozen
+# `build_reference` historical copy. Off by default -- see
+# `independence_capacity.rs`'s module docs.
+bench-reference = ["fornax-verify/bench-reference"]

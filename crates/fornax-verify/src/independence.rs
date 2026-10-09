@@ -342,6 +342,186 @@ pub fn ancestors_of(evidence_id: Uuid, evidence: &[Evidence]) -> BTreeSet<Uuid> 
     result
 }
 
+/// FORNX-432 PR 1: byte-for-byte historical copy of [`ancestors_of`], kept
+/// behind the `bench-reference` feature so a future optimization pass over
+/// `ancestors_of` still has a stable correctness oracle to property-test
+/// against, and `fornax-bench`'s capacity harness has a reproducible
+/// "before" baseline that survives that pass landing. **Not called by any
+/// production code path** -- only `fornax-bench`, and only when built with
+/// `--features fornax-verify/bench-reference`. Keep this in sync with
+/// [`ancestors_of`] ONLY by never modifying it -- if `ancestors_of` is ever
+/// intentionally changed, this function must NOT be changed to match; that
+/// divergence is the whole point.
+#[cfg(feature = "bench-reference")]
+pub fn ancestors_of_reference(evidence_id: Uuid, evidence: &[Evidence]) -> BTreeSet<Uuid> {
+    let by_id: BTreeMap<Uuid, &Evidence> = evidence.iter().map(|e| (e.id, e)).collect();
+    let mut result = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    let mut stack = vec![evidence_id];
+    while let Some(current) = stack.pop() {
+        if !visited.insert(current) {
+            continue;
+        }
+        let Some(ev) = by_id.get(&current) else {
+            continue;
+        };
+        let parents = ev
+            .source
+            .as_ref()
+            .map(|s| s.derived_from.as_slice())
+            .unwrap_or(&[]);
+        for &parent in parents {
+            if parent != evidence_id && by_id.contains_key(&parent) {
+                result.insert(parent);
+                stack.push(parent);
+            }
+        }
+    }
+    result
+}
+
+/// FORNX-432 PR 1: byte-for-byte historical copy of
+/// [`SourceFamilyMap::build`] (the only difference is calling
+/// [`ancestors_of_reference`] instead of [`ancestors_of`] for Rule 2, so
+/// this stays the stable "before" oracle even after a future optimization
+/// pass changes the real `build`). Same non-production-path caveat as
+/// [`ancestors_of_reference`] -- never call this outside a benchmark/test.
+#[cfg(feature = "bench-reference")]
+pub fn build_reference(evidence: &[Evidence]) -> SourceFamilyMap {
+    let mut sorted: Vec<&Evidence> = evidence.iter().collect();
+    sorted.sort_by_key(|e| e.id);
+
+    let by_id: BTreeMap<Uuid, &Evidence> = sorted.iter().map(|e| (e.id, *e)).collect();
+
+    let mut parent: BTreeMap<Uuid, Uuid> = sorted.iter().map(|e| (e.id, e.id)).collect();
+    fn find(parent: &mut BTreeMap<Uuid, Uuid>, x: Uuid) -> Uuid {
+        let p = parent[&x];
+        if p == x {
+            return x;
+        }
+        let root = find(parent, p);
+        parent.insert(x, root);
+        root
+    }
+    fn union(parent: &mut BTreeMap<Uuid, Uuid>, a: Uuid, b: Uuid) {
+        let ra = find(parent, a);
+        let rb = find(parent, b);
+        if ra != rb {
+            if ra < rb {
+                parent.insert(rb, ra);
+            } else {
+                parent.insert(ra, rb);
+            }
+        }
+    }
+
+    let mut bases_by_pair: BTreeSet<(Uuid, Uuid, FamilyBasisTag)> = BTreeSet::new();
+
+    let mut by_group: BTreeMap<Uuid, Vec<Uuid>> = BTreeMap::new();
+    for e in &sorted {
+        if let Some(group) = e.source.as_ref().and_then(|s| s.correlation_group) {
+            by_group.entry(group).or_default().push(e.id);
+        }
+    }
+    for (group, ids) in &by_group {
+        for pair in ids.windows(2) {
+            union(&mut parent, pair[0], pair[1]);
+            bases_by_pair.insert((
+                pair[0].min(pair[1]),
+                pair[0].max(pair[1]),
+                FamilyBasisTag::ExplicitCorrelationGroup(*group),
+            ));
+        }
+    }
+
+    for e in &sorted {
+        for ancestor in ancestors_of_reference(e.id, evidence) {
+            if by_id.contains_key(&ancestor) {
+                union(&mut parent, e.id, ancestor);
+                bases_by_pair.insert((
+                    e.id.min(ancestor),
+                    e.id.max(ancestor),
+                    FamilyBasisTag::DerivationAncestry {
+                        parent: ancestor,
+                        child: e.id,
+                    },
+                ));
+            }
+        }
+    }
+
+    let mut by_event: BTreeMap<Uuid, Vec<Uuid>> = BTreeMap::new();
+    for e in &sorted {
+        let on_agent_channel = e
+            .source
+            .as_ref()
+            .map(|s| {
+                matches!(
+                    s.trust_class,
+                    TrustClass::AgentAdjacent | TrustClass::ModelInternal
+                )
+            })
+            .unwrap_or(false);
+        if e.source.is_some() && on_agent_channel {
+            by_event.entry(e.source_event_id).or_default().push(e.id);
+        }
+    }
+    for (event_id, ids) in &by_event {
+        for pair in ids.windows(2) {
+            union(&mut parent, pair[0], pair[1]);
+            bases_by_pair.insert((
+                pair[0].min(pair[1]),
+                pair[0].max(pair[1]),
+                FamilyBasisTag::SameAgentTurn(*event_id),
+            ));
+        }
+    }
+
+    let mut members_by_root: BTreeMap<Uuid, Vec<Uuid>> = BTreeMap::new();
+    for e in &sorted {
+        if e.source.is_none() {
+            members_by_root.entry(e.id).or_default().push(e.id);
+            continue;
+        }
+        let root = find(&mut parent, e.id);
+        members_by_root.entry(root).or_default().push(e.id);
+    }
+
+    let mut families = Vec::new();
+    for (_, mut ids) in members_by_root {
+        ids.sort();
+        ids.dedup();
+        let mut bases: BTreeSet<FamilyBasisTag> = BTreeSet::new();
+        if ids.len() == 1
+            && evidence
+                .iter()
+                .find(|e| e.id == ids[0])
+                .map(|e| e.source.is_none())
+                .unwrap_or(false)
+        {
+            bases.insert(FamilyBasisTag::UnknownProvenance);
+        }
+        for (a, b, tag) in &bases_by_pair {
+            if ids.contains(a) && ids.contains(b) {
+                bases.insert(tag.clone());
+            }
+        }
+        families.push(SourceFamily {
+            evidence_ids: ids,
+            bases: bases.into_iter().map(FamilyBasisTag::into_basis).collect(),
+        });
+    }
+    families.sort_by_key(|f| f.evidence_ids.first().copied());
+    let mut index = HashMap::new();
+    for (i, f) in families.iter().enumerate() {
+        for id in &f.evidence_ids {
+            index.insert(*id, i);
+        }
+    }
+
+    SourceFamilyMap { families, index }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
