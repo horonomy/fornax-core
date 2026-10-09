@@ -1,0 +1,33 @@
+[package]
+name = "fornax-host-adapter-exec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "fornax_host_adapter_exec"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fornax-host-adapter-exec"
+path = "src/main.rs"
+
+# HORO-1715 / HORO-1712: lives outside `crates/` for the same structural
+# reason as `exec/fornax-acquire-exec` (ADR-0022) -- so the zero-subprocess
+# scan in `crates/fornax-daemon/tests/adversarial_daemon_input.rs` never
+# needs to know about it. Unlike that crate, this one spawns NOTHING: the
+# founder decision on 2026-10-09 is fail-closed pending a same-user-writer
+# integrity model, so every execution path returns a typed refusal. See
+# `src/main.rs`'s module docs.
+[dependencies]
+fornax-types = { path = "../../crates/fornax-types" }
+fornax-store = { path = "../../crates/fornax-store" }
+fornax-experiment-runner = { path = "../../crates/fornax-experiment-runner" }
+clap.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true

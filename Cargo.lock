@@ -1081,6 +1081,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "fornax-host-adapter-exec"
+version = "0.0.8"
+dependencies = [
+ "clap",
+ "fornax-experiment-runner",
+ "fornax-store",
+ "fornax-types",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "fornax-load-harness"
 version = "0.0.8"
 dependencies = [
