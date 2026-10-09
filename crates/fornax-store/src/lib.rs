@@ -20,6 +20,7 @@ pub mod audit_ledger;
 pub mod calibration;
 pub mod compliance_report;
 pub mod corpus;
+pub mod evidence_consumption;
 pub mod feedback;
 pub mod policy_cache;
 pub mod quarantine;
@@ -63,6 +64,12 @@ pub enum StoreError {
     /// error path -- see `audit_ledger.rs`'s trust-boundary doc comment).
     #[error("audit ledger data corrupt: {0}")]
     AuditLedgerCorrupt(String),
+    /// FORNX-431: a persisted `evidence_consumption` row's `claim_id` or
+    /// `anchor_event_id` failed to parse back into a `Uuid`. Should never
+    /// happen for a row `Store::record_consumption` itself wrote --
+    /// indicates on-disk corruption or manual tampering with `fornax.db`.
+    #[error("evidence consumption ledger data corrupt: {0}")]
+    EvidenceConsumptionCorrupt(String),
     /// FORNX-341: `Store::insert_corpus_candidate` refuses to persist while
     /// `fornax_types::privacy::corpus_mining_allowed` is closed (the
     /// default). Unlike `retention::longitudinal_persistence_allowed`'s
