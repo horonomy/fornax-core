@@ -1339,7 +1339,13 @@ mod tests {
         colliding.tool_response = Some(serde_json::json!({"exit_code": 1}));
         let result = store.insert_event(&colliding).await;
         assert!(
-            matches!(result, Err(StoreError::IdCollision { table: "agent_events", .. })),
+            matches!(
+                result,
+                Err(StoreError::IdCollision {
+                    table: "agent_events",
+                    ..
+                })
+            ),
             "expected IdCollision, got {result:?}"
         );
 
@@ -1387,7 +1393,10 @@ mod tests {
             evidence_purged: false,
         };
         assert_eq!(
-            store.insert_evidence(&evidence).await.expect("first insert"),
+            store
+                .insert_evidence(&evidence)
+                .await
+                .expect("first insert"),
             InsertOutcome::Inserted
         );
 
@@ -1455,7 +1464,13 @@ mod tests {
         colliding.payload = serde_json::json!({"command": ["pytest"], "exit_code": 1});
         let result = store.insert_evidence(&colliding).await;
         assert!(
-            matches!(result, Err(StoreError::IdCollision { table: "evidence", .. })),
+            matches!(
+                result,
+                Err(StoreError::IdCollision {
+                    table: "evidence",
+                    ..
+                })
+            ),
             "expected IdCollision, got {result:?}"
         );
 

@@ -34,3 +34,9 @@ ed25519-dalek.workspace = true
 sqlx.workspace = true
 sha2.workspace = true
 hex.workspace = true
+# HORO-1712: the idempotent-dedup integration test feeds a real
+# `fornax-adapter-codex` translation (dedup_id-stamped Event/Evidence)
+# through `process_line` twice, exercising the actual id scheme end to
+# end rather than hand-rolling ids that merely resemble it. No cycle:
+# fornax-adapter-codex does not depend on this crate.
+fornax-adapter-codex = { path = "../fornax-adapter-codex" }

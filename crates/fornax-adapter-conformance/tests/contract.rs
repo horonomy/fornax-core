@@ -117,16 +117,19 @@ fn claude_declares_process_result_unsupported_and_never_emits_a_literal_exit_cod
 }
 
 /// Same kind of cross-check for Codex: `ToolInvocation` is declared
-/// `Unsupported` (rollout-tail cannot intercept pre-execution) — no golden
-/// fixture replay may ever yield a `PreToolUse` event, which would
-/// contradict that declaration.
+/// `Unavailable` (HORO-1712; was `Unsupported` -- Codex hooks are a real
+/// pre-execution mechanism in principle, this adapter's rollout-tail path
+/// just doesn't ingest them, same honest-claim distinction already drawn
+/// for `ProcessResult`) — no golden fixture replay may ever yield a
+/// `PreToolUse` event, which would contradict that declaration regardless
+/// of which of the two "not observed" states it's phrased as.
 #[test]
-fn codex_declares_tool_invocation_unsupported_and_never_emits_pre_tool_use() {
+fn codex_declares_tool_invocation_unavailable_and_never_emits_pre_tool_use() {
     let adapter = CodexAdapter::new();
     assert_eq!(
         adapter.probe().state_of(&SignalClass::ToolInvocation),
-        SignalAvailability::Unsupported,
-        "this test's other assertion depends on this declaration staying Unsupported"
+        SignalAvailability::Unavailable,
+        "this test's other assertion depends on this declaration staying Unavailable"
     );
 
     let mut adapter = CodexAdapter::new();
@@ -137,7 +140,7 @@ fn codex_declares_tool_invocation_unsupported_and_never_emits_pre_tool_use() {
                     assert_ne!(
                         ev.kind,
                         EventKind::PreToolUse,
-                        "CodexAdapter declares ToolInvocation Unsupported, so it must never \
+                        "CodexAdapter declares ToolInvocation Unavailable, so it must never \
                          emit a PreToolUse event"
                     );
                 }
