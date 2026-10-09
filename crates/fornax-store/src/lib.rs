@@ -78,6 +78,38 @@ pub enum StoreError {
     /// existing one.
     #[error("gold label revision {case_id}#{revision} is already frozen -- relabeling must use the next revision number, never overwrite one")]
     GoldLabelAlreadyFrozen { case_id: String, revision: u32 },
+    /// HORO-1712: `insert_event`/`insert_evidence` are idempotent on a
+    /// primary-key id collision (see [`InsertOutcome`]) -- a hook and the
+    /// rollout tailer observing the *same* real event compute the same
+    /// deterministic id (`fornax_adapter_codex::dedup_id`) and the second
+    /// insert is a safe no-op. This variant is the *other* case: the
+    /// incoming row's own identifying tuple (`session_id`/`provider`/`kind`,
+    /// plus `source_event_id` for evidence) does not match the row already
+    /// stored under that id -- a genuine id collision, not an idempotent
+    /// replay. Must never be silently resolved by overwriting the existing
+    /// row (rows are immutable by this crate's own convention); the caller
+    /// is expected to quarantine it instead.
+    #[error(
+        "id collision: {table} row {id} already exists with a different session/provider/kind \
+         tuple than this insert attempted -- not a safe idempotent replay"
+    )]
+    IdCollision { table: &'static str, id: String },
+}
+
+/// Outcome of an idempotent insert (`Store::insert_event`/
+/// `Store::insert_evidence`, HORO-1712). `Duplicate` means the exact row id
+/// already existed with a matching core identifying tuple -- the insert was
+/// a safe no-op, e.g. a hook observation and a rollout-tailer observation of
+/// the same real event, or the rollout tailer re-reading from offset 0 after
+/// a restart. Callers that only cared about "did this succeed" (the
+/// overwhelming majority -- see call sites across `fornax-cli`/
+/// `fornax-daemon`) can keep using `?`/`.expect(..)` unchanged; only a
+/// caller that needs to distinguish a fresh insert from a replay (currently
+/// `fornax-daemon::handle_message`) matches on this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertOutcome {
+    Inserted,
+    Duplicate,
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -225,16 +257,19 @@ impl Store {
     /// local daemon's closest available tenant-scoping key; see
     /// `retention::retention_class_for_table`'s doc comment for the same
     /// choice applied uniformly across all four insert paths.
-    pub async fn insert_event(&self, e: &AgentEvent) -> Result<()> {
+    pub async fn insert_event(&self, e: &AgentEvent) -> Result<InsertOutcome> {
+        let provider_tag = tag(&e.provider)?;
+        let kind_tag = tag(&e.kind)?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        sqlx::query(
+        let outcome = sqlx::query(
             "INSERT INTO agent_events (id, session_id, provider, kind, observed_at, tool_name, tool_input, tool_response, raw)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(id) DO NOTHING",
         )
         .bind(e.id.to_string())
         .bind(&e.session_id)
-        .bind(tag(&e.provider)?)
-        .bind(tag(&e.kind)?)
+        .bind(&provider_tag)
+        .bind(&kind_tag)
         .bind(&e.observed_at)
         .bind(&e.tool_name)
         .bind(e.tool_input.as_ref().map(|v| v.to_string()))
@@ -242,13 +277,39 @@ impl Store {
         .bind(e.raw.to_string())
         .execute(&mut *tx)
         .await?;
+
+        if outcome.rows_affected() == 0 {
+            // HORO-1712: id already present -- either a safe idempotent
+            // replay (same core tuple) or a genuine id collision. Read back
+            // inside the same transaction so this check sees a consistent
+            // snapshot even under concurrent writers.
+            let existing: Option<(String, String, String)> = sqlx::query_as(
+                "SELECT session_id, provider, kind FROM agent_events WHERE id = ?1",
+            )
+            .bind(e.id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+            return match existing {
+                Some((sid, prov, kind))
+                    if sid == e.session_id && prov == provider_tag && kind == kind_tag =>
+                {
+                    tx.commit().await?;
+                    Ok(InsertOutcome::Duplicate)
+                }
+                _ => Err(StoreError::IdCollision {
+                    table: "agent_events",
+                    id: e.id.to_string(),
+                }),
+            };
+        }
+
         let lineage_tag = DatasetLineageTag::new(
             retention::retention_class_for_table("agent_events"),
             TenantRef(e.session_id.clone()),
         );
         insert_lineage_tag_row(&mut *tx, "agent_events", &e.id.to_string(), &lineage_tag).await?;
         tx.commit().await?;
-        Ok(())
+        Ok(InsertOutcome::Inserted)
     }
 
     /// See [`Store::insert_event`]'s doc comment — same atomic
@@ -280,22 +341,24 @@ impl Store {
     /// insert-plus-lineage-tag shape (FORNX-319 AC1). `ev.evidence_purged`
     /// is always `false` for a freshly-collected row; a purge only ever
     /// happens later, via [`retention::purge_evidence_payload`].
-    pub async fn insert_evidence(&self, ev: &Evidence) -> Result<()> {
+    pub async fn insert_evidence(&self, ev: &Evidence) -> Result<InsertOutcome> {
         let source = ev.source.as_ref().map(serde_json::to_string).transpose()?;
         let extension = ev
             .extension
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
+        let kind_tag = tag(&ev.kind)?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        sqlx::query(
+        let outcome = sqlx::query(
             "INSERT INTO evidence (id, session_id, source_event_id, kind, observed_at, payload, provenance, source, extension, evidence_purged)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(id) DO NOTHING",
         )
         .bind(ev.id.to_string())
         .bind(&ev.session_id)
         .bind(ev.source_event_id.to_string())
-        .bind(tag(&ev.kind)?)
+        .bind(&kind_tag)
         .bind(&ev.observed_at)
         .bind(ev.payload.to_string())
         .bind(&ev.provenance)
@@ -304,13 +367,43 @@ impl Store {
         .bind(ev.evidence_purged)
         .execute(&mut *tx)
         .await?;
+
+        if outcome.rows_affected() == 0 {
+            // HORO-1712: no `provider` column exists on `evidence` -- the
+            // closest-to-provider-scoping tuple this table actually has is
+            // `(session_id, kind, source_event_id)`. Never compares
+            // `observed_at` (fresh `Utc::now()` on every translate, always
+            // differs on replay) or `payload` (daemon-side redaction may
+            // rewrite it) -- neither is part of "is this the same logical
+            // row", just incidental wall-clock/processing detail.
+            let existing: Option<(String, String, String)> = sqlx::query_as(
+                "SELECT session_id, kind, source_event_id FROM evidence WHERE id = ?1",
+            )
+            .bind(ev.id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+            let source_event_id = ev.source_event_id.to_string();
+            return match existing {
+                Some((sid, kind, src_event))
+                    if sid == ev.session_id && kind == kind_tag && src_event == source_event_id =>
+                {
+                    tx.commit().await?;
+                    Ok(InsertOutcome::Duplicate)
+                }
+                _ => Err(StoreError::IdCollision {
+                    table: "evidence",
+                    id: ev.id.to_string(),
+                }),
+            };
+        }
+
         let lineage_tag = DatasetLineageTag::new(
             retention::retention_class_for_table("evidence"),
             TenantRef(ev.session_id.clone()),
         );
         insert_lineage_tag_row(&mut *tx, "evidence", &ev.id.to_string(), &lineage_tag).await?;
         tx.commit().await?;
-        Ok(())
+        Ok(InsertOutcome::Inserted)
     }
 
     /// See [`Store::insert_event`]'s doc comment — same atomic
