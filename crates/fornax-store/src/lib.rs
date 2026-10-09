@@ -20,6 +20,7 @@ pub mod audit_ledger;
 pub mod calibration;
 pub mod compliance_report;
 pub mod corpus;
+pub mod evidence_consumption;
 pub mod feedback;
 pub mod policy_cache;
 pub mod quarantine;
@@ -63,6 +64,12 @@ pub enum StoreError {
     /// error path -- see `audit_ledger.rs`'s trust-boundary doc comment).
     #[error("audit ledger data corrupt: {0}")]
     AuditLedgerCorrupt(String),
+    /// FORNX-431: a persisted `evidence_consumption` row's `claim_id` or
+    /// `anchor_event_id` failed to parse back into a `Uuid`. Should never
+    /// happen for a row `Store::record_consumption` itself wrote --
+    /// indicates on-disk corruption or manual tampering with `fornax.db`.
+    #[error("evidence consumption ledger data corrupt: {0}")]
+    EvidenceConsumptionCorrupt(String),
     /// FORNX-341: `Store::insert_corpus_candidate` refuses to persist while
     /// `fornax_types::privacy::corpus_mining_allowed` is closed (the
     /// default). Unlike `retention::longitudinal_persistence_allowed`'s
@@ -384,10 +391,27 @@ impl Store {
     /// See [`Store::insert_event`]'s doc comment — same atomic
     /// insert-plus-lineage-tag shape (FORNX-319 AC1).
     pub async fn insert_claim(&self, c: &Claim) -> Result<()> {
+        self.insert_claim_idempotent(c).await?;
+        Ok(())
+    }
+
+    /// Same insert as [`Store::insert_claim`], but a `c.id` that already
+    /// exists is treated as a resubmission, not an error (FORNX-431 slice
+    /// 3): the daemon's UDS path has no way to know whether a client
+    /// retried after a dropped response, so an identical claim arriving
+    /// twice must not land in `ingest_quarantine` as a spurious
+    /// `HandleError` — that would make FORNX-212's quarantine table noisy
+    /// with "failures" that are actually just network retries, not real
+    /// unprocessable input. Returns `true` if this call actually inserted a
+    /// new row, `false` if `c.id` already existed (caller decides whether
+    /// re-verifying an already-known claim is worth doing — this method
+    /// only answers "is this new or not").
+    pub async fn insert_claim_idempotent(&self, c: &Claim) -> Result<bool> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        sqlx::query(
+        let result = sqlx::query(
             "INSERT INTO claims (id, session_id, source_event_id, text, subject, claimed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (id) DO NOTHING",
         )
         .bind(c.id.to_string())
         .bind(&c.session_id)
@@ -397,13 +421,16 @@ impl Store {
         .bind(&c.claimed_at)
         .execute(&mut *tx)
         .await?;
-        let lineage_tag = DatasetLineageTag::new(
-            retention::retention_class_for_table("claims"),
-            TenantRef(c.session_id.clone()),
-        );
-        insert_lineage_tag_row(&mut *tx, "claims", &c.id.to_string(), &lineage_tag).await?;
+        let inserted = result.rows_affected() > 0;
+        if inserted {
+            let lineage_tag = DatasetLineageTag::new(
+                retention::retention_class_for_table("claims"),
+                TenantRef(c.session_id.clone()),
+            );
+            insert_lineage_tag_row(&mut *tx, "claims", &c.id.to_string(), &lineage_tag).await?;
+        }
         tx.commit().await?;
-        Ok(())
+        Ok(inserted)
     }
 
     /// See [`Store::insert_event`]'s doc comment — same atomic
@@ -411,6 +438,47 @@ impl Store {
     /// is always `false` for a freshly-collected row; a purge only ever
     /// happens later, via [`retention::purge_evidence_payload`].
     pub async fn insert_evidence(&self, ev: &Evidence) -> Result<InsertOutcome> {
+        self.insert_evidence_with_origin_opt(ev, None).await
+    }
+
+    /// Same insert as [`Store::insert_evidence`], additionally stamping
+    /// `evidence.ingress_origin` with how `ev` actually arrived (FORNX-431
+    /// slice 3 — slice 2 added the column, this is the first real writer of
+    /// it). `origin` must come from the receiving process's own knowledge
+    /// of its transport/call path (UDS ingest, the acquisition HTTP
+    /// handler, a privileged executor) — never from anything inside `ev`
+    /// itself, which is exactly the untrusted-payload-label problem this
+    /// column exists to not be. Callers that don't yet have a real origin
+    /// to assert (CLI imports, internal replay/migration helpers, tests)
+    /// keep using [`Store::insert_evidence`], which leaves the column NULL
+    /// — read back as [`fornax_types::provenance_guard::EvidenceOrigin::Unknown`],
+    /// not silently upgraded to anything trusted.
+    pub async fn insert_evidence_with_origin(
+        &self,
+        ev: &Evidence,
+        origin: fornax_types::provenance_guard::EvidenceOrigin,
+    ) -> Result<InsertOutcome> {
+        self.insert_evidence_with_origin_opt(ev, origin.as_column_str())
+            .await
+    }
+
+    /// HORO-1712 + FORNX-431 slice 3, unioned: shared insert body.
+    /// `ON CONFLICT(id) DO NOTHING` plus the readback-and-compare below
+    /// (see the `rows_affected() == 0` arm) makes a same-id insert
+    /// idempotent on a safe replay and fail-closed into `IdCollision` on a
+    /// genuine content mismatch; `ingress_origin` is bound alongside the
+    /// rest of the row so both concerns share one atomic transaction.
+    /// `ingress_origin` is deliberately not part of the replay-match
+    /// comparison below -- the same real event can legitimately be
+    /// observed via two different transports (e.g. a future hook path vs.
+    /// the rollout tailer), so a differing origin on a replay is expected,
+    /// not a collision; whichever insert won first keeps its stamped
+    /// origin, same treatment as `observed_at`.
+    async fn insert_evidence_with_origin_opt(
+        &self,
+        ev: &Evidence,
+        ingress_origin: Option<&'static str>,
+    ) -> Result<InsertOutcome> {
         let source = ev.source.as_ref().map(serde_json::to_string).transpose()?;
         let extension = ev
             .extension
@@ -420,8 +488,8 @@ impl Store {
         let kind_tag = tag(&ev.kind)?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let outcome = sqlx::query(
-            "INSERT INTO evidence (id, session_id, source_event_id, kind, observed_at, payload, provenance, source, extension, evidence_purged)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "INSERT INTO evidence (id, session_id, source_event_id, kind, observed_at, payload, provenance, source, extension, evidence_purged, ingress_origin)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(id) DO NOTHING",
         )
         .bind(ev.id.to_string())
@@ -434,6 +502,7 @@ impl Store {
         .bind(source)
         .bind(extension)
         .bind(ev.evidence_purged)
+        .bind(ingress_origin)
         .execute(&mut *tx)
         .await?;
 
@@ -2156,6 +2225,146 @@ mod tests {
             extension: None,
             evidence_purged: false,
         }
+    }
+
+    /// FORNX-431 slice 3: `insert_evidence_with_origin` must actually
+    /// stamp the column — a legacy/plain `insert_evidence` row must keep
+    /// reading back as `Unknown`, not accidentally pick up a trusted
+    /// origin from whatever the last-called sibling method happened to be.
+    #[tokio::test]
+    async fn insert_evidence_with_origin_stamps_the_column_insert_evidence_does_not() {
+        use fornax_types::provenance_guard::EvidenceOrigin;
+
+        let path = tmp_db_path("origin-stamp");
+        let store = Store::open(&path).await.expect("open db");
+
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: None,
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        store.insert_event(&event).await.expect("insert event");
+        let event_id = event.id;
+        let stamped = sample_evidence("s1", event_id);
+        let stamped_id = stamped.id;
+        store
+            .insert_evidence_with_origin(&stamped, EvidenceOrigin::DaemonAcquisition)
+            .await
+            .expect("insert with origin");
+
+        let unstamped = sample_evidence("s1", event_id);
+        let unstamped_id = unstamped.id;
+        store
+            .insert_evidence(&unstamped)
+            .await
+            .expect("insert without origin");
+
+        assert_eq!(
+            store.evidence_origin(stamped_id).await.unwrap(),
+            EvidenceOrigin::DaemonAcquisition
+        );
+        assert_eq!(
+            store.evidence_origin(unstamped_id).await.unwrap(),
+            EvidenceOrigin::Unknown,
+            "insert_evidence must never silently pick up a trusted origin"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// FORNX-431 slice 3: a privileged-executor origin round-trips the same
+    /// way — this is the exact stamp `fornax-acquire-exec` applies.
+    #[tokio::test]
+    async fn insert_evidence_with_origin_privileged_executor_round_trips() {
+        use fornax_types::provenance_guard::EvidenceOrigin;
+
+        let path = tmp_db_path("origin-privileged");
+        let store = Store::open(&path).await.expect("open db");
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: None,
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        store.insert_event(&event).await.expect("insert event");
+        let evidence = sample_evidence("s1", event.id);
+        let id = evidence.id;
+        store
+            .insert_evidence_with_origin(&evidence, EvidenceOrigin::PrivilegedExecutor)
+            .await
+            .expect("insert with origin");
+        assert_eq!(
+            store.evidence_origin(id).await.unwrap(),
+            EvidenceOrigin::PrivilegedExecutor
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// FORNX-431 slice 3: a client retrying after a dropped response must
+    /// not have its retry treated as a constraint-violation error — the
+    /// schema-level `ON CONFLICT (id) DO NOTHING` plus this method's
+    /// `Ok(false)` return is the whole contract.
+    #[tokio::test]
+    async fn insert_claim_idempotent_reports_duplicate_without_erroring() {
+        let path = tmp_db_path("claim-idempotent");
+        let store = Store::open(&path).await.expect("open db");
+
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: None,
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        store.insert_event(&event).await.expect("insert event");
+
+        let claim = Claim {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            source_event_id: event.id,
+            text: "idempotency test claim".into(),
+            subject: "test".into(),
+            claimed_at: "2026-01-01T00:00:01Z".into(),
+        };
+
+        let first = store
+            .insert_claim_idempotent(&claim)
+            .await
+            .expect("first insert");
+        assert!(first, "the first insert of a new claim must report true");
+
+        let second = store
+            .insert_claim_idempotent(&claim)
+            .await
+            .expect("second insert must not error");
+        assert!(
+            !second,
+            "an identical retry must report false, not insert a duplicate"
+        );
+
+        let claims = store.claims_for_session("s1").await.expect("read claims");
+        assert_eq!(
+            claims.len(),
+            1,
+            "exactly one claim row must exist after two identical submissions"
+        );
+
+        std::fs::remove_file(&path).ok();
     }
 
     /// FORNX-89 core scenario: a claim with 2 supporting + 1 contradicting

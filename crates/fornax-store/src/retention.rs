@@ -147,6 +147,7 @@ pub const KNOWN_RECORD_TABLES: &[&str] = &[
     "acquisition_log",
     "review_feedback",
     "ingest_quarantine",
+    "evidence_consumption",
 ];
 
 /// Explicit retention duration for a [`RetentionClass`] (FORNX-106 AC1). See
@@ -178,9 +179,12 @@ pub fn retention_duration_for(class: &RetentionClass) -> Duration {
 /// it forever.
 pub fn retention_class_for_table(record_table: &str) -> RetentionClass {
     match record_table {
-        "agent_events" | "claims" | "evidence" | "acquisition_log" | "ingest_quarantine" => {
-            RetentionClass::RawLocal
-        }
+        "agent_events"
+        | "claims"
+        | "evidence"
+        | "acquisition_log"
+        | "ingest_quarantine"
+        | "evidence_consumption" => RetentionClass::RawLocal,
         "findings" => RetentionClass::DerivedFinding,
         "corpus_candidates"
         | "adjudication_queue"
@@ -470,6 +474,17 @@ impl Store {
                         .await?;
                     true
                 }
+                // Unlike `ingest_quarantine`, a consumption row *does* carry a
+                // real `session_id` (recorded at write time, see the
+                // evidence_consumption module) -- this arm is reachable in
+                // practice, not just for match-arm-consistency's sake.
+                "evidence_consumption" => {
+                    sqlx::query("DELETE FROM evidence_consumption WHERE id = ?1")
+                        .bind(&record.record_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    true
+                }
                 _ => false,
             };
             if deleted {
@@ -748,6 +763,13 @@ impl Store {
                         .await?;
                     report.deleted_records += 1;
                 }
+                "evidence_consumption" => {
+                    sqlx::query("DELETE FROM evidence_consumption WHERE id = ?1")
+                        .bind(&record.record_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    report.deleted_records += 1;
+                }
                 _ => {
                     report.unknown_table_skipped += 1;
                 }
@@ -970,6 +992,7 @@ mod tests {
             "acquisition_log",
             "review_feedback",
             "ingest_quarantine",
+            "evidence_consumption",
         ];
         assert_eq!(KNOWN_RECORD_TABLES, &match_arm_tables);
     }
