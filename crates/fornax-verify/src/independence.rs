@@ -395,17 +395,27 @@ impl SourceFamilyMap {
         }
 
         // Rule 2: derived_from ancestry, transitive -- the real cost driver.
-        // Charged per ancestor edge visited (via `ancestors_of_indexed_counted`)
-        // plus one unit per `bases_by_pair` entry recorded.
+        // Charged per ancestor edge visited (via `ancestors_of_indexed_counted`,
+        // which checks the budget itself after every single edge -- see its
+        // doc comment for why that must happen inside the traversal rather
+        // than once after it returns) plus one unit per `bases_by_pair`
+        // entry recorded below.
         for e in &sorted {
-            let ancestors = ancestors_of_indexed_counted(e.id, &by_id, &mut work_units);
-            if work_units > budget.max_work_units {
-                return Err(BudgetExceeded {
-                    evidence_count: evidence.len(),
-                    work_units_at_abort: work_units,
-                    limit: budget.max_work_units,
-                });
-            }
+            let ancestors = match ancestors_of_indexed_counted(
+                e.id,
+                &by_id,
+                &mut work_units,
+                budget.max_work_units,
+            ) {
+                Ok(ancestors) => ancestors,
+                Err(()) => {
+                    return Err(BudgetExceeded {
+                        evidence_count: evidence.len(),
+                        work_units_at_abort: work_units,
+                        limit: budget.max_work_units,
+                    });
+                }
+            };
             for ancestor in ancestors {
                 if by_id.contains_key(&ancestor) {
                     union(&mut parent, e.id, ancestor);
@@ -669,14 +679,30 @@ impl std::error::Error for BudgetExceeded {}
 /// by one per edge visited (an edge that resolves to a present record in
 /// `by_id`, mirroring what `try_build`'s caller then charges a second unit
 /// for when it records the resulting `bases_by_pair` entry -- this function
-/// only charges the traversal half). Does NOT check the budget itself --
-/// the caller checks after each call, consistent with every other charge
-/// point in `try_build`.
+/// only charges the traversal half) and checks `*work_units` against
+/// `limit` immediately after EVERY increment, aborting the traversal itself
+/// (returning `Err(())`) the moment it's exceeded.
+///
+/// This check must live inside the loop, not after it returns: a single
+/// evidence record's reachable-ancestor closure can be large on its own on
+/// an adversarial pool (`adversarial_dense`/`rejoining_dag`/`deep_chain` in
+/// `docs/research/fornx-432-independence-capacity.md` -- e.g. one record's
+/// closure in a dense n=2000 graph can touch on the order of n^2/2 edges).
+/// An earlier version of this function ran its traversal to completion and
+/// let the caller check only once the whole call returned, which meant one
+/// call could do unbounded-relative-to-`limit` work -- up to the full
+/// ~78s/n=2000 `adversarial_dense` cost measured unbounded in PR 1/2 --
+/// before the first check ever fired, defeating the budget's purpose for
+/// exactly the shape it exists to bound. Checking after each single
+/// increment (the same granularity the `charge!` macro already uses for
+/// `bases_by_pair` entries) closes that gap: the traversal can overshoot
+/// `limit` by at most one unit before returning.
 fn ancestors_of_indexed_counted(
     evidence_id: Uuid,
     by_id: &BTreeMap<Uuid, &Evidence>,
     work_units: &mut u64,
-) -> BTreeSet<Uuid> {
+    limit: u64,
+) -> Result<BTreeSet<Uuid>, ()> {
     let mut result = BTreeSet::new();
     let mut visited = BTreeSet::new();
     let mut stack = vec![evidence_id];
@@ -695,12 +721,15 @@ fn ancestors_of_indexed_counted(
         for &parent in parents {
             if parent != evidence_id && by_id.contains_key(&parent) {
                 *work_units = work_units.saturating_add(1);
+                if *work_units > limit {
+                    return Err(());
+                }
                 result.insert(parent);
                 stack.push(parent);
             }
         }
     }
-    result
+    Ok(result)
 }
 
 /// FORNX-432 PR 1: byte-for-byte historical copy of [`ancestors_of`], kept
@@ -1138,6 +1167,65 @@ mod tests {
         let message = err.to_string();
         assert!(!message.contains(&a_id.to_string()));
         assert!(!message.contains(&b_id.to_string()));
+    }
+
+    /// The regression test for the mid-traversal overshoot bug: a single
+    /// record's `derived_from` ancestry closure must stop growing shortly
+    /// after the budget is crossed, not only after the WHOLE closure (which
+    /// can be far larger than the budget on an adversarial pool) has been
+    /// walked. Before `ancestors_of_indexed_counted` checked the budget
+    /// after every single increment, this traversal ran to completion
+    /// first (processing all 5,000 direct `derived_from` edges below in one
+    /// uninterrupted pass) and only then let `try_build`'s caller check the
+    /// total once -- so `work_units_at_abort` would land at ~5,000 even
+    /// under a 100-unit budget. With the check inside the loop, it must
+    /// land close to the limit instead.
+    #[test]
+    fn try_build_aborts_close_to_the_limit_not_after_the_whole_ancestor_closure() {
+        const PARENT_COUNT: usize = 5_000;
+        let parents: Vec<Evidence> = (0..PARENT_COUNT)
+            .map(|_| evidence_with_source(TrustClass::HostObserved, Uuid::new_v4(), None, vec![]))
+            .collect();
+        let parent_ids: Vec<Uuid> = parents.iter().map(|e| e.id).collect();
+        let child = evidence_with_source(
+            TrustClass::HostObserved,
+            Uuid::new_v4(),
+            None,
+            parent_ids.clone(),
+        );
+
+        let mut pool = parents;
+        pool.push(child);
+
+        let limit = 100u64;
+        let err = SourceFamilyMap::try_build(
+            &pool,
+            &FamilyBudget {
+                max_work_units: limit,
+            },
+        )
+        .expect_err("5,000 direct derived_from edges must exceed a 100-unit budget");
+        assert_eq!(err.limit, limit);
+        // The real assertion: the traversal must have aborted close to the
+        // limit (overshoot bounded by one increment), never anywhere near
+        // the full closure size. `limit + 1` is the exact expected value
+        // given the fix (check fires the instant the increment pushes the
+        // counter past `limit`); a generous `limit * 4` upper bound keeps
+        // this robust to a reasonable alternate correct implementation
+        // without being so loose it would still pass against the old,
+        // buggy ~5,000 behavior.
+        assert!(
+            err.work_units_at_abort > limit,
+            "must have actually exceeded the limit: {} vs limit {limit}",
+            err.work_units_at_abort
+        );
+        assert!(
+            err.work_units_at_abort <= limit * 4,
+            "work_units_at_abort ({}) is nowhere near the {limit}-unit budget -- the ancestor \
+             traversal ran to completion (full closure of {PARENT_COUNT} edges) before the \
+             budget was ever checked, instead of aborting mid-traversal",
+            err.work_units_at_abort
+        );
     }
 
     // FORNX-432 PR 2: property-based proof that the speed-ups above
