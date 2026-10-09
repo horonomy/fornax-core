@@ -702,6 +702,26 @@ fn translate_line(
                 };
                 let command = pending_calls.remove(call_id).unwrap_or_default();
 
+                // HORO-1712: once this stream is confirmed to use the
+                // 0.160+ item-format shape, this "code-mode cell" wrapper
+                // is never trusted for exit-code evidence again -- it is
+                // the actual false-green bug (codex-cli 0.160+ wraps a
+                // nested shell command in this custom_tool_call_output
+                // *and* reports it via a real item_completed
+                // CommandExecution; the cell's own "Script completed" text
+                // carries no real exit code at all and was previously
+                // reported as heuristic:true, exit_code:0 regardless of
+                // whether the nested command actually failed). Suppressed
+                // entirely -- no Event, no Evidence -- once the real
+                // per-command signal is available; `pending_calls.remove`
+                // above already drains the entry either way, so nothing
+                // leaks across lines even while suppressed.
+                if item_format {
+                    return NormalizationOutcome::Ignored {
+                        reason: "code-mode cell; nested commands observed via CommandExecution",
+                    };
+                }
+
                 let now = chrono::Utc::now().to_rfc3339();
                 // HORO-1712: deterministic id when a real call_id is known
                 // (the normal case for this shape) so a replay of this
@@ -1702,5 +1722,160 @@ mod tests {
             }
             other => panic!("expected Unrecognized, got {other:?}"),
         }
+    }
+
+    // ---- HORO-1712: outer code-mode cell suppression -----------------
+
+    /// The actual false-green-bug fix: once `item_format` is latched, the
+    /// pre-0.160 `custom_tool_call_output` "Script completed" heuristic
+    /// path must produce neither Event nor Evidence, and must still drain
+    /// `pending_calls` so nothing leaks across lines.
+    #[test]
+    fn custom_tool_call_output_is_suppressed_once_item_format_latched() {
+        let mut adapter = CodexAdapter::new();
+        let meta = serde_json::json!({
+            "type": "session_meta",
+            "payload": {"session_id": "s", "cli_version": "0.160.0"}
+        });
+        let _ = normalize(&mut adapter, &meta);
+
+        let call = serde_json::json!({
+            "type": "response_item",
+            "payload": {"type": "custom_tool_call", "name": "exec", "call_id": "c1", "input": "echo hi"}
+        });
+        let _ = normalize(&mut adapter, &call);
+        assert_eq!(
+            adapter.pending_calls.get("c1").map(String::as_str),
+            Some("echo hi")
+        );
+
+        let output = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "c1",
+                "output": [{"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"}]
+            }
+        });
+        match normalize(&mut adapter, &output) {
+            NormalizationOutcome::Ignored { reason } => {
+                assert!(reason.contains("CommandExecution"));
+            }
+            other => panic!("expected Ignored (suppressed), got {other:?}"),
+        }
+        assert!(
+            adapter.pending_calls.is_empty(),
+            "pending_calls must be drained even while suppressed"
+        );
+    }
+
+    /// HORO-1712 false-green regression, as a real repro: a 0.160-style
+    /// stream where the outer code-mode cell's `custom_tool_call_output`
+    /// claims "Script completed" (the old heuristic would report
+    /// heuristic:true, exit_code:0) while the real per-command
+    /// `item_completed` CommandExecution for the same logical command
+    /// reports `exit_code: 1`. Fed into the real `TestResultVerifier`
+    /// (not a reimplementation of its logic), the claim "All tests
+    /// passed." must resolve `Contradicted`, never `Verified`.
+    ///
+    /// Mutation-tested by hand during development (not committed): with
+    /// the `if item_format { return Ignored }` suppression check in
+    /// `translate_line`'s `custom_tool_call_output` arm commented out,
+    /// this test fails (`Verified`, from the heuristic's fabricated
+    /// exit_code:0 landing after the real exit_code:1 evidence as the
+    /// verifier's most-recent match) -- restoring the check makes it pass.
+    #[test]
+    fn false_green_regression_item_completed_contradicts_code_mode_heuristic() {
+        use fornax_verify::{TestResultVerifier, Verifier};
+
+        let mut adapter = CodexAdapter::new();
+        let meta = serde_json::json!({
+            "type": "session_meta",
+            "payload": {"session_id": "sess-fg", "cli_version": "0.160.1"}
+        });
+        let _ = normalize(&mut adapter, &meta);
+        assert!(
+            adapter.item_format(),
+            "latch must be set from session_meta cli_version before the rest of this test means anything"
+        );
+
+        let call = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "call_id": "call_fg",
+                "input": "const r = await tools.exec_command({cmd:\"cargo test\",workdir:\"/tmp\"}); text(r.output);\n"
+            }
+        });
+        let _ = normalize(&mut adapter, &call);
+
+        // The nested command's own real result, observed first (realistic
+        // causality: the nested exec finishes before the outer code-mode
+        // cell's own wrapper completion fires).
+        let item_completed = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "id": "item_fg_1",
+                    "type": "CommandExecution",
+                    "status": "failed",
+                    "exit_code": 1,
+                    "command": ["cargo", "test"],
+                    "source": "agent"
+                }
+            }
+        });
+        let mut evidence: Vec<Evidence> = Vec::new();
+        let mut event_count = 0usize;
+        for msg in normalize(&mut adapter, &item_completed).into_messages() {
+            match msg {
+                IngestMessage::Evidence(ev) => evidence.push(ev),
+                IngestMessage::Event(_) => event_count += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(event_count, 1);
+        assert_eq!(
+            evidence.len(),
+            1,
+            "item_completed must produce the real exit_code=1 evidence"
+        );
+
+        // The outer cell's own completion, observed second -- with the
+        // fix, this must be fully suppressed (no second, contradicting
+        // heuristic Evidence appended after the real one).
+        let output = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "call_fg",
+                "output": [{"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"}]
+            }
+        });
+        match normalize(&mut adapter, &output) {
+            NormalizationOutcome::Ignored { .. } => {}
+            other => panic!(
+                "expected the code-mode cell to be suppressed once item_format is latched, got {other:?}"
+            ),
+        }
+
+        let claim = Claim {
+            id: Uuid::new_v4(),
+            session_id: "sess-fg".to_string(),
+            source_event_id: Uuid::new_v4(),
+            text: "All tests passed.".to_string(),
+            subject: "test_result".to_string(),
+            claimed_at: chrono::Utc::now().to_rfc3339(),
+        };
+
+        let caps = adapter.probe();
+        let finding = TestResultVerifier.verify(&claim, &evidence, &caps);
+        assert_eq!(
+            finding.verdict,
+            fornax_types::Verdict::Contradicted,
+            "a failing exit_code must never be verified as passing: {finding:?}"
+        );
     }
 }
