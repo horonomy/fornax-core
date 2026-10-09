@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
 use tokio::time::timeout;
 
 mod audit_checkpoint_submit;
@@ -156,6 +156,16 @@ struct AppState {
     /// *whose turn is currently being served* and only advances once a
     /// ticket's processing turn actually finishes.
     next_ticket: Arc<AtomicU64>,
+    /// HORO-1712: caps how many accepted connections may be simultaneously
+    /// open (waiting for their turn, draining, or handed off) at once.
+    /// Without this, accept volume exceeding processing rate grows the
+    /// turnstile queue -- and each queued connection's held-open fd --
+    /// without bound, eventually exhausting the process's file-descriptor
+    /// limit and taking the whole listener down. `run_uds_server` acquires
+    /// a permit *before* calling `accept()`, so once at capacity the excess
+    /// connections queue in the OS's own listen backlog rather than as
+    /// open, unconsumed fds in this process.
+    inflight: Arc<Semaphore>,
     /// FORNX-339: this daemon's `$FORNAX_HOME` identity, sent as a response
     /// header on every HTTP reply so a client can prove it's talking to the
     /// daemon serving its own home rather than a different one that won the
@@ -398,6 +408,7 @@ async fn main() -> anyhow::Result<()> {
         next_turn: Arc::new(AtomicU64::new(0)),
         turn_advanced: Arc::new(Notify::new()),
         next_ticket: Arc::new(AtomicU64::new(0)),
+        inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_CONNECTIONS)),
         home_id: Arc::from(home_identity(&home).as_str()),
         trust: Arc::new(trusted),
         policy: Arc::new(RwLock::new(policy_snapshot)),
@@ -496,6 +507,14 @@ const DRAIN_IDLE: Duration = Duration::from_millis(250);
 /// does not count against this budget — a large one-shot payload that is
 /// slow to *process* must never be handed off mid-message.
 const DRAIN_READ_BUDGET: Duration = Duration::from_secs(1);
+/// Maximum number of UDS ingest connections that may be simultaneously
+/// open (queued on the turnstile, draining, or handed off) at once. Bounds
+/// the process's own file-descriptor usage under load that exceeds
+/// processing rate — the per-connection resource that was previously
+/// unbounded. One Claude Code/Codex/opencode session opens only a handful
+/// of connections at a time, so this is sized generously above any
+/// realistic legitimate burst while still bounding worst case.
+const MAX_INFLIGHT_CONNECTIONS: usize = 256;
 
 type IngestLines = tokio::io::Lines<BufReader<UnixStream>>;
 
@@ -545,10 +564,26 @@ enum Drain {
 /// continues independently via [`continue_connection`], so it can never
 /// hold up the connections queued behind it beyond that bounded window
 /// either.
+///
+/// Before calling `accept()` at all, this loop acquires a permit from
+/// `AppState::inflight`, capped at [`MAX_INFLIGHT_CONNECTIONS`]. Without
+/// this, accept volume exceeding processing rate would grow the turnstile
+/// queue -- and each queued connection's held-open fd -- without bound,
+/// eventually exhausting the process's file-descriptor limit and taking
+/// the whole listener down; a security review of an earlier draft (no cap
+/// at all) caught exactly this. Acquiring the permit *before* `accept()`
+/// means excess connections past the cap queue in the OS's own listen
+/// backlog rather than as open, unconsumed fds here.
 async fn run_uds_server(sock_path: &PathBuf, state: AppState) -> anyhow::Result<()> {
     let listener = UnixListener::bind(sock_path)?;
     tracing::info!(path = %sock_path.display(), "UDS ingest listening");
     loop {
+        let permit = state
+            .inflight
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("AppState::inflight is never closed for the process lifetime");
         let (stream, _addr) = listener.accept().await?;
         // Ticket order equals accept order exactly: the accept loop is
         // single-threaded (one `accept()` in flight at a time), so handing
@@ -558,6 +593,12 @@ async fn run_uds_server(sock_path: &PathBuf, state: AppState) -> anyhow::Result<
         let ticket = state.next_ticket.fetch_add(1, Ordering::SeqCst);
         let state = state.clone();
         tokio::spawn(async move {
+            // Held until this connection's task ends (any outcome,
+            // including panic -- `OwnedSemaphorePermit::drop` always
+            // releases it), so the permit genuinely bounds concurrently
+            // open connections, not just connections currently in the
+            // accept loop.
+            let _permit = permit;
             if let Err(e) = handle_connection_in_turn(stream, state, ticket).await {
                 tracing::warn!(error = %e, "ingest connection ended with error");
             }
@@ -573,28 +614,34 @@ async fn run_uds_server(sock_path: &PathBuf, state: AppState) -> anyhow::Result<
 /// [`continue_connection`] — a handed-off connection runs with the same
 /// mutual-exclusion-only contract `AppState::processing` always provided,
 /// never blocking any later connection's turn.
+///
+/// The turn is released via [`TurnGuard`]'s `Drop`, not a manual call in
+/// each match arm: an earlier draft called `advance_turn` explicitly in
+/// every `Ok`/`Err` branch but had nothing covering a panic inside
+/// `drain_in_order` itself (e.g. a malformed line reaching deep enough to
+/// panic in `process_line`) -- a security review caught that such a panic,
+/// caught at the `tokio::spawn` task boundary with nothing ever calling
+/// `advance_turn` for that ticket, would stall every connection queued
+/// behind it, permanently. A `Drop` impl runs during unwind the same as on
+/// a normal return, so it cannot be skipped that way.
 async fn handle_connection_in_turn(
     stream: UnixStream,
     state: AppState,
     ticket: u64,
 ) -> anyhow::Result<()> {
     wait_for_turn(&state, ticket).await;
-    match drain_in_order(stream, state.clone()).await {
-        Ok(Drain::Eof) => {
-            advance_turn(&state);
-            Ok(())
-        }
+    let guard = TurnGuard::new(&state);
+    let outcome = drain_in_order(stream, state.clone()).await;
+    // Relinquish the turn *before* continuing independently (the `Handoff`
+    // case): a long-lived connection must never hold up every connection
+    // accepted after it just because it is still open.
+    drop(guard);
+    match outcome {
+        Ok(Drain::Eof) => Ok(()),
         Ok(Drain::Handoff(lines, session_hint)) => {
-            // Relinquish the turn *before* continuing independently: a
-            // long-lived connection must never hold up every connection
-            // accepted after it just because it is still open.
-            advance_turn(&state);
             continue_connection(lines, session_hint, state).await
         }
-        Err(e) => {
-            advance_turn(&state);
-            Err(e)
-        }
+        Err(e) => Err(e),
     }
 }
 
@@ -614,9 +661,29 @@ async fn wait_for_turn(state: &AppState, ticket: u64) {
 
 /// Advances the turnstile by one and wakes every connection currently
 /// waiting for its turn, so the one whose ticket now matches can proceed.
-fn advance_turn(state: &AppState) {
-    state.next_turn.fetch_add(1, Ordering::SeqCst);
-    state.turn_advanced.notify_waiters();
+/// Runs exactly once per ticket, on `Drop`, regardless of whether the
+/// holder returned normally, returned an error, or panicked -- see
+/// `handle_connection_in_turn`'s doc comment for why a manual call at each
+/// return site was not enough.
+struct TurnGuard {
+    next_turn: Arc<AtomicU64>,
+    turn_advanced: Arc<Notify>,
+}
+
+impl TurnGuard {
+    fn new(state: &AppState) -> Self {
+        Self {
+            next_turn: state.next_turn.clone(),
+            turn_advanced: state.turn_advanced.clone(),
+        }
+    }
+}
+
+impl Drop for TurnGuard {
+    fn drop(&mut self) {
+        self.next_turn.fetch_add(1, Ordering::SeqCst);
+        self.turn_advanced.notify_waiters();
+    }
 }
 
 /// Reads and processes this connection's immediately-available lines, in
@@ -2661,6 +2728,7 @@ mod tests {
             next_turn: Arc::new(AtomicU64::new(0)),
             turn_advanced: Arc::new(Notify::new()),
             next_ticket: Arc::new(AtomicU64::new(0)),
+            inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_CONNECTIONS)),
             home_id: Arc::from(format!("test-home-{}", Uuid::new_v4()).as_str()),
             trust: Arc::new(None),
             policy: Arc::new(RwLock::new(PolicyCacheSnapshot::empty())),
@@ -4696,6 +4764,7 @@ mod tests {
             next_turn: Arc::new(AtomicU64::new(0)),
             turn_advanced: Arc::new(Notify::new()),
             next_ticket: Arc::new(AtomicU64::new(0)),
+            inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_CONNECTIONS)),
             home_id: Arc::from(format!("test-home-{}", Uuid::new_v4()).as_str()),
             trust: Arc::new(None),
             policy: Arc::new(RwLock::new(PolicyCacheSnapshot::empty())),
@@ -4926,6 +4995,7 @@ mod tests {
             next_turn: Arc::new(AtomicU64::new(0)),
             turn_advanced: Arc::new(Notify::new()),
             next_ticket: Arc::new(AtomicU64::new(0)),
+            inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_CONNECTIONS)),
             home_id: Arc::from(format!("test-home-{}", Uuid::new_v4()).as_str()),
             trust: Arc::new(None),
             policy: Arc::new(RwLock::new(PolicyCacheSnapshot::empty())),

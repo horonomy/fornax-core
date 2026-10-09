@@ -305,6 +305,7 @@ mod tests {
             next_turn: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             turn_advanced: std::sync::Arc::new(tokio::sync::Notify::new()),
             next_ticket: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            inflight: std::sync::Arc::new(tokio::sync::Semaphore::new(256)),
             home_id: std::sync::Arc::from(format!("test-home-{}", uuid::Uuid::new_v4()).as_str()),
             trust: std::sync::Arc::new(None),
             policy: std::sync::Arc::new(tokio::sync::RwLock::new(

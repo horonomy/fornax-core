@@ -1017,6 +1017,7 @@ mod tests {
             next_turn: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             turn_advanced: Arc::new(tokio::sync::Notify::new()),
             next_ticket: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            inflight: Arc::new(tokio::sync::Semaphore::new(256)),
             home_id: Arc::from(format!("test-home-{}", uuid::Uuid::new_v4()).as_str()),
             trust: Arc::new(trust),
             policy: Arc::new(TokioRwLock::new(crate::PolicyCacheSnapshot::empty())),
