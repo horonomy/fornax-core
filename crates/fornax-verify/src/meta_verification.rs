@@ -195,7 +195,23 @@ pub fn dependency_groups<'a>(
     contributions: &'a [MonitorContribution],
     evidence_pool: &[Evidence],
 ) -> Vec<Vec<&'a MonitorContribution>> {
-    let map = SourceFamilyMap::build(evidence_pool);
+    let map = match SourceFamilyMap::try_build(
+        evidence_pool,
+        &crate::independence::FamilyBudget::default_budget(),
+    ) {
+        Ok(map) => map,
+        // FORNX-432 PR 3: fail safe toward OVER-grouping, not under --
+        // this function exists to stop several same-family monitors from
+        // manufacturing independent corroboration, so when independence
+        // cannot be verified at all, treating everything as one group
+        // (maximally cautious: "assume shared dependency") is the safe
+        // direction, unlike `voi`'s `Independence::Unverified`/fusion's
+        // `Review` (which fail toward "flag as uncertain", appropriate for
+        // their own different failure semantics). Here there is no
+        // "uncertain" group kind to report -- the caller only sees grouped
+        // contributions -- so over-grouping is the only safe substitute.
+        Err(_budget_exceeded) => return vec![contributions.iter().collect()],
+    };
     let mut by_family_key: BTreeMap<Uuid, Vec<&MonitorContribution>> = BTreeMap::new();
     let mut singletons: Vec<Vec<&MonitorContribution>> = Vec::new();
 

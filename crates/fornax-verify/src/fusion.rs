@@ -192,6 +192,17 @@ pub enum FusionRule {
     /// R6: the final verdict decision, summarizing the counted votes (or
     /// their absence) that produced it.
     VerdictDecided,
+    /// FORNX-432 PR 3: R5b's source-family construction exceeded its
+    /// deterministic work budget on this claim's full evidence pool --
+    /// never a partial/truncated family map (that would risk treating
+    /// correlated evidence as independent, the unsafe direction), so the
+    /// whole fusion result fails safe to `Verdict::Review` /
+    /// `UncertaintyBand::Undetermined` instead. `Review` specifically, not
+    /// `Unverified`: an attacker flooding a session's evidence pool to push
+    /// this rule could otherwise turn a real `Contradicted` into a quiet
+    /// `Unverified`, which hides a real problem; `Review` is never
+    /// `Verified` and hides nothing.
+    IndependenceBudgetExceeded,
 }
 
 /// What a [`RationaleEntry`] did to the links/missing-evidence it names.
@@ -306,7 +317,12 @@ impl FusionPolicy for BaselineFusionPolicy {
         // one level, and R5 gains a common-source-family collapse rule (see
         // `FusionRule::CommonSourceCollapsed`) -- both are real behavior
         // changes, so the version bumps once to cover both.
-        2
+        // v3 (FORNX-432 PR 3): R5b's source-family construction is now
+        // bounded by a work budget and can fail safe to
+        // `FusionRule::IndependenceBudgetExceeded` on an adversarial pool --
+        // a real behavior change on that (otherwise unreachable without a
+        // deliberately pathological `derived_from` graph) path.
+        3
     }
 
     fn fuse(&self, input: &FusionInput<'_>, computed_at: &str) -> FusedFinding {
@@ -554,7 +570,51 @@ impl FusionPolicy for BaselineFusionPolicy {
         // real traffic, since no shipped sensor stamps `correlation_group`
         // yet. Keyed by the family's minimum evidence id (stable and
         // deterministic, unlike a union-find root) rather than an index.
-        let family_map = crate::independence::SourceFamilyMap::build(input.evidence);
+        let family_map = match crate::independence::SourceFamilyMap::try_build(
+            input.evidence,
+            &crate::independence::FamilyBudget::default_budget(),
+        ) {
+            Ok(map) => map,
+            Err(budget_exceeded) => {
+                // FORNX-432 PR 3: fail safe rather than complete on an
+                // adversarial pool -- see `FusionRule::IndependenceBudgetExceeded`'s
+                // doc comment for why `Review`/`Undetermined`, not
+                // `Unverified`. Prior R1-R4 rationale entries are kept
+                // (cheap, bounded by construction, genuinely informative)
+                // but the verdict/uncertainty/counted-votes below are
+                // overridden -- this result must never look like a normal
+                // `VerdictDecided` outcome.
+                rationale.push(RationaleEntry {
+                    rule: FusionRule::IndependenceBudgetExceeded,
+                    effect: RuleEffect::Decided,
+                    link_ids: vec![],
+                    missing_evidence_ids: vec![],
+                    evidence_ids: vec![],
+                    detail: format!(
+                        "source-family construction over {} evidence record(s) exceeded its \
+                         work budget ({} work unit(s) at abort, limit {}); this claim's fusion \
+                         result cannot verify evidence independence and fails safe to Review \
+                         rather than completing",
+                        budget_exceeded.evidence_count,
+                        budget_exceeded.work_units_at_abort,
+                        budget_exceeded.limit
+                    ),
+                });
+                return FusedFinding {
+                    claim_id: claim.id,
+                    verdict: Verdict::Review,
+                    uncertainty: UncertaintyBand::Undetermined,
+                    rationale,
+                    counted_link_ids: vec![],
+                    discounted_link_ids,
+                    missing_evidence_ids: missing.iter().map(|m| m.id).collect(),
+                    unresolved_conflict: false,
+                    policy_name: self.name().to_string(),
+                    policy_version: self.policy_version(),
+                    computed_at: computed_at.to_string(),
+                };
+            }
+        };
         let mut by_family: BTreeMap<(u8, Uuid), Vec<(Candidate<'_>, bool)>> = BTreeMap::new();
         let mut solo: Vec<(Candidate<'_>, bool)> = Vec::new();
         for (c, had_group) in phase1_survivors {

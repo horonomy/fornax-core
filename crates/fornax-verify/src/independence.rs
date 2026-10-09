@@ -302,6 +302,214 @@ impl SourceFamilyMap {
         Self { families, index }
     }
 
+    /// Bounded variant of [`Self::build`] (FORNX-432 PR 3, AC2/AC3): aborts
+    /// with [`BudgetExceeded`] instead of completing on a pool whose
+    /// `derived_from` structure would make Rule 2's ancestry walk and the
+    /// resulting `bases_by_pair`/`bases_by_family` bookkeeping exceed
+    /// `budget`. The real cost driver on an adversarial pool is Rule 2 (a
+    /// dense or deeply-rejoining `derived_from` graph) -- see
+    /// `docs/research/fornx-432-independence-capacity.md`'s `adversarial_dense`/
+    /// `rejoining_dag`/`deep_chain` rows, which stay expensive even after PR
+    /// 2's speed-ups because their cost is genuinely large OUTPUT (the
+    /// `bases` list), not an algorithmic inefficiency. Rules 1 and 3 are
+    /// bounded by construction (each is at most one pass grouping by an
+    /// already-bounded key), so only Rule 2 and the final family-assembly
+    /// bookkeeping are counted.
+    ///
+    /// One work unit = one `derived_from` edge visited during Rule 2's
+    /// traversal, counted inside [`ancestors_of_indexed`] via a shared
+    /// counter, PLUS one `bases_by_pair` entry recorded. Checked AFTER each
+    /// increment (never before), so the abort path itself never allocates
+    /// unboundedly past the limit. On abort, returns `Err` with only counts
+    /// -- never an evidence id or payload (AC3's "bounded diagnostic"
+    /// requirement) -- and never a partial/truncated `SourceFamilyMap`:
+    /// under-unioning would make genuinely correlated evidence look
+    /// independent, which is the unsafe direction, so this aborts fully
+    /// rather than returning anything partial.
+    pub fn try_build(evidence: &[Evidence], budget: &FamilyBudget) -> Result<Self, BudgetExceeded> {
+        let mut sorted: Vec<&Evidence> = evidence.iter().collect();
+        sorted.sort_by_key(|e| e.id);
+
+        let by_id: BTreeMap<Uuid, &Evidence> = sorted.iter().map(|e| (e.id, *e)).collect();
+
+        let mut is_no_source: HashMap<Uuid, bool> = HashMap::new();
+        for e in evidence {
+            is_no_source.entry(e.id).or_insert(e.source.is_none());
+        }
+
+        let mut parent: BTreeMap<Uuid, Uuid> = sorted.iter().map(|e| (e.id, e.id)).collect();
+        fn find(parent: &mut BTreeMap<Uuid, Uuid>, x: Uuid) -> Uuid {
+            let p = parent[&x];
+            if p == x {
+                return x;
+            }
+            let root = find(parent, p);
+            parent.insert(x, root);
+            root
+        }
+        fn union(parent: &mut BTreeMap<Uuid, Uuid>, a: Uuid, b: Uuid) {
+            let ra = find(parent, a);
+            let rb = find(parent, b);
+            if ra != rb {
+                if ra < rb {
+                    parent.insert(rb, ra);
+                } else {
+                    parent.insert(ra, rb);
+                }
+            }
+        }
+
+        let mut bases_by_pair: BTreeSet<(Uuid, Uuid, FamilyBasisTag)> = BTreeSet::new();
+        let mut work_units: u64 = 0;
+        macro_rules! charge {
+            ($n:expr) => {
+                work_units = work_units.saturating_add($n);
+                if work_units > budget.max_work_units {
+                    return Err(BudgetExceeded {
+                        evidence_count: evidence.len(),
+                        work_units_at_abort: work_units,
+                        limit: budget.max_work_units,
+                    });
+                }
+            };
+        }
+
+        // Rule 1: explicit correlation_group -- bounded by construction
+        // (one pass, grouped by an id already present on the record), not
+        // charged against the budget.
+        let mut by_group: BTreeMap<Uuid, Vec<Uuid>> = BTreeMap::new();
+        for e in &sorted {
+            if let Some(group) = e.source.as_ref().and_then(|s| s.correlation_group) {
+                by_group.entry(group).or_default().push(e.id);
+            }
+        }
+        for (group, ids) in &by_group {
+            for pair in ids.windows(2) {
+                union(&mut parent, pair[0], pair[1]);
+                bases_by_pair.insert((
+                    pair[0].min(pair[1]),
+                    pair[0].max(pair[1]),
+                    FamilyBasisTag::ExplicitCorrelationGroup(*group),
+                ));
+            }
+        }
+
+        // Rule 2: derived_from ancestry, transitive -- the real cost driver.
+        // Charged per ancestor edge visited (via `ancestors_of_indexed_counted`,
+        // which checks the budget itself after every single edge -- see its
+        // doc comment for why that must happen inside the traversal rather
+        // than once after it returns) plus one unit per `bases_by_pair`
+        // entry recorded below.
+        for e in &sorted {
+            let ancestors = match ancestors_of_indexed_counted(
+                e.id,
+                &by_id,
+                &mut work_units,
+                budget.max_work_units,
+            ) {
+                Ok(ancestors) => ancestors,
+                Err(()) => {
+                    return Err(BudgetExceeded {
+                        evidence_count: evidence.len(),
+                        work_units_at_abort: work_units,
+                        limit: budget.max_work_units,
+                    });
+                }
+            };
+            for ancestor in ancestors {
+                if by_id.contains_key(&ancestor) {
+                    union(&mut parent, e.id, ancestor);
+                    bases_by_pair.insert((
+                        e.id.min(ancestor),
+                        e.id.max(ancestor),
+                        FamilyBasisTag::DerivationAncestry {
+                            parent: ancestor,
+                            child: e.id,
+                        },
+                    ));
+                    charge!(1);
+                }
+            }
+        }
+
+        // Rule 3: same source_event_id, agent-reported channel only --
+        // bounded by construction (grouped by an already-bounded key), not
+        // charged.
+        let mut by_event: BTreeMap<Uuid, Vec<Uuid>> = BTreeMap::new();
+        for e in &sorted {
+            let on_agent_channel = e
+                .source
+                .as_ref()
+                .map(|s| {
+                    matches!(
+                        s.trust_class,
+                        TrustClass::AgentAdjacent | TrustClass::ModelInternal
+                    )
+                })
+                .unwrap_or(false);
+            if e.source.is_some() && on_agent_channel {
+                by_event.entry(e.source_event_id).or_default().push(e.id);
+            }
+        }
+        for (event_id, ids) in &by_event {
+            for pair in ids.windows(2) {
+                union(&mut parent, pair[0], pair[1]);
+                bases_by_pair.insert((
+                    pair[0].min(pair[1]),
+                    pair[0].max(pair[1]),
+                    FamilyBasisTag::SameAgentTurn(*event_id),
+                ));
+            }
+        }
+
+        let mut members_by_root: BTreeMap<Uuid, Vec<Uuid>> = BTreeMap::new();
+        let mut value_to_keys: HashMap<Uuid, std::collections::HashSet<Uuid>> = HashMap::new();
+        for e in &sorted {
+            let key = if e.source.is_none() {
+                e.id
+            } else {
+                find(&mut parent, e.id)
+            };
+            members_by_root.entry(key).or_default().push(e.id);
+            value_to_keys.entry(e.id).or_default().insert(key);
+        }
+
+        let mut bases_by_family: BTreeMap<Uuid, BTreeSet<FamilyBasisTag>> = BTreeMap::new();
+        for (a, b, tag) in &bases_by_pair {
+            if let (Some(keys_a), Some(keys_b)) = (value_to_keys.get(a), value_to_keys.get(b)) {
+                for &key in keys_a.intersection(keys_b) {
+                    bases_by_family.entry(key).or_default().insert(tag.clone());
+                }
+            }
+        }
+
+        let mut families = Vec::new();
+        for (key, mut ids) in members_by_root {
+            ids.sort();
+            ids.dedup();
+            let mut bases: BTreeSet<FamilyBasisTag> = BTreeSet::new();
+            if ids.len() == 1 && is_no_source.get(&ids[0]).copied().unwrap_or(false) {
+                bases.insert(FamilyBasisTag::UnknownProvenance);
+            }
+            if let Some(pair_bases) = bases_by_family.get(&key) {
+                bases.extend(pair_bases.iter().cloned());
+            }
+            families.push(SourceFamily {
+                evidence_ids: ids,
+                bases: bases.into_iter().map(FamilyBasisTag::into_basis).collect(),
+            });
+        }
+        families.sort_by_key(|f| f.evidence_ids.first().copied());
+        let mut index = HashMap::new();
+        for (i, f) in families.iter().enumerate() {
+            for id in &f.evidence_ids {
+                index.insert(*id, i);
+            }
+        }
+
+        Ok(Self { families, index })
+    }
+
     /// The [`SourceFamily`] `evidence_id` belongs to, if it's in this map's
     /// pool at all.
     pub fn family_of(&self, evidence_id: Uuid) -> Option<&SourceFamily> {
@@ -401,6 +609,127 @@ pub(crate) fn ancestors_of_indexed(
         }
     }
     result
+}
+
+/// FORNX-432 PR 3: a deterministic work-budget for [`SourceFamilyMap::try_build`].
+/// A work unit is one `derived_from` edge visited during Rule 2's ancestry
+/// walk plus one recorded `bases_by_pair` entry -- see `try_build`'s doc
+/// comment for why those two are the real cost driver on an adversarial
+/// pool. Not time-based and not a pool-size cap: this module must stay
+/// pure/deterministic/synchronous (verdict replay depends on it), and a
+/// size-only cap would be wrong too -- after PR 2's speed-ups, a large
+/// `flat`/`agent_turn_fanout`/`wide_derived_fanout` pool is cheap, while a
+/// much smaller `adversarial_dense` pool is not; the cost is about graph
+/// shape, not evidence count.
+#[derive(Debug, Clone, Copy)]
+pub struct FamilyBudget {
+    pub max_work_units: u64,
+}
+
+impl FamilyBudget {
+    /// Calibrated against the real measured numbers in
+    /// `docs/research/fornx-432-independence-capacity.md` (PR 1/PR 2 "after"
+    /// columns): `adversarial_dense` crosses 100ms between n=300 (203ms) and
+    /// n=1000 (8.9s) wall-time, with `bases_by_pair`/ancestor-edge growth
+    /// roughly tracking `alloc_count`, which sits at ~86,847 for n=300 and
+    /// ~881,502 for n=1000 in that row. A limit of 100,000 work units sits
+    /// just above the n=300 cost (clearing it with real traffic's much
+    /// sparser graphs) and well below the n=1000 cost (aborting before an
+    /// adversarial pool reaches multi-second/sub-second-but-still-abusive
+    /// territory), while every cheap shape (`flat`/`agent_turn_fanout`/
+    /// `wide_derived_fanout`) stays several orders of magnitude under this
+    /// even at n=10,000 (those shapes do zero or near-zero Rule-2 work by
+    /// construction). Expressed as a named constant, not inlined, so a
+    /// future recalibration has one place to change.
+    pub const DEFAULT_MAX_WORK_UNITS: u64 = 100_000;
+
+    pub fn default_budget() -> Self {
+        Self {
+            max_work_units: Self::DEFAULT_MAX_WORK_UNITS,
+        }
+    }
+}
+
+/// Why [`SourceFamilyMap::try_build`] aborted. Carries only counts -- never
+/// an evidence id, a payload, or anything else drawn from the pool content
+/// itself (FORNX-432 AC3's "bounded diagnostic" requirement: a poisoned
+/// pool's own content must never leak into the error a caller logs or
+/// returns to a client).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BudgetExceeded {
+    pub evidence_count: usize,
+    pub work_units_at_abort: u64,
+    pub limit: u64,
+}
+
+impl std::fmt::Display for BudgetExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "source-family construction over {} evidence record(s) exceeded its work budget \
+             ({} work unit(s) at abort, limit {}); aborted rather than returning a partial map",
+            self.evidence_count, self.work_units_at_abort, self.limit
+        )
+    }
+}
+
+impl std::error::Error for BudgetExceeded {}
+
+/// Same traversal as [`ancestors_of_indexed`], but increments `*work_units`
+/// by one per edge visited (an edge that resolves to a present record in
+/// `by_id`, mirroring what `try_build`'s caller then charges a second unit
+/// for when it records the resulting `bases_by_pair` entry -- this function
+/// only charges the traversal half) and checks `*work_units` against
+/// `limit` immediately after EVERY increment, aborting the traversal itself
+/// (returning `Err(())`) the moment it's exceeded.
+///
+/// This check must live inside the loop, not after it returns: a single
+/// evidence record's reachable-ancestor closure can be large on its own on
+/// an adversarial pool (`adversarial_dense`/`rejoining_dag`/`deep_chain` in
+/// `docs/research/fornx-432-independence-capacity.md` -- e.g. one record's
+/// closure in a dense n=2000 graph can touch on the order of n^2/2 edges).
+/// An earlier version of this function ran its traversal to completion and
+/// let the caller check only once the whole call returned, which meant one
+/// call could do unbounded-relative-to-`limit` work -- up to the full
+/// ~78s/n=2000 `adversarial_dense` cost measured unbounded in PR 1/2 --
+/// before the first check ever fired, defeating the budget's purpose for
+/// exactly the shape it exists to bound. Checking after each single
+/// increment (the same granularity the `charge!` macro already uses for
+/// `bases_by_pair` entries) closes that gap: the traversal can overshoot
+/// `limit` by at most one unit before returning.
+fn ancestors_of_indexed_counted(
+    evidence_id: Uuid,
+    by_id: &BTreeMap<Uuid, &Evidence>,
+    work_units: &mut u64,
+    limit: u64,
+) -> Result<BTreeSet<Uuid>, ()> {
+    let mut result = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    let mut stack = vec![evidence_id];
+    while let Some(current) = stack.pop() {
+        if !visited.insert(current) {
+            continue;
+        }
+        let Some(ev) = by_id.get(&current) else {
+            continue;
+        };
+        let parents = ev
+            .source
+            .as_ref()
+            .map(|s| s.derived_from.as_slice())
+            .unwrap_or(&[]);
+        for &parent in parents {
+            if parent != evidence_id && by_id.contains_key(&parent) {
+                *work_units = work_units.saturating_add(1);
+                if *work_units > limit {
+                    return Err(());
+                }
+                result.insert(parent);
+                stack.push(parent);
+            }
+        }
+    }
+    Ok(result)
 }
 
 /// FORNX-432 PR 1: byte-for-byte historical copy of [`ancestors_of`], kept
@@ -763,6 +1092,142 @@ mod tests {
         assert_eq!(map1.all_families(), map2.all_families());
     }
 
+    // FORNX-432 PR 3: `try_build` under a generous budget must agree with
+    // `build` exactly -- the bounded path is not a second, divergent
+    // implementation of family construction.
+    #[test]
+    fn try_build_matches_build_when_under_budget() {
+        let event = Uuid::new_v4();
+        let a = evidence_with_source(TrustClass::AgentAdjacent, event, None, vec![]);
+        let b = evidence_with_source(TrustClass::AgentAdjacent, event, None, vec![]);
+        let pool = vec![a, b];
+        let budget = FamilyBudget::default_budget();
+        let bounded = SourceFamilyMap::try_build(&pool, &budget).expect("under budget");
+        let unbounded = SourceFamilyMap::build(&pool);
+        assert_eq!(bounded.all_families(), unbounded.all_families());
+    }
+
+    /// The real safety property: a budget too small for even one
+    /// `derived_from` edge must abort, never silently return a partial map.
+    #[test]
+    fn try_build_aborts_on_a_too_small_budget_rather_than_returning_a_partial_map() {
+        let root = evidence_with_source(TrustClass::HostObserved, Uuid::new_v4(), None, vec![]);
+        let child = evidence_with_source(
+            TrustClass::HostObserved,
+            Uuid::new_v4(),
+            None,
+            vec![root.id],
+        );
+        let pool = vec![root, child];
+        let budget = FamilyBudget { max_work_units: 0 };
+        let err = SourceFamilyMap::try_build(&pool, &budget)
+            .expect_err("a single derived_from edge must exceed a zero-unit budget");
+        assert_eq!(err.evidence_count, 2);
+        assert_eq!(err.limit, 0);
+        assert!(err.work_units_at_abort > 0);
+    }
+
+    /// A pool with no `derived_from` edges at all costs zero Rule-2 work
+    /// units (Rule 1/Rule 3 are bounded by construction and never
+    /// charged), so even a zero-unit budget must succeed on it -- the
+    /// budget bounds the real cost driver, not evidence count.
+    #[test]
+    fn try_build_succeeds_on_a_zero_unit_budget_when_there_is_no_derived_from_ancestry() {
+        let event = Uuid::new_v4();
+        let a = evidence_with_source(TrustClass::AgentAdjacent, event, None, vec![]);
+        let b = evidence_with_source(TrustClass::AgentAdjacent, event, None, vec![]);
+        let pool = vec![a.clone(), b.clone()];
+        let budget = FamilyBudget { max_work_units: 0 };
+        let map = SourceFamilyMap::try_build(&pool, &budget).expect("no Rule-2 work at all");
+        assert_eq!(map.family_of(a.id), map.family_of(b.id));
+    }
+
+    /// `BudgetExceeded`'s `Display` must carry only counts -- AC3's bounded
+    /// diagnostic requirement, checked by never mentioning an id-shaped
+    /// substring from the pool in the formatted error.
+    #[test]
+    fn budget_exceeded_display_never_leaks_an_evidence_id() {
+        let a_id = Uuid::new_v4();
+        let b_id = Uuid::new_v4();
+        let root = {
+            let mut e =
+                evidence_with_source(TrustClass::HostObserved, Uuid::new_v4(), None, vec![]);
+            e.id = a_id;
+            e
+        };
+        let child = {
+            let mut e =
+                evidence_with_source(TrustClass::HostObserved, Uuid::new_v4(), None, vec![a_id]);
+            e.id = b_id;
+            e
+        };
+        let pool = vec![root, child];
+        let err = SourceFamilyMap::try_build(&pool, &FamilyBudget { max_work_units: 0 })
+            .expect_err("exceeds a zero-unit budget");
+        let message = err.to_string();
+        assert!(!message.contains(&a_id.to_string()));
+        assert!(!message.contains(&b_id.to_string()));
+    }
+
+    /// The regression test for the mid-traversal overshoot bug: a single
+    /// record's `derived_from` ancestry closure must stop growing shortly
+    /// after the budget is crossed, not only after the WHOLE closure (which
+    /// can be far larger than the budget on an adversarial pool) has been
+    /// walked. Before `ancestors_of_indexed_counted` checked the budget
+    /// after every single increment, this traversal ran to completion
+    /// first (processing all 5,000 direct `derived_from` edges below in one
+    /// uninterrupted pass) and only then let `try_build`'s caller check the
+    /// total once -- so `work_units_at_abort` would land at ~5,000 even
+    /// under a 100-unit budget. With the check inside the loop, it must
+    /// land close to the limit instead.
+    #[test]
+    fn try_build_aborts_close_to_the_limit_not_after_the_whole_ancestor_closure() {
+        const PARENT_COUNT: usize = 5_000;
+        let parents: Vec<Evidence> = (0..PARENT_COUNT)
+            .map(|_| evidence_with_source(TrustClass::HostObserved, Uuid::new_v4(), None, vec![]))
+            .collect();
+        let parent_ids: Vec<Uuid> = parents.iter().map(|e| e.id).collect();
+        let child = evidence_with_source(
+            TrustClass::HostObserved,
+            Uuid::new_v4(),
+            None,
+            parent_ids.clone(),
+        );
+
+        let mut pool = parents;
+        pool.push(child);
+
+        let limit = 100u64;
+        let err = SourceFamilyMap::try_build(
+            &pool,
+            &FamilyBudget {
+                max_work_units: limit,
+            },
+        )
+        .expect_err("5,000 direct derived_from edges must exceed a 100-unit budget");
+        assert_eq!(err.limit, limit);
+        // The real assertion: the traversal must have aborted close to the
+        // limit (overshoot bounded by one increment), never anywhere near
+        // the full closure size. `limit + 1` is the exact expected value
+        // given the fix (check fires the instant the increment pushes the
+        // counter past `limit`); a generous `limit * 4` upper bound keeps
+        // this robust to a reasonable alternate correct implementation
+        // without being so loose it would still pass against the old,
+        // buggy ~5,000 behavior.
+        assert!(
+            err.work_units_at_abort > limit,
+            "must have actually exceeded the limit: {} vs limit {limit}",
+            err.work_units_at_abort
+        );
+        assert!(
+            err.work_units_at_abort <= limit * 4,
+            "work_units_at_abort ({}) is nowhere near the {limit}-unit budget -- the ancestor \
+             traversal ran to completion (full closure of {PARENT_COUNT} edges) before the \
+             budget was ever checked, instead of aborting mid-traversal",
+            err.work_units_at_abort
+        );
+    }
+
     // FORNX-432 PR 2: property-based proof that the speed-ups above
     // (`ancestors_of_indexed` reuse, `family_key`/`bases_by_family`
     // replacing the per-family `Vec::contains`/`evidence.iter().find`
@@ -930,6 +1395,24 @@ mod tests {
                         ancestors_of_reference(e.id, &pool)
                     );
                 }
+            }
+
+            /// FORNX-432 PR 3: under a budget generous enough for every
+            /// generated pool (small by construction -- at most 10 records,
+            /// each with at most 3 `derived_from` entries, so real work
+            /// units stay far below any realistic budget), `try_build` must
+            /// produce exactly what `build` does. The bounded path must
+            /// never be a silently divergent second implementation.
+            #[test]
+            fn try_build_matches_build_under_a_generous_budget(
+                specs in prop::collection::vec(arb_evidence_spec(), 0..10)
+            ) {
+                let pool = build_pool(specs);
+                let generous = super::FamilyBudget { max_work_units: 1_000_000 };
+                let bounded = SourceFamilyMap::try_build(&pool, &generous)
+                    .expect("generous budget must never abort on a pool this small");
+                let unbounded = SourceFamilyMap::build(&pool);
+                prop_assert_eq!(bounded.all_families(), unbounded.all_families());
             }
         }
     }

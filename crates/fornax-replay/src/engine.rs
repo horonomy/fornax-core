@@ -295,7 +295,8 @@ mod tests {
             .fusion_policy_drift
             .expect("expected fusion policy drift to be reported");
         assert_eq!(drift.recorded, "deterministic_baseline_v1 v99");
-        assert_eq!(drift.live, "deterministic_baseline_v1 v2");
+        // FORNX-432 PR 3: BaselineFusionPolicy bumped to v3.
+        assert_eq!(drift.live, "deterministic_baseline_v1 v3");
         // the outcome fields are still compared -- drift is additive
         // information, not a replacement for the verdict comparison.
         assert!(comparison.verdict_matches);

@@ -150,7 +150,12 @@ pub fn signals_for_case(
                 signals.insert(SamplingSignal::HighUncertainty);
             }
             EvidenceGapKind::IndependenceUnverified
-            | EvidenceGapKind::SingleSourceCorroboration => {
+            | EvidenceGapKind::SingleSourceCorroboration
+            // FORNX-432 PR 3: a budget-exceeded independence check means
+            // "cannot verify", which is the same sampling-worthy signal as
+            // "verified but unverified/correlated" -- both say this case's
+            // evidence independence needs a human look.
+            | EvidenceGapKind::IndependenceBudgetExceeded => {
                 signals.insert(SamplingSignal::CorrelatedEvidenceSuspected);
             }
             EvidenceGapKind::NoEvidenceAtAll => {

@@ -163,6 +163,46 @@ stamping `correlation_group` at the adapters on the persisted ingest path
 crates); persisting/linking judge evidence into the graph (would make gap
 #1 above live); a real Evidence Explorer UI (FORNX-90's unfinished half).
 
+## Addendum (FORNX-432 PR 3): bounded construction
+
+`SourceFamilyMap::build`'s O(n² log n) worst case (confirmed, measured, and
+then sped up for the common case by FORNX-432 PRs 1-2 — see
+`docs/research/fornx-432-independence-capacity.md`) remained genuinely
+unbounded on an adversarial `derived_from` graph (a dense or deeply-rejoining
+DAG), independent of pool size: the cost is driven by graph *shape*, not
+evidence count, and a long `bases`/ancestry chain is real output, not an
+algorithmic inefficiency a speed-up alone can remove.
+
+`SourceFamilyMap::try_build(evidence, &FamilyBudget)` adds a deterministic
+work-unit cap (one unit per `derived_from` edge visited plus one per
+recorded `bases_by_pair` entry) over the exact same algorithm. It aborts the
+whole construction on `BudgetExceeded` rather than ever returning a
+partial/truncated map — under-unioning would make genuinely correlated
+evidence look independent, the unsafe direction this whole ADR exists to
+prevent. Every production consumer now routes through `try_build`, each
+failing safe in its own vocabulary rather than a shared new state:
+`fusion::fuse` → `Verdict::Review`/`FusionRule::IndependenceBudgetExceeded`
+(bumping `BaselineFusionPolicy::policy_version` to 3); `voi`'s two
+independence-adjacent functions → the existing `Independence::Unverified`/
+a new `EvidenceGapKind::IndependenceBudgetExceeded`;
+`contract_satisfaction::assess` → `SatisfactionState::Unknown` on the
+independence-constrained requirement only (its own doc comment already
+describes exactly this "cannot determine" case); `meta_verification`'s
+dependency grouping → one maximally-cautious group rather than all
+singletons (the opposite fail-safe direction from the others, because
+under-grouping there is the unsafe one); receipt issuance
+(`fornax-cli::receipt_cmd`) → refuses to issue at all, the strictest
+mapping, since a signed receipt is the worst place to carry an uncertain
+result. The daemon wraps the (still real, now-bounded) CPU cost in
+`tokio::task::spawn_blocking` so a poisoned session's fusion/evidence-graph
+request cannot stall a concurrent request for a different, clean session —
+proven directly (not just argued) by
+`fornax-daemon::tests::poisoned_session_fails_safe_without_stalling_a_concurrent_clean_session`.
+
+`BudgetExceeded` carries only counts (evidence count, work units at abort,
+limit) — never an evidence id or payload, so a poisoned pool's own content
+can never leak into a log line or API response through this path.
+
 ## Escalation
 
 None. This is read-side derivation over columns already persisted: no

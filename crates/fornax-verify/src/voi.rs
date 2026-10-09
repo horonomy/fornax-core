@@ -84,6 +84,11 @@ pub enum EvidenceGapKind {
         requirement_id: String,
         state: fornax_types::epistemic_contract::SatisfactionState,
     },
+    /// FORNX-432 PR 3: `independence::SourceFamilyMap::try_build` exceeded
+    /// its work budget over this claim's evidence pool -- independence
+    /// could not be verified, which is itself a real evidence gap (never
+    /// silently reported as "no gap found").
+    IndependenceBudgetExceeded,
 }
 
 /// One reason to want more evidence for a claim, naming exactly which
@@ -163,23 +168,42 @@ pub fn derive_gaps(
     // (one Supports and one Contradicts counted vote from the same
     // underlying source). Genuinely real and interesting, but a much
     // narrower trigger than before this ticket.
-    let family_map = crate::independence::SourceFamilyMap::build(evidence);
-    let counted_evidence_ids: Vec<Uuid> = fused
-        .counted_link_ids
-        .iter()
-        .filter_map(|link_id| graph.links.iter().find(|l| &l.id == link_id))
-        .map(|l| l.evidence_id)
-        .collect();
-    if family_map.families_among(&counted_evidence_ids).len() == 1
-        && fused.counted_link_ids.len() >= 2
-    {
-        gaps.push(EvidenceGap {
-            kind: EvidenceGapKind::SingleSourceCorroboration,
-            claim_id: claim.id,
-            link_ids: fused.counted_link_ids.clone(),
-            missing_evidence_ids: vec![],
-            detail: "every counted vote traces back to one source family".to_string(),
-        });
+    match crate::independence::SourceFamilyMap::try_build(
+        evidence,
+        &crate::independence::FamilyBudget::default_budget(),
+    ) {
+        Ok(family_map) => {
+            let counted_evidence_ids: Vec<Uuid> = fused
+                .counted_link_ids
+                .iter()
+                .filter_map(|link_id| graph.links.iter().find(|l| &l.id == link_id))
+                .map(|l| l.evidence_id)
+                .collect();
+            if family_map.families_among(&counted_evidence_ids).len() == 1
+                && fused.counted_link_ids.len() >= 2
+            {
+                gaps.push(EvidenceGap {
+                    kind: EvidenceGapKind::SingleSourceCorroboration,
+                    claim_id: claim.id,
+                    link_ids: fused.counted_link_ids.clone(),
+                    missing_evidence_ids: vec![],
+                    detail: "every counted vote traces back to one source family".to_string(),
+                });
+            }
+        }
+        Err(_budget_exceeded) => {
+            // FORNX-432 PR 3: fail safe -- report the gap explicitly rather
+            // than silently skipping the single-source-corroboration check.
+            gaps.push(EvidenceGap {
+                kind: EvidenceGapKind::IndependenceBudgetExceeded,
+                claim_id: claim.id,
+                link_ids: fused.counted_link_ids.clone(),
+                missing_evidence_ids: vec![],
+                detail: "source-family construction exceeded its work budget; independence \
+                         could not be verified for this claim's evidence pool"
+                    .to_string(),
+            });
+        }
     }
 
     for missing in &graph.missing {
@@ -338,7 +362,16 @@ fn independence_of(
         return Independence::IndependentOfCounted;
     }
 
-    let family_map = crate::independence::SourceFamilyMap::build(evidence);
+    let family_map = match crate::independence::SourceFamilyMap::try_build(
+        evidence,
+        &crate::independence::FamilyBudget::default_budget(),
+    ) {
+        Ok(map) => map,
+        // FORNX-432 PR 3: fail safe -- `Independence::Unverified` already
+        // exists for exactly this "cannot verify" semantics (distinct from
+        // `IndependentOfCounted`, which would be the unsafe direction here).
+        Err(_budget_exceeded) => return Independence::Unverified,
+    };
     let counted_evidence_ids: Vec<Uuid> = fused
         .counted_link_ids
         .iter()
@@ -471,7 +504,9 @@ pub(crate) fn probes_for_gap(gap: &EvidenceGap) -> Vec<EvidenceRequest> {
                 "query current CI status as a fresh, independent observation",
             ),
         ],
-        EvidenceGapKind::IndependenceUnverified | EvidenceGapKind::SingleSourceCorroboration => vec![
+        EvidenceGapKind::IndependenceUnverified
+        | EvidenceGapKind::SingleSourceCorroboration
+        | EvidenceGapKind::IndependenceBudgetExceeded => vec![
             describe(
                 ProbeKind::QueryCiStatus,
                 SignalClass::ToolResultPayload,

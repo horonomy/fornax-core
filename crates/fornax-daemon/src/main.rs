@@ -1604,11 +1604,44 @@ async fn api_evidence_graph(
             // uses -- no new store method. Only families containing at
             // least one evidence id linked on THIS claim are surfaced, so
             // the response never leaks unrelated session families.
-            let family_map = match state.store.evidence_for_session(&q.session).await {
-                Ok(read) => Some(fornax_verify::independence::SourceFamilyMap::build(
-                    &read.evidence,
-                )),
-                Err(_) => None,
+            // FORNX-432 PR 3 (AC2/AC3): bounded, and the build itself runs
+            // via `spawn_blocking` (same reasoning as `compute_fusion`'s own
+            // `fuse` wrapping, above) so a poisoned session's family
+            // construction cannot stall a concurrent request for a
+            // different session on the async runtime's worker threads.
+            let (family_map, independence_status): (
+                Option<fornax_verify::independence::SourceFamilyMap>,
+                Option<serde_json::Value>,
+            ) = match state.store.evidence_for_session(&q.session).await {
+                Ok(read) => {
+                    let build_result = tokio::task::spawn_blocking(move || {
+                        fornax_verify::independence::SourceFamilyMap::try_build(
+                            &read.evidence,
+                            &fornax_verify::independence::FamilyBudget::default_budget(),
+                        )
+                    })
+                    .await;
+                    match build_result {
+                        Ok(Ok(map)) => (Some(map), None),
+                        Ok(Err(budget_exceeded)) => (
+                            None,
+                            Some(serde_json::json!({
+                                "status": "budget_exceeded",
+                                "evidence_count": budget_exceeded.evidence_count,
+                                "work_units_at_abort": budget_exceeded.work_units_at_abort,
+                                "limit": budget_exceeded.limit,
+                            })),
+                        ),
+                        Err(e) => (
+                            None,
+                            Some(serde_json::json!({
+                                "status": "error",
+                                "detail": format!("source-family build task panicked: {e}"),
+                            })),
+                        ),
+                    }
+                }
+                Err(_) => (None, None),
             };
             let claim_evidence_ids: Vec<uuid::Uuid> =
                 graph.links.iter().map(|l| l.evidence_id).collect();
@@ -1660,14 +1693,28 @@ async fn api_evidence_graph(
                 }
                 links_json.push(value);
             }
-            Json(serde_json::json!({
+            // FORNX-432 PR 3 (AC3's "bounded diagnostic" requirement):
+            // `source_families` degrades to `null` rather than erroring the
+            // whole request when the budget was exceeded, and
+            // `independence` carries only counts -- never evidence content.
+            let mut body = serde_json::json!({
                 "claim": q.claim,
                 "session": q.session,
                 "found": true,
                 "links": links_json,
                 "missing": graph.missing,
-                "source_families": source_families_json,
-            }))
+                "source_families": if family_map.is_some() {
+                    serde_json::json!(source_families_json)
+                } else {
+                    serde_json::Value::Null
+                },
+            });
+            if let Some(status) = independence_status {
+                if let serde_json::Value::Object(ref mut map) = body {
+                    map.insert("independence".to_string(), status);
+                }
+            }
+            Json(body)
         }
         Err(e) => Json(
             serde_json::json!({ "claim": q.claim, "session": q.session, "error": e.to_string() }),
@@ -1961,21 +2008,40 @@ async fn compute_fusion(state: &AppState, claim_id: &str, session: &str) -> Fusi
         }
     };
 
-    let input = FusionInput {
-        claim: &claim,
-        graph: &graph,
-        evidence: &evidence_read.evidence,
-    };
     let computed_at = chrono::Utc::now().to_rfc3339();
-    let fused = BaselineFusionPolicy.fuse(&input, &computed_at);
+    let evidence_pool = evidence_read.evidence;
+    // FORNX-432 PR 3 (AC3): `fuse` now builds a `SourceFamilyMap` internally
+    // (R5b) which, even bounded by a work budget, can still take real CPU
+    // time on an adversarial pool before it aborts -- `spawn_blocking`
+    // keeps that work off the async runtime's worker threads, so a
+    // poisoned session's fusion request cannot stall a concurrent request
+    // for a different, clean session (same precedent as `api_judge`'s
+    // `spawn_blocking` around its sync judge HTTP client, above). `claim`/
+    // `graph`/`evidence_pool` are moved in and handed back out through the
+    // closure's return value since `FusionInput` only borrows them.
+    let fuse_result = tokio::task::spawn_blocking(move || {
+        let input = FusionInput {
+            claim: &claim,
+            graph: &graph,
+            evidence: &evidence_pool,
+        };
+        let fused = BaselineFusionPolicy.fuse(&input, &computed_at);
+        (fused, claim, graph, evidence_pool)
+    })
+    .await;
 
-    FusionOutcome::Found(Box::new(FusionFound {
-        graph_source,
-        fused,
-        claim,
-        graph,
-        evidence_pool: evidence_read.evidence,
-    }))
+    match fuse_result {
+        Ok((fused, claim, graph, evidence_pool)) => FusionOutcome::Found(Box::new(FusionFound {
+            graph_source,
+            fused,
+            claim,
+            graph,
+            evidence_pool,
+        })),
+        Err(e) => FusionOutcome::Error {
+            message: format!("fusion task panicked: {e}"),
+        },
+    }
 }
 
 async fn api_fusion(
@@ -4653,6 +4719,172 @@ mod tests {
         assert_eq!(
             fused["counted_link_ids"],
             serde_json::json!([link.id.to_string()])
+        );
+    }
+
+    /// FORNX-432 PR 3 (AC3): a session whose evidence pool is an
+    /// adversarially dense `derived_from` DAG (every record derives
+    /// directly from every prior record -- the real `adversarial_dense`
+    /// shape from `docs/research/fornx-432-independence-capacity.md`, sized
+    /// here to exceed `FamilyBudget::DEFAULT_MAX_WORK_UNITS`) must get a
+    /// fail-safe `Review`/`IndependenceBudgetExceeded` result from
+    /// `/api/fusion` -- never hang, never panic, never silently complete
+    /// with a partial family map. Proven alongside a concurrent request for
+    /// a separate, clean session: `fuse`'s `spawn_blocking` wrapping means
+    /// the poisoned session's (still real, non-trivial) CPU cost must never
+    /// stall the clean session's response.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn poisoned_session_fails_safe_without_stalling_a_concurrent_clean_session() {
+        use fornax_types::sensor::{
+            ClockSource, CollectionMethod, EvidenceSource, Freshness, TamperBoundary, TrustClass,
+        };
+
+        let state = test_state().await;
+
+        // --- the poisoned session: a dense derived_from DAG -----------------
+        let poisoned_session = "fornx-432-poisoned";
+        let poisoned_event = test_event(&state, poisoned_session).await;
+        let poisoned_claim = test_claim(poisoned_session, poisoned_event);
+        state
+            .store
+            .insert_claim(&poisoned_claim)
+            .await
+            .expect("insert poisoned claim");
+
+        let dense_source = |derived_from: Vec<Uuid>| EvidenceSource {
+            sensor_name: "fornx432_adversarial_sensor".to_string(),
+            trust_class: TrustClass::HostObserved,
+            collected_at: "2026-09-01T00:00:00Z".to_string(),
+            provider: None,
+            collection_method: CollectionMethod::HookCallback,
+            collector_version: None,
+            freshness: Freshness {
+                clock_source: ClockSource::HostClock,
+                caveat: None,
+            },
+            tamper_boundary: TamperBoundary::default(),
+            correlation_group: None,
+            derived_from,
+        };
+
+        // Sized well past `FamilyBudget::DEFAULT_MAX_WORK_UNITS` (100,000):
+        // this shape's total work is ~n*(n-1) (each of n records directly
+        // derives from all prior records, so Rule 2 visits that many
+        // ancestor edges plus records that many `bases_by_pair` entries) --
+        // n=500 gives ~249,500, well over budget while keeping the insert
+        // loop itself fast.
+        const N: usize = 500;
+        let mut prior_ids: Vec<Uuid> = Vec::with_capacity(N);
+        for i in 0..N {
+            let id = Uuid::new_v4();
+            let evidence = fornax_types::Evidence {
+                id,
+                session_id: poisoned_session.to_string(),
+                source_event_id: poisoned_event,
+                kind: fornax_types::EvidenceKind::ExitCode,
+                observed_at: "2026-09-01T00:00:00Z".to_string(),
+                payload: serde_json::json!({}),
+                provenance: format!("fornx432-adversarial-{i}"),
+                source: Some(dense_source(prior_ids.clone())),
+                extension: None,
+                evidence_purged: false,
+            };
+            state
+                .store
+                .insert_evidence(&evidence)
+                .await
+                .expect("insert adversarial evidence");
+            prior_ids.push(id);
+        }
+
+        // --- a separate, clean session ---------------------------------
+        let clean_session = "fornx-432-clean";
+        let clean_event = test_event(&state, clean_session).await;
+        let clean_claim = test_claim(clean_session, clean_event);
+        let clean_evidence = test_evidence(clean_session, clean_event);
+        state
+            .store
+            .insert_claim(&clean_claim)
+            .await
+            .expect("insert clean claim");
+        state
+            .store
+            .insert_evidence(&clean_evidence)
+            .await
+            .expect("insert clean evidence");
+        let clean_link = fornax_types::EvidenceLink {
+            id: Uuid::new_v4(),
+            session_id: clean_session.to_string(),
+            claim_id: clean_claim.id,
+            evidence_id: clean_evidence.id,
+            relation: fornax_types::EvidenceRelation::Supports,
+            linked_at: "2026-09-01T00:00:00Z".to_string(),
+        };
+        state
+            .store
+            .insert_evidence_link(&clean_link)
+            .await
+            .expect("insert clean link");
+
+        // --- fire both concurrently --------------------------------------
+        let clean_started = std::time::Instant::now();
+        let (poisoned_response, clean_response) = tokio::join!(
+            api_fusion(
+                State(state.clone()),
+                Query(FusionQuery {
+                    claim: poisoned_claim.id.to_string(),
+                    session: poisoned_session.to_string(),
+                }),
+            ),
+            api_fusion(
+                State(state.clone()),
+                Query(FusionQuery {
+                    claim: clean_claim.id.to_string(),
+                    session: clean_session.to_string(),
+                }),
+            )
+        );
+        let clean_elapsed = clean_started.elapsed();
+
+        let poisoned_v = poisoned_response.0;
+        assert_eq!(poisoned_v["found"], serde_json::json!(true));
+        let poisoned_fused = &poisoned_v["fused"];
+        assert_eq!(poisoned_fused["verdict"], serde_json::json!("review"));
+        assert_eq!(
+            poisoned_fused["uncertainty"],
+            serde_json::json!("undetermined")
+        );
+        let fired_rules: Vec<String> = poisoned_fused["rationale"]
+            .as_array()
+            .expect("rationale array")
+            .iter()
+            .map(|r| r["rule"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            fired_rules.contains(&"independence_budget_exceeded".to_string()),
+            "expected IndependenceBudgetExceeded in rationale, got {fired_rules:?}"
+        );
+        assert_eq!(poisoned_fused["counted_link_ids"], serde_json::json!([]));
+
+        let clean_v = clean_response.0;
+        assert_eq!(clean_v["found"], serde_json::json!(true));
+        assert_eq!(
+            clean_v["fused"]["verdict"],
+            serde_json::json!("verified"),
+            "the clean session's own, much smaller evidence pool must fuse normally"
+        );
+        // Generous but real: a regression that let the poisoned session's
+        // `spawn_blocking` task block the clean session's response on the
+        // SAME worker thread (e.g. if `fuse` were ever called directly on
+        // the async runtime instead of via `spawn_blocking`) would make
+        // this concurrent pair take roughly as long as the poisoned
+        // session's own (non-trivial, pre-abort) CPU work -- this bound is
+        // loose enough to never flake on CI variance, tight enough to catch
+        // that regression.
+        assert!(
+            clean_elapsed < std::time::Duration::from_secs(5),
+            "clean session's fusion took {clean_elapsed:?} -- the poisoned session's \
+             spawn_blocking task may be stalling it"
         );
     }
 
