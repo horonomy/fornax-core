@@ -14,8 +14,9 @@
 //! property of the shared host, is tested there against a real custom script,
 //! and is deliberately not duplicated (or silently skipped) here.
 
+use std::io::Write;
 use std::net::TcpListener;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use uuid::Uuid;
@@ -189,4 +190,61 @@ fn a_hung_daemon_is_bounded_and_is_not_reported_as_a_stopped_one() {
     // budget bit; the generous bound leaves room for macOS's one-time
     // first-exec cost on a freshly built binary.
     assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
+}
+
+/// Feeds a real, well-formed identity-stdin document to the real process on
+/// its real stdin (HORO-1601/1602/1604 anti-vacuity: "raw provider/session
+/// ID printed to statusline"). `read_identity_stdin()` runs unconditionally
+/// before the daemon probe, so this exercises the actual parse-then-render
+/// path end to end -- not just `parse_identity_document`'s own unit tests,
+/// which never go through a real pipe, and not just `reading()`'s unit
+/// tests, which start from a hand-built daemon response rather than a real
+/// resolved session id flowing in from stdin.
+fn run_with_stdin(subcommand: &str, home: &std::path::Path, port: u16, stdin_bytes: &[u8]) -> Run {
+    let mut child = Command::new(fornax_bin())
+        .args(["statusline", subcommand])
+        .env("FORNAX_HOME", home)
+        .env("FORNAX_HTTP_PORT", port.to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(stdin_bytes).unwrap();
+    let out = child.wait_with_output().unwrap();
+    Run {
+        stdout: String::from_utf8(out.stdout).unwrap(),
+        stderr: String::from_utf8(out.stderr).unwrap(),
+        status: out.status,
+    }
+}
+
+#[test]
+fn a_real_session_id_piped_on_stdin_never_reaches_stdout_or_stderr() {
+    let home = temp_home("identity-no-leak");
+    let session_id = format!("claude-sess-{}", Uuid::new_v4());
+    let identity_doc = serde_json::json!({
+        "identity_stdin_version": 1,
+        "provider_session_id": session_id,
+        "host_capabilities": ["segment_scope"],
+    });
+    for subcommand in ["provider", "explain"] {
+        let run = run_with_stdin(
+            subcommand,
+            &home,
+            closed_port(),
+            identity_doc.to_string().as_bytes(),
+        );
+        assert!(run.status.success(), "exit {:?}", run.status.code());
+        assert!(
+            !run.stdout.contains(&session_id),
+            "{subcommand} leaked the session id into stdout: {}",
+            run.stdout
+        );
+        assert!(
+            !run.stderr.contains(&session_id),
+            "{subcommand} leaked the session id into stderr: {}",
+            run.stderr
+        );
+    }
 }
