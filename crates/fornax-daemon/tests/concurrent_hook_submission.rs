@@ -1089,3 +1089,145 @@ async fn claim_evaluated_during_a_handoff_is_downgraded_not_falsely_bound_to_sta
     send_line(&mut conn_a, &IngestMessage::Evidence(new_evidence)).await;
     drop(conn_a);
 }
+
+/// HORO-1712, fifth independent adversarial review round: `pending_handoff`'s
+/// per-session tracking must be refcounted, not a plain set/flag -- a
+/// session can legitimately have more than one handed-off connection in
+/// flight at once (e.g. both a Codex rollout tailer and an opencode bridge
+/// connected for the same session). Proves the survivor case directly:
+/// two connections for the *same* session both go mid-handoff, the first
+/// one closes (its `HandoffGuard` drops), and a Claim evaluated while the
+/// *second* is still open must still be downgraded to `review` -- if the
+/// refcount were instead a plain set/bool, the first connection's `Drop`
+/// would have cleared the session's pending marker entirely, even though
+/// the second handoff is still genuinely in flight, and the Claim would
+/// wrongly resolve to a confident `verified` against the same kind of
+/// stale evidence `claim_evaluated_during_a_handoff_is_downgraded_not_falsely_bound_to_stale_evidence`
+/// closes for the single-handoff case.
+#[tokio::test]
+async fn second_concurrent_handoff_for_the_same_session_keeps_claims_downgraded_after_the_first_closes(
+) {
+    let daemon = start_daemon().await;
+    let store = open_store(&daemon).await;
+    let session = format!("handoff-refcount-{}", short_id());
+    let now = chrono::Utc::now().to_rfc3339();
+
+    // Same stale-evidence setup as the single-handoff case: an earlier,
+    // unrelated *passing* evidence row already on record for this session.
+    let old_event_id = Uuid::new_v4();
+    let old_event = AgentEvent {
+        id: old_event_id,
+        session_id: session.clone(),
+        provider: Provider::ClaudeCode,
+        kind: EventKind::PostToolUse,
+        observed_at: now.clone(),
+        tool_name: Some("Bash".to_string()),
+        tool_input: Some(serde_json::json!({"command": "cargo test"})),
+        tool_response: Some(serde_json::json!({"exit_code": 0})),
+        raw: serde_json::json!({}),
+    };
+    let old_evidence = Evidence {
+        id: Uuid::new_v4(),
+        session_id: session.clone(),
+        source_event_id: old_event_id,
+        kind: EvidenceKind::ExitCode,
+        observed_at: now.clone(),
+        payload: serde_json::json!({"command": "cargo test", "exit_code": 0}),
+        provenance: "claude_code:PostToolUse:Bash#tool_response".to_string(),
+        source: None,
+        extension: None,
+        evidence_purged: false,
+    };
+    let mut setup = connect_raw(&daemon.home).await;
+    send_line(
+        &mut setup,
+        &IngestMessage::Capabilities(observable_caps(&session)),
+    )
+    .await;
+    send_line(&mut setup, &IngestMessage::Event(old_event)).await;
+    send_line(&mut setup, &IngestMessage::Evidence(old_evidence)).await;
+    drop(setup);
+    {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let read = store
+                .evidence_for_session(&session)
+                .await
+                .expect("read evidence");
+            if !read.evidence.is_empty() {
+                break;
+            }
+            if tokio::time::Instant::now() > deadline {
+                panic!("setup evidence never persisted");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    // Connection A: reveal the session, then go idle past DRAIN_READ_BUDGET
+    // -- handed off, registering the session with refcount 1.
+    let mut conn_a = connect_raw(&daemon.home).await;
+    send_line(
+        &mut conn_a,
+        &IngestMessage::Capabilities(observable_caps(&session)),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+
+    // Connection C: accepted after A, so its own turn only begins once A's
+    // handoff releases A's turn (around the 1.4s mark above). Reveal the
+    // same session quickly, then also go idle past budget -- handed off,
+    // registering the *same* session again, refcount 2.
+    let mut conn_c = connect_raw(&daemon.home).await;
+    send_line(
+        &mut conn_c,
+        &IngestMessage::Capabilities(observable_caps(&session)),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+
+    // Close A: its HandoffGuard drops, refcount 2 -> 1. The session must
+    // still be tracked as pending because C is still open.
+    drop(conn_a);
+
+    let claim = Claim {
+        id: Uuid::new_v4(),
+        session_id: session.clone(),
+        source_event_id: old_event_id,
+        text: "All tests passed".to_string(),
+        subject: "test_result".to_string(),
+        claimed_at: now.clone(),
+    };
+    let mut conn_b = connect_raw(&daemon.home).await;
+    send_line(&mut conn_b, &IngestMessage::Claim(claim)).await;
+    drop(conn_b);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let finding = loop {
+        let mut findings = store
+            .findings_for_session(&session)
+            .await
+            .expect("read findings");
+        if let Some(finding) = findings.pop() {
+            break finding;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!(
+                "no finding appeared within 5s; daemon log:\n{}",
+                daemon.log_contents()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+
+    assert_eq!(
+        finding.verdict, "review",
+        "connection A's handoff closing must not clear the session's pending marker while \
+         connection C's handoff is still open -- a plain set/bool would wrongly let this \
+         Claim resolve to a confident verdict against the stale exit_code=0 evidence; \
+         rationale={}",
+        finding.rationale
+    );
+
+    drop(conn_c);
+}
