@@ -978,10 +978,34 @@ async fn process_line(state: &AppState, line: &str, session_hint: &mut Option<St
     };
     if let Err(e) = handle_message(state, msg, session_hint).await {
         tracing::warn!(error = %e, "failed to process ingest message");
+        // HORO-1712 (security-review follow-up on the id-collision fix):
+        // `IdCollision` is the one `handle_message` error that can fire on
+        // a *complete, well-formed* Event/Evidence message whose own
+        // tool_response/payload/raw may carry real tool output (including
+        // whatever `fornax_types::redact::redact_json` didn't recognize as
+        // a secret shape). The ordinary ParseError/HandleError quarantine
+        // path below already stores the full `line` verbatim and un-
+        // retained (`ingest_quarantine` predates and is outside this
+        // ticket's scope) -- that pre-existing exposure is not widened
+        // here, but routing a *second*, structurally different source of
+        // genuine evidence content through the same sink would be a new
+        // one. An operator only needs the table/id/session to look the
+        // row up and decide what to do; the raw content stays out of the
+        // quarantine table entirely for this one error kind.
+        let raw_for_quarantine: std::borrow::Cow<'_, str> =
+            match e.downcast_ref::<fornax_store::StoreError>() {
+                Some(fornax_store::StoreError::IdCollision { table, id }) => {
+                    std::borrow::Cow::Owned(format!(
+                        "id_collision: table={table} id={id} session={}",
+                        session_hint.as_deref().unwrap_or("unknown")
+                    ))
+                }
+                _ => std::borrow::Cow::Borrowed(line),
+            };
         if let Err(store_err) = state
             .store
             .record_quarantine(
-                line,
+                &raw_for_quarantine,
                 &e.to_string(),
                 fornax_store::quarantine::QuarantineReason::HandleError,
             )
@@ -3088,6 +3112,90 @@ mod tests {
             stored_claims[0].text.contains("REDACTED"),
             "expected a redacted placeholder in stored claim text: {}",
             stored_claims[0].text
+        );
+    }
+
+    /// HORO-1712 (security-review follow-up): a genuine `IdCollision` --
+    /// two different ingest lines sharing one id, which `process_line`
+    /// quarantines via the existing `HandleError` path -- must never carry
+    /// the colliding message's own content (e.g. real tool output) into
+    /// the `ingest_quarantine` table. The marker here is deliberately
+    /// natural-language (has whitespace, no token-shaped prefix) so it
+    /// survives `redact_json` unredacted when inserted normally -- proving
+    /// this is the id-collision quarantine stand-in doing the work, not
+    /// the pre-existing redaction boundary.
+    #[tokio::test]
+    async fn id_collision_quarantine_never_leaks_colliding_message_content() {
+        let state = test_state().await;
+        let mut hint = None;
+        let marker = "the secret passphrase is horse battery staple 2026, HORO-1712 canary";
+        let session_id = "horo-1712-collision-test".to_string();
+        let event_id = Uuid::new_v4();
+
+        let first = AgentEvent {
+            id: event_id,
+            session_id: session_id.clone(),
+            provider: Provider::Codex,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".to_string(),
+            tool_name: Some("exec_command".to_string()),
+            tool_input: None,
+            tool_response: Some(serde_json::json!({"exit_code": 0, "note": marker})),
+            raw: serde_json::json!({}),
+        };
+        let line1 =
+            serde_json::to_string(&IngestMessage::Event(first.clone())).expect("serialize");
+        process_line(&state, &line1, &mut hint).await;
+
+        // Same id, same session/provider/kind, but a genuinely different
+        // tool_response -- a real id collision, not an idempotent replay.
+        let mut colliding = first.clone();
+        colliding.tool_response = Some(serde_json::json!({"exit_code": 1, "note": marker}));
+        let line2 =
+            serde_json::to_string(&IngestMessage::Event(colliding)).expect("serialize");
+        process_line(&state, &line2, &mut hint).await;
+
+        let quarantined = state
+            .store
+            .list_quarantine(10)
+            .await
+            .expect("list quarantine");
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "expected exactly one quarantined row for the collision"
+        );
+        assert!(
+            !quarantined[0].raw_line.contains(marker),
+            "colliding message content leaked into ingest_quarantine.raw_line: {}",
+            quarantined[0].raw_line
+        );
+        assert!(
+            !quarantined[0].reason.contains(marker),
+            "colliding message content leaked into ingest_quarantine.reason: {}",
+            quarantined[0].reason
+        );
+        assert!(
+            quarantined[0].raw_line.contains("id_collision"),
+            "expected the redacted id-collision stand-in, got: {}",
+            quarantined[0].raw_line
+        );
+        assert!(
+            quarantined[0].raw_line.contains(&session_id),
+            "expected the session id in the stand-in for operator lookup: {}",
+            quarantined[0].raw_line
+        );
+
+        let events = state
+            .store
+            .events_for_session(&session_id)
+            .await
+            .expect("read back events");
+        assert_eq!(events.len(), 1, "the original row must be untouched");
+        assert_eq!(
+            events[0].tool_response,
+            Some(serde_json::json!({"exit_code": 0, "note": marker})),
+            "the first write must survive unmodified"
         );
     }
 
