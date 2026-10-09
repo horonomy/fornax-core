@@ -137,7 +137,27 @@ async fn issue(
     // must be reproducible from the same frozen inputs regardless of which
     // machine/session capabilities happen to be live when it's issued.
     let gaps = derive_gaps(&claim, &graph, &full_pool, &fused, &[]);
-    let families = SourceFamilyMap::build(&full_pool);
+    // FORNX-432 PR 3: refuse to issue rather than issue a receipt whose
+    // `source_families`/independence-adjacent content was built from a
+    // partial/truncated map -- `try_build` never returns one (it aborts
+    // fully instead), but a signed receipt is exactly the surface where
+    // "fail closed" matters most in this ticket, so this is the strictest
+    // of the per-consumer fail-safe mappings: no receipt at all, not even
+    // one marked uncertain.
+    let families = SourceFamilyMap::try_build(
+        &full_pool,
+        &fornax_verify::independence::FamilyBudget::default_budget(),
+    )
+    .map_err(|budget_exceeded| {
+        anyhow::anyhow!(
+            "refusing to issue a receipt: source-family construction exceeded its work budget \
+             ({} evidence record(s), {} work unit(s) at abort, limit {}); independence cannot \
+             be verified for this claim's evidence pool",
+            budget_exceeded.evidence_count,
+            budget_exceeded.work_units_at_abort,
+            budget_exceeded.limit
+        )
+    })?;
 
     let capabilities = store
         .capabilities_for_session(session_id)
