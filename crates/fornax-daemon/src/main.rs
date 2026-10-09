@@ -12,6 +12,7 @@ use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use fornax_experiment_runner::GlobalExperimentPolicy;
 use fornax_store::policy_cache::RevocationIngestOutcome;
+use fornax_types::provenance_guard;
 use fornax_types::provenance_guard::EvidenceOrigin;
 use fornax_types::redact::{redact_json, redact_text};
 use fornax_types::{
@@ -1720,6 +1721,51 @@ async fn run_verifiers_and_persist_findings(
     // from verdict computation instead of relying on each new call site to
     // remember to check it.
     let evidence_may_be_incomplete = evidence_may_be_incomplete_for(state, &claim.session_id);
+
+    // FORNX-431 slice 4: this is the one real choke point every live
+    // verdict passes through (all 3 callers -- Claim ingest, /api/
+    // acquire-evidence, /api/reverify -- route through this function) --
+    // closing AC1's actual gap: before this, a verifier read every row in
+    // `evidence` unconditionally, regardless of how it arrived or whether
+    // its claimed collector/provider is trustworthy. `admission_decision`
+    // (slice 1) is the pure rule; `evidence_origin`/`session_owner`
+    // (slice 2) are what makes it possible to apply against a real row
+    // instead of trusting the payload's own labels. A quarantined row is
+    // dropped from what the verifier sees -- never silently: every
+    // rejection is durably recorded via `record_admission_quarantine`
+    // (queryable, same `evidence_consumption` table slice 2 introduced),
+    // not just logged.
+    let authority = provenance_guard::CollectorAuthority::known_sensors();
+    let owner = state.store.session_owner(&claim.session_id).await?;
+    let anchor = provenance_guard::anchor_of(claim);
+
+    let mut admitted_evidence: Vec<fornax_types::Evidence> = Vec::with_capacity(evidence.len());
+    for ev in evidence {
+        let origin = state.store.evidence_origin(ev.id).await?;
+        match provenance_guard::admission_decision(ev, origin, &authority, owner) {
+            provenance_guard::AdmissionVerdict::Admitted => admitted_evidence.push(ev.clone()),
+            provenance_guard::AdmissionVerdict::Quarantined { reason } => {
+                tracing::warn!(
+                    evidence_id = %ev.id,
+                    session_id = %claim.session_id,
+                    reason = %reason,
+                    "evidence refused admission -- excluded from verifier input"
+                );
+                if let Err(e) = state
+                    .store
+                    .record_admission_quarantine(ev.id, claim.id, &anchor, &reason)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        evidence_id = %ev.id,
+                        "failed to durably record evidence admission quarantine"
+                    );
+                }
+            }
+        }
+    }
+
     let verifiers: Vec<Box<dyn Verifier + Send + Sync>> = vec![
         Box::new(TestResultVerifier),
         Box::new(CommandExecutedVerifier),
@@ -1728,7 +1774,7 @@ async fn run_verifiers_and_persist_findings(
         Box::new(GitOperationVerifier),
     ];
     for verifier in verifiers.iter().filter(|v| v.applies_to(claim)) {
-        let mut finding = verifier.verify(claim, evidence, caps);
+        let mut finding = verifier.verify(claim, &admitted_evidence, caps);
         // The turnstile orders entry into draining, not evidence
         // completeness by Claim-evaluation time: a handed-off connection
         // relinquishes its turn before its remaining evidence is written,
@@ -1752,6 +1798,51 @@ async fn run_verifiers_and_persist_findings(
             );
             finding.verdict = fornax_types::Verdict::Review;
         }
+
+        // FORNX-431 slice 4 (AC1/AC3): a `Verified` verdict is only ever
+        // persisted after checking every evidence row it cites has not
+        // already been consumed by a claim from a genuinely different
+        // turn (cross-anchor replay, FORNX-380 fixture 10). A same-anchor
+        // reuse (`ReusedByRelatedClaim` -- one turn yielding several
+        // legitimately related claims) is explicitly NOT a downgrade
+        // reason; only `ReplayedAcrossClaims` is. This is the actual
+        // enforcement half of the anchor rule slices 1-2 only designed
+        // and persisted -- nothing called `record_consumption` from a
+        // live verdict path before this.
+        if finding.verdict == fornax_types::Verdict::Verified {
+            let mut replayed = false;
+            for evidence_id in finding.evidence_ids.clone() {
+                match state
+                    .store
+                    .record_consumption(evidence_id, claim.id, &anchor, Some(verifier.name()))
+                    .await
+                {
+                    Ok(provenance_guard::ReplayVerdict::ReplayedAcrossClaims {
+                        originally_consumed_by,
+                    }) => {
+                        replayed = true;
+                        finding.rationale = format!(
+                            "{} -- downgraded: evidence {evidence_id} was already consumed \
+                             by claim {originally_consumed_by} from a different turn \
+                             (FORNX-431 replay guard)",
+                            finding.rationale
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            evidence_id = %evidence_id,
+                            "failed to record evidence consumption for a Verified finding"
+                        );
+                    }
+                }
+            }
+            if replayed {
+                finding.verdict = fornax_types::Verdict::Review;
+            }
+        }
+
         tracing::info!(verdict = ?finding.verdict, claim = %claim.text, "finding computed");
         state.store.insert_finding(&finding).await?;
     }
