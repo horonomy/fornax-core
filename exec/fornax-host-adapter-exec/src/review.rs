@@ -470,3 +470,95 @@ pub fn drift_counts(review: &Review) -> BTreeMap<&'static str, usize> {
     counts.insert("mismatched_or_unreadable", mismatched);
     counts
 }
+
+#[cfg(test)]
+mod digest_vectors {
+    //! Byte-for-byte test vectors for `implementation_digest` (ADR-0023
+    //! D11), computed independently in Python against this module's own
+    //! documented wire format, not by calling `implementation_digest`
+    //! twice and comparing it to itself -- a vector pinned as a literal
+    //! expected hash is what makes this a genuine regression guard against
+    //! an accidental change to the byte layout, not just a
+    //! round-trip-with-itself tautology.
+
+    use super::*;
+
+    const EMPTY_SHA256: &str =
+        "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const EMPTY_SHA256_RAW: [u8; 32] = [
+        0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9,
+        0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52,
+        0xb8, 0x55,
+    ];
+
+    fn fields_with(executable: &str, argv: &[&str]) -> ManifestFields {
+        ManifestFields {
+            adapter_id: "vector".to_string(),
+            adapter_version: "1.0.0".to_string(),
+            protocol_versions: vec![1],
+            contract_minimum: 1,
+            contract_maximum: 1,
+            roles: vec![],
+            capabilities: vec![],
+            executable: executable.to_string(),
+            argv: argv.iter().map(|s| s.to_string()).collect(),
+            runtime_files: vec![],
+            input_max_bytes: 1,
+            needs_environment: vec![],
+            needs_read_paths: vec![],
+            needs_write_paths: vec![],
+        }
+    }
+
+    /// Positive vector: one entrypoint runtime file, computed by an
+    /// independent Python reimplementation of this module's documented
+    /// wire format. If `implementation_digest`'s byte layout ever changes
+    /// without updating this vector, this test fails -- that's the point.
+    #[test]
+    fn positive_vector_matches_independently_computed_digest() {
+        let fields = fields_with("/opt/horonom/adapters/synthetic", &["--stdio-json"]);
+        let measured = vec![MeasuredFile {
+            path: "/opt/horonom/adapters/synthetic".to_string(),
+            kind: "entrypoint".to_string(),
+            declared_digest: EMPTY_SHA256.to_string(),
+            measured_digest: Some(EMPTY_SHA256.to_string()),
+            matches_declared: true,
+        }];
+        let digest = implementation_digest(&fields, &EMPTY_SHA256_RAW, &measured)
+            .expect("vector has a measured digest for its one file");
+        assert_eq!(
+            digest,
+            "sha256:4370a9f540b08bb4d7a6f86f49d975357d078f60611f41a9b7dd1b26efaddb55"
+        );
+    }
+
+    /// Negative/field-boundary vector: `executable="ab", argv=["c"]` and
+    /// `executable="a", argv=["bc"]` concatenate to the identical raw bytes
+    /// (`"abc"`) if fields were *not* length-prefixed -- this is exactly
+    /// the field-boundary-confusion class of bug the length-prefix scheme
+    /// exists to prevent. Both digests are independently pinned (not just
+    /// asserted not-equal to each other) so a regression that collapses
+    /// them to the same wrong value, or changes either in isolation, is
+    /// still caught.
+    #[test]
+    fn length_prefixing_prevents_field_boundary_confusion() {
+        let digest_ab_c = implementation_digest(&fields_with("ab", &["c"]), &EMPTY_SHA256_RAW, &[])
+            .expect("no runtime files, so no file-digest dependency");
+        let digest_a_bc = implementation_digest(&fields_with("a", &["bc"]), &EMPTY_SHA256_RAW, &[])
+            .expect("no runtime files, so no file-digest dependency");
+
+        assert_eq!(
+            digest_ab_c,
+            "sha256:a90f319d076969841f8f4062f7e8296744233a3c3afa47954eab5b9ed3aba3c7"
+        );
+        assert_eq!(
+            digest_a_bc,
+            "sha256:746e7fab78cfce1b5e84ee96e7318cd444ac926e6c4565ecaded8b8d425017af"
+        );
+        assert_ne!(
+            digest_ab_c, digest_a_bc,
+            "naive concatenation of 'ab'+'c' and 'a'+'bc' collides on raw bytes ('abc'); \
+             length-prefixing must keep these distinct"
+        );
+    }
+}
