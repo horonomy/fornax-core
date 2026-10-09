@@ -61,7 +61,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::sensor::{EvidenceSource, TrustClass};
-use crate::{Claim, Evidence};
+use crate::{Claim, Evidence, Provider};
 
 // ---------------------------------------------------------------------
 // AC1: collector authority — a named collector may only assert the trust
@@ -206,6 +206,161 @@ pub fn authorize_evidence_source(
 }
 
 // ---------------------------------------------------------------------
+// FORNX-431 (builds on FORNX-381's AC1): authenticated collector identity
+// must derive from trusted registry/transport, not evidence payload
+// labels. `authorize_evidence_source` above already refuses to trust a
+// *trust_class* claim at face value; this section closes the remaining
+// gap — nothing yet refuses to trust the *origin* (how the row physically
+// arrived at the daemon) at face value either. A payload can set
+// `sensor_name`/`trust_class` to anything; it can never set its own
+// `EvidenceOrigin`, because that value is never a field on the wire
+// `Evidence` type at all — only the receiving process (fornax-daemon, in a
+// later slice) can stamp it, from which transport handed the row over.
+// ---------------------------------------------------------------------
+
+/// How a piece of evidence physically arrived, as determined by the
+/// *receiving* process — never by anything the payload itself claims.
+/// Deliberately not a field on [`Evidence`]: adding it there would make it
+/// exactly the kind of untrusted, caller-supplied label this type exists to
+/// not be. A future integration (`fornax-store`, FORNX-431 slice 2) stamps
+/// this server-side at the moment a row is persisted, from the real
+/// transport/call path, and is the only thing that may ever construct an
+/// [`AdmissionContext`] carrying one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EvidenceOrigin {
+    /// Arrived over the daemon's UDS ingest socket, as an
+    /// `IngestMessage::Evidence` line — i.e. from a sensor process, subject
+    /// to [`CollectorAuthority`]'s per-sensor allowlist.
+    UdsIngest,
+    /// Written by the daemon's own `/api/acquire-evidence` acquisition
+    /// path. The daemon is the collector here, not an external sensor — a
+    /// missing [`EvidenceSource`] is expected, not a quarantine reason.
+    DaemonAcquisition,
+    /// Written by a privileged, non-adapter executor process (e.g.
+    /// `fornax-acquire-exec`) that this deployment has explicitly
+    /// authorized to write evidence directly. Same trust posture as
+    /// `DaemonAcquisition`: authorized by origin alone.
+    PrivilegedExecutor,
+    /// No receiving process stamped an origin for this row — either a
+    /// legacy row written before this mechanism existed, or a row read
+    /// back without going through the real admission path. Always
+    /// quarantined: an unknown origin is never upgraded to trusted by
+    /// anything the row itself says.
+    Unknown,
+}
+
+/// Who, if anyone, has announced themselves as the owning provider for a
+/// session (via `runtime_capabilities`, i.e. a real `SessionStart`/
+/// capability announcement — never guessed from a sensor-name prefix or
+/// any other heuristic). Used to catch evidence whose claimed
+/// `source.provider` doesn't match what the session itself has actually
+/// announced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionOwner {
+    /// No provider has announced itself for this session yet. Never
+    /// treated as "any provider is fine" — evidence citing a provider for
+    /// an unclaimed session is exactly the kind of unverifiable claim this
+    /// module exists to catch.
+    Unknown,
+    /// Exactly one provider has announced itself.
+    Single(Provider),
+    /// More than one provider has announced itself for the same session
+    /// (e.g. two adapters racing, or a forged announcement). Fails closed:
+    /// an ambiguous owner can never be used to *validate* a provider claim,
+    /// only to reject one.
+    Ambiguous,
+}
+
+/// AC1 (FORNX-431 extension)/AC4: the outcome of checking one piece of
+/// evidence's origin and (for [`EvidenceOrigin::UdsIngest`]) its collector
+/// identity, against `authority` and the claim's session owner. A
+/// deliberately separate vocabulary from [`ProvenanceVerdict`] — that type
+/// answers "is this *trust_class* claim vouched for"; this one answers "is
+/// this row admissible at all, given how it arrived and who owns the
+/// session it claims to belong to".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdmissionVerdict {
+    /// Admissible: a trusted origin, and (for `UdsIngest`) a registered
+    /// collector asserting a provider that matches the session's real
+    /// owner (or the session has no announced owner yet, counted as
+    /// consistent rather than contradictory — see
+    /// [`admission_decision`]'s doc comment).
+    Admitted,
+    /// Not admissible. Carries the same `reason` discipline as
+    /// [`ProvenanceVerdict::Quarantined`] — never silently dropped.
+    Quarantined { reason: String },
+}
+
+/// Decide whether one piece of evidence is admissible for `claim`, given
+/// how it arrived (`origin`) and who the claim's session has actually
+/// announced as its owning provider (`owner`). This is the pure decision
+/// function both the in-process guard and a future `fornax-store`
+/// persistence layer (FORNX-431 slice 2) call, so the rule never drifts
+/// between the two.
+///
+/// Deliberately permissive on `SessionOwner::Unknown`: a session with no
+/// announced provider yet is not evidence of forgery, only of a session
+/// that hasn't sent a capability announcement — the verifiers downstream
+/// already return `Unavailable` for an unannounced session on their own
+/// terms, so this function does not need to additionally fail it closed
+/// here. `SessionOwner::Ambiguous` is the opposite: two or more real
+/// announcements for one session is itself the anomaly, and is never used
+/// to admit a provider match.
+pub fn admission_decision(
+    evidence: &Evidence,
+    origin: EvidenceOrigin,
+    authority: &CollectorAuthority,
+    owner: SessionOwner,
+) -> AdmissionVerdict {
+    match origin {
+        EvidenceOrigin::Unknown => AdmissionVerdict::Quarantined {
+            reason: "evidence has no known ingress origin — never admitted on a payload's \
+                     own say-so"
+                .to_string(),
+        },
+        EvidenceOrigin::DaemonAcquisition | EvidenceOrigin::PrivilegedExecutor => {
+            // Authorized by origin alone: the daemon/executor is the
+            // collector here, so a missing `source` is expected, not a
+            // quarantine reason — mirrors `CollectorAuthority`'s own
+            // "authority is the trust anchor" principle, just anchored on
+            // origin instead of a named sensor.
+            AdmissionVerdict::Admitted
+        }
+        EvidenceOrigin::UdsIngest => {
+            let Some(source) = &evidence.source else {
+                return AdmissionVerdict::Quarantined {
+                    reason: "uds-ingest evidence with no EvidenceSource cannot be vouched for"
+                        .to_string(),
+                };
+            };
+            if let ProvenanceVerdict::Quarantined { reason } =
+                authorize_evidence_source(authority, source)
+            {
+                return AdmissionVerdict::Quarantined { reason };
+            }
+            match (source.provider, owner) {
+                (_, SessionOwner::Unknown) => AdmissionVerdict::Admitted,
+                (Some(claimed), SessionOwner::Single(real)) if claimed == real => {
+                    AdmissionVerdict::Admitted
+                }
+                (Some(claimed), SessionOwner::Single(real)) => AdmissionVerdict::Quarantined {
+                    reason: format!(
+                        "evidence source claims provider {claimed:?}, but this session's \
+                         announced owner is {real:?}"
+                    ),
+                },
+                (None, SessionOwner::Single(_)) => AdmissionVerdict::Admitted,
+                (_, SessionOwner::Ambiguous) => AdmissionVerdict::Quarantined {
+                    reason: "session has ambiguous/conflicting provider announcements — \
+                             cannot validate a provider claim against it"
+                        .to_string(),
+                },
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // AC2 (session axis): cross-session attribution fails closed.
 // ---------------------------------------------------------------------
 
@@ -267,6 +422,60 @@ pub enum ReplayVerdict {
     /// Already recorded for a *different* claim — a genuine cross-claim
     /// replay attempt (FORNX-380 fixture 10).
     ReplayedAcrossClaims { originally_consumed_by: Uuid },
+    /// Already recorded for a *different* claim, but that claim shares the
+    /// same anchor (`claim.session_id` + `claim.source_event_id`) as the
+    /// new one — e.g. one `AgentEvent` turn yielding two claims
+    /// (`command_executed` and `command_success`) that legitimately cite
+    /// the same evidence row. FORNX-431's "no blanket ban on one
+    /// observation supporting legitimately related claims" — scoped to the
+    /// *anchor*, not `Claim::subject`: subject is an open-ended, coarse
+    /// free-text category ("test_result" etc.) many genuinely unrelated
+    /// claims across different sessions/turns can share, so it is too weak
+    /// a compatibility key on its own. A caller downgrades the new
+    /// finding (e.g. to `Review`), never treats it as an unrelated
+    /// contradiction.
+    ReusedByRelatedClaim { originally_consumed_by: Uuid },
+}
+
+/// The identity of the "turn" a claim came from — `claim.session_id` plus
+/// `claim.source_event_id`, i.e. literally the same `AgentEvent`. Two
+/// claims sharing an anchor are claims minted from the same observed turn
+/// (the retry/multi-claim-per-turn case); two claims with different
+/// anchors are, per FORNX-380 fixture 10's own framing, "entirely unrelated
+/// claims" even if they happen to share a `subject` string.
+pub type ClaimAnchor = (String, Uuid);
+
+/// `claim`'s anchor (see [`ClaimAnchor`]).
+pub fn anchor_of(claim: &Claim) -> ClaimAnchor {
+    (claim.session_id.clone(), claim.source_event_id)
+}
+
+/// The anchor-aware sibling of [`EvidenceConsumptionLedger::record_and_check`]
+/// (which only ever distinguishes "same claim" from "any other claim").
+/// This is the pure decision both an in-memory ledger and a future
+/// `fornax-store` persisted ledger (FORNX-431 slice 2) call, so the
+/// compatibility rule never drifts between the two. `existing` is the
+/// current owner, if any: `(claim_id, anchor)` of whichever claim first
+/// consumed this evidence row.
+pub fn classify_consumption_by_anchor(
+    existing: Option<(Uuid, ClaimAnchor)>,
+    claim_id: Uuid,
+    anchor: &ClaimAnchor,
+) -> ReplayVerdict {
+    match existing {
+        None => ReplayVerdict::FreshlyRecorded,
+        Some((owner_claim_id, _)) if owner_claim_id == claim_id => {
+            ReplayVerdict::AlreadyConsumedBySameClaim
+        }
+        Some((owner_claim_id, owner_anchor)) if owner_anchor == *anchor => {
+            ReplayVerdict::ReusedByRelatedClaim {
+                originally_consumed_by: owner_claim_id,
+            }
+        }
+        Some((owner_claim_id, _)) => ReplayVerdict::ReplayedAcrossClaims {
+            originally_consumed_by: owner_claim_id,
+        },
+    }
 }
 
 /// AC3/AC7: closes `fornx380-10-receipt-replay-cross-claim` — the same
@@ -384,6 +593,13 @@ mod tests {
             subject: "tests_passed".to_string(),
             claimed_at: "2026-09-25T00:10:00Z".to_string(),
         }
+    }
+
+    fn claim_with_anchor(session_id: &str, source_event_id: Uuid, subject: &str) -> Claim {
+        let mut c = claim(session_id);
+        c.source_event_id = source_event_id;
+        c.subject = subject.to_string();
+        c
     }
 
     fn evidence_with(session_id: &str, sensor_name: &str, trust_class: TrustClass) -> Evidence {
@@ -633,5 +849,243 @@ mod tests {
             digest_1,
             "a changed payload must change the digest"
         );
+    }
+
+    // --- FORNX-431: EvidenceOrigin / admission_decision -------------------
+
+    #[test]
+    fn unknown_origin_is_always_quarantined() {
+        let ev = evidence_with(
+            "s1",
+            "claude_bash_exit_code_sensor_v1",
+            TrustClass::AgentAdjacent,
+        );
+        let authority = CollectorAuthority::known_sensors();
+        let verdict = admission_decision(
+            &ev,
+            EvidenceOrigin::Unknown,
+            &authority,
+            SessionOwner::Unknown,
+        );
+        assert!(matches!(verdict, AdmissionVerdict::Quarantined { .. }));
+    }
+
+    #[test]
+    fn daemon_acquisition_origin_is_admitted_without_a_source() {
+        let mut ev = evidence_with(
+            "s1",
+            "claude_bash_exit_code_sensor_v1",
+            TrustClass::AgentAdjacent,
+        );
+        ev.source = None; // acquisition evidence never has one
+        let authority = CollectorAuthority::known_sensors();
+        let verdict = admission_decision(
+            &ev,
+            EvidenceOrigin::DaemonAcquisition,
+            &authority,
+            SessionOwner::Unknown,
+        );
+        assert_eq!(verdict, AdmissionVerdict::Admitted);
+    }
+
+    #[test]
+    fn privileged_executor_origin_is_admitted_without_a_source() {
+        let mut ev = evidence_with(
+            "s1",
+            "claude_bash_exit_code_sensor_v1",
+            TrustClass::AgentAdjacent,
+        );
+        ev.source = None;
+        let authority = CollectorAuthority::known_sensors();
+        let verdict = admission_decision(
+            &ev,
+            EvidenceOrigin::PrivilegedExecutor,
+            &authority,
+            SessionOwner::Unknown,
+        );
+        assert_eq!(verdict, AdmissionVerdict::Admitted);
+    }
+
+    #[test]
+    fn uds_ingest_with_an_unregistered_sensor_is_quarantined() {
+        let ev = evidence_with("s1", "totally_made_up_sensor", TrustClass::HostObserved);
+        let authority = CollectorAuthority::known_sensors();
+        let verdict = admission_decision(
+            &ev,
+            EvidenceOrigin::UdsIngest,
+            &authority,
+            SessionOwner::Unknown,
+        );
+        assert!(matches!(verdict, AdmissionVerdict::Quarantined { .. }));
+    }
+
+    #[test]
+    fn uds_ingest_forged_trust_class_label_is_quarantined() {
+        // Same FORNX-380 fixture 11 exploit as authorize_evidence_source's
+        // own test, routed through the full admission decision.
+        let ev = evidence_with(
+            "s1",
+            "claude_bash_exit_code_sensor_v1", // only ever AgentAdjacent
+            TrustClass::HostObserved,
+        );
+        let authority = CollectorAuthority::known_sensors();
+        let verdict = admission_decision(
+            &ev,
+            EvidenceOrigin::UdsIngest,
+            &authority,
+            SessionOwner::Unknown,
+        );
+        assert!(matches!(verdict, AdmissionVerdict::Quarantined { .. }));
+    }
+
+    #[test]
+    fn uds_ingest_with_no_source_is_quarantined() {
+        let mut ev = evidence_with(
+            "s1",
+            "claude_bash_exit_code_sensor_v1",
+            TrustClass::AgentAdjacent,
+        );
+        ev.source = None;
+        let authority = CollectorAuthority::known_sensors();
+        let verdict = admission_decision(
+            &ev,
+            EvidenceOrigin::UdsIngest,
+            &authority,
+            SessionOwner::Unknown,
+        );
+        assert!(matches!(verdict, AdmissionVerdict::Quarantined { .. }));
+    }
+
+    #[test]
+    fn provider_matching_the_sessions_single_announced_owner_is_admitted() {
+        let ev = evidence_with(
+            "s1",
+            "claude_bash_exit_code_sensor_v1",
+            TrustClass::AgentAdjacent,
+        );
+        let authority = CollectorAuthority::known_sensors();
+        let verdict = admission_decision(
+            &ev,
+            EvidenceOrigin::UdsIngest,
+            &authority,
+            SessionOwner::Single(Provider::ClaudeCode),
+        );
+        assert_eq!(verdict, AdmissionVerdict::Admitted);
+    }
+
+    #[test]
+    fn provider_mismatching_the_sessions_single_announced_owner_is_quarantined() {
+        let ev = evidence_with(
+            "s1",
+            "claude_bash_exit_code_sensor_v1",
+            TrustClass::AgentAdjacent,
+        );
+        let authority = CollectorAuthority::known_sensors();
+        let verdict = admission_decision(
+            &ev,
+            EvidenceOrigin::UdsIngest,
+            &authority,
+            SessionOwner::Single(Provider::Codex),
+        );
+        assert!(matches!(verdict, AdmissionVerdict::Quarantined { .. }));
+    }
+
+    #[test]
+    fn ambiguous_session_owner_never_admits_a_provider_claim() {
+        let ev = evidence_with(
+            "s1",
+            "claude_bash_exit_code_sensor_v1",
+            TrustClass::AgentAdjacent,
+        );
+        let authority = CollectorAuthority::known_sensors();
+        let verdict = admission_decision(
+            &ev,
+            EvidenceOrigin::UdsIngest,
+            &authority,
+            SessionOwner::Ambiguous,
+        );
+        assert!(matches!(verdict, AdmissionVerdict::Quarantined { .. }));
+    }
+
+    #[test]
+    fn unannounced_session_owner_is_not_treated_as_forgery() {
+        let ev = evidence_with(
+            "s1",
+            "claude_bash_exit_code_sensor_v1",
+            TrustClass::AgentAdjacent,
+        );
+        let authority = CollectorAuthority::known_sensors();
+        let verdict = admission_decision(
+            &ev,
+            EvidenceOrigin::UdsIngest,
+            &authority,
+            SessionOwner::Unknown,
+        );
+        assert_eq!(verdict, AdmissionVerdict::Admitted);
+    }
+
+    // --- FORNX-431: anchor-based related-claim reuse ----------------------
+
+    #[test]
+    fn same_claim_id_reconsumption_is_idempotent() {
+        let claim_a = claim_with_anchor("s1", Uuid::new_v4(), "test_result");
+        let anchor = anchor_of(&claim_a);
+        let verdict =
+            classify_consumption_by_anchor(Some((claim_a.id, anchor.clone())), claim_a.id, &anchor);
+        assert_eq!(verdict, ReplayVerdict::AlreadyConsumedBySameClaim);
+    }
+
+    #[test]
+    fn two_claims_from_the_same_turn_are_a_legitimate_related_reuse() {
+        // One AgentEvent turn yielding two claims (e.g. command_executed +
+        // command_success) — same session, same source_event_id, different
+        // claim ids and even different subjects.
+        let event_id = Uuid::new_v4();
+        let claim_a = claim_with_anchor("s1", event_id, "command_executed");
+        let claim_b = claim_with_anchor("s1", event_id, "command_success");
+        let anchor_b = anchor_of(&claim_b);
+        assert_eq!(anchor_of(&claim_a), anchor_b, "same turn => same anchor");
+
+        let verdict = classify_consumption_by_anchor(
+            Some((claim_a.id, anchor_b.clone())),
+            claim_b.id,
+            &anchor_b,
+        );
+        assert_eq!(
+            verdict,
+            ReplayVerdict::ReusedByRelatedClaim {
+                originally_consumed_by: claim_a.id
+            }
+        );
+    }
+
+    #[test]
+    fn two_unrelated_claims_sharing_a_subject_but_not_an_anchor_is_a_real_replay() {
+        // fornx380-10's exact exploit, and the reason `subject` alone is
+        // the wrong compatibility key: two different sessions/turns, same
+        // free-text subject string ("test_result"), citing one row.
+        let claim_a = claim_with_anchor("session-a", Uuid::new_v4(), "test_result");
+        let claim_b = claim_with_anchor("session-b", Uuid::new_v4(), "test_result");
+        let anchor_a = anchor_of(&claim_a);
+        let anchor_b = anchor_of(&claim_b);
+        assert_ne!(anchor_a, anchor_b, "different session => different anchor");
+
+        let verdict =
+            classify_consumption_by_anchor(Some((claim_a.id, anchor_a)), claim_b.id, &anchor_b);
+        assert_eq!(
+            verdict,
+            ReplayVerdict::ReplayedAcrossClaims {
+                originally_consumed_by: claim_a.id
+            },
+            "same subject, different anchor must still be a real replay, not a related reuse"
+        );
+    }
+
+    #[test]
+    fn a_fresh_anchor_with_no_prior_owner_is_freshly_recorded() {
+        let claim_a = claim("s1");
+        let anchor = anchor_of(&claim_a);
+        let verdict = classify_consumption_by_anchor(None, claim_a.id, &anchor);
+        assert_eq!(verdict, ReplayVerdict::FreshlyRecorded);
     }
 }

@@ -20,9 +20,10 @@
 //! criterion actually asks for.
 
 use chrono::Utc;
+use fornax_types::{DatasetLineageTag, TenantRef};
 use uuid::Uuid;
 
-use crate::{Result, Store};
+use crate::{insert_lineage_tag_row, Result, Store};
 
 /// Why a line was quarantined. Closed on purpose, mirroring
 /// `fornax_types::EvidenceKind`'s own closed-enum precedent — a third
@@ -70,6 +71,7 @@ impl Store {
     ) -> Result<String> {
         let id = Uuid::new_v4().to_string();
         let received_at = Utc::now().to_rfc3339();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
             "INSERT INTO ingest_quarantine (id, received_at, reason_kind, reason, raw_line)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -79,8 +81,23 @@ impl Store {
         .bind(kind.as_str())
         .bind(reason)
         .bind(raw_line)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        // A quarantined line may not even parse enough to know which
+        // session it came from (a `ParseError` row has no reliable
+        // `session_id` at all) — unlike every other insert path in this
+        // crate, there is no real tenant to scope this row to. A unique
+        // per-row marker (never a shared constant) means per-tenant erasure
+        // can never accidentally match it, while still giving it a real
+        // `dataset_lineage_tags` row so the age-based sweep actually covers
+        // it — before this, a quarantined line (raw, unvalidated input) was
+        // retained forever, with no purge/expiry at all.
+        let lineage_tag = DatasetLineageTag::new(
+            crate::retention::retention_class_for_table("ingest_quarantine"),
+            TenantRef(format!("unattributed-quarantine-{id}")),
+        );
+        insert_lineage_tag_row(&mut *tx, "ingest_quarantine", &id, &lineage_tag).await?;
+        tx.commit().await?;
         Ok(id)
     }
 
