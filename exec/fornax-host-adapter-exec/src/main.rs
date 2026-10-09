@@ -32,6 +32,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use fornax_experiment_runner::GlobalExperimentPolicy;
+use fornax_host_adapter_exec::display::sanitize_for_display;
 use fornax_host_adapter_exec::review::{self, Review, VersionCompatibility};
 use fornax_store::adapter_registry::lookup_host_descriptor;
 use fornax_types::experiment::SideEffectClass;
@@ -138,7 +139,10 @@ fn print_lookup_failure(id: &str, reason_code: &str, json: bool) {
             serde_json::to_string_pretty(&envelope).expect("serialize envelope")
         );
     } else {
-        println!("fornax-host-adapter-exec doctor: {id}");
+        println!(
+            "fornax-host-adapter-exec doctor: {}",
+            sanitize_for_display(id)
+        );
         println!("  registration lookup failed: {reason_code}");
         println!("  outcome: refused (no review performed)");
     }
@@ -159,7 +163,10 @@ fn print_malformed_manifest(id: &str, detail: &str, json: bool) {
             serde_json::to_string_pretty(&envelope).expect("serialize envelope")
         );
     } else {
-        println!("fornax-host-adapter-exec doctor: {id}");
+        println!(
+            "fornax-host-adapter-exec doctor: {}",
+            sanitize_for_display(id)
+        );
         println!("  registered manifest did not have an expected field shape: {detail}");
         println!("  outcome: refused (no review performed)");
     }
@@ -219,7 +226,10 @@ fn print_json_review(process_spawn_granted: bool, review: &Review) {
 }
 
 fn print_human_review(id: &str, process_spawn_granted: bool, review: &Review) {
-    println!("fornax-host-adapter-exec doctor: {id}");
+    println!(
+        "fornax-host-adapter-exec doctor: {}",
+        sanitize_for_display(id)
+    );
     println!(
         "  registration: {} ({})",
         if review.entry_enabled {
@@ -227,10 +237,16 @@ fn print_human_review(id: &str, process_spawn_granted: bool, review: &Review) {
         } else {
             "disabled"
         },
-        review.fields.adapter_version
+        sanitize_for_display(&review.fields.adapter_version)
     );
-    println!("  roles: {}", review.fields.roles.join(", "));
-    println!("  capabilities: {}", review.fields.capabilities.join(", "));
+    println!(
+        "  roles: {}",
+        sanitize_for_display(&review.fields.roles.join(", "))
+    );
+    println!(
+        "  capabilities: {}",
+        sanitize_for_display(&review.fields.capabilities.join(", "))
+    );
     match &review.version {
         VersionCompatibility::Compatible {
             protocol_version,
@@ -276,7 +292,11 @@ fn print_human_review(id: &str, process_spawn_granted: bool, review: &Review) {
         } else {
             "MISMATCH"
         };
-        println!("    [{status}] {} ({})", file.path, file.kind);
+        println!(
+            "    [{status}] {} ({})",
+            sanitize_for_display(&file.path),
+            sanitize_for_display(&file.kind)
+        );
     }
     if review.measurement_capacity_exceeded {
         println!(
