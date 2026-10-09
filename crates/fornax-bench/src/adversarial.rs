@@ -346,10 +346,10 @@ pub fn corpus() -> Vec<AttackFixture> {
         fixture(
             "fornx380-12-graph-resource-abuse-family-map",
             AttackClass::GraphResourceAbuse,
-            "SourceFamilyMap::build's transitive derived_from ancestry pass is O(n^2 log n) regardless of whether derived_from is populated (found during FORNX-378's own security review, PR #181) — not fixed here, cataloged as a known, still-unresolved resource-abuse surface for a future ticket against fornax-verify::independence.",
+            "SourceFamilyMap::build's transitive derived_from ancestry pass was O(n^2 log n) regardless of whether derived_from is populated (found during FORNX-378's own security review, PR #181). FORNX-432 PR 3 closes this: SourceFamilyMap::try_build bounds Rule 2's ancestry walk and bases-pair bookkeeping by a deterministic work budget (FamilyBudget::DEFAULT_MAX_WORK_UNITS), aborting the whole construction (never a partial/truncated map) rather than completing on an adversarial pool; contract_satisfaction::assess fails the independence-constrained requirement safe to SatisfactionState::Unknown on abort, fusion fails safe to Verdict::Review/FusionRule::IndependenceBudgetExceeded, and the daemon's /api/fusion and /api/evidence-graph handlers run the (still real, bounded) CPU cost via spawn_blocking so a poisoned session cannot stall a concurrent clean one (fornax-daemon::tests::poisoned_session_fails_safe_without_stalling_a_concurrent_clean_session).",
             false,
-            AttackOutcome::Escaped,
-            "cargo test -p fornax-verify --lib -- contract_satisfaction::tests::large_evidence_pool_does_not_panic_or_hang",
+            AttackOutcome::Prevented,
+            "cargo test -p fornax-verify --lib -- contract_satisfaction::tests::adversarial_derived_from_graph_fails_safe_within_budget_instead_of_hanging",
         ),
         fixture(
             "fornx380-13-harness-crash-is-inconclusive-not-prevented",
