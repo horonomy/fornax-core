@@ -1081,6 +1081,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "fornax-load-harness"
+version = "0.0.8"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "fornax-store",
+ "fornax-types",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "fornax-protocol"
 version = "0.0.8"
 dependencies = [

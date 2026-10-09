@@ -1,0 +1,20 @@
+[package]
+name = "fornax-load-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "fornax-load-harness"
+path = "src/main.rs"
+
+[dependencies]
+fornax-store = { path = "../fornax-store" }
+fornax-types = { path = "../fornax-types" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
