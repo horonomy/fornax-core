@@ -20,6 +20,33 @@ Jira epic FORNX-20.
   the shared CLI operation-envelope v1 shape; these facts do not establish
   host installation, trust, or native observation.
 
+- **Evidence-ingress provenance and replay enforcement** (FORNX-431, Stage
+  7A/v0.0.9). The daemon's real verdict-persistence choke point now filters
+  evidence through a provenance guard (server-stamped origin, session-owner
+  derivation from real capability announcements) before any verifier sees
+  it, and checks a durable `evidence_consumption` ledger before persisting a
+  `Verified` finding. A cross-claim replay of already-consumed evidence
+  downgrades to `Review`, never silently re-verifies. Independently
+  re-verified against the live daemon under genuine concurrency (FORNX-435).
+  See `docs/adr/0024-evidence-ingress-provenance-and-consumption.md`.
+
+- **Evidence-independence capacity bounding** (FORNX-432, Stage 7A/v0.0.9).
+  `SourceFamilyMap::build`/`ancestors_of` sped up 10–143x on common shapes
+  with byte-identical output (proptest-proven against a frozen reference
+  oracle); a new `try_build` aborts construction under a deterministic
+  100,000-work-unit budget rather than completing on an adversarial pool,
+  with fusion/contract-satisfaction/receipt-issuance/voi all failing safe
+  (never a partial result) and the daemon running the bounded cost via
+  `spawn_blocking`. Independently re-verified, including a fixture-potency
+  negative control (FORNX-436). See
+  `docs/research/fornx-432-independence-capacity.md`.
+
+- **Local-daemon ingest quarantine and backpressure** (FORNX-212, local
+  scope). A malformed or unprocessable ingest line is now durably recorded
+  (`ingest_quarantine` table, with retention-sweep coverage) instead of only
+  logged and dropped. A real 512-concurrent-event test proves zero loss and
+  bounded drain time against the daemon's 256-connection inflight cap.
+
 ### Changed
 
 - `fornax adapter unregister` (and the underlying registry `remove`) adopts
