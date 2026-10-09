@@ -109,6 +109,17 @@ impl SourceFamilyMap {
 
         let by_id: BTreeMap<Uuid, &Evidence> = sorted.iter().map(|e| (e.id, *e)).collect();
 
+        // FORNX-432 PR 2: first-occurrence `source.is_none()` per id, built
+        // once instead of the `evidence.iter().find(...)` rescan every
+        // singleton family previously did below (cost source E in the
+        // FORNX-432 design doc). `.entry().or_insert()` preserves the same
+        // "first match in `evidence`'s original order" semantics `.find()`
+        // had, including when `evidence` contains a duplicate id.
+        let mut is_no_source: HashMap<Uuid, bool> = HashMap::new();
+        for e in evidence {
+            is_no_source.entry(e.id).or_insert(e.source.is_none());
+        }
+
         // Union-find over the sorted id list. Path compression is fine
         // internally -- the *root* id is never exposed as output; the
         // representative element of a rendered family is chosen separately
@@ -157,9 +168,14 @@ impl SourceFamilyMap {
             }
         }
 
-        // Rule 2: derived_from ancestry, transitive.
+        // Rule 2: derived_from ancestry, transitive. FORNX-432 PR 2: reuses
+        // `by_id` (already built once above) via `ancestors_of_indexed`
+        // instead of calling public `ancestors_of`, which rebuilt the same
+        // index from scratch on every one of these `sorted.len()` calls --
+        // this was cost source A in the FORNX-432 design doc, the dominant
+        // cost even on a `flat` pool with zero `derived_from` edges at all.
         for e in &sorted {
-            for ancestor in ancestors_of(e.id, evidence) {
+            for ancestor in ancestors_of_indexed(e.id, &by_id) {
                 if by_id.contains_key(&ancestor) {
                     union(&mut parent, e.id, ancestor);
                     bases_by_pair.insert((
@@ -202,40 +218,70 @@ impl SourceFamilyMap {
             }
         }
 
-        // Assemble families from the final union-find state.
+        // Assemble families from the final union-find state. FORNX-432 PR 2:
+        // `value_to_keys` is computed once per occurrence here and reused
+        // for both grouping steps below, replacing two scans that were
+        // previously O(families * n) and O(families * bases_by_pair.len())
+        // (cost sources D and E in the design doc) -- `evidence.iter().find(...)`
+        // per singleton family, and `ids.contains(a) && ids.contains(b)`
+        // tested against every family for every recorded pair.
+        //
+        // This maps each id *value* to the SET of family keys it landed in
+        // -- not a single key -- because `evidence` can legitimately
+        // contain more than one record sharing the same id value, with
+        // different `source.is_none()` outcomes: the input's pool is never
+        // deduplicated before this pass (only each resulting family's own
+        // `ids` list is, below), so the same id value can end up a member
+        // of two *different* families simultaneously (one occurrence's
+        // "no-source -- own singleton" override landing it in its own key,
+        // another occurrence of the identical id value unioned by `find`
+        // into someone else's key). A single id-to-key map would silently
+        // collapse that into whichever occurrence was processed last;
+        // `prop_build_matches_reference_oracle` below is what caught this.
         let mut members_by_root: BTreeMap<Uuid, Vec<Uuid>> = BTreeMap::new();
+        let mut value_to_keys: HashMap<Uuid, std::collections::HashSet<Uuid>> = HashMap::new();
         for e in &sorted {
-            if e.source.is_none() {
+            let key = if e.source.is_none() {
                 // Unknown provenance is always its own singleton, never
                 // unioned -- assign it its own "root" (itself) regardless
                 // of what union-find computed (it was never unioned with
                 // anything for this id, so this is a no-op in practice,
                 // stated explicitly for clarity and defense-in-depth).
-                members_by_root.entry(e.id).or_default().push(e.id);
-                continue;
+                e.id
+            } else {
+                find(&mut parent, e.id)
+            };
+            members_by_root.entry(key).or_default().push(e.id);
+            value_to_keys.entry(e.id).or_default().insert(key);
+        }
+
+        // For each recorded pair, add its tag to every family whose
+        // `ids` list genuinely contains both endpoint values -- i.e. every
+        // key common to both endpoints' key-sets -- reproducing the
+        // original `ids.contains(a) && ids.contains(b)` membership test
+        // exactly (including the duplicate-id case above), without
+        // rescanning every family per pair. In the overwhelmingly common
+        // case (no duplicate ids) each key-set has exactly one element, so
+        // this is still an O(1) intersection per pair.
+        let mut bases_by_family: BTreeMap<Uuid, BTreeSet<FamilyBasisTag>> = BTreeMap::new();
+        for (a, b, tag) in &bases_by_pair {
+            if let (Some(keys_a), Some(keys_b)) = (value_to_keys.get(a), value_to_keys.get(b)) {
+                for &key in keys_a.intersection(keys_b) {
+                    bases_by_family.entry(key).or_default().insert(tag.clone());
+                }
             }
-            let root = find(&mut parent, e.id);
-            members_by_root.entry(root).or_default().push(e.id);
         }
 
         let mut families = Vec::new();
-        for (_, mut ids) in members_by_root {
+        for (key, mut ids) in members_by_root {
             ids.sort();
             ids.dedup();
             let mut bases: BTreeSet<FamilyBasisTag> = BTreeSet::new();
-            if ids.len() == 1
-                && evidence
-                    .iter()
-                    .find(|e| e.id == ids[0])
-                    .map(|e| e.source.is_none())
-                    .unwrap_or(false)
-            {
+            if ids.len() == 1 && is_no_source.get(&ids[0]).copied().unwrap_or(false) {
                 bases.insert(FamilyBasisTag::UnknownProvenance);
             }
-            for (a, b, tag) in &bases_by_pair {
-                if ids.contains(a) && ids.contains(b) {
-                    bases.insert(tag.clone());
-                }
+            if let Some(pair_bases) = bases_by_family.get(&key) {
+                bases.extend(pair_bases.iter().cloned());
             }
             families.push(SourceFamily {
                 evidence_ids: ids,
@@ -317,6 +363,21 @@ impl FamilyBasisTag {
 /// hang or panic on hostile/malformed input).
 pub fn ancestors_of(evidence_id: Uuid, evidence: &[Evidence]) -> BTreeSet<Uuid> {
     let by_id: BTreeMap<Uuid, &Evidence> = evidence.iter().map(|e| (e.id, e)).collect();
+    ancestors_of_indexed(evidence_id, &by_id)
+}
+
+/// FORNX-432 PR 2: the same traversal [`ancestors_of`] does, but taking an
+/// already-built id index instead of rebuilding one from the full evidence
+/// slice -- the fix for cost source A in the FORNX-432 design doc, where
+/// `build`'s own Rule 2 called public `ancestors_of` once per evidence
+/// record, rebuilding the identical index `sorted.len()` times over
+/// (dominant even on a `flat` pool with zero edges). `pub(crate)` so
+/// `fusion.rs`'s R3 loop can build its own index once before its candidate
+/// loop, for the same reason.
+pub(crate) fn ancestors_of_indexed(
+    evidence_id: Uuid,
+    by_id: &BTreeMap<Uuid, &Evidence>,
+) -> BTreeSet<Uuid> {
     let mut result = BTreeSet::new();
     let mut visited = BTreeSet::new();
     let mut stack = vec![evidence_id];
@@ -700,5 +761,176 @@ mod tests {
         let map1 = SourceFamilyMap::build(&pool);
         let map2 = SourceFamilyMap::build(&pool);
         assert_eq!(map1.all_families(), map2.all_families());
+    }
+
+    // FORNX-432 PR 2: property-based proof that the speed-ups above
+    // (`ancestors_of_indexed` reuse, `family_key`/`bases_by_family`
+    // replacing the per-family `Vec::contains`/`evidence.iter().find`
+    // rescans) produce byte-identical output to the PR-1 reference oracle
+    // (`build_reference`/`ancestors_of_reference`, untouched copies of
+    // what this module's real `build`/`ancestors_of` did before PR 2).
+    // Only compiled with `--features bench-reference`, since the oracle
+    // functions themselves are gated behind it.
+    #[cfg(feature = "bench-reference")]
+    mod speedup_equivalence {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// A small fixed id table, reused across all of a single generated
+        /// pool's evidence records so ids/correlation-groups/event-ids can
+        /// collide, derived_from can dangle (point at an id never assigned
+        /// to any record in the pool) or cycle, and two records can share
+        /// an id outright -- all real inputs `build`/`build_reference` must
+        /// agree on. `Uuid::from_u128` keeps the table deterministic across
+        /// runs, independent of any RNG seed.
+        const ID_TABLE_LEN: u128 = 12;
+
+        fn id_at(i: u128) -> Uuid {
+            Uuid::from_u128(i)
+        }
+
+        fn arb_trust_class() -> impl Strategy<Value = TrustClass> {
+            prop_oneof![
+                Just(TrustClass::AgentAdjacent),
+                Just(TrustClass::ModelInternal),
+                Just(TrustClass::HostObserved),
+                Just(TrustClass::IndependentExternal),
+                Just(TrustClass::HumanReviewed),
+            ]
+        }
+
+        /// One evidence record spec: an id-table index (0..ID_TABLE_LEN,
+        /// duplicates across the generated pool allowed on purpose), an
+        /// optional source (`None` ~20% of the time), a small
+        /// correlation-group index, a small source_event_id index, and 0-3
+        /// derived_from indices drawn from the SAME id-table range --
+        /// including indices never used as any record's own id (dangling)
+        /// and indices that point back at an earlier or later record in the
+        /// same generated pool (can form a cycle once assembled).
+        /// (id-table index, optional trust class, correlation-group index,
+        /// source_event_id index, derived_from indices).
+        type EvidenceSpec = (u128, Option<TrustClass>, u128, u128, Vec<u128>);
+
+        fn arb_evidence_spec() -> impl Strategy<Value = EvidenceSpec> {
+            (
+                0..ID_TABLE_LEN,
+                prop::option::weighted(0.8, arb_trust_class()),
+                0..4u128,
+                0..4u128,
+                prop::collection::vec(0..ID_TABLE_LEN, 0..3),
+            )
+        }
+
+        fn build_pool(specs: Vec<EvidenceSpec>) -> Vec<Evidence> {
+            specs
+                .into_iter()
+                .map(|(id_idx, trust, group_idx, event_idx, derived_idx)| {
+                    let id = id_at(id_idx);
+                    let source_event_id = id_at(100 + event_idx);
+                    let derived_from: Vec<Uuid> = derived_idx.into_iter().map(id_at).collect();
+                    match trust {
+                        None => Evidence {
+                            id,
+                            session_id: "prop".to_string(),
+                            source_event_id,
+                            kind: EvidenceKind::ExitCode,
+                            observed_at: "2026-01-01T00:00:00Z".to_string(),
+                            payload: serde_json::json!({}),
+                            provenance: "prop".to_string(),
+                            source: None,
+                            extension: None,
+                            evidence_purged: false,
+                        },
+                        Some(trust_class) => {
+                            // Index 0 is reserved to mean "no correlation
+                            // group" -- correlation_group is only ever
+                            // Some(..) for indices 1..4, so the "no group"
+                            // case is still well represented.
+                            let correlation_group = if group_idx == 0 {
+                                None
+                            } else {
+                                Some(id_at(200 + group_idx))
+                            };
+                            Evidence {
+                                id,
+                                session_id: "prop".to_string(),
+                                source_event_id,
+                                kind: EvidenceKind::ExitCode,
+                                observed_at: "2026-01-01T00:00:00Z".to_string(),
+                                payload: serde_json::json!({}),
+                                provenance: "prop".to_string(),
+                                source: Some(EvidenceSource {
+                                    sensor_name: "prop_sensor".to_string(),
+                                    trust_class,
+                                    collected_at: "2026-01-01T00:00:00Z".to_string(),
+                                    provider: None,
+                                    collection_method: CollectionMethod::HookCallback,
+                                    collector_version: None,
+                                    freshness: Freshness {
+                                        clock_source: ClockSource::HostClock,
+                                        caveat: None,
+                                    },
+                                    tamper_boundary: TamperBoundary::default(),
+                                    correlation_group,
+                                    derived_from,
+                                }),
+                                extension: None,
+                                evidence_purged: false,
+                            }
+                        }
+                    }
+                })
+                .collect()
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            /// `build` and `build_reference` must agree on every generated
+            /// pool -- the core correctness claim of PR 2's speed-ups.
+            #[test]
+            fn build_matches_reference_oracle(
+                specs in prop::collection::vec(arb_evidence_spec(), 0..10)
+            ) {
+                let pool = build_pool(specs);
+                let fast = SourceFamilyMap::build(&pool);
+                let reference = build_reference(&pool);
+                prop_assert_eq!(fast.all_families(), reference.all_families());
+
+                // `family_of` must also agree for every distinct id in the
+                // pool (a duplicate id in `pool` still only needs checking
+                // once).
+                let mut seen = std::collections::HashSet::new();
+                for e in &pool {
+                    if !seen.insert(e.id) {
+                        continue;
+                    }
+                    prop_assert_eq!(
+                        fast.family_of(e.id).cloned(),
+                        reference.family_of(e.id).cloned()
+                    );
+                }
+            }
+
+            /// `ancestors_of` and `ancestors_of_reference` must agree for
+            /// every id in a generated pool, including a dangling or
+            /// self-cyclic `derived_from` entry.
+            #[test]
+            fn ancestors_of_matches_reference_oracle(
+                specs in prop::collection::vec(arb_evidence_spec(), 0..10)
+            ) {
+                let pool = build_pool(specs);
+                let mut seen = std::collections::HashSet::new();
+                for e in &pool {
+                    if !seen.insert(e.id) {
+                        continue;
+                    }
+                    prop_assert_eq!(
+                        ancestors_of(e.id, &pool),
+                        ancestors_of_reference(e.id, &pool)
+                    );
+                }
+            }
+        }
     }
 }
