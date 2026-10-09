@@ -254,17 +254,29 @@ impl CapabilityProbe for CodexAdapter {
                 },
                 if self.item_format {
                     // HORO-1712: codex-cli 0.160+'s `item_completed`
-                    // CommandExecution item carries a real, always-present
-                    // `exit_code` field for every completed/failed command
-                    // -- unlike the pre-0.160 shapes documented in the
-                    // `else` branch below, this is not conditional on which
-                    // exec tool the session happens to use.
+                    // CommandExecution item is *specified* (this ticket's
+                    // own plan text, not a live capture -- HORO-1712
+                    // deferred the actual `codex exec` capture to a
+                    // separate cost-authorization step) to carry a real,
+                    // always-present `exit_code` field for every
+                    // completed/failed command, unconditionally on which
+                    // exec tool the session uses -- unlike the pre-0.160
+                    // shapes documented in the `else` branch below, which
+                    // *are* confirmed against real captures (FORNX-16).
+                    // `Available` here is this adapter's honest claim about
+                    // what it *translates when the shape matches*, not a
+                    // claim that the shape itself has been independently
+                    // verified against a running codex-cli 0.160+ -- do
+                    // not read this as "verified ground truth" until that
+                    // capture happens.
                     CapabilitySignal {
                         class: SignalClass::ProcessResult,
                         state: SignalAvailability::Available,
                         detail: Some(
                             "item_completed CommandExecution.exit_code (codex-cli 0.160+, \
-                             HORO-1712, live-confirmed)"
+                             HORO-1712) -- schema inferred from ticket spec text, not yet \
+                             confirmed against a live codex-cli 0.160+ capture (see \
+                             HORO-1712's deferred Step 0)"
                                 .to_string(),
                         ),
                     }
@@ -870,6 +882,15 @@ fn translate_line(
 /// is `Ignored`, and an unknown one is `Unrecognized` (HORO-1712's own
 /// spec, closed list: `UserMessage`/`AgentMessage`/`Reasoning`/
 /// `CollabAgentToolCall`/`Extension`/`FileChange`/`ContextCompaction`).
+///
+/// The field names and shape this function matches on (`item.id`,
+/// `item.type`, `status`, `exit_code`, `item.command`, `item.source`) are
+/// taken from HORO-1712's own plan text, not from a live codex-cli 0.160+
+/// capture -- that capture is deliberately deferred (a separate cost-
+/// authorization decision), so this is an informed schema guess, not a
+/// confirmed one. Re-verify against a real capture before trusting it the
+/// way `docs/research/adapter-capability-matrix.md`'s other rows (backed
+/// by live captures, e.g. FORNX-16/FORNX-55) are trusted.
 fn translate_item_completed(
     payload: &serde_json::Value,
     entry: &serde_json::Value,
@@ -922,6 +943,25 @@ fn translate_item_completed(
             // non-integer" drift this must catch. The returned reason
             // names only the field, never its (possibly malformed/
             // attacker-controlled) value.
+            //
+            // NOT cross-checked here: whether `status` and `exit_code`
+            // are required to agree (e.g. `status: "failed"` with
+            // `exit_code: 0`, or `status: "completed"` with a nonzero
+            // `exit_code`). This function's schema is inferred from
+            // HORO-1712's own plan text, not a live codex-cli 0.160+
+            // capture (see this function's doc comment above), so
+            // whether Codex's real semantics treat `status` (the
+            // execution mechanism's own outcome -- e.g. did the process
+            // get killed/declined vs. run to completion) and `exit_code`
+            // (the command's own return code) as independent facts that
+            // can legitimately disagree, or as a pair that's always
+            // consistent, is unconfirmed either way. Both fields are
+            // passed through into the Evidence payload verbatim
+            // (`"status"`/`"exit_code"`) rather than one being derived
+            // from or validated against the other, so no claim is
+            // fabricated regardless of which relationship turns out to
+            // be true -- but a caller should not assume this path
+            // already rejects an internally-inconsistent pair.
             let Some(code) = item.get("exit_code").and_then(|v| v.as_i64()) else {
                 return NormalizationOutcome::Unrecognized {
                     discriminator: format!(
