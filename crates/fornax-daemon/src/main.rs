@@ -24,7 +24,7 @@ use fornax_verify::{
     CommandExecutedVerifier, CommandSuccessVerifier, FileModifiedVerifier, GitOperationVerifier,
     TestResultVerifier, Verifier,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -756,7 +756,17 @@ impl Drop for TurnGuard {
 /// locked from `Drop`.
 #[derive(Default)]
 struct PendingHandoff {
-    sessions: HashSet<String>,
+    /// Refcounted, not a `HashSet` -- a session can legitimately have more
+    /// than one handed-off connection in flight at once (e.g. both a Codex
+    /// rollout tailer and an opencode bridge connected for the same
+    /// session). A plain set was a real fail-open bug caught by a third
+    /// independent adversarial review: with a set, the *first* of two
+    /// concurrent handoffs for the same session to `Drop` would remove the
+    /// session entirely, even though the second handoff was still
+    /// genuinely in flight -- silently reopening the stale-evidence race
+    /// for the survivor. The count only reaches zero (and the entry is
+    /// removed) once every holder for that session has dropped.
+    sessions: HashMap<String, usize>,
     /// Count of in-flight handoffs whose session id isn't known yet (no
     /// line was processed during the drain phase before the budget
     /// expired). Scoped globally, not per-session, because there's no
@@ -806,7 +816,7 @@ impl HandoffGuard {
         let mut pending = lock_pending_handoff(&state.pending_handoff);
         let token = match session_hint {
             Some(sid) => {
-                pending.sessions.insert(sid.clone());
+                *pending.sessions.entry(sid.clone()).or_insert(0) += 1;
                 HandoffToken::Session(sid.clone())
             }
             None => {
@@ -826,12 +836,15 @@ impl Drop for HandoffGuard {
     fn drop(&mut self) {
         let mut pending = lock_pending_handoff(&self.pending);
         match &self.token {
-            // `HashSet::remove` of an absent entry is a no-op, never a
-            // panic, so an unexpected second guard for the same session
-            // (not possible today -- one handoff per session in practice)
-            // would degrade safely rather than corrupt the set.
             HandoffToken::Session(sid) => {
-                pending.sessions.remove(sid);
+                if let std::collections::hash_map::Entry::Occupied(mut entry) =
+                    pending.sessions.entry(sid.clone())
+                {
+                    *entry.get_mut() = entry.get().saturating_sub(1);
+                    if *entry.get() == 0 {
+                        entry.remove();
+                    }
+                }
             }
             HandoffToken::Unknown => {
                 pending.unknown = pending.unknown.saturating_sub(1);
@@ -844,9 +857,9 @@ impl Drop for HandoffGuard {
 /// panicking again: a prior panic while *this* lock was held must not
 /// permanently wedge every future handoff/claim in the daemon into
 /// thinking a lock lives here that can never be acquired again. The
-/// recovered guard's data is used as-is (a `HashSet`/counter has no
-/// invariant a partial mutation could violate beyond what `remove`/
-/// `saturating_sub` already tolerate).
+/// recovered guard's data is used as-is (the refcount map/counter have no
+/// invariant a partial mutation could violate beyond what `saturating_sub`
+/// already tolerates).
 fn lock_pending_handoff(
     pending: &Arc<std::sync::Mutex<PendingHandoff>>,
 ) -> std::sync::MutexGuard<'_, PendingHandoff> {
@@ -860,7 +873,7 @@ fn lock_pending_handoff(
 /// flight, or some unidentified session does (see `PendingHandoff::unknown`).
 fn evidence_may_be_incomplete_for(state: &AppState, session_id: &str) -> bool {
     let pending = lock_pending_handoff(&state.pending_handoff);
-    pending.unknown > 0 || pending.sessions.contains(session_id)
+    pending.unknown > 0 || pending.sessions.contains_key(session_id)
 }
 
 /// Reads and processes this connection's immediately-available lines, in
