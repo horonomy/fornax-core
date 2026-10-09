@@ -101,6 +101,18 @@ pub enum StoreError {
          tuple than this insert attempted -- not a safe idempotent replay"
     )]
     IdCollision { table: &'static str, id: String },
+    /// FORNX-431: `insert_claim_idempotent`'s `ON CONFLICT (id) DO NOTHING`
+    /// fired, but the colliding row's content doesn't match the incoming
+    /// claim -- a genuine UUID collision (or a forged/replayed id), not a
+    /// legitimate retry of the same submission. Returning `Ok(false)` here
+    /// (this crate's prior behavior) would have been indistinguishable from
+    /// a real idempotent resubmission, and the daemon's caller skips
+    /// re-verification on `false` -- silently treating a divergent claim as
+    /// "already seen" with no quarantine trail at all. Fail closed instead:
+    /// propagate this as an error so `process_line` (FORNX-212) quarantines
+    /// it, the same path a genuinely unprocessable line already takes.
+    #[error("claim id {id} collides with an existing row whose content differs -- not a legitimate retry")]
+    ClaimIdCollision { id: String },
 }
 
 /// Outcome of an idempotent insert (`Store::insert_event`/
@@ -428,9 +440,38 @@ impl Store {
                 TenantRef(c.session_id.clone()),
             );
             insert_lineage_tag_row(&mut *tx, "claims", &c.id.to_string(), &lineage_tag).await?;
+            tx.commit().await?;
+            return Ok(true);
         }
+
+        // `ON CONFLICT DO NOTHING` fired -- a row with this id already
+        // exists. Read it back and compare: only a byte-for-byte match on
+        // every field is a legitimate retry (`Ok(false)`); any divergence
+        // is a genuine collision, failed closed as an error rather than
+        // silently treated as "already seen" (see `StoreError::
+        // ClaimIdCollision`'s doc comment).
+        let existing: (String, String, String, String) = sqlx::query_as(
+            "SELECT session_id, source_event_id, text, subject FROM claims WHERE id = ?1",
+        )
+        .bind(c.id.to_string())
+        .fetch_one(&mut *tx)
+        .await?;
         tx.commit().await?;
-        Ok(inserted)
+
+        if existing
+            == (
+                c.session_id.clone(),
+                c.source_event_id.to_string(),
+                c.text.clone(),
+                c.subject.clone(),
+            )
+        {
+            Ok(false)
+        } else {
+            Err(StoreError::ClaimIdCollision {
+                id: c.id.to_string(),
+            })
+        }
     }
 
     /// See [`Store::insert_event`]'s doc comment — same atomic
@@ -2363,6 +2404,66 @@ mod tests {
             1,
             "exactly one claim row must exist after two identical submissions"
         );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// FORNX-431 gap closure: before this fix, `insert_claim_idempotent`
+    /// returned `Ok(false)` for ANY id collision, legitimate retry or not
+    /// -- a genuinely different claim minted with a colliding id would be
+    /// silently treated as "already seen, skip verification" with no
+    /// quarantine trail. A real collision must fail closed instead.
+    #[tokio::test]
+    async fn insert_claim_idempotent_fails_closed_on_a_genuine_id_collision() {
+        let path = tmp_db_path("claim-id-collision");
+        let store = Store::open(&path).await.expect("open db");
+
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: None,
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        store.insert_event(&event).await.expect("insert event");
+
+        let shared_id = Uuid::new_v4();
+        let original = Claim {
+            id: shared_id,
+            session_id: "s1".into(),
+            source_event_id: event.id,
+            text: "original claim text".into(),
+            subject: "test".into(),
+            claimed_at: "2026-01-01T00:00:01Z".into(),
+        };
+        let first = store
+            .insert_claim_idempotent(&original)
+            .await
+            .expect("first insert");
+        assert!(first);
+
+        // Same id, different text -- a genuine collision, never a
+        // legitimate retry of `original`.
+        let colliding = Claim {
+            id: shared_id,
+            text: "an entirely different assertion".into(),
+            ..original.clone()
+        };
+        let result = store.insert_claim_idempotent(&colliding).await;
+        assert!(
+            matches!(result, Err(StoreError::ClaimIdCollision { .. })),
+            "a content-divergent collision must be a hard error, not Ok(false): {result:?}"
+        );
+
+        // The original row must survive untouched -- the collision is
+        // rejected, never allowed to overwrite.
+        let claims = store.claims_for_session("s1").await.expect("read claims");
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].text, "original claim text");
 
         std::fs::remove_file(&path).ok();
     }
