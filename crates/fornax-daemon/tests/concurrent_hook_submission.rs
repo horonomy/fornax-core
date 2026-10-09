@@ -41,8 +41,9 @@ use std::time::Duration;
 
 use fornax_store::Store;
 use fornax_types::{
-    AgentEvent, CapabilitySignal, Claim, EventKind, Evidence, EvidenceKind, IngestMessage,
-    Provider, RuntimeCapabilities, SignalAvailability, SignalClass,
+    AgentEvent, CapabilitySignal, Claim, CollectionMethod, EventKind, Evidence, EvidenceKind,
+    EvidenceSource, IngestMessage, Provider, RuntimeCapabilities, SignalAvailability, SignalClass,
+    TrustClass,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
@@ -778,7 +779,19 @@ async fn later_connections_claim_never_overtakes_an_earlier_connections_evidence
         observed_at: now.clone(),
         payload: serde_json::json!({"command": "cargo test", "exit_code": 1}),
         provenance: "claude_code:PostToolUse:Bash#tool_response".to_string(),
-        source: None,
+        // FORNX-431 slice 4: this fixture simulates real exit-code evidence
+        // arriving over UDS (see `send_hook`/raw-connection submission
+        // below) -- admission now requires a registered collector identity,
+        // matching the real `claude_bash_exit_code_sensor_v1` sensor this
+        // scenario is standing in for (`fornax-adapter-claude`'s real
+        // `collect_claude_bash_exit_code`), not a bare `None`.
+        source: Some(EvidenceSource::now(
+            "claude_bash_exit_code_sensor_v1",
+            TrustClass::AgentAdjacent,
+            Some(Provider::ClaudeCode),
+            CollectionMethod::HookCallback,
+            None,
+        )),
         extension: None,
         evidence_purged: false,
     };
@@ -978,7 +991,19 @@ async fn claim_evaluated_during_a_handoff_is_downgraded_not_falsely_bound_to_sta
         observed_at: now.clone(),
         payload: serde_json::json!({"command": "cargo test", "exit_code": 0}),
         provenance: "claude_code:PostToolUse:Bash#tool_response".to_string(),
-        source: None,
+        // FORNX-431 slice 4: this fixture simulates real exit-code evidence
+        // arriving over UDS (see `send_hook`/raw-connection submission
+        // below) -- admission now requires a registered collector identity,
+        // matching the real `claude_bash_exit_code_sensor_v1` sensor this
+        // scenario is standing in for (`fornax-adapter-claude`'s real
+        // `collect_claude_bash_exit_code`), not a bare `None`.
+        source: Some(EvidenceSource::now(
+            "claude_bash_exit_code_sensor_v1",
+            TrustClass::AgentAdjacent,
+            Some(Provider::ClaudeCode),
+            CollectionMethod::HookCallback,
+            None,
+        )),
         extension: None,
         evidence_purged: false,
     };
@@ -1082,7 +1107,19 @@ async fn claim_evaluated_during_a_handoff_is_downgraded_not_falsely_bound_to_sta
         observed_at: now.clone(),
         payload: serde_json::json!({"command": "cargo test", "exit_code": 1}),
         provenance: "claude_code:PostToolUse:Bash#tool_response".to_string(),
-        source: None,
+        // FORNX-431 slice 4: this fixture simulates real exit-code evidence
+        // arriving over UDS (see `send_hook`/raw-connection submission
+        // below) -- admission now requires a registered collector identity,
+        // matching the real `claude_bash_exit_code_sensor_v1` sensor this
+        // scenario is standing in for (`fornax-adapter-claude`'s real
+        // `collect_claude_bash_exit_code`), not a bare `None`.
+        source: Some(EvidenceSource::now(
+            "claude_bash_exit_code_sensor_v1",
+            TrustClass::AgentAdjacent,
+            Some(Provider::ClaudeCode),
+            CollectionMethod::HookCallback,
+            None,
+        )),
         extension: None,
         evidence_purged: false,
     };
@@ -1134,7 +1171,19 @@ async fn second_concurrent_handoff_for_the_same_session_keeps_claims_downgraded_
         observed_at: now.clone(),
         payload: serde_json::json!({"command": "cargo test", "exit_code": 0}),
         provenance: "claude_code:PostToolUse:Bash#tool_response".to_string(),
-        source: None,
+        // FORNX-431 slice 4: this fixture simulates real exit-code evidence
+        // arriving over UDS (see `send_hook`/raw-connection submission
+        // below) -- admission now requires a registered collector identity,
+        // matching the real `claude_bash_exit_code_sensor_v1` sensor this
+        // scenario is standing in for (`fornax-adapter-claude`'s real
+        // `collect_claude_bash_exit_code`), not a bare `None`.
+        source: Some(EvidenceSource::now(
+            "claude_bash_exit_code_sensor_v1",
+            TrustClass::AgentAdjacent,
+            Some(Provider::ClaudeCode),
+            CollectionMethod::HookCallback,
+            None,
+        )),
         extension: None,
         evidence_purged: false,
     };

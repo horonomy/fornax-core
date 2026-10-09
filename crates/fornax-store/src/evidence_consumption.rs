@@ -162,6 +162,53 @@ impl Store {
         tx.commit().await?;
         Ok(verdict)
     }
+
+    /// Durably records that `evidence_id` was refused admission for
+    /// `claim_id` (FORNX-431 slice 4) — the AC1 "never silently dropped"
+    /// requirement applied to the admission gate itself, not just to
+    /// unparseable input (`ingest_quarantine`, FORNX-212) or to replay
+    /// (`record_consumption`'s `outcome = 'consumed'` rows above). Same
+    /// `UNIQUE(evidence_id, claim_id)` idempotency as a consumption row —
+    /// a claim re-evaluated against evidence that's still inadmissible
+    /// records the fact once, not once per re-evaluation.
+    pub async fn record_admission_quarantine(
+        &self,
+        evidence_id: Uuid,
+        claim_id: Uuid,
+        anchor: &ClaimAnchor,
+        reason: &str,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let id = Uuid::new_v4().to_string();
+        let recorded_at = Utc::now().to_rfc3339();
+        let inserted = sqlx::query(
+            "INSERT INTO evidence_consumption
+                (id, evidence_id, claim_id, session_id, anchor_event_id, verifier_name,
+                 outcome, reason, recorded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, 'quarantined', ?6, ?7)
+             ON CONFLICT (evidence_id, claim_id) DO NOTHING",
+        )
+        .bind(&id)
+        .bind(evidence_id.to_string())
+        .bind(claim_id.to_string())
+        .bind(&anchor.0)
+        .bind(anchor.1.to_string())
+        .bind(reason)
+        .bind(&recorded_at)
+        .execute(&mut *tx)
+        .await?;
+
+        if inserted.rows_affected() > 0 {
+            let lineage_tag = DatasetLineageTag::new(
+                retention::retention_class_for_table("evidence_consumption"),
+                TenantRef(anchor.0.clone()),
+            );
+            insert_lineage_tag_row(&mut *tx, "evidence_consumption", &id, &lineage_tag).await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
