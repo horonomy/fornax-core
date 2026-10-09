@@ -22,6 +22,7 @@ pub mod compliance_report;
 pub mod corpus;
 pub mod feedback;
 pub mod policy_cache;
+pub mod quarantine;
 pub mod retention;
 
 pub use audit_checkpoint::{
