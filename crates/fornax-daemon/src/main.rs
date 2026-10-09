@@ -12,6 +12,7 @@ use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use fornax_experiment_runner::GlobalExperimentPolicy;
 use fornax_store::policy_cache::RevocationIngestOutcome;
+use fornax_types::provenance_guard::EvidenceOrigin;
 use fornax_types::redact::{redact_json, redact_text};
 use fornax_types::{
     compute_posture, home_identity, verify_bundle, verify_revocation_list, ActivationOutcome,
@@ -1087,7 +1088,16 @@ async fn handle_message(
                         _ => unreachable!("redact_json preserves the Object variant"),
                     };
             }
-            state.store.insert_evidence(&ev).await?;
+            // FORNX-431 slice 3: this line arrived over the daemon's real
+            // UDS ingest socket, so its origin is known to the receiving
+            // process itself, not asserted by the payload — exactly the
+            // trust boundary `EvidenceOrigin`/`admission_decision` (slices
+            // 1-2) exist to enforce once slice 4 wires them into the
+            // verdict path.
+            state
+                .store
+                .insert_evidence_with_origin(&ev, EvidenceOrigin::UdsIngest)
+                .await?;
         }
         IngestMessage::PolicyBundle { envelope } => {
             handle_policy_bundle_ingest(state, envelope.into_bytes()).await;
@@ -1103,7 +1113,19 @@ async fn handle_message(
             // logs, and export-spool output unredacted. Apply the same
             // privacy boundary as Event/Evidence, once, before persistence.
             claim.text = redact_text(&claim.text);
-            state.store.insert_claim(&claim).await?;
+            // FORNX-431 slice 3: a client (hook process) that retries
+            // after a dropped response has no way to know whether its
+            // first attempt actually landed — an identical claim_id
+            // arriving twice must be treated as the same resubmission, not
+            // a new claim and not a quarantine-worthy failure (FORNX-212's
+            // `ingest_quarantine` would otherwise fill up with what are
+            // really just network retries). A duplicate skips
+            // re-verification: harmless either way since the claim content
+            // is identical, but pointless repeated work otherwise.
+            let is_new_claim = state.store.insert_claim_idempotent(&claim).await?;
+            if !is_new_claim {
+                return Ok(());
+            }
 
             let caps = state
                 .caps
@@ -2389,7 +2411,16 @@ async fn api_acquire_evidence(
     }
 
     let fused_after = if let fornax_acquire::AcquisitionOutcome::Acquired(evidence) = outcome {
-        if let Err(e) = state.store.insert_evidence(&evidence).await {
+        // FORNX-431 slice 3: this evidence was produced by the daemon's
+        // own acquisition path, not received from an external sensor — the
+        // daemon is the collector here (see `EvidenceOrigin::DaemonAcquisition`'s
+        // doc comment), so a missing `source` is expected, not a quarantine
+        // reason, once slice 4 enforces this.
+        if let Err(e) = state
+            .store
+            .insert_evidence_with_origin(&evidence, EvidenceOrigin::DaemonAcquisition)
+            .await
+        {
             return Json(serde_json::json!({
                 "claim": q.claim,
                 "session": q.session,

@@ -40,6 +40,7 @@ use clap::Parser;
 use fornax_acquire::AcquisitionRoots;
 use fornax_acquire_exec::{ci, grants::ExecutorGrants, rerun};
 use fornax_experiment_runner::GlobalExperimentPolicy;
+use fornax_types::provenance_guard::EvidenceOrigin;
 use fornax_verify::voi::{AcquisitionCandidate, CandidateAvailability, ProbeKind};
 use uuid::Uuid;
 
@@ -352,7 +353,14 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     };
 
-    store.insert_evidence(&evidence).await?;
+    // FORNX-431 slice 3: this binary is a privileged, non-adapter executor
+    // this deployment has explicitly authorized to write evidence directly
+    // (see `EvidenceOrigin::PrivilegedExecutor`'s doc comment) — same trust
+    // posture as the daemon's own acquisition path, authorized by origin
+    // alone.
+    store
+        .insert_evidence_with_origin(&evidence, EvidenceOrigin::PrivilegedExecutor)
+        .await?;
 
     let reverify_url = format!(
         "{}/api/reverify?claim={}&session={}",
