@@ -212,7 +212,40 @@ pub fn assess(
 
     if let ContractLookup::Found(_) = registry.lookup(claim_class) {
         let requirements = registry.effective_requirements(claim_class)?;
-        let families = SourceFamilyMap::build(&deduped);
+        let families = match SourceFamilyMap::try_build(
+            &deduped,
+            &crate::independence::FamilyBudget::default_budget(),
+        ) {
+            Ok(families) => families,
+            Err(_budget_exceeded) => {
+                // FORNX-432 PR 3: fail to `SatisfactionState::Unknown` --
+                // its own doc comment is exactly this case ("applicability
+                // or satisfaction could not be determined at all... never
+                // used as a substitute for Satisfied", see `assess_claim`'s
+                // "unknown never passes" invariant). Only requirements that
+                // actually declare `IndependenceRule::MustBeIndependentOf`
+                // depend on the family map, so only those are touched; a
+                // requirement already `Unsatisfied`/`Stale`/`Contradicted`/
+                // etc. keeps its more specific, already-determined state.
+                for req in &requirements {
+                    if matches!(req.independence, IndependenceRule::None) {
+                        continue;
+                    }
+                    for ra in &mut assessment.per_requirement {
+                        if ra.requirement_id == req.id
+                            && matches!(ra.state, SatisfactionState::Satisfied)
+                        {
+                            ra.state = SatisfactionState::Unknown;
+                        }
+                    }
+                }
+                assessment.overall = recompute_overall(&assessment.per_requirement);
+                return Ok(SatisfactionReport {
+                    assessment,
+                    family_violations: violations,
+                });
+            }
+        };
         let matched_by_id: HashMap<String, Vec<Uuid>> = assessment
             .per_requirement
             .iter()
@@ -1216,6 +1249,65 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(5),
             "800-item evidence pool took unreasonably long: {:?}",
             started.elapsed()
+        );
+    }
+
+    /// FORNX-432 PR 3: the real resource-abuse surface fixture 12
+    /// (`fornx380-12`, see `fornax-bench::adversarial`) catalogued --
+    /// `SourceFamilyMap::build`'s O(n^2 log n) ancestry pass -- is now
+    /// bounded. A dense `derived_from` DAG (every record derives directly
+    /// from every prior record, the real `adversarial_dense` shape from
+    /// `docs/research/fornx-432-independence-capacity.md`) sized past
+    /// `FamilyBudget::DEFAULT_MAX_WORK_UNITS` must make `assess` fail safe
+    /// to `SatisfactionState::Unknown` on the independence-constrained
+    /// requirement within bounded time, never hang and never silently stay
+    /// `Satisfied` on a pool whose independence could not actually be
+    /// verified.
+    #[test]
+    fn adversarial_derived_from_graph_fails_safe_within_budget_instead_of_hanging() {
+        let reg = registry_with_double_check(1);
+        let cc = ClaimClassId::new("fornx378_double_check", 1);
+        let claim_obj = claim("fornx378_double_check", "2026-09-24T00:10:00Z");
+
+        // Sized well past the 100,000-work-unit default budget -- see the
+        // identical construction and sizing rationale in
+        // `fornax-daemon`'s `poisoned_session_fails_safe_without_stalling_a_concurrent_clean_session`.
+        const N: usize = 500;
+        let mut pool: Vec<Evidence> = Vec::with_capacity(N);
+        let mut prior_ids: Vec<Uuid> = Vec::with_capacity(N);
+        for i in 0..N {
+            let mut ev = evidence_with_source(
+                EvidenceKind::ExitCode,
+                "2026-09-24T00:00:00Z",
+                TrustClass::HostObserved,
+                None,
+            );
+            ev.provenance = format!("fornx432-adversarial-{i}");
+            if let Some(source) = ev.source.as_mut() {
+                source.derived_from = prior_ids.clone();
+            }
+            prior_ids.push(ev.id);
+            pool.push(ev);
+        }
+
+        let started = std::time::Instant::now();
+        let report = assess(&reg, &cc, &claim_obj, &pool, &[]).expect("assess ok, never Err");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "adversarial pool must fail safe quickly, not hang: {:?}",
+            started.elapsed()
+        );
+        let second_check = report
+            .assessment
+            .per_requirement
+            .iter()
+            .find(|ra| ra.requirement_id == "second_independent_check")
+            .expect("second_independent_check requirement present");
+        assert_eq!(
+            second_check.state,
+            SatisfactionState::Unknown,
+            "independence could not be verified under budget, so this requirement must fail \
+             safe to Unknown, never stay Satisfied"
         );
     }
 
