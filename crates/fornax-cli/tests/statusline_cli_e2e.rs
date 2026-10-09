@@ -219,6 +219,160 @@ fn run_with_stdin(subcommand: &str, home: &std::path::Path, port: u16, stdin_byt
     }
 }
 
+/// Starts a fake daemon that answers `/api/status` with a correctly-identified,
+/// session-scoped reading and lets every other path (`/api/fusion` included)
+/// fall through to a plain error response.
+///
+/// `closed_port()` alone only proves the leak-free property when the daemon
+/// is unreachable, which steers every call through `no_reading`/
+/// `explain_unavailable` -- neither of which takes a session id. Only a
+/// *successful* probe reaches `reading()` and, for `explain`, `explain_text()`,
+/// which is the one function that actually receives the resolved session id
+/// as a parameter (HORO-1604 adversarial review: a raw-session-id
+/// interpolation into `explain_text`'s header survived the closed-port test
+/// untouched). This stub exists to make that path real.
+fn spawn_stub_daemon(
+    home: &std::path::Path,
+    session_id: &str,
+) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let identity = fornax_types::home_identity(home);
+    let session_id = session_id.to_string();
+    let seen_requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_requests_bg = seen_requests.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            handle_stub_connection(stream, &identity, &session_id, &seen_requests_bg);
+        }
+    });
+    (port, seen_requests)
+}
+
+fn handle_stub_connection(
+    mut stream: std::net::TcpStream,
+    identity: &str,
+    session_id: &str,
+    seen_requests: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    use std::io::BufRead;
+
+    let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+    let mut request_line = String::new();
+    if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+        return;
+    }
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) if line == "\r\n" || line == "\n" => break,
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    seen_requests
+        .lock()
+        .unwrap()
+        .push(request_line.trim().to_string());
+
+    let body = if request_line.contains("/api/status") {
+        serde_json::json!({
+            "latest": {
+                "verdict": "verified",
+                "computed_at": "2026-01-01T00:00:00Z",
+                "claim_id": "stub-claim",
+                "session_id": session_id,
+            },
+            "session_scoped": true,
+        })
+        .to_string()
+    } else {
+        // `probe_fusion` collapses every failure to `None`; an unrecognized
+        // path answering with an error body is enough to exercise that, and
+        // nothing in this test depends on the fusion surface.
+        serde_json::json!({"error": "not found"}).to_string()
+    };
+
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-fornax-home-id: {identity}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes());
+}
+
+#[test]
+fn a_real_session_id_never_leaks_through_a_successful_daemon_response_either() {
+    let home = temp_home("identity-no-leak-success");
+    let session_id = format!("claude-sess-{}", Uuid::new_v4());
+    let identity_doc = serde_json::json!({
+        "identity_stdin_version": 1,
+        "provider_session_id": session_id,
+        "host_capabilities": ["segment_scope"],
+    });
+    let (port, _seen) = spawn_stub_daemon(&home, &session_id);
+
+    for subcommand in ["provider", "explain"] {
+        let run = run_with_stdin(subcommand, &home, port, identity_doc.to_string().as_bytes());
+        assert!(run.status.success(), "exit {:?}", run.status.code());
+        assert!(
+            !run.stdout.contains(&session_id),
+            "{subcommand} leaked the session id into stdout on a successful probe: {}",
+            run.stdout
+        );
+        assert!(
+            !run.stderr.contains(&session_id),
+            "{subcommand} leaked the session id into stderr on a successful probe: {}",
+            run.stderr
+        );
+    }
+}
+
+/// Anti-vacuity guard: "guessed session ID derived from cwd/PID/tmux". With
+/// no identity document on stdin at all, the real outbound request to the
+/// daemon must carry no `session` query parameter -- proving nothing derived
+/// from this process's own PID, cwd, or any other local guess ever gets
+/// substituted for the absent, host-supplied identity. A text-only assertion
+/// on stdout/stderr would miss a guess that never gets printed but still
+/// gets sent to the daemon and silently narrows the query.
+#[test]
+fn no_identity_on_stdin_means_no_guessed_session_is_ever_sent_to_the_daemon() {
+    let home = temp_home("no-identity-no-guess");
+    let session_id = format!("claude-sess-{}", Uuid::new_v4());
+    let (port, seen_requests) = spawn_stub_daemon(&home, &session_id);
+    let pid = std::process::id().to_string();
+
+    for subcommand in ["provider", "explain"] {
+        // Empty stdin: `read_identity_stdin()` sees zero bytes and must
+        // resolve to `None`, not fall back to a local guess.
+        let run = run_with_stdin(subcommand, &home, port, b"");
+        assert!(run.status.success(), "exit {:?}", run.status.code());
+        assert!(
+            !run.stdout.contains(&pid),
+            "{subcommand} leaked this process's own pid into stdout: {}",
+            run.stdout
+        );
+    }
+
+    let requests = seen_requests.lock().unwrap();
+    let status_requests: Vec<&String> = requests
+        .iter()
+        .filter(|r| r.contains("/api/status"))
+        .collect();
+    assert_eq!(
+        status_requests.len(),
+        2,
+        "expected one /api/status request per subcommand, saw: {requests:?}"
+    );
+    for request_line in status_requests {
+        assert!(
+            !request_line.contains("session="),
+            "a session query parameter was sent to the daemon with no identity document on stdin: {request_line}"
+        );
+    }
+}
+
 #[test]
 fn a_real_session_id_piped_on_stdin_never_reaches_stdout_or_stderr() {
     let home = temp_home("identity-no-leak");
