@@ -208,22 +208,38 @@ async fn seed_session_verdict(
 }
 
 /// The core HORO-1604 matrix proof: restart the daemon on the same
-/// `$FORNAX_HOME`/SQLite file, with two sessions' *different* pre-existing
-/// verdicts, and confirm each session still sees only its own verdict
-/// afterward -- resume/continue (item 7) and process restart (item 10)
-/// together, since restart is strictly the harder case resume already
-/// implies (the in-memory `caps` cache is also empty on first contact for a
-/// resumed session that the daemon has never seen before this call).
+/// `$FORNAX_HOME`/SQLite file, with two sessions' *different* verdicts
+/// committed during the FIRST instance's own lifetime, and confirm each
+/// session still sees only its own verdict after a kill + relaunch of a
+/// second instance against that same file -- resume/continue (item 7) and
+/// process restart (item 10) together, since restart is strictly the
+/// harder case resume already implies.
+///
+/// Deliberately seeds AFTER the first daemon is already up, not before: a
+/// startup step that silently clears persisted findings (a realistic
+/// regression -- e.g. an over-eager "reset on launch" migration/cleanup
+/// step) would be a no-op against an empty table on the very first start,
+/// so seeding before that point would never exercise it. Seeding only after
+/// the first instance is confirmed live is what makes the second instance's
+/// startup the one place such a bug could actually bite -- see this test's
+/// own mutation evidence in the PR description.
 #[tokio::test]
 async fn each_sessions_own_verdict_survives_a_real_daemon_restart() {
     let home = PathBuf::from("/tmp").join(format!("fnx-restart-{}", short_id()));
     std::fs::create_dir_all(&home).expect("create scratch FORNAX_HOME");
     let port_before = free_tcp_port();
-
-    // Seed two sessions with distinct verdicts directly against the
-    // database file the daemon itself will open -- matching
-    // `crates/fornax-daemon/src/main.rs`'s `db_path = home.join("fornax.db")`.
     let db_path = home.join("fornax.db");
+
+    let daemon = start_daemon(&home, port_before).await;
+
+    // Seed two sessions with distinct verdicts directly against the same
+    // database file the already-running daemon opened in WAL mode
+    // (`crates/fornax-store/src/lib.rs`'s `Store::open` -- WAL mode is what
+    // makes a second connection to the same file from this test process
+    // safe here). This test is about restart/persistence at the HTTP
+    // route, not about exercising the verifiers -- same determinism
+    // reasoning as `crates/fornax-daemon/src/main.rs`'s
+    // `api_status_with_session_confirms_scoping_and_isolates_sessions`.
     {
         let store = Store::open(&db_path).await.expect("open db to seed");
         seed_session_verdict(
@@ -241,8 +257,6 @@ async fn each_sessions_own_verdict_survives_a_real_daemon_restart() {
         )
         .await;
     }
-
-    let daemon = start_daemon(&home, port_before).await;
 
     // Sanity before restart: each session already sees its own verdict,
     // not the other's, through the real running process.
