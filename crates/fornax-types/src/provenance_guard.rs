@@ -249,6 +249,24 @@ pub enum EvidenceOrigin {
     Unknown,
 }
 
+impl EvidenceOrigin {
+    /// The `evidence.ingress_origin` column value for this origin (FORNX-431
+    /// slice 2's migration), as `fornax-store`'s `origin_from_column` parses
+    /// it back. `Unknown` has no column representation of its own — it is
+    /// the NULL/not-yet-stamped state, never a literal value a row could be
+    /// written with, so storing one would be indistinguishable from a
+    /// genuinely legacy row (which is the point: there is nothing a caller
+    /// can do to assert "unknown" as if it were a real, determined origin).
+    pub fn as_column_str(&self) -> Option<&'static str> {
+        match self {
+            EvidenceOrigin::UdsIngest => Some("uds_ingest"),
+            EvidenceOrigin::DaemonAcquisition => Some("daemon_acquisition"),
+            EvidenceOrigin::PrivilegedExecutor => Some("privileged_executor"),
+            EvidenceOrigin::Unknown => None,
+        }
+    }
+}
+
 /// Who, if anyone, has announced themselves as the owning provider for a
 /// session (via `runtime_capabilities`, i.e. a real `SessionStart`/
 /// capability announcement — never guessed from a sensor-name prefix or
