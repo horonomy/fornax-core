@@ -956,11 +956,39 @@ async fn process_line(state: &AppState, line: &str, session_hint: &mut Option<St
         Ok(m) => m,
         Err(e) => {
             tracing::warn!(error = %e, "dropping malformed ingest line");
+            // FORNX-212: a malformed line is still possibly-real evidence
+            // (e.g. a schema-mismatched adapter, not necessarily garbage) —
+            // record it durably rather than letting the warn! be the only
+            // trace it ever existed. A failure to quarantine (e.g. a full
+            // disk) is itself worth another warn!, not a reason to crash
+            // the connection.
+            if let Err(store_err) = state
+                .store
+                .record_quarantine(
+                    line,
+                    &e.to_string(),
+                    fornax_store::quarantine::QuarantineReason::ParseError,
+                )
+                .await
+            {
+                tracing::warn!(error = %store_err, "failed to quarantine malformed ingest line");
+            }
             return;
         }
     };
     if let Err(e) = handle_message(state, msg, session_hint).await {
         tracing::warn!(error = %e, "failed to process ingest message");
+        if let Err(store_err) = state
+            .store
+            .record_quarantine(
+                line,
+                &e.to_string(),
+                fornax_store::quarantine::QuarantineReason::HandleError,
+            )
+            .await
+        {
+            tracing::warn!(error = %store_err, "failed to quarantine ingest message that failed handling");
+        }
     }
 }
 
