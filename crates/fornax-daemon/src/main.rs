@@ -26,11 +26,12 @@ use fornax_verify::{
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::time::timeout;
 
 mod audit_checkpoint_submit;
@@ -130,10 +131,31 @@ struct AppState {
     /// payload (e.g. Stop's Claim) could therefore still reach `.lock()`
     /// before an earlier-accepted connection with a larger payload (e.g.
     /// PostToolUse's Evidence, still being read/redacted) — exactly the race
-    /// `run_uds_server`'s connection-ordering handoff exists to close. See
-    /// that function's doc comment for the actual ordering guarantee.
+    /// `next_turn`/`turn_advanced` below exist to close. See
+    /// `run_uds_server`'s doc comment for the actual ordering guarantee.
     /// Held for the full duration of `handle_message`.
     processing: Arc<Mutex<()>>,
+    /// HORO-1712: the turn ticket a connection must hold before its lines
+    /// may enter `handle_message` — this, not `processing` above,
+    /// establishes true connection-accept order. `run_uds_server` hands out
+    /// tickets `0, 1, 2, ...` as it accepts, matching the real accept
+    /// sequence exactly; a connection's own task waits here for its ticket
+    /// without ever making the accept loop itself wait, so a slow or
+    /// deliberately-trickling connection can only ever delay the
+    /// *processing turn* of connections after it, never the daemon's
+    /// ability to keep *accepting* new ones (that would be a trivial
+    /// accept-starvation DoS — a security review of this fix's first draft
+    /// caught exactly that: it awaited the drain inside the accept loop).
+    next_turn: Arc<AtomicU64>,
+    /// Woken every time `next_turn` advances, so every connection
+    /// currently waiting for its ticket re-checks rather than polling.
+    turn_advanced: Arc<Notify>,
+    /// Ticket dispenser: `fetch_add`ed once per accepted connection, in
+    /// the accept loop itself, so ticket order equals accept order
+    /// exactly. Distinct from `next_turn` above, which instead tracks
+    /// *whose turn is currently being served* and only advances once a
+    /// ticket's processing turn actually finishes.
+    next_ticket: Arc<AtomicU64>,
     /// FORNX-339: this daemon's `$FORNAX_HOME` identity, sent as a response
     /// header on every HTTP reply so a client can prove it's talking to the
     /// daemon serving its own home rather than a different one that won the
@@ -373,6 +395,9 @@ async fn main() -> anyhow::Result<()> {
         store,
         caps: Arc::new(Mutex::new(HashMap::new())),
         processing: Arc::new(Mutex::new(())),
+        next_turn: Arc::new(AtomicU64::new(0)),
+        turn_advanced: Arc::new(Notify::new()),
+        next_ticket: Arc::new(AtomicU64::new(0)),
         home_id: Arc::from(home_identity(&home).as_str()),
         trust: Arc::new(trusted),
         policy: Arc::new(RwLock::new(policy_snapshot)),
@@ -484,13 +509,27 @@ enum Drain {
     Handoff(IngestLines, Option<String>),
 }
 
-/// Accepts connections one at a time and drains each fully — in true
-/// connection-accept order, not whichever spawned task happens to finish
-/// parsing first — before accepting the next. This is the actual ordering
-/// guarantee `AppState::processing`'s mutex alone does not provide: that
-/// mutex only prevents two `handle_message` calls from running
-/// concurrently, it does not make an earlier-accepted connection's messages
-/// process before a later-accepted connection's.
+/// Accepts connections as fast as the OS can hand them over — **never**
+/// waiting on any connection's own processing — while still guaranteeing
+/// each one's lines enter `handle_message` in true connection-accept order.
+/// This is the actual ordering guarantee `AppState::processing`'s mutex
+/// alone does not provide: that mutex only prevents two `handle_message`
+/// calls from running concurrently, it does not make an earlier-accepted
+/// connection's messages process before a later-accepted connection's.
+///
+/// Ordering is established by a ticket turnstile
+/// (`AppState::{next_turn,turn_advanced}`), not by blocking `accept()`:
+/// each accepted connection is handed the next sequential ticket and
+/// immediately spawned — the accept loop itself never awaits a spawned
+/// task, so a slow, hung, or deliberately-trickling connection can only
+/// ever delay the *processing turn* of connections accepted after it,
+/// never the daemon's ability to keep accepting new ones. An earlier draft
+/// of this fix awaited each connection's drain directly inside the accept
+/// loop, which — a security review caught — let any single slow connection
+/// throttle the whole daemon's accept rate to one per
+/// `DRAIN_READ_BUDGET`: a trivial accept-starvation denial of service. The
+/// turnstile closes that: `accept()` is unconditional and immediate, full
+/// stop.
 ///
 /// Connection-accept order equals causal (host-side) order here because
 /// every installed Claude Code hook entry is a synchronous `"command"`
@@ -501,37 +540,83 @@ enum Drain {
 /// this daemon can detect or defend against, so not attempted here.
 ///
 /// A connection that doesn't close within [`DRAIN_IDLE`]/[`DRAIN_READ_BUDGET`]
-/// (a long-lived adapter bridge, not a one-shot hook) is hung off to a
-/// background task via [`continue_connection`] so it can never block the
-/// accept loop — and therefore never block a later one-shot hook — for
-/// longer than that bounded drain window.
+/// of actually holding its turn (a long-lived adapter bridge, not a
+/// one-shot hook) relinquishes its turn via [`Drain::Handoff`] and
+/// continues independently via [`continue_connection`], so it can never
+/// hold up the connections queued behind it beyond that bounded window
+/// either.
 async fn run_uds_server(sock_path: &PathBuf, state: AppState) -> anyhow::Result<()> {
     let listener = UnixListener::bind(sock_path)?;
     tracing::info!(path = %sock_path.display(), "UDS ingest listening");
     loop {
         let (stream, _addr) = listener.accept().await?;
-        let drain_state = state.clone();
-        // Run the drain in its own task and await it to completion before
-        // accepting the next connection: a panic inside `handle_message`
-        // (e.g. a verifier bug) is contained by `JoinHandle`'s `Err` rather
-        // than silently killing this accept loop while the HTTP side keeps
-        // serving stale state.
-        match tokio::spawn(drain_in_order(stream, drain_state)).await {
-            Ok(Ok(Drain::Eof)) => {}
-            Ok(Ok(Drain::Handoff(lines, session_hint))) => {
-                let state = state.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = continue_connection(lines, session_hint, state).await {
-                        tracing::warn!(error = %e, "ingest connection ended with error");
-                    }
-                });
+        // Ticket order equals accept order exactly: the accept loop is
+        // single-threaded (one `accept()` in flight at a time), so handing
+        // out ticket N to the Nth accepted connection, in this same loop,
+        // right after `accept()` returns, cannot race with any other
+        // ticket assignment.
+        let ticket = state.next_ticket.fetch_add(1, Ordering::SeqCst);
+        let state = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_connection_in_turn(stream, state, ticket).await {
+                tracing::warn!(error = %e, "ingest connection ended with error");
             }
-            Ok(Err(e)) => tracing::warn!(error = %e, "ingest connection ended with error"),
-            Err(join_err) => {
-                tracing::error!(error = %join_err, "ingest drain task panicked")
-            }
+        });
+        // Deliberately not awaited: accepting the next connection must
+        // never wait on this one's turn, drain, or processing.
+    }
+}
+
+/// Waits for `ticket`'s turn (see `AppState::next_turn`'s doc comment),
+/// then drains the connection in-order, relinquishing the turn either once
+/// it hits EOF or once it proves itself long-lived and is handed off to
+/// [`continue_connection`] — a handed-off connection runs with the same
+/// mutual-exclusion-only contract `AppState::processing` always provided,
+/// never blocking any later connection's turn.
+async fn handle_connection_in_turn(
+    stream: UnixStream,
+    state: AppState,
+    ticket: u64,
+) -> anyhow::Result<()> {
+    wait_for_turn(&state, ticket).await;
+    match drain_in_order(stream, state.clone()).await {
+        Ok(Drain::Eof) => {
+            advance_turn(&state);
+            Ok(())
+        }
+        Ok(Drain::Handoff(lines, session_hint)) => {
+            // Relinquish the turn *before* continuing independently: a
+            // long-lived connection must never hold up every connection
+            // accepted after it just because it is still open.
+            advance_turn(&state);
+            continue_connection(lines, session_hint, state).await
+        }
+        Err(e) => {
+            advance_turn(&state);
+            Err(e)
         }
     }
+}
+
+/// Blocks until `AppState::next_turn` reaches `ticket`. Creates the
+/// `Notified` future *before* checking the condition (tokio's documented
+/// safe pattern for `Notify`) so a `notify_waiters` call that lands between
+/// the check and the await can never be missed.
+async fn wait_for_turn(state: &AppState, ticket: u64) {
+    loop {
+        let notified = state.turn_advanced.notified();
+        if state.next_turn.load(Ordering::SeqCst) == ticket {
+            return;
+        }
+        notified.await;
+    }
+}
+
+/// Advances the turnstile by one and wakes every connection currently
+/// waiting for its turn, so the one whose ticket now matches can proceed.
+fn advance_turn(state: &AppState) {
+    state.next_turn.fetch_add(1, Ordering::SeqCst);
+    state.turn_advanced.notify_waiters();
 }
 
 /// Reads and processes this connection's immediately-available lines, in
@@ -542,25 +627,37 @@ async fn run_uds_server(sock_path: &PathBuf, state: AppState) -> anyhow::Result<
 async fn drain_in_order(stream: UnixStream, state: AppState) -> anyhow::Result<Drain> {
     let mut lines = BufReader::new(stream).lines();
     let mut session_hint: Option<String> = None;
-    let mut waited = Duration::ZERO;
+    // A fixed wall-clock deadline for the *whole* drain, not an
+    // idle-time accumulator: a bug found by independent adversarial review
+    // of an earlier draft of this fix. Accumulating only the time spent in
+    // the `Err` (timeout) branch meant a connection sending one short line
+    // every `DRAIN_IDLE - epsilon` never tripped a single timeout and so
+    // never handed off -- `fornax-hook-codex`'s rollout tailer, polling and
+    // emitting lines faster than once per `DRAIN_IDLE`, could have stalled
+    // the processing turn (and, in an even earlier draft, the accept loop
+    // itself) indefinitely. Measuring wall-clock time since this
+    // connection's turn began, regardless of how many lines arrived or how
+    // quickly, closes that: the deadline is real elapsed time, full stop.
+    let deadline = tokio::time::Instant::now() + DRAIN_READ_BUDGET;
 
     loop {
-        let remaining = DRAIN_READ_BUDGET.saturating_sub(waited);
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             return Ok(Drain::Handoff(lines, session_hint));
         }
         let wait = DRAIN_IDLE.min(remaining);
-        let started = tokio::time::Instant::now();
         match timeout(wait, lines.next_line()).await {
             Ok(Ok(None)) => return Ok(Drain::Eof),
             Ok(Ok(Some(line))) => {
                 process_line(&state, &line, &mut session_hint).await;
-                // A line that arrived does not count against the read
-                // budget -- only time spent genuinely idle/waiting does.
+                // Processing time is real wall-clock time too: it already
+                // counts against `remaining` on the next loop iteration via
+                // `tokio::time::Instant::now()` above, with no separate
+                // bookkeeping needed.
             }
             Ok(Err(e)) => return Err(e.into()),
             Err(_elapsed) => {
-                waited += started.elapsed();
+                // Idle timeout -- loop back and recompute `remaining`.
             }
         }
     }
@@ -2561,6 +2658,9 @@ mod tests {
             store,
             caps: Arc::new(Mutex::new(HashMap::new())),
             processing: Arc::new(Mutex::new(())),
+            next_turn: Arc::new(AtomicU64::new(0)),
+            turn_advanced: Arc::new(Notify::new()),
+            next_ticket: Arc::new(AtomicU64::new(0)),
             home_id: Arc::from(format!("test-home-{}", Uuid::new_v4()).as_str()),
             trust: Arc::new(None),
             policy: Arc::new(RwLock::new(PolicyCacheSnapshot::empty())),
@@ -4593,6 +4693,9 @@ mod tests {
             store,
             caps: Arc::new(Mutex::new(HashMap::new())),
             processing: Arc::new(Mutex::new(())),
+            next_turn: Arc::new(AtomicU64::new(0)),
+            turn_advanced: Arc::new(Notify::new()),
+            next_ticket: Arc::new(AtomicU64::new(0)),
             home_id: Arc::from(format!("test-home-{}", Uuid::new_v4()).as_str()),
             trust: Arc::new(None),
             policy: Arc::new(RwLock::new(PolicyCacheSnapshot::empty())),
@@ -4820,6 +4923,9 @@ mod tests {
             store,
             caps: Arc::new(Mutex::new(HashMap::new())),
             processing: Arc::new(Mutex::new(())),
+            next_turn: Arc::new(AtomicU64::new(0)),
+            turn_advanced: Arc::new(Notify::new()),
+            next_ticket: Arc::new(AtomicU64::new(0)),
             home_id: Arc::from(format!("test-home-{}", Uuid::new_v4()).as_str()),
             trust: Arc::new(None),
             policy: Arc::new(RwLock::new(PolicyCacheSnapshot::empty())),
