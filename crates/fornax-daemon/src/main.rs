@@ -1064,7 +1064,20 @@ async fn handle_message(
             ev.tool_input = ev.tool_input.as_ref().map(redact_json);
             ev.tool_response = ev.tool_response.as_ref().map(redact_json);
             ev.raw = redact_json(&ev.raw);
-            state.store.insert_event(&ev).await?;
+            // HORO-1712: a deterministic-id replay (e.g. a Codex hook and
+            // the rollout tailer observing the same real event, or the
+            // tailer re-reading from offset 0 after a restart) is expected
+            // and benign -- log it, do not quarantine, and do not touch any
+            // downstream state derived from this row (there is none in this
+            // arm). `Err(IdCollision)` is a genuine, unexpected id
+            // collision; it propagates via `?` into `process_line`'s
+            // existing `HandleError` quarantine path unchanged.
+            match state.store.insert_event(&ev).await? {
+                fornax_store::InsertOutcome::Inserted => {}
+                fornax_store::InsertOutcome::Duplicate => {
+                    tracing::debug!(event_id = %ev.id, session_id = %ev.session_id, "duplicate event id -- idempotent replay, not re-inserted");
+                }
+            }
         }
         IngestMessage::Evidence(mut ev) => {
             *session_hint = Some(ev.session_id.clone());
@@ -1087,7 +1100,14 @@ async fn handle_message(
                         _ => unreachable!("redact_json preserves the Object variant"),
                     };
             }
-            state.store.insert_evidence(&ev).await?;
+            // HORO-1712: same idempotent-replay handling as the Event arm
+            // above.
+            match state.store.insert_evidence(&ev).await? {
+                fornax_store::InsertOutcome::Inserted => {}
+                fornax_store::InsertOutcome::Duplicate => {
+                    tracing::debug!(evidence_id = %ev.id, session_id = %ev.session_id, "duplicate evidence id -- idempotent replay, not re-inserted");
+                }
+            }
         }
         IngestMessage::PolicyBundle { envelope } => {
             handle_policy_bundle_ingest(state, envelope.into_bytes()).await;
