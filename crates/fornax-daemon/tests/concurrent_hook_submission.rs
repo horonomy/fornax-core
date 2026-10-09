@@ -922,3 +922,170 @@ async fn an_idle_long_lived_connection_does_not_block_a_later_one_shot_connectio
     })
     .await;
 }
+
+/// HORO-1712, second independent adversarial review round: the turnstile
+/// only orders *entry into draining*, not *evidence completeness by
+/// Claim-evaluation time*. A connection relinquishes its turn the instant
+/// it's handed off (see `TurnGuard`/`drop(guard)` in `handle_connection_in_turn`),
+/// *before* its remaining evidence is actually written -- a later ticket's
+/// Claim can therefore be evaluated while this connection is still mid-
+/// handoff and bind to currently-visible (but about to be superseded)
+/// evidence.
+///
+/// Reproduces the review's "dangerous direction" finding exactly: an
+/// earlier, unrelated *passing* evidence row already exists for this
+/// session (e.g. an earlier successful run). Connection A reports a new
+/// event, then goes idle well past `DRAIN_READ_BUDGET` without sending its
+/// (contradicting, `exit_code=1`) Evidence -- forcing a handoff. While A is
+/// mid-handoff, connection B's Claim ("All tests passed") is evaluated.
+///
+/// Before the `pending_handoff` fix: `TestResultVerifier` picks the only
+/// evidence currently visible -- the stale, unrelated `exit_code=0` row --
+/// and returns a confident `verified`, not merely an early/conservative
+/// `unverified`. That is a wrong answer, not just an incomplete one.
+///
+/// After the fix: the session has a handoff in flight, so a `verified`
+/// finding is downgraded to `review` rather than bound to possibly-stale
+/// evidence. Once A's real evidence later lands, nothing about this
+/// finding has asserted something false in the meantime.
+#[tokio::test]
+async fn claim_evaluated_during_a_handoff_is_downgraded_not_falsely_bound_to_stale_evidence() {
+    let daemon = start_daemon().await;
+    let store = open_store(&daemon).await;
+    let session = format!("handoff-stale-{}", short_id());
+    let now = chrono::Utc::now().to_rfc3339();
+
+    // Prerequisite: an earlier, unrelated *passing* evidence row already on
+    // record for this session -- fully persisted and connection closed
+    // before the real race below even starts.
+    let old_event_id = Uuid::new_v4();
+    let old_event = AgentEvent {
+        id: old_event_id,
+        session_id: session.clone(),
+        provider: Provider::ClaudeCode,
+        kind: EventKind::PostToolUse,
+        observed_at: now.clone(),
+        tool_name: Some("Bash".to_string()),
+        tool_input: Some(serde_json::json!({"command": "cargo test"})),
+        tool_response: Some(serde_json::json!({"exit_code": 0})),
+        raw: serde_json::json!({}),
+    };
+    let old_evidence = Evidence {
+        id: Uuid::new_v4(),
+        session_id: session.clone(),
+        source_event_id: old_event_id,
+        kind: EvidenceKind::ExitCode,
+        observed_at: now.clone(),
+        payload: serde_json::json!({"command": "cargo test", "exit_code": 0}),
+        provenance: "claude_code:PostToolUse:Bash#tool_response".to_string(),
+        source: None,
+        extension: None,
+        evidence_purged: false,
+    };
+
+    let mut setup = connect_raw(&daemon.home).await;
+    send_line(
+        &mut setup,
+        &IngestMessage::Capabilities(observable_caps(&session)),
+    )
+    .await;
+    send_line(&mut setup, &IngestMessage::Event(old_event)).await;
+    send_line(&mut setup, &IngestMessage::Evidence(old_evidence)).await;
+    drop(setup);
+
+    {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let read = store
+                .evidence_for_session(&session)
+                .await
+                .expect("read evidence");
+            if !read.evidence.is_empty() {
+                break;
+            }
+            if tokio::time::Instant::now() > deadline {
+                panic!("setup evidence never persisted");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    // Connection A: report a new event, then go idle without sending its
+    // Evidence -- past `DRAIN_READ_BUDGET` (1s in production), forcing a
+    // handoff before the real, contradicting exit_code=1 evidence ever
+    // arrives.
+    let new_event_id = Uuid::new_v4();
+    let new_event = AgentEvent {
+        id: new_event_id,
+        session_id: session.clone(),
+        provider: Provider::ClaudeCode,
+        kind: EventKind::PostToolUse,
+        observed_at: now.clone(),
+        tool_name: Some("Bash".to_string()),
+        tool_input: Some(serde_json::json!({"command": "cargo test"})),
+        tool_response: Some(serde_json::json!({"exit_code": 1})),
+        raw: serde_json::json!({}),
+    };
+    let mut conn_a = connect_raw(&daemon.home).await;
+    send_line(&mut conn_a, &IngestMessage::Event(new_event)).await;
+
+    // Real margin past the 1s drain budget so A is definitely handed off
+    // before B's Claim is sent -- this reproduces "B evaluated while A is
+    // mid-handoff", not the already-covered same-generation race.
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+
+    let claim = Claim {
+        id: Uuid::new_v4(),
+        session_id: session.clone(),
+        source_event_id: new_event_id,
+        text: "All tests passed".to_string(),
+        subject: "test_result".to_string(),
+        claimed_at: now.clone(),
+    };
+    let mut conn_b = connect_raw(&daemon.home).await;
+    send_line(&mut conn_b, &IngestMessage::Claim(claim)).await;
+    drop(conn_b);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let finding = loop {
+        let mut findings = store
+            .findings_for_session(&session)
+            .await
+            .expect("read findings");
+        if let Some(finding) = findings.pop() {
+            break finding;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!(
+                "no finding appeared within 5s; daemon log:\n{}",
+                daemon.log_contents()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+
+    assert_eq!(
+        finding.verdict, "review",
+        "a Claim evaluated while connection A is still mid-handoff must be downgraded \
+         to review, never bound confidently to the stale exit_code=0 evidence as \
+         verified (or any other definite verdict); rationale={}",
+        finding.rationale
+    );
+
+    // Complete A: send its real, contradicting evidence, so the connection
+    // (and this test's daemon process) ends cleanly.
+    let new_evidence = Evidence {
+        id: Uuid::new_v4(),
+        session_id: session.clone(),
+        source_event_id: new_event_id,
+        kind: EvidenceKind::ExitCode,
+        observed_at: now.clone(),
+        payload: serde_json::json!({"command": "cargo test", "exit_code": 1}),
+        provenance: "claude_code:PostToolUse:Bash#tool_response".to_string(),
+        source: None,
+        extension: None,
+        evidence_purged: false,
+    };
+    send_line(&mut conn_a, &IngestMessage::Evidence(new_evidence)).await;
+    drop(conn_a);
+}

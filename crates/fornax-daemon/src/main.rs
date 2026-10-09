@@ -24,7 +24,7 @@ use fornax_verify::{
     CommandExecutedVerifier, CommandSuccessVerifier, FileModifiedVerifier, GitOperationVerifier,
     TestResultVerifier, Verifier,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -166,6 +166,24 @@ struct AppState {
     /// connections queue in the OS's own listen backlog rather than as
     /// open, unconsumed fds in this process.
     inflight: Arc<Semaphore>,
+    /// HORO-1712 (post-review fix): session ids -- plus an `unknown` count
+    /// for a handed-off connection whose session id isn't known yet --
+    /// with an outstanding handed-off connection that has not yet made its
+    /// *first post-handoff* line resolution (a line, or EOF). The turnstile
+    /// only orders *entry into draining*, not *evidence completeness by
+    /// Claim-evaluation time*: a connection relinquishes its turn the
+    /// instant it's handed off to `continue_connection`, before its
+    /// remaining evidence is actually written, so a later ticket's Claim
+    /// can run while this connection's write is still in flight and bind
+    /// to stale same-session evidence -- an independent adversarial review
+    /// proved this produces an incorrect (not just conservative) verdict:
+    /// a false `Verified` against a stale exit_code row while the real,
+    /// contradicting exit_code is still in transit. `run_verifiers_and_persist_findings`
+    /// checks this set/counter and downgrades a `Verified`/`Contradicted`
+    /// verdict to `Review` whenever this session (or an unknown one) has a
+    /// handoff in flight, rather than binding confidently to
+    /// currently-visible evidence that might not yet be complete.
+    pending_handoff: Arc<Mutex<PendingHandoff>>,
     /// FORNX-339: this daemon's `$FORNAX_HOME` identity, sent as a response
     /// header on every HTTP reply so a client can prove it's talking to the
     /// daemon serving its own home rather than a different one that won the
@@ -409,6 +427,7 @@ async fn main() -> anyhow::Result<()> {
         turn_advanced: Arc::new(Notify::new()),
         next_ticket: Arc::new(AtomicU64::new(0)),
         inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_CONNECTIONS)),
+        pending_handoff: Arc::new(Mutex::new(PendingHandoff::default())),
         home_id: Arc::from(home_identity(&home).as_str()),
         trust: Arc::new(trusted),
         policy: Arc::new(RwLock::new(policy_snapshot)),
@@ -662,7 +681,14 @@ async fn handle_connection_in_turn(
     match outcome {
         Ok(Drain::Eof) => Ok(()),
         Ok(Drain::Handoff(lines, session_hint)) => {
-            continue_connection(lines, session_hint, state).await
+            // HORO-1712 (post-review fix): this connection's turn is about
+            // to be relinquished (already was, by `drop(guard)` above)
+            // before its remaining evidence is written -- mark it as an
+            // in-flight handoff so a Claim evaluated in that window is
+            // downgraded rather than bound to possibly-stale evidence. See
+            // `AppState::pending_handoff`'s doc comment for why.
+            let token = register_pending_handoff(&state, &session_hint).await;
+            continue_connection(lines, session_hint, state, token).await
         }
         Err(e) => Err(e),
     }
@@ -707,6 +733,75 @@ impl Drop for TurnGuard {
         self.next_turn.fetch_add(1, Ordering::SeqCst);
         self.turn_advanced.notify_waiters();
     }
+}
+
+/// Backing state for `AppState::pending_handoff` -- see its doc comment.
+#[derive(Default)]
+struct PendingHandoff {
+    sessions: HashSet<String>,
+    /// Count of in-flight handoffs whose session id isn't known yet (no
+    /// line was processed during the drain phase before the budget
+    /// expired). Scoped globally, not per-session, because there's no
+    /// session id to scope it to yet -- every Claim evaluated while this is
+    /// nonzero is conservatively downgraded, not just claims for one
+    /// session, since the unidentified handoff could belong to any of them.
+    unknown: usize,
+}
+
+/// Which bucket of `PendingHandoff` a given handoff was registered into --
+/// returned by `register_pending_handoff` and consumed by exactly one
+/// matching `clear_pending_handoff` call so the two always agree on which
+/// counter/entry to adjust, even though `session_hint` can become known
+/// between registration and the first post-handoff line.
+enum PendingHandoffToken {
+    Session(String),
+    Unknown,
+}
+
+/// Marks a handoff as in flight, using whatever `session_hint` is known at
+/// the moment the turn is relinquished (may be `None` if the drain phase
+/// never processed a line that reveals it).
+async fn register_pending_handoff(
+    state: &AppState,
+    session_hint: &Option<String>,
+) -> PendingHandoffToken {
+    let mut pending = state.pending_handoff.lock().await;
+    match session_hint {
+        Some(sid) => {
+            pending.sessions.insert(sid.clone());
+            PendingHandoffToken::Session(sid.clone())
+        }
+        None => {
+            pending.unknown += 1;
+            PendingHandoffToken::Unknown
+        }
+    }
+}
+
+/// Clears exactly the bucket `register_pending_handoff` returned a token
+/// for. Only removes a session entry if nothing else is currently relying
+/// on it -- not used today (one handoff per session in practice, since a
+/// session's hooks are one-shot connections apart from the single
+/// long-lived bridge), but `HashSet::remove` already degrades safely if it
+/// somehow were: removing an absent entry is a no-op, never a panic.
+async fn clear_pending_handoff(state: &AppState, token: PendingHandoffToken) {
+    let mut pending = state.pending_handoff.lock().await;
+    match token {
+        PendingHandoffToken::Session(sid) => {
+            pending.sessions.remove(&sid);
+        }
+        PendingHandoffToken::Unknown => {
+            pending.unknown = pending.unknown.saturating_sub(1);
+        }
+    }
+}
+
+/// True if a Claim for `session_id` might be evaluated against evidence
+/// that is still incomplete -- either this exact session has a handoff in
+/// flight, or some unidentified session does (see `PendingHandoff::unknown`).
+async fn evidence_may_be_incomplete_for(state: &AppState, session_id: &str) -> bool {
+    let pending = state.pending_handoff.lock().await;
+    pending.unknown > 0 || pending.sessions.contains(session_id)
 }
 
 /// Reads and processes this connection's immediately-available lines, in
@@ -758,15 +853,32 @@ async fn drain_in_order(stream: UnixStream, state: AppState) -> anyhow::Result<D
 /// exclusion-only contract `AppState::processing` always provided. Only
 /// reached for a long-lived connection that already proved itself not a
 /// one-shot hook by outliving the drain window.
+///
+/// `token` marks this handoff as in flight in `AppState::pending_handoff`
+/// (registered by the caller before this runs). It is cleared the instant
+/// the *first* post-handoff line resolves -- whether that's a real line or
+/// EOF -- because that resolution is exactly the boundary at which
+/// "evidence might still be coming from this specific connection" stops
+/// being true: either another line just arrived (and was processed,
+/// extending completeness up to that point) or the connection is now known
+/// to have nothing further to say, ever.
 async fn continue_connection(
     mut lines: IngestLines,
     mut session_hint: Option<String>,
     state: AppState,
+    token: PendingHandoffToken,
 ) -> anyhow::Result<()> {
-    while let Some(line) = lines.next_line().await? {
-        process_line(&state, &line, &mut session_hint).await;
+    let mut token = Some(token);
+    loop {
+        let next = lines.next_line().await;
+        if let Some(token) = token.take() {
+            clear_pending_handoff(&state, token).await;
+        }
+        match next? {
+            Some(line) => process_line(&state, &line, &mut session_hint).await,
+            None => return Ok(()),
+        }
     }
-    Ok(())
 }
 
 /// Parses and processes one ingest line, warning (never failing the
@@ -1442,6 +1554,13 @@ async fn run_verifiers_and_persist_findings(
     evidence: &[fornax_types::Evidence],
     caps: &RuntimeCapabilities,
 ) -> anyhow::Result<()> {
+    // HORO-1712 (post-review fix): checked fresh for every call, under the
+    // caller's own lock scope, rather than threaded through as a
+    // caller-computed bool -- every call site resolves `claim.session_id`
+    // anyway, and checking here keeps the completeness gate inseparable
+    // from verdict computation instead of relying on each new call site to
+    // remember to check it.
+    let evidence_may_be_incomplete = evidence_may_be_incomplete_for(state, &claim.session_id).await;
     let verifiers: Vec<Box<dyn Verifier + Send + Sync>> = vec![
         Box::new(TestResultVerifier),
         Box::new(CommandExecutedVerifier),
@@ -1450,7 +1569,30 @@ async fn run_verifiers_and_persist_findings(
         Box::new(GitOperationVerifier),
     ];
     for verifier in verifiers.iter().filter(|v| v.applies_to(claim)) {
-        let finding = verifier.verify(claim, evidence, caps);
+        let mut finding = verifier.verify(claim, evidence, caps);
+        // The turnstile orders entry into draining, not evidence
+        // completeness by Claim-evaluation time: a handed-off connection
+        // relinquishes its turn before its remaining evidence is written,
+        // so a `Verified`/`Contradicted` verdict computed while this
+        // session (or an unidentified one) has a handoff in flight might be
+        // binding confidently to evidence that is about to be superseded.
+        // `Unverified`/`Unavailable`/`Review` are already non-committal and
+        // stay honest even if the missing evidence later lands, so they are
+        // left alone.
+        if evidence_may_be_incomplete
+            && matches!(
+                finding.verdict,
+                fornax_types::Verdict::Verified | fornax_types::Verdict::Contradicted
+            )
+        {
+            finding.rationale = format!(
+                "{} -- downgraded from a definite verdict: a connection for this \
+                 session was still mid-handoff when this claim was evaluated, so \
+                 currently-visible evidence may not yet be complete (HORO-1712)",
+                finding.rationale
+            );
+            finding.verdict = fornax_types::Verdict::Review;
+        }
         tracing::info!(verdict = ?finding.verdict, claim = %claim.text, "finding computed");
         state.store.insert_finding(&finding).await?;
     }
@@ -2752,6 +2894,7 @@ mod tests {
             turn_advanced: Arc::new(Notify::new()),
             next_ticket: Arc::new(AtomicU64::new(0)),
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_CONNECTIONS)),
+            pending_handoff: Arc::new(Mutex::new(PendingHandoff::default())),
             home_id: Arc::from(format!("test-home-{}", Uuid::new_v4()).as_str()),
             trust: Arc::new(None),
             policy: Arc::new(RwLock::new(PolicyCacheSnapshot::empty())),
@@ -4788,6 +4931,7 @@ mod tests {
             turn_advanced: Arc::new(Notify::new()),
             next_ticket: Arc::new(AtomicU64::new(0)),
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_CONNECTIONS)),
+            pending_handoff: Arc::new(Mutex::new(PendingHandoff::default())),
             home_id: Arc::from(format!("test-home-{}", Uuid::new_v4()).as_str()),
             trust: Arc::new(None),
             policy: Arc::new(RwLock::new(PolicyCacheSnapshot::empty())),
@@ -5019,6 +5163,7 @@ mod tests {
             turn_advanced: Arc::new(Notify::new()),
             next_ticket: Arc::new(AtomicU64::new(0)),
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_CONNECTIONS)),
+            pending_handoff: Arc::new(Mutex::new(PendingHandoff::default())),
             home_id: Arc::from(format!("test-home-{}", Uuid::new_v4()).as_str()),
             trust: Arc::new(None),
             policy: Arc::new(RwLock::new(PolicyCacheSnapshot::empty())),
