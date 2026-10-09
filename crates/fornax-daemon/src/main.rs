@@ -574,16 +574,39 @@ enum Drain {
 /// at all) caught exactly this. Acquiring the permit *before* `accept()`
 /// means excess connections past the cap queue in the OS's own listen
 /// backlog rather than as open, unconsumed fds here.
+///
+/// A handed-off long-lived connection (the Codex/opencode persistent
+/// bridges) holds its permit for the rest of its process's lifetime, by
+/// design -- one real session opens only a handful of these, so
+/// `MAX_INFLIGHT_CONNECTIONS` comfortably covers legitimate concurrent
+/// sessions. A client that leaks connections without ever closing them
+/// (crashes holding the socket open, etc.) could still, over a long
+/// enough uptime, walk the count toward the cap and make this loop block
+/// on `acquire_owned` indefinitely -- a second security review flagged
+/// that this degraded-but-bounded state previously had zero visibility.
+/// This is accepted, bounded backpressure, not a new defect in itself
+/// (the alternative is the unbounded fd growth the cap exists to
+/// prevent), but it must be observable: log once, loudly, the moment
+/// acquisition is not immediate, so an operator can tell starvation is
+/// forming before the daemon looks simply unresponsive.
 async fn run_uds_server(sock_path: &PathBuf, state: AppState) -> anyhow::Result<()> {
     let listener = UnixListener::bind(sock_path)?;
     tracing::info!(path = %sock_path.display(), "UDS ingest listening");
     loop {
-        let permit = state
-            .inflight
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("AppState::inflight is never closed for the process lifetime");
+        let inflight = state.inflight.clone();
+        let permit = match inflight.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                tracing::warn!(
+                    cap = MAX_INFLIGHT_CONNECTIONS,
+                    "UDS ingest at max inflight connections; accept is now blocked until one closes"
+                );
+                inflight
+                    .acquire_owned()
+                    .await
+                    .expect("AppState::inflight is never closed for the process lifetime")
+            }
+        };
         let (stream, _addr) = listener.accept().await?;
         // Ticket order equals accept order exactly: the accept loop is
         // single-threaded (one `accept()` in flight at a time), so handing
