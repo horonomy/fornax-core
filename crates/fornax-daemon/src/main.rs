@@ -27,9 +27,11 @@ use fornax_verify::{
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, RwLock};
+use tokio::time::timeout;
 
 mod audit_checkpoint_submit;
 mod policy_poll;
@@ -119,17 +121,18 @@ struct AppState {
     /// live-session verdict computation never pays a DB round trip on the
     /// claim-verification hot path.
     caps: Arc<Mutex<HashMap<String, RuntimeCapabilities>>>,
-    /// FORNX-281: each hook invocation is a fresh UDS connection handled by
-    /// its own spawned task, with no ack from the daemon back to the hook —
-    /// so nothing guarantees an earlier event (e.g. PostToolUse, carrying
-    /// the exit-code Evidence a claim needs) finishes its DB write before a
-    /// later message (e.g. Stop's Claim, which verifies against whatever
-    /// Evidence already exists) starts processing on a different task. This
-    /// is a single local daemon serving one user's sequential agent
-    /// actions (ADR 0001) — not a system that needs concurrent throughput —
-    /// so the correct fix is to make message *processing* strictly
-    /// serialized in arrival order, not to make verification tolerant of
-    /// partial evidence. Held for the full duration of `handle_message`.
+    /// FORNX-281/HORO-1712: mutual exclusion only — never two `handle_message`
+    /// calls run concurrently. This alone does **not** guarantee arrival
+    /// order: each hook invocation is a fresh UDS connection handled by its
+    /// own spawned task, with no ack from the daemon back to the hook, and
+    /// a task only calls `.lock()` after it finishes reading+parsing its own
+    /// line. A later-accepted connection with a smaller/faster-to-parse
+    /// payload (e.g. Stop's Claim) could therefore still reach `.lock()`
+    /// before an earlier-accepted connection with a larger payload (e.g.
+    /// PostToolUse's Evidence, still being read/redacted) — exactly the race
+    /// `run_uds_server`'s connection-ordering handoff exists to close. See
+    /// that function's doc comment for the actual ordering guarantee.
+    /// Held for the full duration of `handle_message`.
     processing: Arc<Mutex<()>>,
     /// FORNX-339: this daemon's `$FORNAX_HOME` identity, sent as a response
     /// header on every HTTP reply so a client can prove it's talking to the
@@ -449,40 +452,154 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A fire-and-forget hook connection almost always closes (EOF) well within
+/// this window — Claude Code waits for one hook process to exit before
+/// firing the next lifecycle event (FORNX-281's connect-order-is-causal-order
+/// precondition: see `run_uds_server`'s doc comment), so by the time a
+/// second connection is even accepted the first has typically already sent
+/// its one line and disconnected. A connection still open after this much
+/// *idle* read-wait time is treated as long-lived (e.g. `fornax-hook-codex`'s
+/// rollout tailer, `fornax-hook-opencode`'s persistent bridge — both keep
+/// one connection open for their whole process lifetime) and handed off to
+/// run alongside later connections rather than blocking the accept loop.
+const DRAIN_IDLE: Duration = Duration::from_millis(250);
+/// Total time this connection may spend *waiting on reads* during the
+/// in-order drain phase before being hung off, regardless of how many short
+/// idle gaps it has (a slow writer trickling many small lines could
+/// otherwise never trip `DRAIN_IDLE` on any single read and stall the
+/// accept loop indefinitely). Time spent inside `handle_message` itself
+/// does not count against this budget — a large one-shot payload that is
+/// slow to *process* must never be handed off mid-message.
+const DRAIN_READ_BUDGET: Duration = Duration::from_secs(1);
+
+type IngestLines = tokio::io::Lines<BufReader<UnixStream>>;
+
+/// Outcome of draining a connection's immediately-available lines in true
+/// accept order, before the next connection is accepted.
+enum Drain {
+    /// The connection sent everything it had and closed within budget.
+    Eof,
+    /// Still open after [`DRAIN_IDLE`]/[`DRAIN_READ_BUDGET`] — a long-lived
+    /// connection, handed off to continue independently.
+    Handoff(IngestLines, Option<String>),
+}
+
+/// Accepts connections one at a time and drains each fully — in true
+/// connection-accept order, not whichever spawned task happens to finish
+/// parsing first — before accepting the next. This is the actual ordering
+/// guarantee `AppState::processing`'s mutex alone does not provide: that
+/// mutex only prevents two `handle_message` calls from running
+/// concurrently, it does not make an earlier-accepted connection's messages
+/// process before a later-accepted connection's.
+///
+/// Connection-accept order equals causal (host-side) order here because
+/// every installed Claude Code hook entry is a synchronous `"command"`
+/// (never `"async": true`) — Claude Code waits for one hook process to
+/// exit before firing the next lifecycle event, so (for example)
+/// PostToolUse's connection is always accepted before Stop's. A hand-edited
+/// `async: true` hook entry would break this precondition; not something
+/// this daemon can detect or defend against, so not attempted here.
+///
+/// A connection that doesn't close within [`DRAIN_IDLE`]/[`DRAIN_READ_BUDGET`]
+/// (a long-lived adapter bridge, not a one-shot hook) is hung off to a
+/// background task via [`continue_connection`] so it can never block the
+/// accept loop — and therefore never block a later one-shot hook — for
+/// longer than that bounded drain window.
 async fn run_uds_server(sock_path: &PathBuf, state: AppState) -> anyhow::Result<()> {
     let listener = UnixListener::bind(sock_path)?;
     tracing::info!(path = %sock_path.display(), "UDS ingest listening");
     loop {
         let (stream, _addr) = listener.accept().await?;
-        let state = state.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, state).await {
-                tracing::warn!(error = %e, "ingest connection ended with error");
+        let drain_state = state.clone();
+        // Run the drain in its own task and await it to completion before
+        // accepting the next connection: a panic inside `handle_message`
+        // (e.g. a verifier bug) is contained by `JoinHandle`'s `Err` rather
+        // than silently killing this accept loop while the HTTP side keeps
+        // serving stale state.
+        match tokio::spawn(drain_in_order(stream, drain_state)).await {
+            Ok(Ok(Drain::Eof)) => {}
+            Ok(Ok(Drain::Handoff(lines, session_hint))) => {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = continue_connection(lines, session_hint, state).await {
+                        tracing::warn!(error = %e, "ingest connection ended with error");
+                    }
+                });
             }
-        });
+            Ok(Err(e)) => tracing::warn!(error = %e, "ingest connection ended with error"),
+            Err(join_err) => {
+                tracing::error!(error = %join_err, "ingest drain task panicked")
+            }
+        }
     }
 }
 
-async fn handle_connection(stream: UnixStream, state: AppState) -> anyhow::Result<()> {
+/// Reads and processes this connection's immediately-available lines, in
+/// order, up to [`DRAIN_IDLE`]/[`DRAIN_READ_BUDGET`]. Returns [`Drain::Eof`]
+/// once the connection closes within budget, or [`Drain::Handoff`] with the
+/// still-open reader (so no already-buffered bytes are lost) once the
+/// budget is exceeded.
+async fn drain_in_order(stream: UnixStream, state: AppState) -> anyhow::Result<Drain> {
     let mut lines = BufReader::new(stream).lines();
     let mut session_hint: Option<String> = None;
+    let mut waited = Duration::ZERO;
 
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
+    loop {
+        let remaining = DRAIN_READ_BUDGET.saturating_sub(waited);
+        if remaining.is_zero() {
+            return Ok(Drain::Handoff(lines, session_hint));
         }
-        let msg: IngestMessage = match serde_json::from_str(&line) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(error = %e, "dropping malformed ingest line");
-                continue;
+        let wait = DRAIN_IDLE.min(remaining);
+        let started = tokio::time::Instant::now();
+        match timeout(wait, lines.next_line()).await {
+            Ok(Ok(None)) => return Ok(Drain::Eof),
+            Ok(Ok(Some(line))) => {
+                process_line(&state, &line, &mut session_hint).await;
+                // A line that arrived does not count against the read
+                // budget -- only time spent genuinely idle/waiting does.
             }
-        };
-        if let Err(e) = handle_message(&state, msg, &mut session_hint).await {
-            tracing::warn!(error = %e, "failed to process ingest message");
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_elapsed) => {
+                waited += started.elapsed();
+            }
         }
     }
+}
+
+/// Continues a connection [`drain_in_order`] handed off, with no further
+/// ordering guarantee relative to other connections — the same mutual-
+/// exclusion-only contract `AppState::processing` always provided. Only
+/// reached for a long-lived connection that already proved itself not a
+/// one-shot hook by outliving the drain window.
+async fn continue_connection(
+    mut lines: IngestLines,
+    mut session_hint: Option<String>,
+    state: AppState,
+) -> anyhow::Result<()> {
+    while let Some(line) = lines.next_line().await? {
+        process_line(&state, &line, &mut session_hint).await;
+    }
     Ok(())
+}
+
+/// Parses and processes one ingest line, warning (never failing the
+/// connection) on a malformed line or a processing error. Shared by the
+/// in-order drain phase and the post-handoff continuation so both paths
+/// have byte-identical line handling.
+async fn process_line(state: &AppState, line: &str, session_hint: &mut Option<String>) {
+    if line.trim().is_empty() {
+        return;
+    }
+    let msg: IngestMessage = match serde_json::from_str(line) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(error = %e, "dropping malformed ingest line");
+            return;
+        }
+    };
+    if let Err(e) = handle_message(state, msg, session_hint).await {
+        tracing::warn!(error = %e, "failed to process ingest message");
+    }
 }
 
 async fn handle_message(
