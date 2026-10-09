@@ -56,20 +56,25 @@ file's `crates_dir` variable). It is not evasion because:
   inspection, not asserted. An operator invokes `fornax-acquire-exec`
   directly, out-of-band; no hook path, no daemon request handler, and no
   `fornax` CLI subcommand can ever reach it.
-- **A second, workspace-wide test closes the gap the first test's own scope
-  leaves open.** `subprocess_spawn_exception_is_confined_to_the_exec_crate`
-  (added alongside `subprocess_surface_is_still_zero_in_production_code` in
-  the same test file, that existing test left byte-for-byte unmodified)
-  walks the *entire* workspace root (skipping `crates/`, `target/`, `.git/`,
-  and any `tests` path component) and asserts every subprocess-spawn-shaped
-  line it finds anywhere lives under `exec/fornax-acquire-exec/src/` --
-  and, load-bearingly, that at least one such line actually exists, so
-  renaming or deleting the exec crate can never make this test pass by
-  vacuity.
+- **Correction (found during HORO-1715's design pass, 2026-10-09): no such
+  workspace-wide test exists.** This ADR previously claimed a second test,
+  `subprocess_spawn_exception_is_confined_to_the_exec_crate`, closed the
+  gap `subprocess_surface_is_still_zero_in_production_code`'s own
+  `crates/`-only scope leaves open, and that `fornax-acquire-exec` was "the
+  only file in the repository allowed to contain `std::process::Command`."
+  Neither claim was ever true: a repo-wide search found zero matches for
+  that test name, and `exec/fornax-host-adapter-exec` (ADR-0023 D11) now
+  also lives under `exec/`, outside the `crates/`-only scan, by the same
+  structural reasoning -- it just spawns nothing, by its own separate
+  founder decision. A workspace-wide confinement test naming every `exec/`
+  crate explicitly (not a vacuous pass if one is renamed or removed) is
+  recommended future work, not yet built.
 - **`fornax-acquire-exec`'s own `Cargo.toml` documents the exception
   explicitly** rather than hiding it, and `src/rerun.rs`'s module doc
-  states plainly: this is the only file in the repository allowed to
-  contain `std::process::Command` or an inline shell invocation.
+  states that this crate is where `std::process::Command` and inline shell
+  invocation are permitted. `exec/fornax-host-adapter-exec` sits beside it
+  structurally but is not a second such exception: it contains no
+  subprocess-spawn call anywhere (ADR-0023 D11).
 
 ## The two-independent-gates model
 

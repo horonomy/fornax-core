@@ -456,6 +456,81 @@ keys, numeric bounds and declared version ranges. Source paths remain display
 metadata after registration. Owned descriptor integrity never implies code
 trust, installed state or native observation.
 
+### D11. Execution boundary: `fornax-host-adapter-exec` (HORO-1712/HORO-1715)
+
+A registered `host-adapter-v1` descriptor's `launch.executable`/`argv` are
+never resolved, hashed, or executed by anything in `crates/` -- D1 and D10
+already establish that. The separate binary this descriptor's execution
+would eventually go through is `exec/fornax-host-adapter-exec`, outside
+`crates/` for the same structural reason `exec/fornax-acquire-exec`
+(ADR-0022) is: nothing in `crates/` depends on it, so the daemon's
+zero-subprocess scan never needs to know it exists.
+
+**Founder decision, 2026-10-09.** An independent review of an early draft
+found the core problem unresolved: re-checking a path or hash immediately
+before `exec()` cannot prove which bytes the kernel actually loads, against
+a threat model of a non-root writer running as the same user as this
+process. macOS offers no `fexecve`/`execveat` (only path-based
+`posix_spawn`), so there is no way to execute from an already-validated
+file descriptor either -- a held descriptor does not stop the same user
+from rewriting the file in place between the check and the spawn. Given
+that:
+
+1. **Launch is operator-invoked only.** No Codex hook, no daemon, nothing
+   under `crates/` may trigger this binary. Hook-driven execution
+   (`normalize` from within a Codex PreToolUse/PostToolUse hook) is
+   explicitly deferred to a future, separately approved security model --
+   a hook cannot supply the interactive confirmation this ceremony would
+   need, and persistent hook-granted trust would contradict a
+   per-invocation grant in the first place.
+2. **Fail closed whenever executable integrity against that threat cannot
+   be proven.** This build of `fornax-host-adapter-exec` contains no
+   subprocess-spawn call anywhere in its source -- not gated behind a flag,
+   not reachable through any code path, simply absent, and a dedicated
+   test (`source_tree_contains_no_subprocess_spawn_call`) fails CI the
+   moment one is ever added back without a new decision superseding this
+   one. Every `doctor` invocation ends in the single closed outcome
+   `execution_binding_unavailable`, regardless of what it measures.
+
+**What `doctor` does instead: review, not clearance.** It resolves the
+registered descriptor (reusing `lookup_host_descriptor`, this ADR's own
+existing owner API), reports version-negotiation compatibility
+(`protocol_version_incompatible` / `host_contract_version_incompatible`,
+exactly the shared contract's own reason codes), reports whether a
+nonempty `needs.environment` is declared (`environment_grant_unavailable`
+if so -- informational, since nothing would ever be granted that
+regardless), and measures the executable and every declared `runtime_files`
+entry against their pinned digests. A measured match is reported as a
+drift diagnostic only, explicitly labelled as not proving anything about a
+later, hypothetical spawn -- see point 2 above for why no label could
+honestly say otherwise.
+
+**Implementation digest (`fornax-host-impl-v1`).** A single value
+committing to the executable's real on-disk bytes, its literal `argv`, and
+every declared runtime file's path/kind/bytes (declared files are hashed in
+path-sorted order so declaration order never changes the digest; `argv`
+order is preserved, since argv order is semantically meaningful). Defined
+and exercised with byte-for-byte test vectors in
+`exec/fornax-host-adapter-exec/src/review.rs`; this ADR does not duplicate
+the exact byte layout here -- read that module's doc comment for the
+normative definition.
+
+**Resource bounds, independent of the manifest's own declared limits.** At
+most 128 declared `runtime_files`, 256 MiB per measured file, 512 MiB
+total. A capacity overrun stops measurement and is surfaced as
+`measurement_capacity_exceeded` in every report -- never silently dropped
+from an otherwise-clean-looking review.
+
+**What this does not establish.** A compatible version negotiation and a
+matching digest mean the registered descriptor is internally consistent and
+undrifted -- not that it is safe to execute, not that its declared
+`runtime_files` set is complete (an undeclared dynamic dependency stays
+unbound, as D1/D5 already note for the registry generally), and not that a
+hook-driven `normalize`/`probe`/`encode_control` path exists at all. Real
+execution, the bounded handshake protocol, and hook-triggered invocation
+each require their own, separately approved decision before implementation
+-- this decision authorizes the review/refusal surface only.
+
 ## Consequences
 
 - An external configuration adapter can wire a marker-bearing entry into one JSON config
@@ -486,8 +561,8 @@ registration adds no execution surface and no implementation trust.
 | Explicit registration or trusted discovery location | D4: one Fornax-owned directory; only `registry.json` entries load; presence of a file registers nothing. D5: registration requires `--confirm-digest` and refuses a group-/world-writable source file or directory. |
 | No silent PATH-wide plugin execution | D1 (configuration interpretation never executes code) + D4 (`PATH` is never consulted) + the `subprocess_surface_is_still_zero_in_production_code` invariant as the standing proof. |
 | No execution during `--help`/`adapter list` | D1: passive configuration and descriptor operations have no execution surface. `--help`/`--version` additionally never reach `registry()`; `adapter list` reads data and creates nothing (asserted by test). |
-| Bounded subprocess execution/timeouts | **N/A by construction, with proof, not by assertion.** There is no subprocess to bound and no call that can hang; the FORNX-238 invariant test guarantees none can be introduced without failing CI. D7 bounds the surface that *does* exist: parse size and write amplification. |
-| Sanitized environment | **N/A by construction** — no child process inherits an environment. Manifest path handling performs no environment interpolation at all beyond a single leading `~/` → `$HOME` (D6.1), so a manifest cannot reference `$ANYTHING`. |
+| Bounded subprocess execution/timeouts | **N/A by construction for configuration manifest v1, with proof, not by assertion.** There is no subprocess to bound and no call that can hang in `crates/`; the FORNX-238 invariant test guarantees none can be introduced without failing CI. D7 bounds the surface that *does* exist: parse size and write amplification. For `host-adapter-v1`, this requirement is not yet applicable: D11's `fornax-host-adapter-exec` spawns nothing at all (fail-closed, 2026-10-09), so there is no execution to bound yet either — a future decision authorizing real execution must define bounds then, not retroactively satisfy this row now. |
+| Sanitized environment | **N/A by construction for configuration manifest v1** — no child process inherits an environment. Manifest path handling performs no environment interpolation at all beyond a single leading `~/` → `$HOME` (D6.1), so a manifest cannot reference `$ANYTHING`. For `host-adapter-v1`, same status as above: not yet applicable, since D11 spawns nothing. |
 | Non-destructive ownership-aware config mutation | D3: marker-based, additive, idempotent, refuses to overwrite a value of unexpected shape, uninstall removes only marker-bearing elements and prunes only what it emptied — the same rules `uninstall_claude_hooks` already enforces. D6.5/6/7: no directory creation, no symlink follow, contained atomic temp+rename. |
 | Clear provenance in adapter info | D10/`adapter info`: source path, registered-at, pinned digest, enabled state, declared capabilities, compat range, and the `provenance` string explicitly labelled unverified. |
 | No credential values in registry/help output | Structural: `deny_unknown_fields` on every manifest struct means a manifest carrying a `token`/`api_key` field **fails to parse** — undeclared credential fields are refused; free-text metadata must not be treated as credential-free proof. All displayed strings are length-capped and control-char-rejected (D2). `AdapterActionResult.message` never includes config file contents. |
