@@ -397,6 +397,17 @@ enum Commands {
         #[command(subcommand)]
         action: receipt_cmd::ReceiptAction,
     },
+    /// Report which execution-identity dimensions this build's own write
+    /// path actually populates.
+    ///
+    /// Static and side-effect-free -- never a database read, never a daemon
+    /// round trip, just a true statement about the current binary. Mirrors
+    /// Circinus's `circinus doctor`'s `execution_identity_capture` check and
+    /// Libra Governor's `libra-governor doctor` equivalent in intent, not in
+    /// output shape: this product has no multi-check `doctor` framework yet,
+    /// so this is its own single-purpose command rather than a slot in one.
+    /// See `horonomy/.github`'s `governance/product/execution-identity-contract.md`.
+    Doctor,
 }
 
 /// `fornax adapter <list|doctor|plan>` (HORO-1621, FORNX-428 S3). A
@@ -823,8 +834,47 @@ async fn main() -> anyhow::Result<()> {
         Commands::Adjudicate { action } => adjudicate_cmd::handle(action, &fornax_home()).await?,
         Commands::Feedback { action } => feedback_cmd::handle(action, &fornax_home()).await?,
         Commands::Receipt { action } => receipt_cmd::handle(action, &fornax_home()).await?,
+        Commands::Doctor => println!("{}", execution_identity_capture_report()),
     }
     Ok(())
+}
+
+/// HORO-1603 AC2/AC5: a static statement of which execution-identity
+/// dimensions (`session`, `agent`, `turn`, `task`, `host` -- defined in
+/// `horonomy/.github`'s `governance/product/execution-identity-contract.md`)
+/// Fornax's own live write path (`AgentEvent`/`Claim`/`Evidence`, persisted
+/// by `fornax-daemon`'s `handle_message`) actually populates today.
+///
+/// Only `session` is captured: every one of those three structs carries a
+/// real `session_id: String` field (`fornax-types::{AgentEvent,Claim,
+/// Evidence}`), populated from the real native session on the live hook
+/// path, and `fornax statusline`'s `latest_finding` segment declares
+/// `scope: "session"` when the host confirms it (HORO-1601/1602,
+/// `fornax-store::Store::latest_finding_for_session`). `agent`/`turn`/`task`
+/// have no field at all on any persisted row -- not a same-named-but-wrong
+/// field (there is no false-friend case here, unlike Circinus's `task_id`),
+/// just genuinely absent. `CanonicalHostEvent`/`HostEventIdentity`
+/// (`fornax-types::host_event`, HORO-1712's canonical-binding library slice)
+/// do model `agent_id`/`turn_id`/`parent_agent_id`, but that type is a
+/// bounded validation library only -- `fornax-daemon`/`fornax-store` never
+/// construct or persist one; reporting those dimensions as captured would
+/// be exactly the fabricated-precision failure HORO-1597 exists to close.
+/// `host` is implicit: one daemon/one `$FORNAX_HOME` per machine (no
+/// `host_id` column on any of the three row types), mirroring every other
+/// product's "host" in this contract.
+fn execution_identity_capture_report() -> String {
+    "session: captured (AgentEvent/Claim/Evidence all carry a real session_id, \
+     populated from the native hook session; fornax statusline's latest_finding \
+     segment declares scope:\"session\" once the host confirms it, HORO-1601/1602) \
+     -- agent/turn/task: not captured (no field exists on any persisted row; \
+     CanonicalHostEvent/HostEventIdentity model agent_id/turn_id but that type is \
+     a bounded validation library fornax-daemon never constructs or persists, \
+     HORO-1712) -- host: implicit (one daemon/$FORNAX_HOME per machine; no host_id \
+     column on any row) -- not a defect: partial adoption of the execution-identity \
+     contract is expected (horonomy/.github governance/product/\
+     execution-identity-contract.md#partial-adoption-is-expected-not-a-defect); \
+     remaining dimensions tracked under HORO-1603/HORO-1712"
+        .to_string()
 }
 
 async fn handle_timeline_action(
@@ -4732,6 +4782,30 @@ mod tests {
                 "fornax --version must derive from Cargo package metadata, not a \
                  separately hand-maintained constant"
             );
+        }
+    }
+
+    mod execution_identity_doctor {
+        use super::*;
+
+        #[test]
+        fn reports_session_captured_and_others_truthfully_absent() {
+            let report = execution_identity_capture_report();
+            assert!(report.contains("session: captured"));
+            assert!(report.contains("agent/turn/task: not captured"));
+            assert!(report.contains("host: implicit"));
+            assert!(report.contains("#partial-adoption-is-expected-not-a-defect"));
+            // Never claim a dimension is captured when it isn't -- the exact
+            // fabricated-precision failure this check exists to avoid.
+            assert!(!report.contains("agent: captured"));
+            assert!(!report.contains("turn: captured"));
+            assert!(!report.contains("task: captured"));
+        }
+
+        #[test]
+        fn doctor_subcommand_parses() {
+            let cli = Cli::try_parse_from(["fornax", "doctor"]).expect("must parse");
+            assert!(matches!(cli.command, Commands::Doctor));
         }
     }
 }
