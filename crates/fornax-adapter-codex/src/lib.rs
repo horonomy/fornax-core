@@ -35,8 +35,8 @@ pub const ADAPTER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// constant.
 pub const CODEX_NS: Uuid = Uuid::from_bytes(*b"fornax-codex-ns1");
 
-/// Computes a deterministic id for one `(phase, native_id)` pair under
-/// [`CODEX_NS`] (HORO-1712). `phase` is one of:
+/// Computes a deterministic id for one `(session_id, phase, native_id)`
+/// triple under [`CODEX_NS`] (HORO-1712). `phase` is one of:
 /// - `"tool_before"` -- reserved for the hook-ingestion path's
 ///   pre-execution observation; not produced anywhere in this crate yet
 ///   (hook ingestion is out of scope here, HORO-1712 part B), but reserved
@@ -48,10 +48,30 @@ pub const CODEX_NS: Uuid = Uuid::from_bytes(*b"fornax-codex-ns1");
 /// `native_id` is Codex's own call/tool_use id for the command this id
 /// represents (a `response_item` `call_id`, or a rollout `item_completed`
 /// item's own `id`).
-pub fn dedup_id(phase: &str, native_id: &str) -> Uuid {
+///
+/// `session_id` is deliberately part of the key, not left out. Codex's
+/// `call_id`/item `id` values are this adapter's own process-local
+/// correlation keys, not guaranteed-globally-unique identifiers --
+/// `custom_tool_call`'s `call_id` in particular has never been confirmed to
+/// carry anything beyond a small per-session counter/string in any live
+/// capture (see the `exec_command_end` fallback below). Without
+/// `session_id` in the key, two different real sessions could legitimately
+/// produce the same `(phase, native_id)` pair, and `fornax_store`'s
+/// fail-closed `IdCollision` check (a genuine content mismatch, by
+/// design) would then permanently and silently refuse every future insert
+/// for whichever session lost the race -- not a transient quarantine, a
+/// standing block on that session's real evidence forever. Folding
+/// `session_id` into the key removes that cross-session collision
+/// entirely for the one source (the rollout tailer) that writes these ids
+/// today. A future hook-ingestion path observing the same action under a
+/// *different* session id than the rollout tailer is a real, harder
+/// problem -- deliberately deferred to whichever ticket implements that
+/// path, not solved speculatively here at the cost of the bug above in the
+/// path that exists right now.
+pub fn dedup_id(session_id: &str, phase: &str, native_id: &str) -> Uuid {
     Uuid::new_v5(
         &CODEX_NS,
-        format!("codex:v1:{phase}:{native_id}").as_bytes(),
+        format!("codex:v1:{session_id}:{phase}:{native_id}").as_bytes(),
     )
 }
 
@@ -689,7 +709,7 @@ fn translate_line(
                 // after a restart) is recognized as the same event by
                 // `fornax_store`'s idempotent insert, instead of writing a
                 // second row under a fresh random id.
-                let event_id = dedup_id("tool_after", call_id);
+                let event_id = dedup_id(session_id, "tool_after", call_id);
                 let event = AgentEvent {
                     id: event_id,
                     session_id: session_id.to_string(),
@@ -714,7 +734,7 @@ fn translate_line(
                     // `Uuid::new_v4()` -- override with the same
                     // deterministic scheme as the event above so a replay
                     // of this evidence dedups too.
-                    ev.id = dedup_id("tool_after:exit_code", call_id);
+                    ev.id = dedup_id(session_id, "tool_after:exit_code", call_id);
                     IngestMessage::Evidence(ev)
                 }));
                 NormalizationOutcome::Messages(out)
@@ -756,7 +776,7 @@ fn translate_line(
     let event_id = payload
         .get("call_id")
         .and_then(|v| v.as_str())
-        .map(|call_id| dedup_id("tool_after", call_id))
+        .map(|call_id| dedup_id(session_id, "tool_after", call_id))
         .unwrap_or_else(Uuid::new_v4);
 
     match sub_type {
@@ -784,7 +804,7 @@ fn translate_line(
                 // already assigned to `event.id`, so this is a no-op for
                 // every existing fixture.
                 if let Some(call_id) = payload.get("call_id").and_then(|v| v.as_str()) {
-                    ev.id = dedup_id("tool_after:exit_code", call_id);
+                    ev.id = dedup_id(session_id, "tool_after:exit_code", call_id);
                 }
                 IngestMessage::Evidence(ev)
             }));
@@ -894,7 +914,7 @@ fn translate_item_completed(
                 .get("command")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
-            let event_id = dedup_id("tool_after", native_id);
+            let event_id = dedup_id(session_id, "tool_after", native_id);
             let event = AgentEvent {
                 id: event_id,
                 session_id: session_id.to_string(),
@@ -916,7 +936,7 @@ fn translate_item_completed(
             }
 
             let evidence = Evidence {
-                id: dedup_id("tool_after:exit_code", native_id),
+                id: dedup_id(session_id, "tool_after:exit_code", native_id),
                 session_id: session_id.to_string(),
                 source_event_id: event_id,
                 kind: EvidenceKind::ExitCode,
@@ -1429,20 +1449,37 @@ mod tests {
 
     #[test]
     fn dedup_id_is_deterministic_and_phase_sensitive() {
-        let a = dedup_id("tool_after", "call_1");
-        let b = dedup_id("tool_after", "call_1");
+        let a = dedup_id("sess-1", "tool_after", "call_1");
+        let b = dedup_id("sess-1", "tool_after", "call_1");
         assert_eq!(
             a, b,
-            "same (phase, native_id) must always hash to the same id"
+            "same (session_id, phase, native_id) must always hash to the same id"
         );
 
-        let different_phase = dedup_id("tool_after:exit_code", "call_1");
+        let different_phase = dedup_id("sess-1", "tool_after:exit_code", "call_1");
         assert_ne!(a, different_phase, "different phase must change the id");
 
-        let different_native_id = dedup_id("tool_after", "call_2");
+        let different_native_id = dedup_id("sess-1", "tool_after", "call_2");
         assert_ne!(
             a, different_native_id,
             "different native_id must change the id"
+        );
+    }
+
+    /// `session_id` must be part of the key. Codex's own `call_id`/item
+    /// `id` values are this adapter's process-local correlation keys, not
+    /// guaranteed-globally-unique -- two different real sessions reusing
+    /// the same native id (plausible for a small per-session counter in
+    /// an older rollout format) must never collide into the same dedup
+    /// id, or `fornax_store`'s fail-closed `IdCollision` check would
+    /// permanently block whichever session's event arrived second.
+    #[test]
+    fn dedup_id_is_session_sensitive() {
+        let a = dedup_id("sess-a", "tool_after", "call_1");
+        let b = dedup_id("sess-b", "tool_after", "call_1");
+        assert_ne!(
+            a, b,
+            "the same native_id under two different sessions must never collide"
         );
     }
 

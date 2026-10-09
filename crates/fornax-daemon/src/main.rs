@@ -6543,50 +6543,51 @@ mod tests {
         assert_eq!(evidence.len(), 2);
     }
 
-    /// Collision case for the same dedup scheme: the *same* dedup id (same
-    /// native_id/phase) observed under a genuinely different session must
-    /// be rejected as `IdCollision` -- exactly one quarantine row, the
-    /// original row completely untouched, never silently landed under the
-    /// new session either.
+    /// HORO-1712 (security-review follow-up): `dedup_id` folds `session_id`
+    /// into the key specifically so that two different real sessions
+    /// reusing the same native call/item id (plausible for Codex's
+    /// `call_id`, which has never been confirmed to be more than a small
+    /// per-session counter/string) never collide. Two genuinely different
+    /// sessions, same native id, must land as two separate rows -- no
+    /// `IdCollision`, no quarantine, no suppression of either session's
+    /// real event.
     #[tokio::test]
-    async fn codex_item_completed_same_id_different_session_is_quarantined() {
+    async fn codex_same_native_id_under_two_different_sessions_does_not_collide() {
         use fornax_adapter_codex::dedup_id;
 
         let state = test_state().await;
         let mut hint = None;
 
-        let native_id = "item_collide_1";
-        let event_id = dedup_id("tool_after", native_id);
-        let first = AgentEvent {
-            id: event_id,
-            session_id: "sess-a".to_string(),
-            provider: Provider::Codex,
-            kind: EventKind::PostToolUse,
-            observed_at: "2026-01-01T00:00:00Z".to_string(),
-            tool_name: Some("exec_command".to_string()),
-            tool_input: Some(serde_json::json!({"command": ["pytest"]})),
-            tool_response: None,
-            raw: serde_json::json!({}),
-        };
-        let line1 = serde_json::to_string(&IngestMessage::Event(first.clone())).expect("serialize");
-        process_line(&state, &line1, &mut hint).await;
-
-        // Same id (same native_id/phase), but a genuinely different
-        // session -- a real id collision, never a safe replay.
-        let mut colliding = first.clone();
-        colliding.session_id = "sess-b".to_string();
-        let line2 = serde_json::to_string(&IngestMessage::Event(colliding)).expect("serialize");
-        process_line(&state, &line2, &mut hint).await;
+        let native_id = "item_shared_native_id";
+        for session_id in ["sess-a", "sess-b"] {
+            let event = AgentEvent {
+                id: dedup_id(session_id, "tool_after", native_id),
+                session_id: session_id.to_string(),
+                provider: Provider::Codex,
+                kind: EventKind::PostToolUse,
+                observed_at: "2026-01-01T00:00:00Z".to_string(),
+                tool_name: Some("exec_command".to_string()),
+                tool_input: Some(serde_json::json!({"command": ["pytest"]})),
+                tool_response: None,
+                raw: serde_json::json!({}),
+            };
+            let line = serde_json::to_string(&IngestMessage::Event(event)).expect("serialize");
+            process_line(&state, &line, &mut hint).await;
+        }
 
         let quarantined = state.store.list_quarantine(10).await.expect("quarantine");
-        assert_eq!(quarantined.len(), 1, "expected exactly one quarantined row");
+        assert_eq!(
+            quarantined.len(),
+            0,
+            "two different sessions reusing the same native id must never be quarantined"
+        );
 
         let events_a = state
             .store
             .events_for_session("sess-a")
             .await
             .expect("events sess-a");
-        assert_eq!(events_a.len(), 1, "the original row must be untouched");
+        assert_eq!(events_a.len(), 1, "sess-a's event must be written");
 
         let events_b = state
             .store
@@ -6595,8 +6596,60 @@ mod tests {
             .expect("events sess-b");
         assert_eq!(
             events_b.len(),
+            1,
+            "sess-b's event must also be written, not suppressed"
+        );
+
+        assert_ne!(
+            events_a[0].id, events_b[0].id,
+            "the two sessions must compute different dedup ids for the same native_id"
+        );
+    }
+
+    /// Confirms the same-session replay test
+    /// (`codex_item_completed_replay_dedups_to_one_row_and_same_verdict`,
+    /// above) still dedups correctly now that `session_id` is folded into
+    /// the key -- a replay of the *same* session's line must still collapse
+    /// to one row, this isn't just "any two inserts never collide now".
+    #[tokio::test]
+    async fn codex_same_session_replay_still_dedups_with_session_id_in_the_key() {
+        use fornax_adapter_codex::dedup_id;
+
+        let state = test_state().await;
+        let mut hint = None;
+
+        let event = AgentEvent {
+            id: dedup_id("sess-replay-check", "tool_after", "item_replay_check"),
+            session_id: "sess-replay-check".to_string(),
+            provider: Provider::Codex,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".to_string(),
+            tool_name: Some("exec_command".to_string()),
+            tool_input: Some(serde_json::json!({"command": ["pytest"]})),
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        let line = serde_json::to_string(&IngestMessage::Event(event)).expect("serialize");
+        process_line(&state, &line, &mut hint).await;
+        // Replay: the exact same line again.
+        process_line(&state, &line, &mut hint).await;
+
+        let events = state
+            .store
+            .events_for_session("sess-replay-check")
+            .await
+            .expect("events");
+        assert_eq!(
+            events.len(),
+            1,
+            "a same-session replay must still dedup to one row"
+        );
+
+        let quarantined = state.store.list_quarantine(10).await.expect("quarantine");
+        assert_eq!(
+            quarantined.len(),
             0,
-            "the colliding write must not land under the new session either"
+            "a benign same-session replay must never be quarantined"
         );
     }
 }
