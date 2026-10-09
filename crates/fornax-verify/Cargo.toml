@@ -26,3 +26,12 @@ reqwest = { workspace = true, features = ["blocking", "json"] }
 # invariants (session isolation, non-fabricated satisfaction, independence
 # hardening, determinism) alongside the existing example-based tests.
 proptest.workspace = true
+
+[features]
+# FORNX-432 PR 1: exposes `independence::build_reference`/
+# `ancestors_of_reference` -- byte-for-byte historical copies of
+# `build`/`ancestors_of` kept as a stable "before" correctness oracle for a
+# future optimization pass. Off by default; never enabled in production
+# builds (fornax-daemon/fornax-cli never request it). See
+# `independence.rs`'s module docs.
+bench-reference = []
