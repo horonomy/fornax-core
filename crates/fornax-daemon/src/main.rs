@@ -26,10 +26,13 @@ use fornax_verify::{
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
+use tokio::time::timeout;
 
 mod audit_checkpoint_submit;
 mod policy_poll;
@@ -119,18 +122,68 @@ struct AppState {
     /// live-session verdict computation never pays a DB round trip on the
     /// claim-verification hot path.
     caps: Arc<Mutex<HashMap<String, RuntimeCapabilities>>>,
-    /// FORNX-281: each hook invocation is a fresh UDS connection handled by
-    /// its own spawned task, with no ack from the daemon back to the hook —
-    /// so nothing guarantees an earlier event (e.g. PostToolUse, carrying
-    /// the exit-code Evidence a claim needs) finishes its DB write before a
-    /// later message (e.g. Stop's Claim, which verifies against whatever
-    /// Evidence already exists) starts processing on a different task. This
-    /// is a single local daemon serving one user's sequential agent
-    /// actions (ADR 0001) — not a system that needs concurrent throughput —
-    /// so the correct fix is to make message *processing* strictly
-    /// serialized in arrival order, not to make verification tolerant of
-    /// partial evidence. Held for the full duration of `handle_message`.
+    /// FORNX-281/HORO-1712: mutual exclusion only — never two `handle_message`
+    /// calls run concurrently. This alone does **not** guarantee arrival
+    /// order: each hook invocation is a fresh UDS connection handled by its
+    /// own spawned task, with no ack from the daemon back to the hook, and
+    /// a task only calls `.lock()` after it finishes reading+parsing its own
+    /// line. A later-accepted connection with a smaller/faster-to-parse
+    /// payload (e.g. Stop's Claim) could therefore still reach `.lock()`
+    /// before an earlier-accepted connection with a larger payload (e.g.
+    /// PostToolUse's Evidence, still being read/redacted) — exactly the race
+    /// `next_turn`/`turn_advanced` below exist to close. See
+    /// `run_uds_server`'s doc comment for the actual ordering guarantee.
+    /// Held for the full duration of `handle_message`.
     processing: Arc<Mutex<()>>,
+    /// HORO-1712: the turn ticket a connection must hold before its lines
+    /// may enter `handle_message` — this, not `processing` above,
+    /// establishes true connection-accept order. `run_uds_server` hands out
+    /// tickets `0, 1, 2, ...` as it accepts, matching the real accept
+    /// sequence exactly; a connection's own task waits here for its ticket
+    /// without ever making the accept loop itself wait, so a slow or
+    /// deliberately-trickling connection can only ever delay the
+    /// *processing turn* of connections after it, never the daemon's
+    /// ability to keep *accepting* new ones (that would be a trivial
+    /// accept-starvation DoS — a security review of this fix's first draft
+    /// caught exactly that: it awaited the drain inside the accept loop).
+    next_turn: Arc<AtomicU64>,
+    /// Woken every time `next_turn` advances, so every connection
+    /// currently waiting for its ticket re-checks rather than polling.
+    turn_advanced: Arc<Notify>,
+    /// Ticket dispenser: `fetch_add`ed once per accepted connection, in
+    /// the accept loop itself, so ticket order equals accept order
+    /// exactly. Distinct from `next_turn` above, which instead tracks
+    /// *whose turn is currently being served* and only advances once a
+    /// ticket's processing turn actually finishes.
+    next_ticket: Arc<AtomicU64>,
+    /// HORO-1712: caps how many accepted connections may be simultaneously
+    /// open (waiting for their turn, draining, or handed off) at once.
+    /// Without this, accept volume exceeding processing rate grows the
+    /// turnstile queue -- and each queued connection's held-open fd --
+    /// without bound, eventually exhausting the process's file-descriptor
+    /// limit and taking the whole listener down. `run_uds_server` acquires
+    /// a permit *before* calling `accept()`, so once at capacity the excess
+    /// connections queue in the OS's own listen backlog rather than as
+    /// open, unconsumed fds in this process.
+    inflight: Arc<Semaphore>,
+    /// HORO-1712 (post-review fix): session ids -- plus an `unknown` count
+    /// for a handed-off connection whose session id isn't known yet --
+    /// with an outstanding handed-off connection that has not yet made its
+    /// *first post-handoff* line resolution (a line, or EOF). The turnstile
+    /// only orders *entry into draining*, not *evidence completeness by
+    /// Claim-evaluation time*: a connection relinquishes its turn the
+    /// instant it's handed off to `continue_connection`, before its
+    /// remaining evidence is actually written, so a later ticket's Claim
+    /// can run while this connection's write is still in flight and bind
+    /// to stale same-session evidence -- an independent adversarial review
+    /// proved this produces an incorrect (not just conservative) verdict:
+    /// a false `Verified` against a stale exit_code row while the real,
+    /// contradicting exit_code is still in transit. `run_verifiers_and_persist_findings`
+    /// checks this set/counter and downgrades a `Verified`/`Contradicted`
+    /// verdict to `Review` whenever this session (or an unknown one) has a
+    /// handoff in flight, rather than binding confidently to
+    /// currently-visible evidence that might not yet be complete.
+    pending_handoff: Arc<std::sync::Mutex<PendingHandoff>>,
     /// FORNX-339: this daemon's `$FORNAX_HOME` identity, sent as a response
     /// header on every HTTP reply so a client can prove it's talking to the
     /// daemon serving its own home rather than a different one that won the
@@ -370,6 +423,11 @@ async fn main() -> anyhow::Result<()> {
         store,
         caps: Arc::new(Mutex::new(HashMap::new())),
         processing: Arc::new(Mutex::new(())),
+        next_turn: Arc::new(AtomicU64::new(0)),
+        turn_advanced: Arc::new(Notify::new()),
+        next_ticket: Arc::new(AtomicU64::new(0)),
+        inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_CONNECTIONS)),
+        pending_handoff: Arc::new(std::sync::Mutex::new(PendingHandoff::default())),
         home_id: Arc::from(home_identity(&home).as_str()),
         trust: Arc::new(trusted),
         policy: Arc::new(RwLock::new(policy_snapshot)),
@@ -449,40 +507,461 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A fire-and-forget hook connection almost always closes (EOF) well within
+/// this window — Claude Code waits for one hook process to exit before
+/// firing the next lifecycle event (FORNX-281's connect-order-is-causal-order
+/// precondition: see `run_uds_server`'s doc comment), so by the time a
+/// second connection is even accepted the first has typically already sent
+/// its one line and disconnected. A connection still open after this much
+/// *idle* read-wait time is treated as long-lived (e.g. `fornax-hook-codex`'s
+/// rollout tailer, `fornax-hook-opencode`'s persistent bridge — both keep
+/// one connection open for their whole process lifetime) and handed off to
+/// run alongside later connections rather than blocking the accept loop.
+const DRAIN_IDLE: Duration = Duration::from_millis(250);
+/// Total time this connection may spend *waiting on reads* during the
+/// in-order drain phase before being hung off, regardless of how many short
+/// idle gaps it has (a slow writer trickling many small lines could
+/// otherwise never trip `DRAIN_IDLE` on any single read and stall the
+/// accept loop indefinitely). Time spent inside `handle_message` itself
+/// does not count against this budget — a large one-shot payload that is
+/// slow to *process* must never be handed off mid-message.
+const DRAIN_READ_BUDGET: Duration = Duration::from_secs(1);
+/// Maximum number of UDS ingest connections that may be simultaneously
+/// open (queued on the turnstile, draining, or handed off) at once. Bounds
+/// the process's own file-descriptor usage under load that exceeds
+/// processing rate — the per-connection resource that was previously
+/// unbounded. One Claude Code/Codex/opencode session opens only a handful
+/// of connections at a time, so this is sized generously above any
+/// realistic legitimate burst while still bounding worst case.
+const MAX_INFLIGHT_CONNECTIONS: usize = 256;
+
+type IngestLines = tokio::io::Lines<BufReader<UnixStream>>;
+
+/// Outcome of draining a connection's immediately-available lines in true
+/// accept order, before the next connection is accepted.
+enum Drain {
+    /// The connection sent everything it had and closed within budget.
+    Eof,
+    /// Still open after [`DRAIN_IDLE`]/[`DRAIN_READ_BUDGET`] — a long-lived
+    /// connection, handed off to continue independently.
+    Handoff(IngestLines, Option<String>),
+}
+
+/// Accepts connections as fast as the OS can hand them over — **never**
+/// waiting on any connection's own processing — while still guaranteeing
+/// each one's lines enter `handle_message` in true connection-accept order.
+/// This is the actual ordering guarantee `AppState::processing`'s mutex
+/// alone does not provide: that mutex only prevents two `handle_message`
+/// calls from running concurrently, it does not make an earlier-accepted
+/// connection's messages process before a later-accepted connection's.
+///
+/// Ordering is established by a ticket turnstile
+/// (`AppState::{next_turn,turn_advanced}`), not by blocking `accept()`:
+/// each accepted connection is handed the next sequential ticket and
+/// immediately spawned — the accept loop itself never awaits a spawned
+/// task, so a slow, hung, or deliberately-trickling connection can only
+/// ever delay the *processing turn* of connections accepted after it,
+/// never the daemon's ability to keep accepting new ones. An earlier draft
+/// of this fix awaited each connection's drain directly inside the accept
+/// loop, which — a security review caught — let any single slow connection
+/// throttle the whole daemon's accept rate to one per
+/// `DRAIN_READ_BUDGET`: a trivial accept-starvation denial of service. The
+/// turnstile closes that: `accept()` is unconditional and immediate, full
+/// stop.
+///
+/// Connection-accept order equals causal (host-side) order here because
+/// every installed Claude Code hook entry is a synchronous `"command"`
+/// (never `"async": true`) — Claude Code waits for one hook process to
+/// exit before firing the next lifecycle event, so (for example)
+/// PostToolUse's connection is always accepted before Stop's. A hand-edited
+/// `async: true` hook entry would break this precondition; not something
+/// this daemon can detect or defend against, so not attempted here.
+///
+/// A connection that doesn't close within [`DRAIN_IDLE`]/[`DRAIN_READ_BUDGET`]
+/// of actually holding its turn (a long-lived adapter bridge, not a
+/// one-shot hook) relinquishes its turn via [`Drain::Handoff`] and
+/// continues independently via [`continue_connection`], so it can never
+/// hold up the connections queued behind it beyond that bounded window
+/// either.
+///
+/// Before calling `accept()` at all, this loop acquires a permit from
+/// `AppState::inflight`, capped at [`MAX_INFLIGHT_CONNECTIONS`]. Without
+/// this, accept volume exceeding processing rate would grow the turnstile
+/// queue -- and each queued connection's held-open fd -- without bound,
+/// eventually exhausting the process's file-descriptor limit and taking
+/// the whole listener down; a security review of an earlier draft (no cap
+/// at all) caught exactly this. Acquiring the permit *before* `accept()`
+/// means excess connections past the cap queue in the OS's own listen
+/// backlog rather than as open, unconsumed fds here.
+///
+/// A handed-off long-lived connection (the Codex/opencode persistent
+/// bridges) holds its permit for the rest of its process's lifetime, by
+/// design -- one real session opens only a handful of these, so
+/// `MAX_INFLIGHT_CONNECTIONS` comfortably covers legitimate concurrent
+/// sessions. A client that leaks connections without ever closing them
+/// (crashes holding the socket open, etc.) could still, over a long
+/// enough uptime, walk the count toward the cap and make this loop block
+/// on `acquire_owned` indefinitely -- a second security review flagged
+/// that this degraded-but-bounded state previously had zero visibility.
+/// This is accepted, bounded backpressure, not a new defect in itself
+/// (the alternative is the unbounded fd growth the cap exists to
+/// prevent), but it must be observable: log once, loudly, the moment
+/// acquisition is not immediate, so an operator can tell starvation is
+/// forming before the daemon looks simply unresponsive.
 async fn run_uds_server(sock_path: &PathBuf, state: AppState) -> anyhow::Result<()> {
     let listener = UnixListener::bind(sock_path)?;
     tracing::info!(path = %sock_path.display(), "UDS ingest listening");
     loop {
+        let inflight = state.inflight.clone();
+        let permit = match inflight.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                tracing::warn!(
+                    cap = MAX_INFLIGHT_CONNECTIONS,
+                    "UDS ingest at max inflight connections; accept is now blocked until one closes"
+                );
+                inflight
+                    .acquire_owned()
+                    .await
+                    .expect("AppState::inflight is never closed for the process lifetime")
+            }
+        };
         let (stream, _addr) = listener.accept().await?;
+        // Ticket order equals accept order exactly: the accept loop is
+        // single-threaded (one `accept()` in flight at a time), so handing
+        // out ticket N to the Nth accepted connection, in this same loop,
+        // right after `accept()` returns, cannot race with any other
+        // ticket assignment.
+        let ticket = state.next_ticket.fetch_add(1, Ordering::SeqCst);
         let state = state.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, state).await {
+            // Held until this connection's task ends (any outcome,
+            // including panic -- `OwnedSemaphorePermit::drop` always
+            // releases it), so the permit genuinely bounds concurrently
+            // open connections, not just connections currently in the
+            // accept loop.
+            let _permit = permit;
+            if let Err(e) = handle_connection_in_turn(stream, state, ticket).await {
                 tracing::warn!(error = %e, "ingest connection ended with error");
             }
         });
+        // Deliberately not awaited: accepting the next connection must
+        // never wait on this one's turn, drain, or processing.
     }
 }
 
-async fn handle_connection(stream: UnixStream, state: AppState) -> anyhow::Result<()> {
-    let mut lines = BufReader::new(stream).lines();
-    let mut session_hint: Option<String> = None;
-
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
+/// Waits for `ticket`'s turn (see `AppState::next_turn`'s doc comment),
+/// then drains the connection in-order, relinquishing the turn either once
+/// it hits EOF or once it proves itself long-lived and is handed off to
+/// [`continue_connection`] — a handed-off connection runs with the same
+/// mutual-exclusion-only contract `AppState::processing` always provided,
+/// never blocking any later connection's turn.
+///
+/// The turn is released via [`TurnGuard`]'s `Drop`, not a manual call in
+/// each match arm: an earlier draft called `advance_turn` explicitly in
+/// every `Ok`/`Err` branch but had nothing covering a panic inside
+/// `drain_in_order` itself (e.g. a malformed line reaching deep enough to
+/// panic in `process_line`) -- a security review caught that such a panic,
+/// caught at the `tokio::spawn` task boundary with nothing ever calling
+/// `advance_turn` for that ticket, would stall every connection queued
+/// behind it, permanently. A `Drop` impl runs during unwind the same as on
+/// a normal return, so it cannot be skipped that way.
+async fn handle_connection_in_turn(
+    stream: UnixStream,
+    state: AppState,
+    ticket: u64,
+) -> anyhow::Result<()> {
+    wait_for_turn(&state, ticket).await;
+    let guard = TurnGuard::new(&state);
+    let outcome = drain_in_order(stream, state.clone()).await;
+    // HORO-1712 (second post-review fix): register the handoff *before*
+    // relinquishing the turn, not after -- a second independent adversarial
+    // review caught that registering afterward left a real TOCTOU window:
+    // `drop(guard)` lets a later ticket's Claim proceed immediately, but
+    // `register_pending_handoff`'s own `.await` to acquire the lock had not
+    // necessarily completed yet, so a Claim racing in during exactly that
+    // scheduling gap would see no pending handoff at all and could still
+    // bind to stale evidence -- the identical bug the pending-handoff
+    // tracking exists to close, just narrowed to one `.await` instead of
+    // the whole drain budget. Registering first closes it: the marker is
+    // visible before the turn is released, full stop.
+    let handoff_guard = match &outcome {
+        Ok(Drain::Handoff(_, session_hint)) => Some(HandoffGuard::register(&state, session_hint)),
+        _ => None,
+    };
+    // Relinquish the turn *before* continuing independently (the `Handoff`
+    // case): a long-lived connection must never hold up every connection
+    // accepted after it just because it is still open.
+    drop(guard);
+    match outcome {
+        Ok(Drain::Eof) => Ok(()),
+        Ok(Drain::Handoff(lines, session_hint)) => {
+            continue_connection(
+                lines,
+                session_hint,
+                state,
+                handoff_guard.expect("registered above whenever outcome is Handoff"),
+            )
+            .await
         }
-        let msg: IngestMessage = match serde_json::from_str(&line) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(error = %e, "dropping malformed ingest line");
-                continue;
-            }
-        };
-        if let Err(e) = handle_message(&state, msg, &mut session_hint).await {
-            tracing::warn!(error = %e, "failed to process ingest message");
+        Err(e) => Err(e),
+    }
+}
+
+/// Blocks until `AppState::next_turn` reaches `ticket`. Creates the
+/// `Notified` future *before* checking the condition (tokio's documented
+/// safe pattern for `Notify`) so a `notify_waiters` call that lands between
+/// the check and the await can never be missed.
+async fn wait_for_turn(state: &AppState, ticket: u64) {
+    loop {
+        let notified = state.turn_advanced.notified();
+        if state.next_turn.load(Ordering::SeqCst) == ticket {
+            return;
+        }
+        notified.await;
+    }
+}
+
+/// Advances the turnstile by one and wakes every connection currently
+/// waiting for its turn, so the one whose ticket now matches can proceed.
+/// Runs exactly once per ticket, on `Drop`, regardless of whether the
+/// holder returned normally, returned an error, or panicked -- see
+/// `handle_connection_in_turn`'s doc comment for why a manual call at each
+/// return site was not enough.
+struct TurnGuard {
+    next_turn: Arc<AtomicU64>,
+    turn_advanced: Arc<Notify>,
+}
+
+impl TurnGuard {
+    fn new(state: &AppState) -> Self {
+        Self {
+            next_turn: state.next_turn.clone(),
+            turn_advanced: state.turn_advanced.clone(),
         }
     }
+}
+
+impl Drop for TurnGuard {
+    fn drop(&mut self) {
+        self.next_turn.fetch_add(1, Ordering::SeqCst);
+        self.turn_advanced.notify_waiters();
+    }
+}
+
+/// Backing state for `AppState::pending_handoff` -- see its doc comment.
+/// Guarded by a synchronous `std::sync::Mutex`, not `tokio::sync::Mutex`,
+/// specifically so [`HandoffGuard`]'s `Drop` impl can clear it
+/// unconditionally, including mid-panic-unwind -- an async mutex cannot be
+/// locked from `Drop`.
+#[derive(Default)]
+struct PendingHandoff {
+    /// Refcounted, not a `HashSet` -- a session can legitimately have more
+    /// than one handed-off connection in flight at once (e.g. both a Codex
+    /// rollout tailer and an opencode bridge connected for the same
+    /// session). A plain set was a real fail-open bug caught by a third
+    /// independent adversarial review: with a set, the *first* of two
+    /// concurrent handoffs for the same session to `Drop` would remove the
+    /// session entirely, even though the second handoff was still
+    /// genuinely in flight -- silently reopening the stale-evidence race
+    /// for the survivor. The count only reaches zero (and the entry is
+    /// removed) once every holder for that session has dropped.
+    sessions: HashMap<String, usize>,
+    /// Count of in-flight handoffs whose session id isn't known yet (no
+    /// line was processed during the drain phase before the budget
+    /// expired). Scoped globally, not per-session, because there's no
+    /// session id to scope it to yet -- every Claim evaluated while this is
+    /// nonzero is conservatively downgraded, not just claims for one
+    /// session, since the unidentified handoff could belong to any of them.
+    unknown: usize,
+}
+
+/// Which bucket of `PendingHandoff` a [`HandoffGuard`] is holding a
+/// reservation in.
+enum HandoffToken {
+    Session(String),
+    Unknown,
+}
+
+/// RAII marker for one handed-off connection's "evidence may still be
+/// incomplete" window. `register` marks the handoff in flight immediately
+/// (before the caller relinquishes its turnstile turn -- see
+/// `handle_connection_in_turn`); `Drop` clears it.
+///
+/// Deliberately held for the connection's *entire* remaining lifetime
+/// (moved into `continue_connection` and dropped only when that returns or
+/// panics), not cleared after just the first post-handoff line: a second
+/// independent adversarial review caught that an earlier draft cleared on
+/// the first line/EOF resolution, which is only correct if that first line
+/// *is* the evidence a pending Claim needs. A long-lived connection (a
+/// Codex rollout tailer, an opencode bridge) can keep sending lines
+/// indefinitely, and any later one could just as easily be the evidence in
+/// question -- clearing early would silently reopen the exact stale-
+/// evidence race this type exists to close, for every line after the
+/// first. Holding it for the whole connection is more conservative (claims
+/// for this session stay `Review` for as long as the connection is open,
+/// not just for one beat) but that is the honest state: evidence for this
+/// session genuinely could still be incomplete at any point while it's
+/// connected.
+struct HandoffGuard {
+    pending: Arc<std::sync::Mutex<PendingHandoff>>,
+    token: HandoffToken,
+}
+
+impl HandoffGuard {
+    /// Marks a handoff as in flight, using whatever `session_hint` is known
+    /// at the moment the turn is about to be relinquished (may be `None` if
+    /// the drain phase never processed a line that reveals it).
+    fn register(state: &AppState, session_hint: &Option<String>) -> Self {
+        let mut pending = lock_pending_handoff(&state.pending_handoff);
+        let token = match session_hint {
+            Some(sid) => {
+                *pending.sessions.entry(sid.clone()).or_insert(0) += 1;
+                HandoffToken::Session(sid.clone())
+            }
+            None => {
+                pending.unknown += 1;
+                HandoffToken::Unknown
+            }
+        };
+        drop(pending);
+        Self {
+            pending: state.pending_handoff.clone(),
+            token,
+        }
+    }
+}
+
+impl Drop for HandoffGuard {
+    fn drop(&mut self) {
+        let mut pending = lock_pending_handoff(&self.pending);
+        match &self.token {
+            HandoffToken::Session(sid) => {
+                if let std::collections::hash_map::Entry::Occupied(mut entry) =
+                    pending.sessions.entry(sid.clone())
+                {
+                    *entry.get_mut() = entry.get().saturating_sub(1);
+                    if *entry.get() == 0 {
+                        entry.remove();
+                    }
+                }
+            }
+            HandoffToken::Unknown => {
+                pending.unknown = pending.unknown.saturating_sub(1);
+            }
+        }
+    }
+}
+
+/// Locks `pending_handoff`, recovering from poisoning rather than
+/// panicking again: a prior panic while *this* lock was held must not
+/// permanently wedge every future handoff/claim in the daemon into
+/// thinking a lock lives here that can never be acquired again. The
+/// recovered guard's data is used as-is (the refcount map/counter have no
+/// invariant a partial mutation could violate beyond what `saturating_sub`
+/// already tolerates).
+fn lock_pending_handoff(
+    pending: &Arc<std::sync::Mutex<PendingHandoff>>,
+) -> std::sync::MutexGuard<'_, PendingHandoff> {
+    pending
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// True if a Claim for `session_id` might be evaluated against evidence
+/// that is still incomplete -- either this exact session has a handoff in
+/// flight, or some unidentified session does (see `PendingHandoff::unknown`).
+fn evidence_may_be_incomplete_for(state: &AppState, session_id: &str) -> bool {
+    let pending = lock_pending_handoff(&state.pending_handoff);
+    pending.unknown > 0 || pending.sessions.contains_key(session_id)
+}
+
+/// Reads and processes this connection's immediately-available lines, in
+/// order, up to [`DRAIN_IDLE`]/[`DRAIN_READ_BUDGET`]. Returns [`Drain::Eof`]
+/// once the connection closes within budget, or [`Drain::Handoff`] with the
+/// still-open reader (so no already-buffered bytes are lost) once the
+/// budget is exceeded.
+async fn drain_in_order(stream: UnixStream, state: AppState) -> anyhow::Result<Drain> {
+    let mut lines = BufReader::new(stream).lines();
+    let mut session_hint: Option<String> = None;
+    // A fixed wall-clock deadline for the *whole* drain, not an
+    // idle-time accumulator: a bug found by independent adversarial review
+    // of an earlier draft of this fix. Accumulating only the time spent in
+    // the `Err` (timeout) branch meant a connection sending one short line
+    // every `DRAIN_IDLE - epsilon` never tripped a single timeout and so
+    // never handed off -- `fornax-hook-codex`'s rollout tailer, polling and
+    // emitting lines faster than once per `DRAIN_IDLE`, could have stalled
+    // the processing turn (and, in an even earlier draft, the accept loop
+    // itself) indefinitely. Measuring wall-clock time since this
+    // connection's turn began, regardless of how many lines arrived or how
+    // quickly, closes that: the deadline is real elapsed time, full stop.
+    let deadline = tokio::time::Instant::now() + DRAIN_READ_BUDGET;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(Drain::Handoff(lines, session_hint));
+        }
+        let wait = DRAIN_IDLE.min(remaining);
+        match timeout(wait, lines.next_line()).await {
+            Ok(Ok(None)) => return Ok(Drain::Eof),
+            Ok(Ok(Some(line))) => {
+                process_line(&state, &line, &mut session_hint).await;
+                // Processing time is real wall-clock time too: it already
+                // counts against `remaining` on the next loop iteration via
+                // `tokio::time::Instant::now()` above, with no separate
+                // bookkeeping needed.
+            }
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_elapsed) => {
+                // Idle timeout -- loop back and recompute `remaining`.
+            }
+        }
+    }
+}
+
+/// Continues a connection [`drain_in_order`] handed off, with no further
+/// ordering guarantee relative to other connections — the same mutual-
+/// exclusion-only contract `AppState::processing` always provided. Only
+/// reached for a long-lived connection that already proved itself not a
+/// one-shot hook by outliving the drain window.
+///
+/// `_handoff` marks this handoff as in flight in `AppState::pending_handoff`
+/// (registered by the caller before the turn was relinquished -- see
+/// `handle_connection_in_turn`). It is held for this entire function's
+/// lifetime and cleared by its own `Drop` on return *or* panic, not after
+/// just the first line -- see [`HandoffGuard`]'s doc comment for why
+/// clearing any earlier would be unsound.
+async fn continue_connection(
+    mut lines: IngestLines,
+    mut session_hint: Option<String>,
+    state: AppState,
+    _handoff: HandoffGuard,
+) -> anyhow::Result<()> {
+    while let Some(line) = lines.next_line().await? {
+        process_line(&state, &line, &mut session_hint).await;
+    }
     Ok(())
+}
+
+/// Parses and processes one ingest line, warning (never failing the
+/// connection) on a malformed line or a processing error. Shared by the
+/// in-order drain phase and the post-handoff continuation so both paths
+/// have byte-identical line handling.
+async fn process_line(state: &AppState, line: &str, session_hint: &mut Option<String>) {
+    if line.trim().is_empty() {
+        return;
+    }
+    let msg: IngestMessage = match serde_json::from_str(line) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(error = %e, "dropping malformed ingest line");
+            return;
+        }
+    };
+    if let Err(e) = handle_message(state, msg, session_hint).await {
+        tracing::warn!(error = %e, "failed to process ingest message");
+    }
 }
 
 async fn handle_message(
@@ -1138,6 +1617,13 @@ async fn run_verifiers_and_persist_findings(
     evidence: &[fornax_types::Evidence],
     caps: &RuntimeCapabilities,
 ) -> anyhow::Result<()> {
+    // HORO-1712 (post-review fix): checked fresh for every call, under the
+    // caller's own lock scope, rather than threaded through as a
+    // caller-computed bool -- every call site resolves `claim.session_id`
+    // anyway, and checking here keeps the completeness gate inseparable
+    // from verdict computation instead of relying on each new call site to
+    // remember to check it.
+    let evidence_may_be_incomplete = evidence_may_be_incomplete_for(state, &claim.session_id);
     let verifiers: Vec<Box<dyn Verifier + Send + Sync>> = vec![
         Box::new(TestResultVerifier),
         Box::new(CommandExecutedVerifier),
@@ -1146,7 +1632,30 @@ async fn run_verifiers_and_persist_findings(
         Box::new(GitOperationVerifier),
     ];
     for verifier in verifiers.iter().filter(|v| v.applies_to(claim)) {
-        let finding = verifier.verify(claim, evidence, caps);
+        let mut finding = verifier.verify(claim, evidence, caps);
+        // The turnstile orders entry into draining, not evidence
+        // completeness by Claim-evaluation time: a handed-off connection
+        // relinquishes its turn before its remaining evidence is written,
+        // so a `Verified`/`Contradicted` verdict computed while this
+        // session (or an unidentified one) has a handoff in flight might be
+        // binding confidently to evidence that is about to be superseded.
+        // `Unverified`/`Unavailable`/`Review` are already non-committal and
+        // stay honest even if the missing evidence later lands, so they are
+        // left alone.
+        if evidence_may_be_incomplete
+            && matches!(
+                finding.verdict,
+                fornax_types::Verdict::Verified | fornax_types::Verdict::Contradicted
+            )
+        {
+            finding.rationale = format!(
+                "{} -- downgraded from a definite verdict: a connection for this \
+                 session was still mid-handoff when this claim was evaluated, so \
+                 currently-visible evidence may not yet be complete (HORO-1712)",
+                finding.rationale
+            );
+            finding.verdict = fornax_types::Verdict::Review;
+        }
         tracing::info!(verdict = ?finding.verdict, claim = %claim.text, "finding computed");
         state.store.insert_finding(&finding).await?;
     }
@@ -2444,6 +2953,11 @@ mod tests {
             store,
             caps: Arc::new(Mutex::new(HashMap::new())),
             processing: Arc::new(Mutex::new(())),
+            next_turn: Arc::new(AtomicU64::new(0)),
+            turn_advanced: Arc::new(Notify::new()),
+            next_ticket: Arc::new(AtomicU64::new(0)),
+            inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_CONNECTIONS)),
+            pending_handoff: Arc::new(std::sync::Mutex::new(PendingHandoff::default())),
             home_id: Arc::from(format!("test-home-{}", Uuid::new_v4()).as_str()),
             trust: Arc::new(None),
             policy: Arc::new(RwLock::new(PolicyCacheSnapshot::empty())),
@@ -4476,6 +4990,11 @@ mod tests {
             store,
             caps: Arc::new(Mutex::new(HashMap::new())),
             processing: Arc::new(Mutex::new(())),
+            next_turn: Arc::new(AtomicU64::new(0)),
+            turn_advanced: Arc::new(Notify::new()),
+            next_ticket: Arc::new(AtomicU64::new(0)),
+            inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_CONNECTIONS)),
+            pending_handoff: Arc::new(std::sync::Mutex::new(PendingHandoff::default())),
             home_id: Arc::from(format!("test-home-{}", Uuid::new_v4()).as_str()),
             trust: Arc::new(None),
             policy: Arc::new(RwLock::new(PolicyCacheSnapshot::empty())),
@@ -4703,6 +5222,11 @@ mod tests {
             store,
             caps: Arc::new(Mutex::new(HashMap::new())),
             processing: Arc::new(Mutex::new(())),
+            next_turn: Arc::new(AtomicU64::new(0)),
+            turn_advanced: Arc::new(Notify::new()),
+            next_ticket: Arc::new(AtomicU64::new(0)),
+            inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_CONNECTIONS)),
+            pending_handoff: Arc::new(std::sync::Mutex::new(PendingHandoff::default())),
             home_id: Arc::from(format!("test-home-{}", Uuid::new_v4()).as_str()),
             trust: Arc::new(None),
             policy: Arc::new(RwLock::new(PolicyCacheSnapshot::empty())),
