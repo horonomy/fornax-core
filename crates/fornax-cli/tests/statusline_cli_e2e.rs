@@ -373,6 +373,59 @@ fn no_identity_on_stdin_means_no_guessed_session_is_ever_sent_to_the_daemon() {
     }
 }
 
+/// HORO-1604 matrix item 14 ("provider malformed/missing identity"), at the
+/// real-process layer. `parse_identity_document`'s own unit tests already
+/// prove malformed bytes parse to `None`; this proves the *process*
+/// survives that outcome the same way it survives no stdin at all -- exits
+/// zero, writes nothing to stderr, sends no guessed `session=` to the
+/// daemon -- rather than panicking on a read that produced bytes but no
+/// usable document.
+#[test]
+fn malformed_identity_on_stdin_is_treated_as_no_identity_by_the_real_process() {
+    let home = temp_home("malformed-identity");
+    let session_id = format!("claude-sess-{}", Uuid::new_v4());
+    let (port, seen_requests) = spawn_stub_daemon(&home, &session_id);
+
+    for garbage in [
+        &b"{ not json"[..],
+        br#"{"identity_stdin_version": 1}"#, // missing provider_session_id
+        br#"{"identity_stdin_version": 999, "provider_session_id": "x"}"#, // wrong version
+        b"\x00\x01\xff\xfe not even utf8 \xff",
+    ] {
+        for subcommand in ["provider", "explain"] {
+            let run = run_with_stdin(subcommand, &home, port, garbage);
+            assert!(
+                run.status.success(),
+                "{subcommand} must not fail on malformed stdin, got exit {:?}",
+                run.status.code()
+            );
+            assert_eq!(
+                run.stderr, "",
+                "{subcommand} wrote to stderr for malformed stdin: {}",
+                run.stderr
+            );
+        }
+    }
+
+    let requests = seen_requests.lock().unwrap();
+    let status_requests: Vec<&String> = requests
+        .iter()
+        .filter(|r| r.contains("/api/status"))
+        .collect();
+    assert_eq!(
+        status_requests.len(),
+        8,
+        "expected one /api/status request per (garbage, subcommand) pair, saw: {requests:?}"
+    );
+    for request_line in status_requests {
+        assert!(
+            !request_line.contains("session="),
+            "malformed stdin must resolve to host scope, never a guessed/partial session id \
+             sent to the daemon: {request_line}"
+        );
+    }
+}
+
 #[test]
 fn a_real_session_id_piped_on_stdin_never_reaches_stdout_or_stderr() {
     let home = temp_home("identity-no-leak");
