@@ -146,6 +146,7 @@ pub const KNOWN_RECORD_TABLES: &[&str] = &[
     "adjudication_reviews",
     "acquisition_log",
     "review_feedback",
+    "ingest_quarantine",
 ];
 
 /// Explicit retention duration for a [`RetentionClass`] (FORNX-106 AC1). See
@@ -177,7 +178,9 @@ pub fn retention_duration_for(class: &RetentionClass) -> Duration {
 /// it forever.
 pub fn retention_class_for_table(record_table: &str) -> RetentionClass {
     match record_table {
-        "agent_events" | "claims" | "evidence" | "acquisition_log" => RetentionClass::RawLocal,
+        "agent_events" | "claims" | "evidence" | "acquisition_log" | "ingest_quarantine" => {
+            RetentionClass::RawLocal
+        }
         "findings" => RetentionClass::DerivedFinding,
         "corpus_candidates"
         | "adjudication_queue"
@@ -446,6 +449,22 @@ impl Store {
                 }
                 "review_feedback" => {
                     sqlx::query("DELETE FROM review_feedback WHERE id = ?1")
+                        .bind(&record.record_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    true
+                }
+                // In practice never reached: `record_quarantine` tags every
+                // row with a unique per-row tenant marker (see
+                // `quarantine.rs`), so no real tenant's erasure request can
+                // match one — a quarantined line has no attributable
+                // tenant, by construction. The arm exists so this table
+                // participates in the same literal-match-arm contract as
+                // every other `KNOWN_RECORD_TABLES` entry (enforced by
+                // `known_record_tables_matches_delete_records_for_tenants_match_arms`),
+                // not because real erasure traffic is expected to hit it.
+                "ingest_quarantine" => {
+                    sqlx::query("DELETE FROM ingest_quarantine WHERE id = ?1")
                         .bind(&record.record_id)
                         .execute(&mut *tx)
                         .await?;
@@ -722,6 +741,13 @@ impl Store {
                         .await?;
                     report.deleted_records += 1;
                 }
+                "ingest_quarantine" => {
+                    sqlx::query("DELETE FROM ingest_quarantine WHERE id = ?1")
+                        .bind(&record.record_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    report.deleted_records += 1;
+                }
                 _ => {
                     report.unknown_table_skipped += 1;
                 }
@@ -943,6 +969,7 @@ mod tests {
             "adjudication_reviews",
             "acquisition_log",
             "review_feedback",
+            "ingest_quarantine",
         ];
         assert_eq!(KNOWN_RECORD_TABLES, &match_arm_tables);
     }
@@ -1297,6 +1324,52 @@ mod tests {
                 .await
                 .expect("count remaining candidate rows");
         assert_eq!(count, 0, "the expired candidate row must be hard-deleted");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// FORNX-212 gap closure: before `record_quarantine` wrote a
+    /// `dataset_lineage_tags` row, a quarantined ingest line (raw,
+    /// unvalidated input, potentially containing a malformed copy of real
+    /// evidence) was retained forever — the sweep had no way to find it.
+    #[tokio::test]
+    async fn sweep_hard_deletes_an_expired_quarantine_row() {
+        let path = tmp_db_path("sweep-quarantine");
+        let store = Store::open(&path).await.expect("open db");
+
+        let id = store
+            .record_quarantine(
+                "not valid json at all",
+                "parse error: expected value",
+                crate::quarantine::QuarantineReason::ParseError,
+            )
+            .await
+            .expect("record quarantine");
+
+        let backdated = (Utc::now()
+            - chrono::Duration::from_std(RAW_LOCAL_RETENTION).unwrap()
+            - chrono::Duration::days(1))
+        .to_rfc3339();
+        sqlx::query(
+            "UPDATE dataset_lineage_tags SET recorded_at = ?1 WHERE record_table = 'ingest_quarantine' AND record_id = ?2",
+        )
+        .bind(&backdated)
+        .bind(&id)
+        .execute(&store.pool)
+        .await
+        .expect("backdate quarantine lineage tag");
+
+        let report = store
+            .sweep_expired_records(Utc::now(), None, 100)
+            .await
+            .expect("sweep");
+        assert_eq!(report.deleted_records, 1);
+
+        let remaining = store.quarantine_count().await.expect("count quarantine");
+        assert_eq!(
+            remaining, 0,
+            "an expired quarantine row must actually be swept, not retained forever"
+        );
 
         std::fs::remove_file(&path).ok();
     }
