@@ -183,7 +183,7 @@ struct AppState {
     /// verdict to `Review` whenever this session (or an unknown one) has a
     /// handoff in flight, rather than binding confidently to
     /// currently-visible evidence that might not yet be complete.
-    pending_handoff: Arc<Mutex<PendingHandoff>>,
+    pending_handoff: Arc<std::sync::Mutex<PendingHandoff>>,
     /// FORNX-339: this daemon's `$FORNAX_HOME` identity, sent as a response
     /// header on every HTTP reply so a client can prove it's talking to the
     /// daemon serving its own home rather than a different one that won the
@@ -427,7 +427,7 @@ async fn main() -> anyhow::Result<()> {
         turn_advanced: Arc::new(Notify::new()),
         next_ticket: Arc::new(AtomicU64::new(0)),
         inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_CONNECTIONS)),
-        pending_handoff: Arc::new(Mutex::new(PendingHandoff::default())),
+        pending_handoff: Arc::new(std::sync::Mutex::new(PendingHandoff::default())),
         home_id: Arc::from(home_identity(&home).as_str()),
         trust: Arc::new(trusted),
         policy: Arc::new(RwLock::new(policy_snapshot)),
@@ -674,6 +674,21 @@ async fn handle_connection_in_turn(
     wait_for_turn(&state, ticket).await;
     let guard = TurnGuard::new(&state);
     let outcome = drain_in_order(stream, state.clone()).await;
+    // HORO-1712 (second post-review fix): register the handoff *before*
+    // relinquishing the turn, not after -- a second independent adversarial
+    // review caught that registering afterward left a real TOCTOU window:
+    // `drop(guard)` lets a later ticket's Claim proceed immediately, but
+    // `register_pending_handoff`'s own `.await` to acquire the lock had not
+    // necessarily completed yet, so a Claim racing in during exactly that
+    // scheduling gap would see no pending handoff at all and could still
+    // bind to stale evidence -- the identical bug the pending-handoff
+    // tracking exists to close, just narrowed to one `.await` instead of
+    // the whole drain budget. Registering first closes it: the marker is
+    // visible before the turn is released, full stop.
+    let handoff_guard = match &outcome {
+        Ok(Drain::Handoff(_, session_hint)) => Some(HandoffGuard::register(&state, session_hint)),
+        _ => None,
+    };
     // Relinquish the turn *before* continuing independently (the `Handoff`
     // case): a long-lived connection must never hold up every connection
     // accepted after it just because it is still open.
@@ -681,14 +696,13 @@ async fn handle_connection_in_turn(
     match outcome {
         Ok(Drain::Eof) => Ok(()),
         Ok(Drain::Handoff(lines, session_hint)) => {
-            // HORO-1712 (post-review fix): this connection's turn is about
-            // to be relinquished (already was, by `drop(guard)` above)
-            // before its remaining evidence is written -- mark it as an
-            // in-flight handoff so a Claim evaluated in that window is
-            // downgraded rather than bound to possibly-stale evidence. See
-            // `AppState::pending_handoff`'s doc comment for why.
-            let token = register_pending_handoff(&state, &session_hint).await;
-            continue_connection(lines, session_hint, state, token).await
+            continue_connection(
+                lines,
+                session_hint,
+                state,
+                handoff_guard.expect("registered above whenever outcome is Handoff"),
+            )
+            .await
         }
         Err(e) => Err(e),
     }
@@ -736,6 +750,10 @@ impl Drop for TurnGuard {
 }
 
 /// Backing state for `AppState::pending_handoff` -- see its doc comment.
+/// Guarded by a synchronous `std::sync::Mutex`, not `tokio::sync::Mutex`,
+/// specifically so [`HandoffGuard`]'s `Drop` impl can clear it
+/// unconditionally, including mid-panic-unwind -- an async mutex cannot be
+/// locked from `Drop`.
 #[derive(Default)]
 struct PendingHandoff {
     sessions: HashSet<String>,
@@ -748,59 +766,100 @@ struct PendingHandoff {
     unknown: usize,
 }
 
-/// Which bucket of `PendingHandoff` a given handoff was registered into --
-/// returned by `register_pending_handoff` and consumed by exactly one
-/// matching `clear_pending_handoff` call so the two always agree on which
-/// counter/entry to adjust, even though `session_hint` can become known
-/// between registration and the first post-handoff line.
-enum PendingHandoffToken {
+/// Which bucket of `PendingHandoff` a [`HandoffGuard`] is holding a
+/// reservation in.
+enum HandoffToken {
     Session(String),
     Unknown,
 }
 
-/// Marks a handoff as in flight, using whatever `session_hint` is known at
-/// the moment the turn is relinquished (may be `None` if the drain phase
-/// never processed a line that reveals it).
-async fn register_pending_handoff(
-    state: &AppState,
-    session_hint: &Option<String>,
-) -> PendingHandoffToken {
-    let mut pending = state.pending_handoff.lock().await;
-    match session_hint {
-        Some(sid) => {
-            pending.sessions.insert(sid.clone());
-            PendingHandoffToken::Session(sid.clone())
-        }
-        None => {
-            pending.unknown += 1;
-            PendingHandoffToken::Unknown
+/// RAII marker for one handed-off connection's "evidence may still be
+/// incomplete" window. `register` marks the handoff in flight immediately
+/// (before the caller relinquishes its turnstile turn -- see
+/// `handle_connection_in_turn`); `Drop` clears it.
+///
+/// Deliberately held for the connection's *entire* remaining lifetime
+/// (moved into `continue_connection` and dropped only when that returns or
+/// panics), not cleared after just the first post-handoff line: a second
+/// independent adversarial review caught that an earlier draft cleared on
+/// the first line/EOF resolution, which is only correct if that first line
+/// *is* the evidence a pending Claim needs. A long-lived connection (a
+/// Codex rollout tailer, an opencode bridge) can keep sending lines
+/// indefinitely, and any later one could just as easily be the evidence in
+/// question -- clearing early would silently reopen the exact stale-
+/// evidence race this type exists to close, for every line after the
+/// first. Holding it for the whole connection is more conservative (claims
+/// for this session stay `Review` for as long as the connection is open,
+/// not just for one beat) but that is the honest state: evidence for this
+/// session genuinely could still be incomplete at any point while it's
+/// connected.
+struct HandoffGuard {
+    pending: Arc<std::sync::Mutex<PendingHandoff>>,
+    token: HandoffToken,
+}
+
+impl HandoffGuard {
+    /// Marks a handoff as in flight, using whatever `session_hint` is known
+    /// at the moment the turn is about to be relinquished (may be `None` if
+    /// the drain phase never processed a line that reveals it).
+    fn register(state: &AppState, session_hint: &Option<String>) -> Self {
+        let mut pending = lock_pending_handoff(&state.pending_handoff);
+        let token = match session_hint {
+            Some(sid) => {
+                pending.sessions.insert(sid.clone());
+                HandoffToken::Session(sid.clone())
+            }
+            None => {
+                pending.unknown += 1;
+                HandoffToken::Unknown
+            }
+        };
+        drop(pending);
+        Self {
+            pending: state.pending_handoff.clone(),
+            token,
         }
     }
 }
 
-/// Clears exactly the bucket `register_pending_handoff` returned a token
-/// for. Only removes a session entry if nothing else is currently relying
-/// on it -- not used today (one handoff per session in practice, since a
-/// session's hooks are one-shot connections apart from the single
-/// long-lived bridge), but `HashSet::remove` already degrades safely if it
-/// somehow were: removing an absent entry is a no-op, never a panic.
-async fn clear_pending_handoff(state: &AppState, token: PendingHandoffToken) {
-    let mut pending = state.pending_handoff.lock().await;
-    match token {
-        PendingHandoffToken::Session(sid) => {
-            pending.sessions.remove(&sid);
-        }
-        PendingHandoffToken::Unknown => {
-            pending.unknown = pending.unknown.saturating_sub(1);
+impl Drop for HandoffGuard {
+    fn drop(&mut self) {
+        let mut pending = lock_pending_handoff(&self.pending);
+        match &self.token {
+            // `HashSet::remove` of an absent entry is a no-op, never a
+            // panic, so an unexpected second guard for the same session
+            // (not possible today -- one handoff per session in practice)
+            // would degrade safely rather than corrupt the set.
+            HandoffToken::Session(sid) => {
+                pending.sessions.remove(sid);
+            }
+            HandoffToken::Unknown => {
+                pending.unknown = pending.unknown.saturating_sub(1);
+            }
         }
     }
+}
+
+/// Locks `pending_handoff`, recovering from poisoning rather than
+/// panicking again: a prior panic while *this* lock was held must not
+/// permanently wedge every future handoff/claim in the daemon into
+/// thinking a lock lives here that can never be acquired again. The
+/// recovered guard's data is used as-is (a `HashSet`/counter has no
+/// invariant a partial mutation could violate beyond what `remove`/
+/// `saturating_sub` already tolerate).
+fn lock_pending_handoff(
+    pending: &Arc<std::sync::Mutex<PendingHandoff>>,
+) -> std::sync::MutexGuard<'_, PendingHandoff> {
+    pending
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// True if a Claim for `session_id` might be evaluated against evidence
 /// that is still incomplete -- either this exact session has a handoff in
 /// flight, or some unidentified session does (see `PendingHandoff::unknown`).
-async fn evidence_may_be_incomplete_for(state: &AppState, session_id: &str) -> bool {
-    let pending = state.pending_handoff.lock().await;
+fn evidence_may_be_incomplete_for(state: &AppState, session_id: &str) -> bool {
+    let pending = lock_pending_handoff(&state.pending_handoff);
     pending.unknown > 0 || pending.sessions.contains(session_id)
 }
 
@@ -854,31 +913,22 @@ async fn drain_in_order(stream: UnixStream, state: AppState) -> anyhow::Result<D
 /// reached for a long-lived connection that already proved itself not a
 /// one-shot hook by outliving the drain window.
 ///
-/// `token` marks this handoff as in flight in `AppState::pending_handoff`
-/// (registered by the caller before this runs). It is cleared the instant
-/// the *first* post-handoff line resolves -- whether that's a real line or
-/// EOF -- because that resolution is exactly the boundary at which
-/// "evidence might still be coming from this specific connection" stops
-/// being true: either another line just arrived (and was processed,
-/// extending completeness up to that point) or the connection is now known
-/// to have nothing further to say, ever.
+/// `_handoff` marks this handoff as in flight in `AppState::pending_handoff`
+/// (registered by the caller before the turn was relinquished -- see
+/// `handle_connection_in_turn`). It is held for this entire function's
+/// lifetime and cleared by its own `Drop` on return *or* panic, not after
+/// just the first line -- see [`HandoffGuard`]'s doc comment for why
+/// clearing any earlier would be unsound.
 async fn continue_connection(
     mut lines: IngestLines,
     mut session_hint: Option<String>,
     state: AppState,
-    token: PendingHandoffToken,
+    _handoff: HandoffGuard,
 ) -> anyhow::Result<()> {
-    let mut token = Some(token);
-    loop {
-        let next = lines.next_line().await;
-        if let Some(token) = token.take() {
-            clear_pending_handoff(&state, token).await;
-        }
-        match next? {
-            Some(line) => process_line(&state, &line, &mut session_hint).await,
-            None => return Ok(()),
-        }
+    while let Some(line) = lines.next_line().await? {
+        process_line(&state, &line, &mut session_hint).await;
     }
+    Ok(())
 }
 
 /// Parses and processes one ingest line, warning (never failing the
@@ -1560,7 +1610,7 @@ async fn run_verifiers_and_persist_findings(
     // anyway, and checking here keeps the completeness gate inseparable
     // from verdict computation instead of relying on each new call site to
     // remember to check it.
-    let evidence_may_be_incomplete = evidence_may_be_incomplete_for(state, &claim.session_id).await;
+    let evidence_may_be_incomplete = evidence_may_be_incomplete_for(state, &claim.session_id);
     let verifiers: Vec<Box<dyn Verifier + Send + Sync>> = vec![
         Box::new(TestResultVerifier),
         Box::new(CommandExecutedVerifier),
@@ -2894,7 +2944,7 @@ mod tests {
             turn_advanced: Arc::new(Notify::new()),
             next_ticket: Arc::new(AtomicU64::new(0)),
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_CONNECTIONS)),
-            pending_handoff: Arc::new(Mutex::new(PendingHandoff::default())),
+            pending_handoff: Arc::new(std::sync::Mutex::new(PendingHandoff::default())),
             home_id: Arc::from(format!("test-home-{}", Uuid::new_v4()).as_str()),
             trust: Arc::new(None),
             policy: Arc::new(RwLock::new(PolicyCacheSnapshot::empty())),
@@ -4931,7 +4981,7 @@ mod tests {
             turn_advanced: Arc::new(Notify::new()),
             next_ticket: Arc::new(AtomicU64::new(0)),
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_CONNECTIONS)),
-            pending_handoff: Arc::new(Mutex::new(PendingHandoff::default())),
+            pending_handoff: Arc::new(std::sync::Mutex::new(PendingHandoff::default())),
             home_id: Arc::from(format!("test-home-{}", Uuid::new_v4()).as_str()),
             trust: Arc::new(None),
             policy: Arc::new(RwLock::new(PolicyCacheSnapshot::empty())),
@@ -5163,7 +5213,7 @@ mod tests {
             turn_advanced: Arc::new(Notify::new()),
             next_ticket: Arc::new(AtomicU64::new(0)),
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_CONNECTIONS)),
-            pending_handoff: Arc::new(Mutex::new(PendingHandoff::default())),
+            pending_handoff: Arc::new(std::sync::Mutex::new(PendingHandoff::default())),
             home_id: Arc::from(format!("test-home-{}", Uuid::new_v4()).as_str()),
             trust: Arc::new(None),
             policy: Arc::new(RwLock::new(PolicyCacheSnapshot::empty())),
