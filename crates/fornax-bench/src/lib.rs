@@ -56,6 +56,10 @@
 //!   Mechanism-verification only, over synthetic tenant data — see that
 //!   module's docs and `docs/research/federated-calibration-decision-record.md`
 //!   for this ticket's actual conclusion (narrow/defer for v0.3.0).
+//! - [`independence_capacity`] — FORNX-432 PR 1: wall-time/correctness
+//!   capacity benchmark for `fornax_verify::independence::SourceFamilyMap`
+//!   over frozen synthetic fanout/chain/DAG fixtures. Measurement only —
+//!   makes no change to `fornax-verify`'s production behavior.
 
 pub mod ablation;
 pub mod adversarial;
@@ -64,6 +68,7 @@ pub mod dataset;
 pub mod federated_calibration;
 pub mod gate;
 pub mod harness;
+pub mod independence_capacity;
 pub mod manifest;
 pub mod metrics;
 pub mod qualifying;
