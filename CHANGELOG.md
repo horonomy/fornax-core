@@ -62,6 +62,23 @@ Jira epic FORNX-20.
   to configuration and host-adapter registrations alike -- there is no
   special case for either kind.
 
+### Fixed
+
+- **Heuristic `exit_code=0` could reach `Verified` for a `test_result`
+  claim** (FORNX-442, found during FORNX-433's native-ingress testing).
+  `TestResultVerifier`/`CommandSuccessVerifier` treated any `exit_code=0`
+  evidence as `Verified`, including a heuristic inference from "stderr is
+  empty" (`fornax-adapter-claude`'s `ClaudeBashExitCodeSensor`; Codex's
+  default `tools.exec_command`/`unified_exec` "Script completed"
+  fallback). A real `pytest`/`cargo test`/etc. failure writes its summary
+  to stdout, not stderr, so this heuristic fired identically on a genuine
+  failure — a false "tests passed" claim against a real failure reached
+  `Verified`. Fix is safety-monotonic: a heuristic `exit_code=0` now
+  downgrades to `Review`, never `Verified`; every authoritative (literal)
+  exit-code path is unaffected. Consequence: in their default
+  configurations, neither Claude Code nor Codex can currently produce an
+  authoritative `Verified` `test_result` finding — tracked as FORNX-443.
+
 ### Removed
 
 Intentional breaking cleanup during DogFooding (FORNX-428 S3), before any
