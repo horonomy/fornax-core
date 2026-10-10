@@ -6522,12 +6522,15 @@ mod tests {
             match trust_class {
                 TrustClass::HostObserved => Some("claude_file_write_confirmed_sensor_v1"),
                 TrustClass::AgentAdjacent => Some("claude_bash_exit_code_sensor_v1"),
-                // No sensor is registered for these yet -- see the
-                // deployment_healthy/security_defect_fixed fixtures below,
-                // which assert the real (not fabricated) consequence of
-                // that gap rather than assuming a sensor exists.
-                TrustClass::IndependentExternal
-                | TrustClass::HumanReviewed
+                // fornax-ci's GitHubCiStatusSensor (crates/fornax-ci) --
+                // initially missed from known_sensors() too (fixed
+                // alongside this test, see provenance_guard.rs).
+                TrustClass::IndependentExternal => Some("github_ci_status_sensor_v1"),
+                // No sensor is registered for this trust class yet -- see
+                // the security_defect_fixed fixture below, which asserts
+                // the real (not fabricated) consequence of that gap rather
+                // than assuming a sensor exists.
+                TrustClass::HumanReviewed
                 | TrustClass::ModelInternal
                 | TrustClass::Unrecognized(_) => None,
             }
@@ -6679,11 +6682,12 @@ mod tests {
         );
 
         // 5. deployment_healthy (must be IndependentExternal, never
-        // agent-adjacent self-report). FORNX-441: no sensor is registered
-        // for TrustClass::IndependentExternal in production yet (see
-        // `real_sensor_for`), so the guarded endpoint correctly cannot
-        // satisfy this today -- same honest-gap reasoning as
-        // security_defect_fixed above, not a weakened assertion.
+        // agent-adjacent self-report). Genuinely satisfied via
+        // fornax-ci's GitHubCiStatusSensor, the real registered
+        // IndependentExternal sensor -- an independent review of this same
+        // fix caught that an earlier version of this test wrongly assumed
+        // no sensor existed for this trust class at all (it did; it was
+        // just missing from known_sensors(), fixed alongside this test).
         let session = "fornx378-deployment-healthy";
         let claim = insert_claim_and_evidence(
             &state,
@@ -6695,11 +6699,10 @@ mod tests {
         )
         .await;
         let v = assess_via_api(state.clone(), &claim, session).await;
-        assert_ne!(
+        assert_eq!(
             v["assessment"]["overall"],
             serde_json::json!("satisfied"),
-            "deployment_healthy must not be satisfied while no sensor is registered for \
-             TrustClass::IndependentExternal: {v}"
+            "deployment_healthy: {v}"
         );
 
         // 6. security_defect_fixed (needs BOTH a regression-test exit code
