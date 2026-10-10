@@ -105,7 +105,20 @@ async fn seed_clean_claim(home: &std::path::Path) -> (String, String) {
             evidence_purged: false,
         };
         evidence.source.as_mut().unwrap().correlation_group = Some(Uuid::new_v4());
-        store.insert_evidence(&evidence).await.unwrap();
+        // FORNX-441: `fornax receipt issue` now reads
+        // `admitted_evidence_for_claim`, which rejects `EvidenceOrigin::
+        // Unknown` (what plain `insert_evidence` stamps). This fixture's
+        // "exit_code_probe" sensor name is illustrative, not a real
+        // registered sensor, and this test is about receipt/gate
+        // behavior, not sensor-trust enforcement -- `DaemonAcquisition`
+        // admits by origin alone, same as a real acquisition-path row.
+        store
+            .insert_evidence_with_origin(
+                &evidence,
+                fornax_types::provenance_guard::EvidenceOrigin::DaemonAcquisition,
+            )
+            .await
+            .unwrap();
 
         store
             .insert_evidence_link(&fornax_types::EvidenceLink {

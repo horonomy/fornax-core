@@ -119,8 +119,15 @@ async fn issue(
     let graph = store
         .evidence_graph_for_claim(&claim.id.to_string(), session_id)
         .await?;
-    let evidence_outcome = store.evidence_for_session(session_id).await?;
-    let full_pool = evidence_outcome.evidence;
+    // FORNX-441: a signed receipt is exactly the surface where admitting
+    // forged, unregistered-sensor, cross-session, or already-replayed
+    // evidence would matter most -- `admitted_evidence_for_claim` is the
+    // same canonical, origin-aware read `compute_fusion` (fornax-daemon)
+    // uses for this claim's fusion input, applied here too so a receipt
+    // can never be issued over evidence that would have been quarantined
+    // on the live verdict path.
+    let admitted_read = store.admitted_evidence_for_claim(&claim).await?;
+    let full_pool = admitted_read.admitted;
 
     let fused = BaselineFusionPolicy.fuse(
         &FusionInput {
