@@ -575,4 +575,130 @@ mod tests {
 
         std::fs::remove_file(&path).ok();
     }
+
+    /// FORNX-441 adversarial matrix: per the independent security review of
+    /// this PR, the new `[QUARANTINED: ...]` rendering branch had zero test
+    /// coverage -- no test ever produced a rejected row and exercised that
+    /// code path. A finding citing both a legitimate (admitted) evidence id
+    /// and a forged (rejected) one must render the forged one as
+    /// `[QUARANTINED: ...]`, not as the pre-existing "NOT FOUND" (which
+    /// would misleadingly imply the row never existed), while the
+    /// legitimate one still renders in full -- the non-vacuity check.
+    #[tokio::test]
+    async fn quarantined_evidence_is_annotated_not_misreported_as_not_found() {
+        use fornax_types::provenance_guard::EvidenceOrigin;
+        use fornax_types::sensor::{CollectionMethod, EvidenceSource};
+        use fornax_types::TrustClass;
+
+        let path = tmp_db_path("quarantine-annotation");
+        let store = Store::open(&path).await.expect("open db");
+
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "s-quarantine".into(),
+            provider: Provider::Codex,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("exec_command".into()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        store.insert_event(&event).await.expect("insert event");
+
+        let control = Evidence {
+            id: Uuid::new_v4(),
+            session_id: "s-quarantine".into(),
+            source_event_id: event.id,
+            kind: EvidenceKind::ExitCode,
+            observed_at: "2026-01-01T00:00:01Z".into(),
+            payload: serde_json::json!({"exit_code": 0}),
+            provenance: "test".into(),
+            source: None,
+            extension: None,
+            evidence_purged: false,
+        };
+        store
+            .insert_evidence_with_origin(&control, EvidenceOrigin::DaemonAcquisition)
+            .await
+            .expect("insert control evidence");
+
+        // `claude_bash_exit_code_sensor_v1` is a real registered sensor,
+        // but only ever authorized for AgentAdjacent -- this forges
+        // HostObserved under that same identity.
+        let forged = Evidence {
+            id: Uuid::new_v4(),
+            session_id: "s-quarantine".into(),
+            source_event_id: event.id,
+            kind: EvidenceKind::ExitCode,
+            observed_at: "2026-01-01T00:00:01Z".into(),
+            payload: serde_json::json!({"exit_code": 0}),
+            provenance: "test".into(),
+            source: Some(EvidenceSource::now(
+                "claude_bash_exit_code_sensor_v1",
+                TrustClass::HostObserved,
+                None,
+                CollectionMethod::default(),
+                None,
+            )),
+            extension: None,
+            evidence_purged: false,
+        };
+        store
+            .insert_evidence_with_origin(&forged, EvidenceOrigin::UdsIngest)
+            .await
+            .expect("insert forged evidence");
+
+        let claim = Claim {
+            id: Uuid::new_v4(),
+            session_id: "s-quarantine".into(),
+            source_event_id: event.id,
+            text: "the command exited successfully".into(),
+            subject: "command_succeeded".into(),
+            claimed_at: "2026-01-01T00:00:02Z".into(),
+        };
+        store.insert_claim(&claim).await.expect("insert claim");
+
+        let finding = Finding {
+            id: Uuid::new_v4(),
+            claim_id: claim.id,
+            verdict: Verdict::Verified,
+            evidence_ids: vec![control.id, forged.id],
+            verifier_name: "CommandExecutedVerifier".into(),
+            rationale: "exit_code == 0".into(),
+            computed_at: "2026-01-01T00:00:03Z".into(),
+        };
+        store
+            .insert_finding(&finding)
+            .await
+            .expect("insert finding");
+
+        let rendered = render_finding_timeline(&store, &finding.id.to_string())
+            .await
+            .expect("render finding timeline");
+        assert!(
+            rendered.contains(&format!("{}: [QUARANTINED:", forged.id)),
+            "the forged row must be annotated QUARANTINED, not NOT FOUND: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("{}: NOT FOUND", forged.id)),
+            "a row that exists but was rejected must never render identically to a genuinely \
+             missing row: {rendered}"
+        );
+        assert!(
+            rendered.contains(&control.id.to_string()) && !rendered.contains("NOT FOUND"),
+            "the control row must still render in full, proving this test cannot pass by \
+             treating every row as missing: {rendered}"
+        );
+
+        let session_rendered = render_session_timeline(&store, "s-quarantine")
+            .await
+            .expect("render session timeline");
+        assert!(
+            session_rendered.contains(&format!("{}: [QUARANTINED:", forged.id)),
+            "the session-wide renderer must annotate the same way: {session_rendered}"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
 }

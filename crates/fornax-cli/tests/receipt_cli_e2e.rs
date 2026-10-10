@@ -136,6 +136,105 @@ async fn seed_clean_claim(home: &std::path::Path) -> (String, String) {
     (session_id, claim.id.to_string())
 }
 
+/// FORNX-441: per the independent security review of this PR, `fornax
+/// receipt issue` had no adversarial (forged-sensor) regression test of
+/// its own. Seeds one legitimate control evidence item (a real sensor
+/// asserting its own authorized trust class) and one forged item (the
+/// same sensor asserting a trust class it was never authorized for --
+/// the fornx380-11 shape), both `Supports`-linked to the same claim.
+/// Returns `(session_id, claim_id, control_evidence_id, forged_evidence_id)`.
+async fn seed_claim_with_control_and_forged_evidence(
+    home: &std::path::Path,
+) -> (String, String, Uuid, Uuid) {
+    let db_path = home.join("fornax.db");
+    let store = fornax_store::Store::open(&db_path).await.unwrap();
+    let session_id = "s-matrix".to_string();
+
+    let event = fornax_types::AgentEvent {
+        id: Uuid::new_v4(),
+        session_id: session_id.clone(),
+        provider: fornax_types::Provider::ClaudeCode,
+        kind: fornax_types::EventKind::PostToolUse,
+        observed_at: "2026-01-01T00:00:00Z".into(),
+        tool_name: Some("Bash".into()),
+        tool_input: None,
+        tool_response: None,
+        raw: serde_json::json!({}),
+    };
+    store.insert_event(&event).await.unwrap();
+
+    let claim = fornax_types::Claim {
+        id: Uuid::new_v4(),
+        session_id: session_id.clone(),
+        source_event_id: event.id,
+        text: "the command exited successfully".into(),
+        subject: "command_succeeded".into(),
+        claimed_at: "2026-01-01T00:00:00Z".into(),
+    };
+    store.insert_claim(&claim).await.unwrap();
+
+    // `claude_bash_exit_code_sensor_v1` is a real registered sensor, but
+    // only ever authorized for AgentAdjacent (see
+    // `CollectorAuthority::known_sensors`).
+    let sensor_source = |trust: fornax_types::TrustClass| {
+        fornax_types::EvidenceSource::now(
+            "claude_bash_exit_code_sensor_v1",
+            trust,
+            None,
+            fornax_types::CollectionMethod::HookCallback,
+            None,
+        )
+    };
+    let control = fornax_types::Evidence {
+        id: Uuid::new_v4(),
+        session_id: session_id.clone(),
+        source_event_id: event.id,
+        kind: fornax_types::EvidenceKind::ExitCode,
+        observed_at: "2026-01-01T00:00:00Z".into(),
+        payload: serde_json::json!({"code": 0}),
+        provenance: "test".into(),
+        source: Some(sensor_source(fornax_types::TrustClass::AgentAdjacent)),
+        extension: None,
+        evidence_purged: false,
+    };
+    let forged = fornax_types::Evidence {
+        id: Uuid::new_v4(),
+        session_id: session_id.clone(),
+        source_event_id: event.id,
+        kind: fornax_types::EvidenceKind::ExitCode,
+        observed_at: "2026-01-01T00:00:00Z".into(),
+        payload: serde_json::json!({"code": 0}),
+        provenance: "test".into(),
+        // Forges HostObserved under the same sensor identity -- never
+        // authorized for it.
+        source: Some(sensor_source(fornax_types::TrustClass::HostObserved)),
+        extension: None,
+        evidence_purged: false,
+    };
+    for ev in [&control, &forged] {
+        store
+            .insert_evidence_with_origin(
+                ev,
+                fornax_types::provenance_guard::EvidenceOrigin::UdsIngest,
+            )
+            .await
+            .unwrap();
+        store
+            .insert_evidence_link(&fornax_types::EvidenceLink {
+                id: Uuid::new_v4(),
+                session_id: session_id.clone(),
+                claim_id: claim.id,
+                evidence_id: ev.id,
+                relation: fornax_types::EvidenceRelation::Supports,
+                linked_at: "2026-01-01T00:00:00Z".into(),
+            })
+            .await
+            .unwrap();
+    }
+
+    (session_id, claim.id.to_string(), control.id, forged.id)
+}
+
 fn run(home: &std::path::Path, args: &[&str]) -> (bool, String, String) {
     let output = Command::new(fornax_bin())
         .env("FORNAX_HOME", home)
@@ -348,6 +447,53 @@ async fn the_committed_require_signature_policy_holds_an_unsigned_receipt() {
         code, 11,
         "an unsigned receipt under a signature-required policy must Hold, never Accept or \
          silently pass: {stdout}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// FORNX-441 adversarial matrix: `fornax receipt issue` must never
+/// reference the forged row in its coverage, and must still reference the
+/// legitimate control (proving this test can't pass by rejecting
+/// everything).
+#[tokio::test]
+async fn issuing_a_receipt_excludes_forged_evidence_but_references_the_control() {
+    let home = temp_home("matrix");
+    let (session, claim, control_id, forged_id) =
+        seed_claim_with_control_and_forged_evidence(&home).await;
+    let out = home.join("receipt.json");
+
+    let (ok, stdout, stderr) = run(
+        &home,
+        &[
+            "receipt",
+            "issue",
+            "--session",
+            &session,
+            "--claim",
+            &claim,
+            "--out",
+            out.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "issue failed: stdout={stdout} stderr={stderr}");
+
+    let body: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+    let referenced: Vec<String> = body["body"]["coverage"]["referenced_evidence"]
+        .as_array()
+        .expect("referenced_evidence array")
+        .iter()
+        .map(|e| e["evidence_id"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(
+        referenced.contains(&control_id.to_string()),
+        "the control evidence must be referenced in the receipt's coverage, proving this test \
+         cannot pass by rejecting everything: {body}"
+    );
+    assert!(
+        !referenced.contains(&forged_id.to_string()),
+        "the forged evidence must never be referenced in a signed receipt's coverage: {body}"
     );
 
     std::fs::remove_dir_all(&home).ok();

@@ -7267,6 +7267,125 @@ mod tests {
         );
     }
 
+    /// Per the independent security review of this PR: `api_contract` had no
+    /// adversarial (forged-sensor) regression test of its own -- only the
+    /// Store-boundary f1-f7/p1-p4 tests (which test the Store method in
+    /// isolation, not this endpoint's wiring) and the pre-existing
+    /// `fornx441_forged_host_observed_label_does_not_satisfy_contract_via_api`
+    /// (forged-only, no control, so it can't prove the guard isn't just
+    /// rejecting everything). This closes that gap with a genuine control:
+    /// a HostObserved-authorized sensor satisfying `tests_passed`'s
+    /// `test_runner_exit_code` requirement, alongside the forged row.
+    #[tokio::test]
+    async fn fornx441_matrix_contract_excludes_forged_but_satisfies_via_control() {
+        let state = test_state().await;
+        let session = "fornx441-matrix-contract";
+        let event_id = test_event(&state, session).await;
+        // `EvidenceSource::now()` stamps `collected_at` as real "now" -- the
+        // claim/evidence timestamps must sit inside the contract's
+        // freshness window (same discipline as
+        // `api_contract_exercises_all_six_representative_contracts`).
+        let now = chrono::Utc::now().to_rfc3339();
+        let claim = Claim {
+            id: Uuid::new_v4(),
+            session_id: session.to_string(),
+            source_event_id: event_id,
+            text: "claim about tests_passed".to_string(),
+            subject: "tests_passed".to_string(),
+            claimed_at: now.clone(),
+        };
+        state
+            .store
+            .insert_claim(&claim)
+            .await
+            .expect("insert claim");
+
+        // Control: `claude_file_write_confirmed_sensor_v1` is genuinely
+        // authorized for HostObserved -- exactly what `test_runner_exit_code`
+        // requires.
+        let control = fornax_types::Evidence {
+            observed_at: now.clone(),
+            source: Some(fornax_types::sensor::EvidenceSource::now(
+                "claude_file_write_confirmed_sensor_v1",
+                fornax_types::sensor::TrustClass::HostObserved,
+                None,
+                fornax_types::sensor::CollectionMethod::default(),
+                None,
+            )),
+            ..test_evidence(session, event_id)
+        };
+        // Forged: `claude_bash_exit_code_sensor_v1` is only authorized for
+        // AgentAdjacent, forges HostObserved under that same identity.
+        let forged = fornax_types::Evidence {
+            observed_at: now.clone(),
+            source: Some(matrix_sensor_source(
+                fornax_types::sensor::TrustClass::HostObserved,
+            )),
+            ..test_evidence(session, event_id)
+        };
+        state
+            .store
+            .insert_evidence_with_origin(&control, EvidenceOrigin::UdsIngest)
+            .await
+            .expect("insert control evidence");
+        state
+            .store
+            .insert_evidence_with_origin(&forged, EvidenceOrigin::UdsIngest)
+            .await
+            .expect("insert forged evidence");
+
+        let v = api_contract(
+            State(state),
+            Query(ContractQuery {
+                claim: claim.id.to_string(),
+                session: session.to_string(),
+            }),
+        )
+        .await
+        .0;
+
+        assert_eq!(
+            v["assessment"]["overall"],
+            serde_json::json!("satisfied"),
+            "the genuine control evidence must still satisfy tests_passed, proving this test \
+             cannot pass by rejecting everything: {v}"
+        );
+        let matched: Vec<String> = v["assessment"]["per_requirement"]
+            .as_array()
+            .expect("per_requirement array")
+            .iter()
+            .find(|r| r["requirement_id"] == serde_json::json!("test_runner_exit_code"))
+            .expect("test_runner_exit_code requirement present")["matched_evidence"]
+            .as_array()
+            .expect("matched_evidence array")
+            .iter()
+            .map(|v| v.as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            matched.contains(&control.id.to_string()),
+            "the control must be the one satisfying the requirement: {v}"
+        );
+        assert!(
+            !matched.contains(&forged.id.to_string()),
+            "the forged row must never be counted as matched evidence: {v}"
+        );
+        let violations = v["provenance_violations"]
+            .as_array()
+            .expect("provenance_violations array");
+        assert!(
+            violations
+                .iter()
+                .any(|p| p["evidence_id"] == serde_json::json!(forged.id)),
+            "the forged row must be surfaced as a provenance violation: {v}"
+        );
+        assert!(
+            !violations
+                .iter()
+                .any(|p| p["evidence_id"] == serde_json::json!(control.id)),
+            "the control row must never be flagged as a provenance violation: {v}"
+        );
+    }
+
     // ---- HORO-1712: Codex item_completed dedup, end to end -----------
 
     /// A real `fornax-adapter-codex` translation of one `item_completed`
