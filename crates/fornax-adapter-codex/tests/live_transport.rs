@@ -200,13 +200,21 @@ fn spawn_daemon(fornax_home: &Path) -> (KillOnDrop, PathBuf) {
 /// Writes `lines` to a fresh rollout JSONL file upfront, then spawns the
 /// real, compiled `fornax-hook-codex` binary pointed at it via `--file`
 /// (same arg real deployments use to override the default
-/// `~/.codex/sessions` discovery) and lets it tail the whole file in one
-/// pass before killing it -- the real binary's own 500ms poll loop, not a
-/// mocked timer.
+/// `~/.codex/sessions` discovery) and lets it tail the whole file -- the
+/// real binary's own 500ms poll loop, not a mocked timer -- until `done`
+/// reports the condition the caller is actually waiting for, then kills it.
+///
+/// A fixed sleep-and-hope here would be both slow and flaky (same
+/// precedent/warning as `fornax-adapter-opencode`'s `live_transport.rs`):
+/// too short under load and the hook gets killed before it finishes
+/// forwarding every line; too long and every test run pays the worst case.
+/// Poll the real condition the test cares about instead, while the hook
+/// process is still alive.
 fn run_hook_codex_over_rollout(
     fornax_home: &Path,
     rollout_path: &Path,
     lines: &[serde_json::Value],
+    mut done: impl FnMut() -> bool,
 ) {
     let mut content = String::new();
     for line in lines {
@@ -224,12 +232,18 @@ fn run_hook_codex_over_rollout(
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn fornax-hook-codex");
-    // The binary's own poll loop wakes every 500ms; give it several cycles
-    // to read, normalize, and forward every line over the socket before
-    // killing it -- this test controls both ends (the rollout file's full
-    // content is written before the binary even starts), so there is
-    // nothing left to tail after the first full pass.
-    std::thread::sleep(Duration::from_millis(1500));
+
+    let start = Instant::now();
+    let timeout = Duration::from_secs(5);
+    while !done() {
+        if start.elapsed() > timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("fornax-hook-codex: condition not met within {timeout:?}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -253,9 +267,17 @@ fn run_case(label: &str, passed: bool, assistant_text: &str) -> (String, fornax_
     };
     lines.push(task_complete_line(assistant_text));
 
-    run_hook_codex_over_rollout(&fornax_home, &rollout_path, &lines);
-
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    run_hook_codex_over_rollout(&fornax_home, &rollout_path, &lines, || {
+        rt.block_on(async {
+            let store = match fornax_store::Store::open(&db_path).await {
+                Ok(s) => s,
+                Err(_) => return false,
+            };
+            matches!(store.evidence_for_session(&session_id).await, Ok(e) if !e.evidence.is_empty())
+        })
+    });
+
     let finding = poll_until(
         Duration::from_secs(5),
         "waiting for the daemon to persist a real Finding for this session",

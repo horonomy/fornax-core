@@ -37,6 +37,36 @@
 //! This closes FORNX-433 AC1's "real authenticated native positive+negative
 //! pair takes end-to-end ingress through verdict and audit" -- no new
 //! native `claude`/API invocation, no new spend.
+//!
+//! # A real finding this test suite surfaced (and fixed) along the way
+//!
+//! An earlier version of this file's negative control used an *unrealistic*
+//! failure shape (`stderr` carrying the failure text). A real `pytest -q`
+//! failure writes its summary to **stdout**, with `stderr` empty -- and with
+//! that realistic shape, `ClaudeBashExitCodeSensor`'s "stderr empty implies
+//! exit_code 0" heuristic fired, and `TestResultVerifier` (pre-fix) returned
+//! `Verified` for a *false* "all tests passed" claim against a genuine
+//! failure. That is exactly the false-VERIFIED path FORNX-433 AC1 exists to
+//! rule out, and it was real production behavior, not a test bug.
+//!
+//! Fixed in `fornax-verify` (not here): `TestResultVerifier`/
+//! `CommandSuccessVerifier` now downgrade any `exit_code=0` evidence whose
+//! `heuristic` flag is `true` to `Review`, never `Verified` -- a heuristic
+//! absence-of-stderr is not proof of success. That is safety-monotonic (it
+//! only removes `Verified` outcomes) and leaves every *authoritative*
+//! exit-code path (a real literal exit code, from any provider) untouched.
+//!
+//! The consequence for the Claude provider specifically: since Claude Code's
+//! real `PostToolUse` `tool_response` never carries a literal exit code at
+//! all (see the module doc above), `TestResultVerifier` can **never** reach
+//! `Verified` for a Claude-derived `test_result` claim today -- only `Review`
+//! at best, or `Unverified`. Both tests below assert against that real
+//! ceiling rather than against a wished-for `Verified`. Giving the Claude
+//! provider an authoritative exit-code signal (so a real positive case can
+//! reach `Verified`) is tracked separately -- see FORNX-146's linked
+//! follow-up ticket -- since it is a materially different question
+//! (parsing stdout content vs. gating on provenance, with its own review and
+//! blast radius) from what this PR's test infrastructure is responsible for.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -70,12 +100,20 @@ fn sibling_workspace_bin(name: &str) -> PathBuf {
 /// shape (see module docs), with the command text set to a real
 /// test-runner invocation so the evidence this produces actually matches
 /// `is_test_runner_evidence` and can reach `TestResultVerifier`.
+///
+/// Both the passing and failing shape put their summary text in `stdout`
+/// with `stderr` empty -- that is what a real `pytest -q` run actually does
+/// in both directions; stderr only gets used for interpreter/startup
+/// errors, not test failures. See the module doc's "A real finding..."
+/// section for why this realistic shape (not an unrealistic stderr-based
+/// failure) is the one that matters here.
 fn pytest_post_tool_use_payload(session_id: &str, passed: bool) -> serde_json::Value {
-    let (stdout, stderr) = if passed {
-        ("1 passed in 0.02s\n", "")
+    let stdout = if passed {
+        "....                                                                     [100%]\n1 passed in 0.02s\n"
     } else {
-        ("", "1 failed in 0.02s\n")
+        "F                                                                        [100%]\n=== FAILURES ===\n1 failed in 0.02s\n"
     };
+    let stderr = "";
     serde_json::json!({
         "hook_event_name": "PostToolUse",
         "session_id": session_id,
@@ -288,7 +326,15 @@ fn run_case(
 }
 
 #[test]
-fn real_claude_bash_success_fixture_reaches_a_verified_finding_end_to_end() {
+fn real_claude_bash_success_fixture_never_falsely_reaches_verified_end_to_end() {
+    // AC1's positive case, against the real ceiling: Claude Code's genuine
+    // PostToolUse shape carries no literal exit code (see module docs), so
+    // even a true "tests passed" claim backed by a real passing pytest run
+    // can only reach Review today, never Verified -- a heuristic exit_code=0
+    // is not proof. The thing this test actually proves end-to-end is that
+    // the real ingest path produces *some* Finding citing real evidence, and
+    // that the fix (`fornax-verify`'s heuristic downgrade) does not also
+    // suppress the legitimate non-adversarial case into Unverified.
     let finding = run_case(
         "positive",
         true,
@@ -296,9 +342,9 @@ fn real_claude_bash_success_fixture_reaches_a_verified_finding_end_to_end() {
         "all tests passed",
     );
     assert_eq!(
-        finding.verdict, "verified",
-        "a genuine exit-code-0 PostToolUse plus a matching Stop claim must reach Verified \
-         through the real daemon, got verdict={} evidence_ids={}",
+        finding.verdict, "review",
+        "a heuristic exit_code=0 (Claude Code's tool_response carries no real exit code) \
+         must land on Review, not Verified and not Unverified, got verdict={} evidence_ids={}",
         finding.verdict, finding.evidence_ids
     );
     let evidence_ids: Vec<uuid::Uuid> =
@@ -310,13 +356,17 @@ fn real_claude_bash_success_fixture_reaches_a_verified_finding_end_to_end() {
 }
 
 #[test]
-fn real_claude_bash_failure_fixture_contradicts_a_false_success_claim_end_to_end() {
-    // The adversarial negative control (FORNX-433 AC1): a real captured-shape
-    // pytest failure (non-empty stderr, heuristic exit_code 1) plus an
-    // assistant transcript that *falsely* claims success -- exactly the
-    // "no fabricated session attribution" shape AC1 asks for. A verdict of
-    // anything other than Contradicted/Review here would mean the real
-    // ingest path accepted a false claim against real contrary evidence.
+fn real_claude_bash_failure_fixture_never_falsely_reaches_verified_end_to_end() {
+    // The adversarial negative control (FORNX-433 AC1), using the *realistic*
+    // shape (see module doc's "A real finding..." section): a genuine
+    // `pytest -q` failure writes its summary to stdout with stderr empty --
+    // the exact shape the independent review of this PR's earlier revision
+    // demonstrated was being hit by `ClaudeBashExitCodeSensor`'s stderr-empty
+    // heuristic, which (pre-fix) produced a false Verified here. Post-fix,
+    // this and the "positive" case above land on the *same* Review verdict,
+    // because Claude's tool_response genuinely cannot distinguish them --
+    // the one invariant this test exists to prove is that the false claim
+    // never reaches Verified.
     let finding = run_case(
         "negative",
         false,
@@ -325,15 +375,14 @@ fn real_claude_bash_failure_fixture_contradicts_a_false_success_claim_end_to_end
     );
     assert_ne!(
         finding.verdict, "verified",
-        "a false success claim against a real captured failure must never reach Verified, \
+        "a false success claim against a real pytest failure must never reach Verified, \
          got verdict={} evidence_ids={}",
         finding.verdict, finding.evidence_ids
     );
-    assert!(
-        finding.verdict == "contradicted" || finding.verdict == "review",
-        "expected Contradicted or Review for a false claim against real failure evidence, \
-         got verdict={} evidence_ids={}",
-        finding.verdict,
-        finding.evidence_ids
+    assert_eq!(
+        finding.verdict, "review",
+        "expected Review (heuristic exit_code=0, cannot be confirmed as success or failure \
+         from this evidence alone), got verdict={} evidence_ids={}",
+        finding.verdict, finding.evidence_ids
     );
 }
