@@ -328,11 +328,12 @@ fn real_codex_shell_command_failure_contradicts_a_false_success_claim_end_to_end
          got verdict={} evidence_ids={}",
         finding.verdict, finding.evidence_ids
     );
-    assert!(
-        finding.verdict == "contradicted" || finding.verdict == "review",
-        "expected Contradicted or Review for a false claim against real failure evidence, \
-         got verdict={} evidence_ids={}",
-        finding.verdict,
-        finding.evidence_ids
+    assert_eq!(
+        finding.verdict, "contradicted",
+        "this fixture carries a literal, non-heuristic exit_code=1 (FORNX-16's real \
+         tools.shell_command capture), so the verdict is deterministically Contradicted, \
+         not merely Review -- a fallback to Review here would mean the adapter silently \
+         stopped parsing the literal exit code, got verdict={} evidence_ids={}",
+        finding.verdict, finding.evidence_ids
     );
 }

@@ -34,9 +34,16 @@
 //! test, since Claude Code's own Claim-bearing hook is `Stop` with a
 //! `transcript_path`, not a second `PostToolUse` variant.
 //!
-//! This closes FORNX-433 AC1's "real authenticated native positive+negative
-//! pair takes end-to-end ingress through verdict and audit" -- no new
-//! native `claude`/API invocation, no new spend.
+//! This file proves FORNX-433 AC1's negative half for the Claude provider --
+//! "a false claim against real contrary evidence never reaches Verified" --
+//! end-to-end through the real daemon. It does NOT prove the positive half
+//! (a genuine success claim reaching `Verified`) for Claude specifically:
+//! see the "real finding" section below for why that is a real ceiling of
+//! Claude Code's own tool_response shape, not a gap in this test. The
+//! differential Verified-vs-Contradicted pair AC1 asks for is proven by the
+//! sibling `fornax-adapter-codex` `live_transport.rs`, whose `tools.shell_command`
+//! shape does carry a literal, authoritative exit code. No new native
+//! `claude`/API invocation, no new spend.
 //!
 //! # A real finding this test suite surfaced (and fixed) along the way
 //!
@@ -353,6 +360,17 @@ fn real_claude_bash_success_fixture_never_falsely_reaches_verified_end_to_end() 
         !evidence_ids.is_empty(),
         "the finding must actually cite the real evidence the fixture produced"
     );
+    assert_eq!(
+        finding.verifier_name, "test_result_verifier_v1",
+        "the Review must come from TestResultVerifier's heuristic-exit-code-0 downgrade, \
+         not some other verifier reaching Review for an unrelated reason, got verifier_name={}",
+        finding.verifier_name
+    );
+    assert!(
+        finding.rationale.contains("heuristic"),
+        "the rationale must name the heuristic exit_code=0 as the reason, got rationale={}",
+        finding.rationale
+    );
 }
 
 #[test]
@@ -384,5 +402,16 @@ fn real_claude_bash_failure_fixture_never_falsely_reaches_verified_end_to_end() 
         "expected Review (heuristic exit_code=0, cannot be confirmed as success or failure \
          from this evidence alone), got verdict={} evidence_ids={}",
         finding.verdict, finding.evidence_ids
+    );
+    assert_eq!(
+        finding.verifier_name, "test_result_verifier_v1",
+        "the Review must come from TestResultVerifier's heuristic-exit-code-0 downgrade, \
+         not some other verifier reaching Review for an unrelated reason, got verifier_name={}",
+        finding.verifier_name
+    );
+    assert!(
+        finding.rationale.contains("heuristic"),
+        "the rationale must name the heuristic exit_code=0 as the reason, got rationale={}",
+        finding.rationale
     );
 }
