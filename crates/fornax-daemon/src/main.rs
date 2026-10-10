@@ -1589,9 +1589,15 @@ async fn api_evidence_graph(
         Ok(graph) => {
             // FORNX-347: build the source-family map over the FULL session
             // evidence pool (ancestry/event-union can run through evidence
-            // not directly linked to this claim), same
-            // Store::evidence_for_session call `compute_fusion` already
-            // uses -- no new store method. Only families containing at
+            // not directly linked to this claim) -- session-scoped, not
+            // claim-scoped, so `admitted_evidence_for_session` is the right
+            // read here (FORNX-441): it applies the same origin/sensor-trust
+            // admission rule `admitted_evidence_for_claim` does, just
+            // without the cross-claim replay exclusion, which would be the
+            // wrong semantics for a diagnostic that is deliberately not
+            // scoped to one claim's own citations. A forged or unregistered
+            // sensor's row must not be allowed to poison this family/
+            // independence analysis either. Only families containing at
             // least one evidence id linked on THIS claim are surfaced, so
             // the response never leaks unrelated session families.
             // FORNX-432 PR 3 (AC2/AC3): bounded, and the build itself runs
@@ -1602,11 +1608,12 @@ async fn api_evidence_graph(
             let (family_map, independence_status): (
                 Option<fornax_verify::independence::SourceFamilyMap>,
                 Option<serde_json::Value>,
-            ) = match state.store.evidence_for_session(&q.session).await {
+            ) = match state.store.admitted_evidence_for_session(&q.session).await {
                 Ok(read) => {
+                    let admitted = read.admitted;
                     let build_result = tokio::task::spawn_blocking(move || {
                         fornax_verify::independence::SourceFamilyMap::try_build(
-                            &read.evidence,
+                            &admitted,
                             &fornax_verify::independence::FamilyBudget::default_budget(),
                         )
                     })
@@ -1896,6 +1903,47 @@ async fn run_verifiers_and_persist_findings(
 /// fusion logic behind both `/api/fusion` (FORNX-304) and `/api/decision`
 /// (FORNX-96), factored out so neither endpoint duplicates the other's
 /// graph-loading/projection code (FORNX-96 implementation note).
+/// FORNX-441: `AdmissionRejection`/`EvidenceRejection` carry no `Serialize`
+/// impl (`fornax-types` has no serde dependency on this enum) -- every
+/// JSON-returning endpoint that surfaces `FusionFound::rejected` goes
+/// through this one mapping so the shape stays consistent across
+/// `/api/fusion`, `/api/decision`, `/api/judge`, `/api/evidence-plan`, and
+/// `/api/contract`.
+fn rejected_evidence_to_json(
+    rejected: &[fornax_types::provenance_guard::EvidenceRejection],
+) -> serde_json::Value {
+    use fornax_types::provenance_guard::AdmissionRejection;
+    serde_json::Value::Array(
+        rejected
+            .iter()
+            .map(|r| {
+                let reason = match &r.reason {
+                    AdmissionRejection::Provenance { reason } => serde_json::json!({
+                        "kind": "provenance",
+                        "reason": reason,
+                    }),
+                    AdmissionRejection::CrossSession {
+                        evidence_session_id,
+                    } => serde_json::json!({
+                        "kind": "cross_session",
+                        "evidence_session_id": evidence_session_id,
+                    }),
+                    AdmissionRejection::ReplayedAcrossClaims {
+                        originally_consumed_by,
+                    } => serde_json::json!({
+                        "kind": "replayed_across_claims",
+                        "originally_consumed_by": originally_consumed_by,
+                    }),
+                };
+                serde_json::json!({
+                    "evidence_id": r.evidence_id,
+                    "reason": reason,
+                })
+            })
+            .collect(),
+    )
+}
+
 enum FusionOutcome {
     /// No claim with this id is on record for this session.
     NotFound { reason: &'static str },
@@ -1921,6 +1969,14 @@ struct FusionFound {
     claim: fornax_types::Claim,
     graph: fornax_types::EvidenceGraph,
     evidence_pool: Vec<fornax_types::Evidence>,
+    /// FORNX-441: evidence rows `admitted_evidence_for_claim` excluded from
+    /// `evidence_pool` -- forged provenance, an unregistered sensor, an
+    /// `Unknown` origin, or an evidence row already durably consumed by a
+    /// different claim from a genuinely different turn. Every
+    /// fusion-derived endpoint (`/api/fusion`, `/api/decision`,
+    /// `/api/judge`, `/api/evidence-plan`) surfaces this so a caller can
+    /// see that the pool was filtered, not just that it was smaller.
+    rejected: Vec<fornax_types::provenance_guard::EvidenceRejection>,
 }
 
 /// FORNX-304 (extended by FORNX-96 to be shared with `/api/decision`):
@@ -1995,8 +2051,15 @@ async fn compute_fusion(state: &AppState, claim_id: &str, session: &str) -> Fusi
         (real_graph, "graph")
     };
 
-    let evidence_read = match state.store.evidence_for_session(session).await {
-        Ok(outcome) => outcome,
+    // FORNX-441: the one canonical, origin-aware admission read -- every
+    // consumer downstream of `compute_fusion` (fusion, decision, judge,
+    // evidence-plan, acquire-evidence's input, reverify's fused_before/
+    // after) now sees the same filtered pool `run_verifiers_and_persist_findings`
+    // already uses, instead of `evidence_for_session`'s raw, unfiltered
+    // rows. Claim-scoped (not session-scoped) so a row already durably
+    // consumed by a genuinely different claim is excluded here too.
+    let admitted_read = match state.store.admitted_evidence_for_claim(&claim).await {
+        Ok(read) => read,
         Err(e) => {
             return FusionOutcome::Error {
                 message: e.to_string(),
@@ -2005,7 +2068,8 @@ async fn compute_fusion(state: &AppState, claim_id: &str, session: &str) -> Fusi
     };
 
     let computed_at = chrono::Utc::now().to_rfc3339();
-    let evidence_pool = evidence_read.evidence;
+    let evidence_pool = admitted_read.admitted;
+    let rejected = admitted_read.rejected;
     // FORNX-432 PR 3 (AC3): `fuse` now builds a `SourceFamilyMap` internally
     // (R5b) which, even bounded by a work budget, can still take real CPU
     // time on an adversarial pool before it aborts -- `spawn_blocking`
@@ -2033,6 +2097,7 @@ async fn compute_fusion(state: &AppState, claim_id: &str, session: &str) -> Fusi
             claim,
             graph,
             evidence_pool,
+            rejected,
         })),
         Err(e) => FusionOutcome::Error {
             message: format!("fusion task panicked: {e}"),
@@ -2060,6 +2125,7 @@ async fn api_fusion(
             "found": true,
             "graph_source": found.graph_source,
             "fused": found.fused,
+            "provenance_rejected": rejected_evidence_to_json(&found.rejected),
         })),
     }
 }
@@ -2143,6 +2209,7 @@ async fn api_decision(
                 "graph_source": found.graph_source,
                 "recommendation": recommendation,
                 "fused": found.fused,
+                "provenance_rejected": rejected_evidence_to_json(&found.rejected),
             }))
         }
     }
@@ -2183,24 +2250,27 @@ async fn api_contract(
         FusionOutcome::Found(found) => {
             let registry = fornax_verify::contract_satisfaction::default_registry();
             let claim_class = ClaimClassId::new(found.claim.subject.clone(), 1);
-            // FORNX-441: this previously called `assess` directly against
-            // `found.evidence_pool`, which is `evidence_for_session`'s raw,
-            // unfiltered contents (see `compute_fusion` above) -- forged
-            // trust-class labels, unregistered sensors, and cross-session
-            // evidence all reached contract satisfaction with no provenance
-            // check at all, exactly the fornx380-01/-11 attack shape. The
-            // guarded entry point already exists and is already proven by
-            // `fornax-verify`'s attack_1..5 tests; this endpoint simply
-            // wasn't calling it.
-            match fornax_verify::contract_satisfaction::assess_with_provenance_guard(
+            // FORNX-441: `found.evidence_pool` is now `compute_fusion`'s own
+            // `admitted_evidence_for_claim` output -- already filtered by
+            // the one canonical, origin-aware admission rule (forged
+            // trust-class labels, unregistered sensors, cross-session rows,
+            // and cross-claim replays all excluded before this endpoint
+            // ever sees them, same fornx380-01/-11 attack shape the
+            // previous `assess_with_provenance_guard` call tried and failed
+            // to close -- that function had no concept of `EvidenceOrigin`,
+            // so it incorrectly rejected legitimate `DaemonAcquisition`/
+            // `PrivilegedExecutor` evidence, which has no `source` by
+            // design). Plain `assess` is now the right call: the guard
+            // already ran upstream, once, for every consumer -- not a
+            // second, endpoint-local guard with its own, narrower rule.
+            match fornax_verify::contract_satisfaction::assess(
                 &registry,
                 &claim_class,
                 &found.claim,
                 &found.evidence_pool,
                 &[],
-                &provenance_guard::CollectorAuthority::known_sensors(),
             ) {
-                Ok((report, provenance_violations)) => Json(serde_json::json!({
+                Ok(report) => Json(serde_json::json!({
                     "claim": q.claim,
                     "session": q.session,
                     "found": true,
@@ -2211,10 +2281,7 @@ async fn api_contract(
                         "shared_with_requirement_id": v.shared_with_requirement_id,
                         "evidence_id": v.evidence_id,
                     })).collect::<Vec<_>>(),
-                    "provenance_violations": provenance_violations.iter().map(|v| serde_json::json!({
-                        "evidence_id": v.evidence_id,
-                        "reason": v.reason,
-                    })).collect::<Vec<_>>(),
+                    "provenance_violations": rejected_evidence_to_json(&found.rejected),
                 })),
                 Err(e) => Json(serde_json::json!({
                     "claim": q.claim,
@@ -2294,6 +2361,7 @@ async fn api_judge(
                 claim,
                 graph,
                 evidence_pool,
+                rejected,
             } = *found;
             let input = JudgeInput::from_claim_and_graph(
                 &claim,
@@ -2350,6 +2418,7 @@ async fn api_judge(
                 "judge": output,
                 "judge_evidence": judge_evidence,
                 "fused": fused,
+                "provenance_rejected": rejected_evidence_to_json(&rejected),
             }))
         }
     }
@@ -2468,6 +2537,7 @@ async fn api_evidence_plan(
                 "recommendation": recommendation,
                 "fused": found.fused,
                 "plan": plan,
+                "provenance_rejected": rejected_evidence_to_json(&found.rejected),
             }))
         }
     }
@@ -4667,7 +4737,7 @@ mod tests {
             .expect("insert claim");
         state
             .store
-            .insert_evidence(&evidence)
+            .insert_evidence_with_origin(&evidence, EvidenceOrigin::DaemonAcquisition)
             .await
             .expect("insert evidence");
         let link = fornax_types::EvidenceLink {
@@ -4772,7 +4842,7 @@ mod tests {
             };
             state
                 .store
-                .insert_evidence(&evidence)
+                .insert_evidence_with_origin(&evidence, EvidenceOrigin::DaemonAcquisition)
                 .await
                 .expect("insert adversarial evidence");
             prior_ids.push(id);
@@ -4790,7 +4860,7 @@ mod tests {
             .expect("insert clean claim");
         state
             .store
-            .insert_evidence(&clean_evidence)
+            .insert_evidence_with_origin(&clean_evidence, EvidenceOrigin::DaemonAcquisition)
             .await
             .expect("insert clean evidence");
         let clean_link = fornax_types::EvidenceLink {
@@ -4887,7 +4957,7 @@ mod tests {
             .expect("insert claim");
         state
             .store
-            .insert_evidence(&evidence)
+            .insert_evidence_with_origin(&evidence, EvidenceOrigin::DaemonAcquisition)
             .await
             .expect("insert evidence");
         let finding = Finding {
@@ -4964,7 +5034,7 @@ mod tests {
             .expect("insert claim");
         state
             .store
-            .insert_evidence(&evidence)
+            .insert_evidence_with_origin(&evidence, EvidenceOrigin::DaemonAcquisition)
             .await
             .expect("insert evidence");
         let link = fornax_types::EvidenceLink {
@@ -5041,7 +5111,7 @@ mod tests {
             .expect("insert claim");
         state
             .store
-            .insert_evidence(&evidence)
+            .insert_evidence_with_origin(&evidence, EvidenceOrigin::DaemonAcquisition)
             .await
             .expect("insert evidence");
         // A Contradicts link: Corroborated+Contradicted blocks under
@@ -5313,7 +5383,7 @@ mod tests {
             .expect("insert claim");
         state
             .store
-            .insert_evidence(&evidence)
+            .insert_evidence_with_origin(&evidence, EvidenceOrigin::DaemonAcquisition)
             .await
             .expect("insert evidence");
         let link = fornax_types::EvidenceLink {
@@ -5373,7 +5443,7 @@ mod tests {
             .expect("insert claim");
         state
             .store
-            .insert_evidence(&evidence)
+            .insert_evidence_with_origin(&evidence, EvidenceOrigin::DaemonAcquisition)
             .await
             .expect("insert evidence");
         let link = fornax_types::EvidenceLink {
@@ -5529,7 +5599,7 @@ mod tests {
         };
         state
             .store
-            .insert_evidence(&file_diff)
+            .insert_evidence_with_origin(&file_diff, EvidenceOrigin::DaemonAcquisition)
             .await
             .expect("insert file diff evidence");
 
@@ -5664,7 +5734,7 @@ mod tests {
             };
             state
                 .store
-                .insert_evidence(&file_diff)
+                .insert_evidence_with_origin(&file_diff, EvidenceOrigin::DaemonAcquisition)
                 .await
                 .expect("insert file diff evidence");
 
@@ -5902,7 +5972,7 @@ mod tests {
             .expect("insert claim");
         state
             .store
-            .insert_evidence(&evidence)
+            .insert_evidence_with_origin(&evidence, EvidenceOrigin::DaemonAcquisition)
             .await
             .expect("insert evidence");
         let link = fornax_types::EvidenceLink {
@@ -6477,14 +6547,17 @@ mod tests {
 
         let state = test_state().await;
 
-        // FORNX-441: `api_contract` now calls `assess_with_provenance_guard`
-        // (previously plain `assess`), which only admits evidence from a
-        // sensor `CollectorAuthority::known_sensors()` actually registers at
-        // the trust class it claims -- "test_sensor" (used throughout this
-        // test before this fix) is not a registered sensor at all, so every
-        // fixture below is updated to a real sensor name matching its trust
-        // class, proving the guard admits genuine evidence rather than
-        // merely proving it rejects nothing.
+        // FORNX-441: `api_contract` reads `compute_fusion`'s own
+        // `admitted_evidence_for_claim` output, which only admits evidence
+        // from a sensor `CollectorAuthority::known_sensors()` actually
+        // registers at the trust class it claims -- "test_sensor" (used
+        // throughout this test before this fix) is not a registered sensor
+        // at all, so every fixture below is updated to a real sensor name
+        // matching its trust class, proving the guard admits genuine
+        // evidence rather than merely proving it rejects nothing. Each
+        // fixture is also stamped `EvidenceOrigin::UdsIngest` (not plain
+        // `insert_evidence`, which reads back `Unknown` and would be
+        // rejected before the sensor-trust check ever runs).
         fn real_sensor_for(trust_class: &TrustClass) -> Option<&'static str> {
             match trust_class {
                 TrustClass::HostObserved => Some("claude_file_write_confirmed_sensor_v1"),
@@ -6545,7 +6618,7 @@ mod tests {
             };
             state
                 .store
-                .insert_evidence(&evidence)
+                .insert_evidence_with_origin(&evidence, EvidenceOrigin::UdsIngest)
                 .await
                 .expect("insert evidence");
             claim
@@ -6713,7 +6786,7 @@ mod tests {
             };
             state
                 .store
-                .insert_evidence(&evidence)
+                .insert_evidence_with_origin(&evidence, EvidenceOrigin::UdsIngest)
                 .await
                 .expect("insert evidence");
         }
@@ -6809,7 +6882,7 @@ mod tests {
         };
         state
             .store
-            .insert_evidence(&forged)
+            .insert_evidence_with_origin(&forged, EvidenceOrigin::UdsIngest)
             .await
             .expect("insert forged evidence");
 
