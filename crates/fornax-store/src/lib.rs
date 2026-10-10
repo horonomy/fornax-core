@@ -15,6 +15,7 @@ use std::str::FromStr;
 pub mod acquisition;
 pub mod adapter_registry;
 pub mod adjudication;
+pub mod admitted_evidence;
 pub mod audit_checkpoint;
 pub mod audit_ledger;
 pub mod calibration;
@@ -998,28 +999,28 @@ pub struct EvidenceReadFailure {
 }
 
 #[derive(sqlx::FromRow)]
-struct EvidenceRow {
-    id: String,
-    session_id: String,
-    source_event_id: String,
-    kind: String,
-    observed_at: String,
-    payload: String,
-    provenance: String,
+pub(crate) struct EvidenceRow {
+    pub(crate) id: String,
+    pub(crate) session_id: String,
+    pub(crate) source_event_id: String,
+    pub(crate) kind: String,
+    pub(crate) observed_at: String,
+    pub(crate) payload: String,
+    pub(crate) provenance: String,
     /// `NULL` for any row written before FORNX-157's 0004 migration, or by
     /// code not yet migrated onto the `EvidenceSensor` contract — reads
     /// back as `Evidence::source == None`, not a fabricated value (see
     /// `migrations/0004_evidence_source.sql`).
-    source: Option<String>,
+    pub(crate) source: Option<String>,
     /// `NULL` for any row with no provider-extension data (the common
     /// case) or written before FORNX-158's 0005 migration — reads back as
     /// `Evidence::extension == None` (see
     /// `migrations/0005_evidence_extension.sql`).
-    extension: Option<String>,
+    pub(crate) extension: Option<String>,
     /// `0` for any row written before FORNX-319's 0010 migration (the
     /// column's `DEFAULT 0`) — reads back as `Evidence::evidence_purged ==
     /// false`, the correct honest default for a row nothing has purged.
-    evidence_purged: bool,
+    pub(crate) evidence_purged: bool,
 }
 
 impl TryFrom<EvidenceRow> for Evidence {

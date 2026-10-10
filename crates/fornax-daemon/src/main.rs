@@ -1181,17 +1181,7 @@ async fn handle_message(
                 .get(&claim.session_id)
                 .cloned()
                 .unwrap_or_else(default_unknown_caps);
-            let evidence_read = state.store.evidence_for_session(&claim.session_id).await?;
-            if !evidence_read.failed.is_empty() {
-                tracing::warn!(
-                    session_id = %claim.session_id,
-                    failed = evidence_read.failed.len(),
-                    total = evidence_read.evidence.len() + evidence_read.failed.len(),
-                    "skipping evidence rows that failed to deserialize"
-                );
-            }
-            let evidence = evidence_read.evidence;
-            run_verifiers_and_persist_findings(state, &claim, &evidence, &caps).await?;
+            run_verifiers_and_persist_findings(state, &claim, &caps).await?;
         }
     }
     Ok(())
@@ -1758,7 +1748,6 @@ fn finding_row_to_finding(row: &fornax_store::FindingRow) -> anyhow::Result<Find
 async fn run_verifiers_and_persist_findings(
     state: &AppState,
     claim: &fornax_types::Claim,
-    evidence: &[fornax_types::Evidence],
     caps: &RuntimeCapabilities,
 ) -> anyhow::Result<()> {
     // HORO-1712 (post-review fix): checked fresh for every call, under the
@@ -1769,49 +1758,56 @@ async fn run_verifiers_and_persist_findings(
     // remember to check it.
     let evidence_may_be_incomplete = evidence_may_be_incomplete_for(state, &claim.session_id);
 
-    // FORNX-431 slice 4: this is the one real choke point every live
-    // verdict passes through (all 3 callers -- Claim ingest, /api/
+    // FORNX-431 slice 4 / FORNX-441: this is the one real choke point every
+    // live verdict passes through (all 3 callers -- Claim ingest, /api/
     // acquire-evidence, /api/reverify -- route through this function) --
     // closing AC1's actual gap: before this, a verifier read every row in
     // `evidence` unconditionally, regardless of how it arrived or whether
-    // its claimed collector/provider is trustworthy. `admission_decision`
-    // (slice 1) is the pure rule; `evidence_origin`/`session_owner`
-    // (slice 2) are what makes it possible to apply against a real row
-    // instead of trusting the payload's own labels. A quarantined row is
-    // dropped from what the verifier sees -- never silently: every
+    // its claimed collector/provider is trustworthy. `admitted_evidence_for_session`
+    // is the one canonical, origin-aware admission read (FORNX-441) every
+    // verdict-bearing consumer now shares -- this function no longer reads
+    // evidence itself at all; the caller no longer needs to. A quarantined
+    // row is dropped from what the verifier sees -- never silently: every
     // rejection is durably recorded via `record_admission_quarantine`
     // (queryable, same `evidence_consumption` table slice 2 introduced),
     // not just logged.
-    let authority = provenance_guard::CollectorAuthority::known_sensors();
-    let owner = state.store.session_owner(&claim.session_id).await?;
     let anchor = provenance_guard::anchor_of(claim);
-
-    let mut admitted_evidence: Vec<fornax_types::Evidence> = Vec::with_capacity(evidence.len());
-    for ev in evidence {
-        let origin = state.store.evidence_origin(ev.id).await?;
-        match provenance_guard::admission_decision(ev, origin, &authority, owner) {
-            provenance_guard::AdmissionVerdict::Admitted => admitted_evidence.push(ev.clone()),
-            provenance_guard::AdmissionVerdict::Quarantined { reason } => {
-                tracing::warn!(
-                    evidence_id = %ev.id,
-                    session_id = %claim.session_id,
-                    reason = %reason,
-                    "evidence refused admission -- excluded from verifier input"
-                );
-                if let Err(e) = state
-                    .store
-                    .record_admission_quarantine(ev.id, claim.id, &anchor, &reason)
-                    .await
-                {
-                    tracing::warn!(
-                        error = %e,
-                        evidence_id = %ev.id,
-                        "failed to durably record evidence admission quarantine"
-                    );
-                }
-            }
+    let admitted_read = state
+        .store
+        .admitted_evidence_for_session(&claim.session_id)
+        .await?;
+    if !admitted_read.failed.is_empty() {
+        tracing::warn!(
+            session_id = %claim.session_id,
+            failed = admitted_read.failed.len(),
+            "skipping evidence rows that failed to deserialize"
+        );
+    }
+    for rejection in &admitted_read.rejected {
+        tracing::warn!(
+            evidence_id = %rejection.evidence_id,
+            session_id = %claim.session_id,
+            reason = ?rejection.reason,
+            "evidence refused admission -- excluded from verifier input"
+        );
+        if let Err(e) = state
+            .store
+            .record_admission_quarantine(
+                rejection.evidence_id,
+                claim.id,
+                &anchor,
+                &format!("{:?}", rejection.reason),
+            )
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                evidence_id = %rejection.evidence_id,
+                "failed to durably record evidence admission quarantine"
+            );
         }
     }
+    let admitted_evidence = admitted_read.admitted;
 
     let verifiers: Vec<Box<dyn Verifier + Send + Sync>> = vec![
         Box::new(TestResultVerifier),
@@ -2654,22 +2650,7 @@ async fn api_acquire_evidence(
             .get(&q.session)
             .cloned()
             .unwrap_or_else(default_unknown_caps);
-        let evidence_after = match state.store.evidence_for_session(&q.session).await {
-            Ok(read) => read.evidence,
-            Err(e) => {
-                return Json(serde_json::json!({
-                    "claim": q.claim,
-                    "session": q.session,
-                    "found": true,
-                    "outcome": outcome_kind,
-                    "error": format!("failed to re-read evidence after acquisition: {e}"),
-                    "fused_before": fused_before,
-                }))
-            }
-        };
-        if let Err(e) =
-            run_verifiers_and_persist_findings(&state, &found.claim, &evidence_after, &caps).await
-        {
+        if let Err(e) = run_verifiers_and_persist_findings(&state, &found.claim, &caps).await {
             return Json(serde_json::json!({
                 "claim": q.claim,
                 "session": q.session,
@@ -2747,19 +2728,6 @@ async fn api_reverify(
     };
     let fused_before = found.fused.clone();
 
-    let evidence = match state.store.evidence_for_session(&q.session).await {
-        Ok(read) => read.evidence,
-        Err(e) => {
-            return Json(serde_json::json!({
-                "claim": q.claim,
-                "session": q.session,
-                "found": true,
-                "error": format!("failed to read evidence: {e}"),
-                "fused_before": fused_before,
-            }))
-        }
-    };
-
     let caps = state
         .caps
         .lock()
@@ -2768,8 +2736,7 @@ async fn api_reverify(
         .cloned()
         .unwrap_or_else(default_unknown_caps);
 
-    if let Err(e) = run_verifiers_and_persist_findings(&state, &found.claim, &evidence, &caps).await
-    {
+    if let Err(e) = run_verifiers_and_persist_findings(&state, &found.claim, &caps).await {
         return Json(serde_json::json!({
             "claim": q.claim,
             "session": q.session,

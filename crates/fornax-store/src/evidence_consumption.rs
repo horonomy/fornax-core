@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 use crate::{insert_lineage_tag_row, retention, Result, Store, StoreError};
 
-fn origin_from_column(raw: Option<String>) -> EvidenceOrigin {
+pub(crate) fn origin_from_column(raw: Option<String>) -> EvidenceOrigin {
     match raw.as_deref() {
         Some("uds_ingest") => EvidenceOrigin::UdsIngest,
         Some("daemon_acquisition") => EvidenceOrigin::DaemonAcquisition,
