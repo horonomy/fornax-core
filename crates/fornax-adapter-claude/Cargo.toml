@@ -30,3 +30,7 @@ uuid.workspace = true
 # Not a new production dependency — `fornax-vcs` (declared above) already
 # carries `gix` in the actual sensor code path.
 gix = { version = "0.88", features = ["max-performance-safe"] }
+# FORNX-433: live_transport.rs polls the real on-disk store the real
+# fornax-daemon it spawns reads/writes, same precedent as
+# fornax-adapter-opencode's live_transport.rs.
+fornax-store = { path = "../fornax-store" }
