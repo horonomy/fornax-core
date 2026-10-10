@@ -65,12 +65,27 @@ pub async fn render_finding_timeline(store: &Store, finding_id: &str) -> anyhow:
         .map_err(|e| anyhow!("finding {finding_id}: corrupt evidence_ids: {e}"))?;
     let wanted: BTreeSet<Uuid> = evidence_ids.iter().copied().collect();
 
-    let outcome = store.evidence_for_session(&finding.session_id).await?;
+    // FORNX-441: switched from the raw `evidence_for_session` to the
+    // canonical admission read. This is a forensic/diagnostic display,
+    // not a verdict computation, so a quarantined row is never silently
+    // dropped the way a verdict-bearing consumer would drop it -- that
+    // would render identically to "NOT FOUND" and mislead an operator into
+    // thinking the row never existed, when it exists but was refused
+    // admission. `quarantined_by_id` lets the render loop below say which
+    // case it actually is.
+    let outcome = store
+        .admitted_evidence_for_session(&finding.session_id)
+        .await?;
+    let quarantined_by_id: std::collections::HashMap<Uuid, String> = outcome
+        .rejected
+        .iter()
+        .map(|r| (r.evidence_id, admission_rejection_to_display(&r.reason)))
+        .collect();
     // Preserve `finding.evidence_ids`' own order (the order the verifier
     // actually consulted them in), not whatever order the session-wide
     // query happens to return.
     let mut evidence_by_id: std::collections::HashMap<Uuid, &fornax_types::Evidence> = outcome
-        .evidence
+        .admitted
         .iter()
         .filter(|e| wanted.contains(&e.id))
         .map(|e| (e.id, e))
@@ -92,10 +107,15 @@ pub async fn render_finding_timeline(store: &Store, finding_id: &str) -> anyhow:
     for id in &evidence_ids {
         match evidence_by_id.remove(id) {
             Some(e) => out.push_str(&render_evidence_line(e)),
-            None => out.push_str(&format!(
-                "    - {id}: NOT FOUND in session {} (referenced by finding but no matching evidence row)\n",
-                finding.session_id
-            )),
+            None => match quarantined_by_id.get(id) {
+                Some(reason) => out.push_str(&format!(
+                    "    - {id}: [QUARANTINED: {reason}] (row exists but was refused admission)\n"
+                )),
+                None => out.push_str(&format!(
+                    "    - {id}: NOT FOUND in session {} (referenced by finding but no matching evidence row)\n",
+                    finding.session_id
+                )),
+            },
         }
     }
 
@@ -124,9 +144,16 @@ pub async fn render_session_timeline(store: &Store, session_id: &str) -> anyhow:
         let evidence_ids: Vec<Uuid> = serde_json::from_str(&finding.evidence_ids)
             .map_err(|e| anyhow!("finding {}: corrupt evidence_ids: {e}", finding.id))?;
         let wanted: BTreeSet<Uuid> = evidence_ids.iter().copied().collect();
-        let outcome = store.evidence_for_session(session_id).await?;
+        // FORNX-441: see `render_finding_timeline`'s doc comment above for
+        // why this quarantines-and-annotates rather than filters.
+        let outcome = store.admitted_evidence_for_session(session_id).await?;
+        let quarantined_by_id: std::collections::HashMap<Uuid, String> = outcome
+            .rejected
+            .iter()
+            .map(|r| (r.evidence_id, admission_rejection_to_display(&r.reason)))
+            .collect();
         let mut evidence_by_id: std::collections::HashMap<Uuid, &fornax_types::Evidence> = outcome
-            .evidence
+            .admitted
             .iter()
             .filter(|e| wanted.contains(&e.id))
             .map(|e| (e.id, e))
@@ -143,9 +170,14 @@ pub async fn render_session_timeline(store: &Store, session_id: &str) -> anyhow:
         for id in &evidence_ids {
             match evidence_by_id.remove(id) {
                 Some(e) => out.push_str(&render_evidence_line(e)),
-                None => out.push_str(&format!(
-                    "    - {id}: NOT FOUND in session {session_id} (referenced by finding but no matching evidence row)\n"
-                )),
+                None => match quarantined_by_id.get(id) {
+                    Some(reason) => out.push_str(&format!(
+                        "    - {id}: [QUARANTINED: {reason}] (row exists but was refused admission)\n"
+                    )),
+                    None => out.push_str(&format!(
+                        "    - {id}: NOT FOUND in session {session_id} (referenced by finding but no matching evidence row)\n"
+                    )),
+                },
             }
         }
     }
@@ -153,6 +185,28 @@ pub async fn render_session_timeline(store: &Store, session_id: &str) -> anyhow:
     out.push_str(&render_policy_state_section(store).await?);
     out.push_str(&render_audit_ledger_section(store).await?);
     Ok(out)
+}
+
+/// Stable display text for an admission rejection (FORNX-441) -- never
+/// `{:?}` on the enum directly, same reasoning as
+/// `fornax-daemon::admission_rejection_to_persisted_reason`: this is
+/// rendered to an operator reading an incident timeline, not a format
+/// `Debug`'s derive output is free to change.
+fn admission_rejection_to_display(
+    reason: &fornax_types::provenance_guard::AdmissionRejection,
+) -> String {
+    use fornax_types::provenance_guard::AdmissionRejection;
+    match reason {
+        AdmissionRejection::Provenance { reason } => reason.clone(),
+        AdmissionRejection::CrossSession {
+            evidence_session_id,
+        } => format!(
+            "cross-session attribution: evidence belongs to session '{evidence_session_id}'"
+        ),
+        AdmissionRejection::ReplayedAcrossClaims {
+            originally_consumed_by,
+        } => format!("already consumed by claim {originally_consumed_by} from a different turn"),
+    }
 }
 
 /// One evidence item's line -- id, kind, provenance string, and (this
@@ -283,7 +337,10 @@ mod tests {
             evidence_purged: false,
         };
         store
-            .insert_evidence(&evidence)
+            .insert_evidence_with_origin(
+                &evidence,
+                fornax_types::provenance_guard::EvidenceOrigin::DaemonAcquisition,
+            )
             .await
             .expect("insert evidence");
 
@@ -515,6 +572,132 @@ mod tests {
             .await
             .expect_err("session with no findings must error");
         assert!(err.to_string().contains("no findings for session"));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// FORNX-441 adversarial matrix: per the independent security review of
+    /// this PR, the new `[QUARANTINED: ...]` rendering branch had zero test
+    /// coverage -- no test ever produced a rejected row and exercised that
+    /// code path. A finding citing both a legitimate (admitted) evidence id
+    /// and a forged (rejected) one must render the forged one as
+    /// `[QUARANTINED: ...]`, not as the pre-existing "NOT FOUND" (which
+    /// would misleadingly imply the row never existed), while the
+    /// legitimate one still renders in full -- the non-vacuity check.
+    #[tokio::test]
+    async fn quarantined_evidence_is_annotated_not_misreported_as_not_found() {
+        use fornax_types::provenance_guard::EvidenceOrigin;
+        use fornax_types::sensor::{CollectionMethod, EvidenceSource};
+        use fornax_types::TrustClass;
+
+        let path = tmp_db_path("quarantine-annotation");
+        let store = Store::open(&path).await.expect("open db");
+
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "s-quarantine".into(),
+            provider: Provider::Codex,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("exec_command".into()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        store.insert_event(&event).await.expect("insert event");
+
+        let control = Evidence {
+            id: Uuid::new_v4(),
+            session_id: "s-quarantine".into(),
+            source_event_id: event.id,
+            kind: EvidenceKind::ExitCode,
+            observed_at: "2026-01-01T00:00:01Z".into(),
+            payload: serde_json::json!({"exit_code": 0}),
+            provenance: "test".into(),
+            source: None,
+            extension: None,
+            evidence_purged: false,
+        };
+        store
+            .insert_evidence_with_origin(&control, EvidenceOrigin::DaemonAcquisition)
+            .await
+            .expect("insert control evidence");
+
+        // `claude_bash_exit_code_sensor_v1` is a real registered sensor,
+        // but only ever authorized for AgentAdjacent -- this forges
+        // HostObserved under that same identity.
+        let forged = Evidence {
+            id: Uuid::new_v4(),
+            session_id: "s-quarantine".into(),
+            source_event_id: event.id,
+            kind: EvidenceKind::ExitCode,
+            observed_at: "2026-01-01T00:00:01Z".into(),
+            payload: serde_json::json!({"exit_code": 0}),
+            provenance: "test".into(),
+            source: Some(EvidenceSource::now(
+                "claude_bash_exit_code_sensor_v1",
+                TrustClass::HostObserved,
+                None,
+                CollectionMethod::default(),
+                None,
+            )),
+            extension: None,
+            evidence_purged: false,
+        };
+        store
+            .insert_evidence_with_origin(&forged, EvidenceOrigin::UdsIngest)
+            .await
+            .expect("insert forged evidence");
+
+        let claim = Claim {
+            id: Uuid::new_v4(),
+            session_id: "s-quarantine".into(),
+            source_event_id: event.id,
+            text: "the command exited successfully".into(),
+            subject: "command_succeeded".into(),
+            claimed_at: "2026-01-01T00:00:02Z".into(),
+        };
+        store.insert_claim(&claim).await.expect("insert claim");
+
+        let finding = Finding {
+            id: Uuid::new_v4(),
+            claim_id: claim.id,
+            verdict: Verdict::Verified,
+            evidence_ids: vec![control.id, forged.id],
+            verifier_name: "CommandExecutedVerifier".into(),
+            rationale: "exit_code == 0".into(),
+            computed_at: "2026-01-01T00:00:03Z".into(),
+        };
+        store
+            .insert_finding(&finding)
+            .await
+            .expect("insert finding");
+
+        let rendered = render_finding_timeline(&store, &finding.id.to_string())
+            .await
+            .expect("render finding timeline");
+        assert!(
+            rendered.contains(&format!("{}: [QUARANTINED:", forged.id)),
+            "the forged row must be annotated QUARANTINED, not NOT FOUND: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("{}: NOT FOUND", forged.id)),
+            "a row that exists but was rejected must never render identically to a genuinely \
+             missing row: {rendered}"
+        );
+        assert!(
+            rendered.contains(&control.id.to_string()) && !rendered.contains("NOT FOUND"),
+            "the control row must still render in full, proving this test cannot pass by \
+             treating every row as missing: {rendered}"
+        );
+
+        let session_rendered = render_session_timeline(&store, "s-quarantine")
+            .await
+            .expect("render session timeline");
+        assert!(
+            session_rendered.contains(&format!("{}: [QUARANTINED:", forged.id)),
+            "the session-wide renderer must annotate the same way: {session_rendered}"
+        );
 
         std::fs::remove_file(&path).ok();
     }

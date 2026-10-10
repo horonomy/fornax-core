@@ -72,8 +72,6 @@ use fornax_types::epistemic_contract::{
     assess_claim, ClaimAssessment, ClaimClassId, ContractError, ContractLookup, ContractRegistry,
     IndependenceRule, RequirementAssessment, RequirementLevel, SatisfactionState,
 };
-use fornax_types::provenance_guard::{authorize_evidence_source, bind_evidence_to_session};
-use fornax_types::provenance_guard::{CollectorAuthority, ProvenanceVerdict};
 use fornax_types::sensor::TrustClass;
 use fornax_types::{Claim, Evidence};
 use uuid::Uuid;
@@ -410,85 +408,6 @@ pub fn assess_with_capabilities(
     Ok((report, violations))
 }
 
-/// One piece of evidence excluded before assessment ran at all, either
-/// because it was attributed to the wrong session (FORNX-381 AC2) or because
-/// its collector identity could not be authorized to assert its claimed
-/// trust class (FORNX-381 AC1/AC4) — see
-/// [`fornax_types::provenance_guard`]'s module docs. Never silently dropped,
-/// mirroring [`FamilyIndependenceViolation`] and [`CapabilityViolation`]'s
-/// visibility discipline.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProvenanceGuardViolation {
-    pub evidence_id: Uuid,
-    pub reason: String,
-}
-
-/// [`assess`] hardened against two real, previously-`Escaped` FORNX-380
-/// attacks (FORNX-381): `fornx380-11-forged-trust-class-label` (nothing
-/// verified that a claimed [`TrustClass`] was actually assigned by the real
-/// sensor named on the evidence) and `fornx380-10-receipt-replay-cross-claim`'s
-/// sibling gap at the session-attribution layer — evidence carrying a
-/// different session's id was accepted identically to evidence genuinely
-/// from the claim's own session. See
-/// [`fornax_types::provenance_guard`]'s module docs for the full rationale
-/// and the ticket's disclosed scope note on the daemon/acquisition-request
-/// identity axes this does *not* yet cover.
-///
-/// This function closes both gaps **without changing [`assess`]'s signature
-/// or behavior** — every existing caller of `assess`/`assess_with_capabilities`
-/// is completely unaffected (FORNX-381 AC5: no loss of provenance for
-/// existing integrations, because nothing existing changes at all). Evidence
-/// is filtered *before* `assess` runs, not patched after the fact: an
-/// unauthorized or cross-session record contributes nothing to the
-/// assessment, which is the correct honest behavior per AC4 ("quarantined
-/// evidence... not counted negatively or positively") — a requirement with
-/// only quarantined evidence reads as [`SatisfactionState::Unavailable`],
-/// the same as a requirement with no evidence submitted at all, never as a
-/// fabricated contradiction.
-pub fn assess_with_provenance_guard(
-    registry: &ContractRegistry,
-    claim_class: &ClaimClassId,
-    claim: &Claim,
-    evidence: &[Evidence],
-    conditions_met: &[String],
-    authority: &CollectorAuthority,
-) -> Result<(SatisfactionReport, Vec<ProvenanceGuardViolation>), ContractError> {
-    let (bound, session_violations) = bind_evidence_to_session(claim, evidence);
-    let mut violations: Vec<ProvenanceGuardViolation> = session_violations
-        .into_iter()
-        .map(|v| ProvenanceGuardViolation {
-            evidence_id: v.evidence_id,
-            reason: format!(
-                "cross-session attribution: evidence session '{}' does not match claim session '{}'",
-                v.evidence_session_id, v.claim_session_id
-            ),
-        })
-        .collect();
-
-    let mut admitted: Vec<Evidence> = Vec::new();
-    for ev in bound {
-        match &ev.source {
-            Some(source) => match authorize_evidence_source(authority, source) {
-                ProvenanceVerdict::Trusted => admitted.push(ev.clone()),
-                ProvenanceVerdict::Quarantined { reason } => {
-                    violations.push(ProvenanceGuardViolation {
-                        evidence_id: ev.id,
-                        reason,
-                    });
-                }
-            },
-            None => violations.push(ProvenanceGuardViolation {
-                evidence_id: ev.id,
-                reason: "no EvidenceSource attached -- collector identity cannot be authenticated"
-                    .to_string(),
-            }),
-        }
-    }
-
-    let report = assess(registry, claim_class, claim, &admitted, conditions_met)?;
-    Ok((report, violations))
-}
-
 /// Apply the critical-obligation safety floor (FORNX-378 AC: "a
 /// recommendation cannot become PROCEED merely because aggregate support is
 /// high while a critical required obligation is unsatisfied"). Follows
@@ -567,6 +486,10 @@ mod tests {
         CoverageRequirement, EpistemicContract, EvidenceRequirement,
     };
     use fornax_types::graph::FreshnessWindow;
+    use fornax_types::provenance_guard::{
+        admit_evidence_rows, AdmissionOutcome, AdmissionRejection, CollectorAuthority,
+        EvidenceOrigin, SessionOwner,
+    };
     use fornax_types::sensor::EvidenceSource;
     use fornax_types::EvidenceKind;
 
@@ -1357,6 +1280,25 @@ mod tests {
     // Attack 1 (fornx380-11-forged-trust-class-label, was Escaped): a
     // registered collector claims a trust class it was never authorized
     // for.
+    /// FORNX-441: `assess_with_provenance_guard` was deleted -- it had no
+    /// concept of `EvidenceOrigin`, so it would have incorrectly rejected
+    /// legitimate `DaemonAcquisition`/`PrivilegedExecutor` evidence (which
+    /// has no `source` by design). `admit_evidence_rows` is the one
+    /// canonical, origin-aware replacement every consumer now shares; these
+    /// tests exercise it the same way, composed with plain `assess`, rather
+    /// than through a second, endpoint-local guard.
+    fn admit_for_test(
+        evidence: Vec<Evidence>,
+        session_id: &str,
+        authority: &CollectorAuthority,
+    ) -> AdmissionOutcome {
+        let rows = evidence
+            .into_iter()
+            .map(|ev| (ev, EvidenceOrigin::UdsIngest))
+            .collect();
+        admit_evidence_rows(rows, session_id, SessionOwner::Unknown, authority, None)
+    }
+
     #[test]
     fn attack_1_forged_trust_class_from_a_registered_but_unauthorized_sensor_is_quarantined() {
         let reg = default_registry();
@@ -1370,12 +1312,17 @@ mod tests {
             TrustClass::HostObserved,
             "2026-09-24T00:00:00Z",
         );
-        let (report, violations) =
-            assess_with_provenance_guard(&reg, &cc, &c, &[forged], &[], &test_authority())
-                .expect("assess ok");
+        let AdmissionOutcome { admitted, rejected } =
+            admit_for_test(vec![forged], "session-1", &test_authority());
+        let report = assess(&reg, &cc, &c, &admitted, &[]).expect("assess ok");
         assert_eq!(report.assessment.overall, SatisfactionState::Unavailable);
-        assert_eq!(violations.len(), 1);
-        assert!(violations[0].reason.contains("not authorized"));
+        assert_eq!(rejected.len(), 1);
+        match &rejected[0].reason {
+            AdmissionRejection::Provenance { reason } => {
+                assert!(reason.contains("not authorized"))
+            }
+            other => panic!("expected a Provenance rejection, got {other:?}"),
+        }
     }
 
     // Attack 2 (fornx380-10-receipt-replay-cross-claim, was Escaped): the
@@ -1421,12 +1368,17 @@ mod tests {
             TrustClass::HostObserved,
             "2026-09-24T00:00:00Z",
         );
-        let (report, violations) =
-            assess_with_provenance_guard(&reg, &cc, &c, &[fabricated], &[], &test_authority())
-                .expect("assess ok");
+        let AdmissionOutcome { admitted, rejected } =
+            admit_for_test(vec![fabricated], "session-1", &test_authority());
+        let report = assess(&reg, &cc, &c, &admitted, &[]).expect("assess ok");
         assert_eq!(report.assessment.overall, SatisfactionState::Unavailable);
-        assert_eq!(violations.len(), 1);
-        assert!(violations[0].reason.contains("not a registered"));
+        assert_eq!(rejected.len(), 1);
+        match &rejected[0].reason {
+            AdmissionRejection::Provenance { reason } => {
+                assert!(reason.contains("not a registered"))
+            }
+            other => panic!("expected a Provenance rejection, got {other:?}"),
+        }
     }
 
     // Attack 4: cross-session attribution -- evidence from an entirely
@@ -1443,18 +1395,19 @@ mod tests {
             TrustClass::HostObserved,
             "2026-09-24T00:00:00Z",
         );
-        let (report, violations) = assess_with_provenance_guard(
-            &reg,
-            &cc,
-            &c,
-            &[foreign_session_evidence],
-            &[],
+        let AdmissionOutcome { admitted, rejected } = admit_for_test(
+            vec![foreign_session_evidence],
+            "session-1",
             &test_authority(),
-        )
-        .expect("assess ok");
+        );
+        let report = assess(&reg, &cc, &c, &admitted, &[]).expect("assess ok");
         assert_eq!(report.assessment.overall, SatisfactionState::Unavailable);
-        assert_eq!(violations.len(), 1);
-        assert!(violations[0].reason.contains("cross-session"));
+        assert_eq!(rejected.len(), 1);
+        assert!(
+            matches!(rejected[0].reason, AdmissionRejection::CrossSession { .. }),
+            "expected a CrossSession rejection, got {:?}",
+            rejected[0].reason
+        );
     }
 
     // Attack 5: coverage-gaming via a mixed pool -- one legitimate,
@@ -1486,30 +1439,27 @@ mod tests {
             TrustClass::HostObserved,
             "2026-09-24T00:00:02Z",
         );
-        let (report, violations) = assess_with_provenance_guard(
-            &reg,
-            &cc,
-            &c,
-            &[legitimate_1, legitimate_2, forged],
-            &[],
+        let AdmissionOutcome { admitted, rejected } = admit_for_test(
+            vec![legitimate_1, legitimate_2, forged],
+            "session-1",
             &test_authority(),
-        )
-        .expect("assess ok");
+        );
+        let report = assess(&reg, &cc, &c, &admitted, &[]).expect("assess ok");
         // min_coverage is 2 -- only the two legitimate items are admitted,
         // which is exactly enough on its own. This proves the forged item
         // contributed nothing, not that it broke satisfaction outright.
         assert_eq!(report.assessment.overall, SatisfactionState::Unsatisfied);
         assert_eq!(
-            violations.len(),
+            rejected.len(),
             1,
             "exactly the forged item should be flagged"
         );
     }
 
     // Hard negative: fully legitimate evidence, correctly sourced and
-    // session-matched, passes through `assess_with_provenance_guard`
-    // completely unaffected -- proves the guard doesn't false-positive on
-    // genuine evidence, mirroring FORNX-380's hard-negative discipline.
+    // session-matched, passes through `admit_evidence_rows` completely
+    // unaffected -- proves the guard doesn't false-positive on genuine
+    // evidence, mirroring FORNX-380's hard-negative discipline.
     #[test]
     fn hard_negative_legitimate_evidence_is_unaffected_by_the_provenance_guard() {
         let reg = default_registry();
@@ -1523,9 +1473,9 @@ mod tests {
         );
         let plain_report =
             assess(&reg, &cc, &c, std::slice::from_ref(&legitimate), &[]).expect("assess ok");
-        let (guarded_report, violations) =
-            assess_with_provenance_guard(&reg, &cc, &c, &[legitimate], &[], &test_authority())
-                .expect("assess ok");
+        let AdmissionOutcome { admitted, rejected } =
+            admit_for_test(vec![legitimate], "session-1", &test_authority());
+        let guarded_report = assess(&reg, &cc, &c, &admitted, &[]).expect("assess ok");
         assert_eq!(
             guarded_report.assessment.overall,
             plain_report.assessment.overall
@@ -1534,7 +1484,7 @@ mod tests {
             guarded_report.assessment.overall,
             SatisfactionState::Satisfied
         );
-        assert!(violations.is_empty());
+        assert!(rejected.is_empty());
     }
 
     // --- FORNX-382: Self-Integrity property tests ------------------------

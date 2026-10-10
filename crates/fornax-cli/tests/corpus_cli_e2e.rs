@@ -58,7 +58,16 @@ async fn seed_benign_session(home: &std::path::Path, session_id: &str) -> Uuid {
         extension: None,
         evidence_purged: false,
     };
-    store.insert_evidence(&evidence).await.unwrap();
+    // FORNX-441: `fornax corpus mine` now reads `admitted_evidence_for_session`,
+    // which rejects `EvidenceOrigin::Unknown` (what plain `insert_evidence`
+    // stamps).
+    store
+        .insert_evidence_with_origin(
+            &evidence,
+            fornax_types::provenance_guard::EvidenceOrigin::DaemonAcquisition,
+        )
+        .await
+        .unwrap();
 
     store
         .insert_evidence_link(&fornax_types::EvidenceLink {

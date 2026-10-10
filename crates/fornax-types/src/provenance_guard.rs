@@ -561,6 +561,170 @@ impl EvidenceConsumptionLedger {
 }
 
 // ---------------------------------------------------------------------
+// FORNX-441: the one canonical, origin-aware admission rule every
+// verdict-bearing consumer must apply before using a session's raw
+// evidence row-set -- composing session binding (AC2), origin/sensor
+// trust (`admission_decision`), and, where requested, cross-claim replay
+// exclusion (`classify_consumption_by_anchor`), in that order.
+// ---------------------------------------------------------------------
+
+/// Why one piece of evidence was excluded by [`admit_evidence_rows`].
+/// Never collapsed into a single opaque "rejected" bucket — each variant
+/// names which of the three checks fired, since a caller surfacing this to
+/// an operator (or a test asserting *why* a fixture was excluded) needs to
+/// tell "forged/unregistered sensor" apart from "wrong session" apart from
+/// "already consumed by a different claim".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdmissionRejection {
+    /// `admission_decision` quarantined this row — forged trust-class
+    /// label, unregistered sensor, or an `Unknown` origin.
+    Provenance { reason: String },
+    /// The row's own `session_id` does not match the session/claim this
+    /// read is scoped to (AC2's cross-session rule, inlined here rather
+    /// than calling `bind_evidence_to_session` directly so this function
+    /// can return owned `Evidence` without an intermediate borrow).
+    CrossSession { evidence_session_id: String },
+    /// Already durably consumed by a different claim from a genuinely
+    /// different turn (FORNX-380 fixture 10's cross-claim replay shape).
+    /// Only ever applied when `replay` is `Some` — see
+    /// [`admit_evidence_rows`]'s doc comment for why the live verdict path
+    /// deliberately opts out of this check.
+    ReplayedAcrossClaims { originally_consumed_by: Uuid },
+}
+
+/// One evidence row [`admit_evidence_rows`] excluded, with why. Never
+/// silently dropped — the same visibility discipline as every other
+/// rejection type in this module.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceRejection {
+    pub evidence_id: Uuid,
+    pub reason: AdmissionRejection,
+}
+
+/// Result of [`admit_evidence_rows`]: the rows a caller may actually use,
+/// plus every excluded row named by id and reason. `admitted.len() +
+/// rejected.len() == ` the number of input rows, always — nothing is ever
+/// dropped without appearing in exactly one of the two lists.
+#[derive(Debug, Clone, Default)]
+pub struct AdmissionOutcome {
+    pub admitted: Vec<Evidence>,
+    pub rejected: Vec<EvidenceRejection>,
+}
+
+/// The claim-scoped replay context [`admit_evidence_rows`] needs to apply
+/// the cross-claim replay exclusion read-only: who (if anyone) has already
+/// durably consumed each evidence id, as `(owning_claim_id, owning_anchor)`
+/// — the same shape `Store::record_consumption`'s own lookup reads, kept
+/// read-only here (a `SELECT`, never the `INSERT` `record_consumption`
+/// itself performs) so that merely *viewing* evidence through this path
+/// can never steal ownership of a row away from whichever claim should
+/// legitimately own it once the live verdict path actually consumes it.
+pub struct ClaimReplayScope<'a> {
+    pub claim: &'a Claim,
+    pub consumed_by: &'a HashMap<Uuid, (Uuid, ClaimAnchor)>,
+}
+
+/// The one canonical admission rule (FORNX-441). `rows` is every evidence
+/// row a session's Store query returned, paired with each row's real
+/// persisted [`EvidenceOrigin`] (never re-derived from the payload's own
+/// claims). `session_id` is the session this read is scoped to — for a
+/// claim-scoped caller, pass `claim.session_id`.
+///
+/// **Replay is deliberately optional and asymmetric between callers.** The
+/// live verdict path (`run_verifiers_and_persist_findings`) must pass
+/// `replay: None`: ADR 0024's documented behavior computes a `Verified`
+/// finding first, then downgrades it to `Review` via `Store::
+/// record_consumption`'s own *recording* call — a check-and-exclude step
+/// here, before verification, would change that documented behavior and
+/// duplicate a write this function must never perform. Every other
+/// consumer (fusion, contract, judge, decision, reverify's read side,
+/// receipt issuance, evidence-graph, corpus mining, spool export,
+/// timeline) is a read-only view and should pass `replay: Some(..)` so a
+/// row already known-replayed never counts toward a positive outcome
+/// through any of those surfaces either.
+///
+/// Order of checks per row: session binding, then origin/sensor trust,
+/// then (if requested) replay. A row failing an earlier check is never
+/// also evaluated against a later one — the first applicable rejection
+/// reason is the one recorded.
+pub fn admit_evidence_rows(
+    rows: Vec<(Evidence, EvidenceOrigin)>,
+    session_id: &str,
+    owner: SessionOwner,
+    authority: &CollectorAuthority,
+    replay: Option<ClaimReplayScope<'_>>,
+) -> AdmissionOutcome {
+    let mut outcome = AdmissionOutcome {
+        admitted: Vec::with_capacity(rows.len()),
+        rejected: Vec::new(),
+    };
+
+    // A replay scope whose own claim isn't even in this session makes the
+    // whole call meaningless -- fail every row closed rather than silently
+    // ignoring the mismatched scope.
+    if let Some(scope) = &replay {
+        if scope.claim.session_id != session_id {
+            for (ev, _) in rows {
+                outcome.rejected.push(EvidenceRejection {
+                    evidence_id: ev.id,
+                    reason: AdmissionRejection::CrossSession {
+                        evidence_session_id: ev.session_id,
+                    },
+                });
+            }
+            return outcome;
+        }
+    }
+
+    for (ev, origin) in rows {
+        if ev.session_id != session_id {
+            outcome.rejected.push(EvidenceRejection {
+                evidence_id: ev.id,
+                reason: AdmissionRejection::CrossSession {
+                    evidence_session_id: ev.session_id,
+                },
+            });
+            continue;
+        }
+
+        if let AdmissionVerdict::Quarantined { reason } =
+            admission_decision(&ev, origin, authority, owner)
+        {
+            outcome.rejected.push(EvidenceRejection {
+                evidence_id: ev.id,
+                reason: AdmissionRejection::Provenance { reason },
+            });
+            continue;
+        }
+
+        if let Some(scope) = &replay {
+            if let Some((owner_claim_id, owner_anchor)) = scope.consumed_by.get(&ev.id) {
+                let this_anchor = anchor_of(scope.claim);
+                if let ReplayVerdict::ReplayedAcrossClaims {
+                    originally_consumed_by,
+                } = classify_consumption_by_anchor(
+                    Some((*owner_claim_id, owner_anchor.clone())),
+                    scope.claim.id,
+                    &this_anchor,
+                ) {
+                    outcome.rejected.push(EvidenceRejection {
+                        evidence_id: ev.id,
+                        reason: AdmissionRejection::ReplayedAcrossClaims {
+                            originally_consumed_by,
+                        },
+                    });
+                    continue;
+                }
+            }
+        }
+
+        outcome.admitted.push(ev);
+    }
+
+    outcome
+}
+
+// ---------------------------------------------------------------------
 // AC6: optional digest support — honest "unsigned" default, no crypto
 // verification claim without real key-management infrastructure.
 // ---------------------------------------------------------------------
@@ -1158,5 +1322,326 @@ mod tests {
         let anchor = anchor_of(&claim_a);
         let verdict = classify_consumption_by_anchor(None, claim_a.id, &anchor);
         assert_eq!(verdict, ReplayVerdict::FreshlyRecorded);
+    }
+
+    // --- FORNX-441: admit_evidence_rows ---------------------------------
+
+    fn rows_single(ev: Evidence, origin: EvidenceOrigin) -> Vec<(Evidence, EvidenceOrigin)> {
+        vec![(ev, origin)]
+    }
+
+    #[test]
+    fn f1_forged_host_observed_label_is_rejected_with_provenance_reason() {
+        let ev = evidence_with(
+            "s1",
+            "claude_bash_exit_code_sensor_v1",
+            TrustClass::HostObserved,
+        );
+        let outcome = admit_evidence_rows(
+            rows_single(ev.clone(), EvidenceOrigin::UdsIngest),
+            "s1",
+            SessionOwner::Unknown,
+            &CollectorAuthority::known_sensors(),
+            None,
+        );
+        assert!(outcome.admitted.is_empty());
+        assert_eq!(outcome.rejected.len(), 1);
+        assert_eq!(outcome.rejected[0].evidence_id, ev.id);
+        assert!(matches!(
+            &outcome.rejected[0].reason,
+            AdmissionRejection::Provenance { .. }
+        ));
+    }
+
+    #[test]
+    fn f2_unregistered_sensor_is_rejected_with_provenance_reason() {
+        let ev = evidence_with(
+            "s1",
+            "totally_made_up_sensor_v99",
+            TrustClass::AgentAdjacent,
+        );
+        let outcome = admit_evidence_rows(
+            rows_single(ev, EvidenceOrigin::UdsIngest),
+            "s1",
+            SessionOwner::Unknown,
+            &CollectorAuthority::known_sensors(),
+            None,
+        );
+        assert!(outcome.admitted.is_empty());
+        assert!(matches!(
+            &outcome.rejected[0].reason,
+            AdmissionRejection::Provenance { .. }
+        ));
+    }
+
+    #[test]
+    fn f3_uds_row_with_no_source_is_rejected() {
+        let mut ev = evidence_with(
+            "s1",
+            "claude_bash_exit_code_sensor_v1",
+            TrustClass::AgentAdjacent,
+        );
+        ev.source = None;
+        let outcome = admit_evidence_rows(
+            rows_single(ev, EvidenceOrigin::UdsIngest),
+            "s1",
+            SessionOwner::Unknown,
+            &CollectorAuthority::known_sensors(),
+            None,
+        );
+        assert!(outcome.admitted.is_empty());
+        assert!(matches!(
+            &outcome.rejected[0].reason,
+            AdmissionRejection::Provenance { .. }
+        ));
+    }
+
+    #[test]
+    fn f4_provider_mismatch_against_a_single_owner_is_rejected() {
+        let ev = evidence_with(
+            "s1",
+            "claude_bash_exit_code_sensor_v1",
+            TrustClass::AgentAdjacent,
+        );
+        let outcome = admit_evidence_rows(
+            rows_single(ev, EvidenceOrigin::UdsIngest),
+            "s1",
+            SessionOwner::Single(Provider::Codex),
+            &CollectorAuthority::known_sensors(),
+            None,
+        );
+        assert!(outcome.admitted.is_empty());
+        assert!(matches!(
+            &outcome.rejected[0].reason,
+            AdmissionRejection::Provenance { .. }
+        ));
+    }
+
+    #[test]
+    fn f4b_ambiguous_owner_never_admits_a_provider_claim() {
+        let ev = evidence_with(
+            "s1",
+            "claude_bash_exit_code_sensor_v1",
+            TrustClass::AgentAdjacent,
+        );
+        let outcome = admit_evidence_rows(
+            rows_single(ev, EvidenceOrigin::UdsIngest),
+            "s1",
+            SessionOwner::Ambiguous,
+            &CollectorAuthority::known_sensors(),
+            None,
+        );
+        assert!(outcome.admitted.is_empty());
+        assert!(matches!(
+            &outcome.rejected[0].reason,
+            AdmissionRejection::Provenance { .. }
+        ));
+    }
+
+    #[test]
+    fn f5_unknown_origin_with_a_valid_registered_source_is_still_rejected() {
+        // Origin is the ONLY reason this row should be rejected -- proves
+        // admit_evidence_rows actually checks origin and doesn't just
+        // delegate to the sensor check (the exact M1/M9 mutation).
+        let ev = evidence_with(
+            "s1",
+            "claude_bash_exit_code_sensor_v1",
+            TrustClass::AgentAdjacent,
+        );
+        let outcome = admit_evidence_rows(
+            rows_single(ev, EvidenceOrigin::Unknown),
+            "s1",
+            SessionOwner::Unknown,
+            &CollectorAuthority::known_sensors(),
+            None,
+        );
+        assert!(outcome.admitted.is_empty());
+        assert!(matches!(
+            &outcome.rejected[0].reason,
+            AdmissionRejection::Provenance { .. }
+        ));
+    }
+
+    #[test]
+    fn f6_cross_session_evidence_is_rejected_before_any_origin_check() {
+        let ev = evidence_with(
+            "session-attacker",
+            "claude_bash_exit_code_sensor_v1",
+            TrustClass::AgentAdjacent,
+        );
+        let outcome = admit_evidence_rows(
+            rows_single(ev.clone(), EvidenceOrigin::DaemonAcquisition),
+            "session-victim",
+            SessionOwner::Unknown,
+            &CollectorAuthority::known_sensors(),
+            None,
+        );
+        assert!(outcome.admitted.is_empty());
+        assert_eq!(
+            outcome.rejected[0].reason,
+            AdmissionRejection::CrossSession {
+                evidence_session_id: "session-attacker".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn f7_cross_anchor_replay_is_rejected_only_when_a_replay_scope_is_given() {
+        let claim_a = claim_with_anchor("s1", Uuid::new_v4(), "tests_passed");
+        let claim_b = claim_with_anchor("s1", Uuid::new_v4(), "tests_passed");
+        let ev = evidence_with(
+            "s1",
+            "claude_bash_exit_code_sensor_v1",
+            TrustClass::AgentAdjacent,
+        );
+        let anchor_a = anchor_of(&claim_a);
+        let mut consumed_by = HashMap::new();
+        consumed_by.insert(ev.id, (claim_a.id, anchor_a));
+
+        // Without a replay scope (the live verdict path's own choice):
+        // admitted, exactly as ADR 0024 requires -- replay exclusion is
+        // the verdict path's own post-hoc `record_consumption` job, not
+        // this function's, when `replay` is `None`.
+        let outcome_no_replay = admit_evidence_rows(
+            rows_single(ev.clone(), EvidenceOrigin::UdsIngest),
+            "s1",
+            SessionOwner::Unknown,
+            &CollectorAuthority::known_sensors(),
+            None,
+        );
+        assert_eq!(outcome_no_replay.admitted.len(), 1);
+
+        // With a replay scope naming claim_b as the reader and claim_a as
+        // the already-recorded owner from a different turn: rejected.
+        let outcome_with_replay = admit_evidence_rows(
+            rows_single(ev.clone(), EvidenceOrigin::UdsIngest),
+            "s1",
+            SessionOwner::Unknown,
+            &CollectorAuthority::known_sensors(),
+            Some(ClaimReplayScope {
+                claim: &claim_b,
+                consumed_by: &consumed_by,
+            }),
+        );
+        assert!(outcome_with_replay.admitted.is_empty());
+        assert_eq!(
+            outcome_with_replay.rejected[0].reason,
+            AdmissionRejection::ReplayedAcrossClaims {
+                originally_consumed_by: claim_a.id
+            }
+        );
+    }
+
+    #[test]
+    fn p1_legitimate_uds_ingest_row_is_admitted() {
+        let ev = evidence_with(
+            "s1",
+            "claude_bash_exit_code_sensor_v1",
+            TrustClass::AgentAdjacent,
+        );
+        let outcome = admit_evidence_rows(
+            rows_single(ev.clone(), EvidenceOrigin::UdsIngest),
+            "s1",
+            SessionOwner::Unknown,
+            &CollectorAuthority::known_sensors(),
+            None,
+        );
+        assert!(outcome.rejected.is_empty());
+        assert_eq!(outcome.admitted.len(), 1);
+        assert_eq!(outcome.admitted[0].id, ev.id);
+    }
+
+    #[test]
+    fn p2_daemon_acquisition_with_no_source_is_admitted() {
+        let mut ev = evidence_with("s1", "irrelevant", TrustClass::AgentAdjacent);
+        ev.source = None;
+        let outcome = admit_evidence_rows(
+            rows_single(ev, EvidenceOrigin::DaemonAcquisition),
+            "s1",
+            SessionOwner::Unknown,
+            &CollectorAuthority::known_sensors(),
+            None,
+        );
+        assert!(
+            outcome.rejected.is_empty(),
+            "DaemonAcquisition-origin evidence with no source must be admitted by origin alone: {:?}",
+            outcome.rejected
+        );
+        assert_eq!(outcome.admitted.len(), 1);
+    }
+
+    #[test]
+    fn p3_privileged_executor_with_no_source_is_admitted() {
+        let mut ev = evidence_with("s1", "irrelevant", TrustClass::AgentAdjacent);
+        ev.source = None;
+        let outcome = admit_evidence_rows(
+            rows_single(ev, EvidenceOrigin::PrivilegedExecutor),
+            "s1",
+            SessionOwner::Unknown,
+            &CollectorAuthority::known_sensors(),
+            None,
+        );
+        assert!(outcome.rejected.is_empty());
+        assert_eq!(outcome.admitted.len(), 1);
+    }
+
+    #[test]
+    fn p4_a_same_anchor_related_claim_reuse_is_not_rejected_as_replay() {
+        // Over-rejection check (catches the M7 mutation): ReusedByRelatedClaim
+        // (one turn, two legitimately related claims) must NOT be treated
+        // the same as ReplayedAcrossClaims.
+        let source_event_id = Uuid::new_v4();
+        let claim_a = claim_with_anchor("s1", source_event_id, "command_executed");
+        let claim_b = claim_with_anchor("s1", source_event_id, "command_success");
+        let ev = evidence_with(
+            "s1",
+            "claude_bash_exit_code_sensor_v1",
+            TrustClass::AgentAdjacent,
+        );
+        let anchor_a = anchor_of(&claim_a);
+        let mut consumed_by = HashMap::new();
+        consumed_by.insert(ev.id, (claim_a.id, anchor_a));
+
+        let outcome = admit_evidence_rows(
+            rows_single(ev.clone(), EvidenceOrigin::UdsIngest),
+            "s1",
+            SessionOwner::Unknown,
+            &CollectorAuthority::known_sensors(),
+            Some(ClaimReplayScope {
+                claim: &claim_b,
+                consumed_by: &consumed_by,
+            }),
+        );
+        assert_eq!(
+            outcome.admitted.len(),
+            1,
+            "a same-anchor related claim must not be rejected as cross-claim replay: {:?}",
+            outcome.rejected
+        );
+    }
+
+    #[test]
+    fn reads_never_mutate_evidence_or_session_identity() {
+        // Sanity: admit_evidence_rows takes owned rows and returns owned
+        // Evidence -- there is no &mut Store, no record_consumption call
+        // reachable from this function at all. This test exists as a
+        // compile-time/API-shape assertion as much as a runtime one: if a
+        // future edit threaded a `&Store` or `&mut` parameter into this
+        // function's signature, that would itself be the regression this
+        // test is here to make a reviewer notice.
+        let ev = evidence_with(
+            "s1",
+            "claude_bash_exit_code_sensor_v1",
+            TrustClass::AgentAdjacent,
+        );
+        let original_id = ev.id;
+        let outcome = admit_evidence_rows(
+            rows_single(ev, EvidenceOrigin::UdsIngest),
+            "s1",
+            SessionOwner::Unknown,
+            &CollectorAuthority::known_sensors(),
+            None,
+        );
+        assert_eq!(outcome.admitted[0].id, original_id);
     }
 }

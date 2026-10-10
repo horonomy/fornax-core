@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 use crate::{insert_lineage_tag_row, retention, Result, Store, StoreError};
 
-fn origin_from_column(raw: Option<String>) -> EvidenceOrigin {
+pub(crate) fn origin_from_column(raw: Option<String>) -> EvidenceOrigin {
     match raw.as_deref() {
         Some("uds_ingest") => EvidenceOrigin::UdsIngest,
         Some("daemon_acquisition") => EvidenceOrigin::DaemonAcquisition,
@@ -208,6 +208,32 @@ impl Store {
 
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Every evidence id durably quarantined (via
+    /// [`Store::record_admission_quarantine`]) for any claim in
+    /// `session_id` -- the read-side counterpart proving that write
+    /// actually lands, for tests and operator tooling that need to verify
+    /// the admission guard is load-bearing rather than merely called.
+    pub async fn admission_quarantine_for_session(&self, session_id: &str) -> Result<Vec<Uuid>> {
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT c.evidence_id
+             FROM evidence_consumption c
+             JOIN evidence e ON e.id = c.evidence_id
+             WHERE e.session_id = ?1 AND c.outcome = 'quarantined'",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|id| {
+                Uuid::parse_str(&id).map_err(|e| {
+                    StoreError::EvidenceConsumptionCorrupt(format!(
+                        "evidence_id {id:?} is not a valid UUID: {e}"
+                    ))
+                })
+            })
+            .collect()
     }
 }
 

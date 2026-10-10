@@ -1181,17 +1181,7 @@ async fn handle_message(
                 .get(&claim.session_id)
                 .cloned()
                 .unwrap_or_else(default_unknown_caps);
-            let evidence_read = state.store.evidence_for_session(&claim.session_id).await?;
-            if !evidence_read.failed.is_empty() {
-                tracing::warn!(
-                    session_id = %claim.session_id,
-                    failed = evidence_read.failed.len(),
-                    total = evidence_read.evidence.len() + evidence_read.failed.len(),
-                    "skipping evidence rows that failed to deserialize"
-                );
-            }
-            let evidence = evidence_read.evidence;
-            run_verifiers_and_persist_findings(state, &claim, &evidence, &caps).await?;
+            run_verifiers_and_persist_findings(state, &claim, &caps).await?;
         }
     }
     Ok(())
@@ -1599,9 +1589,15 @@ async fn api_evidence_graph(
         Ok(graph) => {
             // FORNX-347: build the source-family map over the FULL session
             // evidence pool (ancestry/event-union can run through evidence
-            // not directly linked to this claim), same
-            // Store::evidence_for_session call `compute_fusion` already
-            // uses -- no new store method. Only families containing at
+            // not directly linked to this claim) -- session-scoped, not
+            // claim-scoped, so `admitted_evidence_for_session` is the right
+            // read here (FORNX-441): it applies the same origin/sensor-trust
+            // admission rule `admitted_evidence_for_claim` does, just
+            // without the cross-claim replay exclusion, which would be the
+            // wrong semantics for a diagnostic that is deliberately not
+            // scoped to one claim's own citations. A forged or unregistered
+            // sensor's row must not be allowed to poison this family/
+            // independence analysis either. Only families containing at
             // least one evidence id linked on THIS claim are surfaced, so
             // the response never leaks unrelated session families.
             // FORNX-432 PR 3 (AC2/AC3): bounded, and the build itself runs
@@ -1609,14 +1605,22 @@ async fn api_evidence_graph(
             // `fuse` wrapping, above) so a poisoned session's family
             // construction cannot stall a concurrent request for a
             // different session on the async runtime's worker threads.
+            // FORNX-441: `rejected_ids` is carried out of this match so the
+            // `links_json` annotation loop below can mark a link to a
+            // since-rejected evidence row explicitly, rather than silently
+            // rendering it identically to an admitted one.
+            let mut rejected_ids: std::collections::HashSet<uuid::Uuid> =
+                std::collections::HashSet::new();
             let (family_map, independence_status): (
                 Option<fornax_verify::independence::SourceFamilyMap>,
                 Option<serde_json::Value>,
-            ) = match state.store.evidence_for_session(&q.session).await {
+            ) = match state.store.admitted_evidence_for_session(&q.session).await {
                 Ok(read) => {
+                    let admitted = read.admitted;
+                    rejected_ids.extend(read.rejected.iter().map(|r| r.evidence_id));
                     let build_result = tokio::task::spawn_blocking(move || {
                         fornax_verify::independence::SourceFamilyMap::try_build(
-                            &read.evidence,
+                            &admitted,
                             &fornax_verify::independence::FamilyBudget::default_budget(),
                         )
                     })
@@ -1671,6 +1675,16 @@ async fn api_evidence_graph(
             // happen for a real evidence id) degrades to `false` — never
             // fabricate "expired" for a row this call couldn't actually
             // read.
+            //
+            // FORNX-441: `graph.links` is the persisted claim_evidence_links
+            // graph, not filtered by admission -- a link can name an
+            // evidence id `admitted_evidence_for_session` has since
+            // rejected (forged provenance, unregistered sensor, an
+            // `Unknown` origin). Rather than silently dropping that link
+            // (which would make a real, persisted link vanish with no
+            // explanation), it stays in the response annotated
+            // `provenance_rejected: true` so a caller can see the
+            // provenance boundary was crossed, not just a smaller count.
             let mut links_json = Vec::with_capacity(graph.links.len());
             for link in &graph.links {
                 let purged = state
@@ -1689,6 +1703,10 @@ async fn api_evidence_graph(
                             .get(&link.evidence_id)
                             .map(|i| serde_json::json!(i))
                             .unwrap_or(serde_json::Value::Null),
+                    );
+                    map.insert(
+                        "provenance_rejected".to_string(),
+                        serde_json::json!(rejected_ids.contains(&link.evidence_id)),
                     );
                 }
                 links_json.push(value);
@@ -1758,7 +1776,6 @@ fn finding_row_to_finding(row: &fornax_store::FindingRow) -> anyhow::Result<Find
 async fn run_verifiers_and_persist_findings(
     state: &AppState,
     claim: &fornax_types::Claim,
-    evidence: &[fornax_types::Evidence],
     caps: &RuntimeCapabilities,
 ) -> anyhow::Result<()> {
     // HORO-1712 (post-review fix): checked fresh for every call, under the
@@ -1769,49 +1786,56 @@ async fn run_verifiers_and_persist_findings(
     // remember to check it.
     let evidence_may_be_incomplete = evidence_may_be_incomplete_for(state, &claim.session_id);
 
-    // FORNX-431 slice 4: this is the one real choke point every live
-    // verdict passes through (all 3 callers -- Claim ingest, /api/
+    // FORNX-431 slice 4 / FORNX-441: this is the one real choke point every
+    // live verdict passes through (all 3 callers -- Claim ingest, /api/
     // acquire-evidence, /api/reverify -- route through this function) --
     // closing AC1's actual gap: before this, a verifier read every row in
     // `evidence` unconditionally, regardless of how it arrived or whether
-    // its claimed collector/provider is trustworthy. `admission_decision`
-    // (slice 1) is the pure rule; `evidence_origin`/`session_owner`
-    // (slice 2) are what makes it possible to apply against a real row
-    // instead of trusting the payload's own labels. A quarantined row is
-    // dropped from what the verifier sees -- never silently: every
+    // its claimed collector/provider is trustworthy. `admitted_evidence_for_session`
+    // is the one canonical, origin-aware admission read (FORNX-441) every
+    // verdict-bearing consumer now shares -- this function no longer reads
+    // evidence itself at all; the caller no longer needs to. A quarantined
+    // row is dropped from what the verifier sees -- never silently: every
     // rejection is durably recorded via `record_admission_quarantine`
     // (queryable, same `evidence_consumption` table slice 2 introduced),
     // not just logged.
-    let authority = provenance_guard::CollectorAuthority::known_sensors();
-    let owner = state.store.session_owner(&claim.session_id).await?;
     let anchor = provenance_guard::anchor_of(claim);
-
-    let mut admitted_evidence: Vec<fornax_types::Evidence> = Vec::with_capacity(evidence.len());
-    for ev in evidence {
-        let origin = state.store.evidence_origin(ev.id).await?;
-        match provenance_guard::admission_decision(ev, origin, &authority, owner) {
-            provenance_guard::AdmissionVerdict::Admitted => admitted_evidence.push(ev.clone()),
-            provenance_guard::AdmissionVerdict::Quarantined { reason } => {
-                tracing::warn!(
-                    evidence_id = %ev.id,
-                    session_id = %claim.session_id,
-                    reason = %reason,
-                    "evidence refused admission -- excluded from verifier input"
-                );
-                if let Err(e) = state
-                    .store
-                    .record_admission_quarantine(ev.id, claim.id, &anchor, &reason)
-                    .await
-                {
-                    tracing::warn!(
-                        error = %e,
-                        evidence_id = %ev.id,
-                        "failed to durably record evidence admission quarantine"
-                    );
-                }
-            }
+    let admitted_read = state
+        .store
+        .admitted_evidence_for_session(&claim.session_id)
+        .await?;
+    if !admitted_read.failed.is_empty() {
+        tracing::warn!(
+            session_id = %claim.session_id,
+            failed = admitted_read.failed.len(),
+            "skipping evidence rows that failed to deserialize"
+        );
+    }
+    for rejection in &admitted_read.rejected {
+        tracing::warn!(
+            evidence_id = %rejection.evidence_id,
+            session_id = %claim.session_id,
+            reason = ?rejection.reason,
+            "evidence refused admission -- excluded from verifier input"
+        );
+        if let Err(e) = state
+            .store
+            .record_admission_quarantine(
+                rejection.evidence_id,
+                claim.id,
+                &anchor,
+                &admission_rejection_to_persisted_reason(&rejection.reason),
+            )
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                evidence_id = %rejection.evidence_id,
+                "failed to durably record evidence admission quarantine"
+            );
         }
     }
+    let admitted_evidence = admitted_read.admitted;
 
     let verifiers: Vec<Box<dyn Verifier + Send + Sync>> = vec![
         Box::new(TestResultVerifier),
@@ -1896,10 +1920,86 @@ async fn run_verifiers_and_persist_findings(
     Ok(())
 }
 
+/// A stable, durable string for `record_admission_quarantine` -- never
+/// `{:?}` (FORNX-441): before this module existed, `admission_decision`
+/// handed `run_verifiers_and_persist_findings` a bare `reason: String`
+/// straight from `authorize_evidence_source`, and every row already
+/// persisted holds exactly that text. `Debug`-formatting the new
+/// `AdmissionRejection` enum would silently change the shape of every
+/// future row (`Provenance { reason: "..." }` instead of the bare
+/// string) while old rows keep the old shape -- a durable-storage format
+/// is not something `Debug`'s "whatever derive happens to produce today"
+/// guarantee is allowed to own. `Provenance` keeps the exact pre-existing
+/// text; the other two variants (only reachable here because this
+/// session-scoped call site has no replay scope, so `ReplayedAcrossClaims`
+/// never fires from this caller, but `CrossSession` can) get their own
+/// explicit, stable wording.
+fn admission_rejection_to_persisted_reason(
+    reason: &fornax_types::provenance_guard::AdmissionRejection,
+) -> String {
+    use fornax_types::provenance_guard::AdmissionRejection;
+    match reason {
+        AdmissionRejection::Provenance { reason } => reason.clone(),
+        AdmissionRejection::CrossSession {
+            evidence_session_id,
+        } => format!(
+            "cross-session attribution: evidence session '{evidence_session_id}' does not \
+             match the session this read is scoped to"
+        ),
+        AdmissionRejection::ReplayedAcrossClaims {
+            originally_consumed_by,
+        } => format!(
+            "evidence already durably consumed by claim {originally_consumed_by} from a \
+             genuinely different turn"
+        ),
+    }
+}
+
 /// Outcome of [`compute_fusion`] — the shared claim-lookup/graph-resolution/
 /// fusion logic behind both `/api/fusion` (FORNX-304) and `/api/decision`
 /// (FORNX-96), factored out so neither endpoint duplicates the other's
 /// graph-loading/projection code (FORNX-96 implementation note).
+/// FORNX-441: `AdmissionRejection`/`EvidenceRejection` carry no `Serialize`
+/// impl (`fornax-types` has no serde dependency on this enum) -- every
+/// JSON-returning endpoint that surfaces `FusionFound::rejected` goes
+/// through this one mapping so the shape stays consistent across
+/// `/api/fusion`, `/api/decision`, `/api/judge`, `/api/evidence-plan`, and
+/// `/api/contract`.
+fn rejected_evidence_to_json(
+    rejected: &[fornax_types::provenance_guard::EvidenceRejection],
+) -> serde_json::Value {
+    use fornax_types::provenance_guard::AdmissionRejection;
+    serde_json::Value::Array(
+        rejected
+            .iter()
+            .map(|r| {
+                let reason = match &r.reason {
+                    AdmissionRejection::Provenance { reason } => serde_json::json!({
+                        "kind": "provenance",
+                        "reason": reason,
+                    }),
+                    AdmissionRejection::CrossSession {
+                        evidence_session_id,
+                    } => serde_json::json!({
+                        "kind": "cross_session",
+                        "evidence_session_id": evidence_session_id,
+                    }),
+                    AdmissionRejection::ReplayedAcrossClaims {
+                        originally_consumed_by,
+                    } => serde_json::json!({
+                        "kind": "replayed_across_claims",
+                        "originally_consumed_by": originally_consumed_by,
+                    }),
+                };
+                serde_json::json!({
+                    "evidence_id": r.evidence_id,
+                    "reason": reason,
+                })
+            })
+            .collect(),
+    )
+}
+
 enum FusionOutcome {
     /// No claim with this id is on record for this session.
     NotFound { reason: &'static str },
@@ -1925,6 +2025,14 @@ struct FusionFound {
     claim: fornax_types::Claim,
     graph: fornax_types::EvidenceGraph,
     evidence_pool: Vec<fornax_types::Evidence>,
+    /// FORNX-441: evidence rows `admitted_evidence_for_claim` excluded from
+    /// `evidence_pool` -- forged provenance, an unregistered sensor, an
+    /// `Unknown` origin, or an evidence row already durably consumed by a
+    /// different claim from a genuinely different turn. Every
+    /// fusion-derived endpoint (`/api/fusion`, `/api/decision`,
+    /// `/api/judge`, `/api/evidence-plan`) surfaces this so a caller can
+    /// see that the pool was filtered, not just that it was smaller.
+    rejected: Vec<fornax_types::provenance_guard::EvidenceRejection>,
 }
 
 /// FORNX-304 (extended by FORNX-96 to be shared with `/api/decision`):
@@ -1999,8 +2107,15 @@ async fn compute_fusion(state: &AppState, claim_id: &str, session: &str) -> Fusi
         (real_graph, "graph")
     };
 
-    let evidence_read = match state.store.evidence_for_session(session).await {
-        Ok(outcome) => outcome,
+    // FORNX-441: the one canonical, origin-aware admission read -- every
+    // consumer downstream of `compute_fusion` (fusion, decision, judge,
+    // evidence-plan, acquire-evidence's input, reverify's fused_before/
+    // after) now sees the same filtered pool `run_verifiers_and_persist_findings`
+    // already uses, instead of `evidence_for_session`'s raw, unfiltered
+    // rows. Claim-scoped (not session-scoped) so a row already durably
+    // consumed by a genuinely different claim is excluded here too.
+    let admitted_read = match state.store.admitted_evidence_for_claim(&claim).await {
+        Ok(read) => read,
         Err(e) => {
             return FusionOutcome::Error {
                 message: e.to_string(),
@@ -2009,7 +2124,8 @@ async fn compute_fusion(state: &AppState, claim_id: &str, session: &str) -> Fusi
     };
 
     let computed_at = chrono::Utc::now().to_rfc3339();
-    let evidence_pool = evidence_read.evidence;
+    let evidence_pool = admitted_read.admitted;
+    let rejected = admitted_read.rejected;
     // FORNX-432 PR 3 (AC3): `fuse` now builds a `SourceFamilyMap` internally
     // (R5b) which, even bounded by a work budget, can still take real CPU
     // time on an adversarial pool before it aborts -- `spawn_blocking`
@@ -2037,6 +2153,7 @@ async fn compute_fusion(state: &AppState, claim_id: &str, session: &str) -> Fusi
             claim,
             graph,
             evidence_pool,
+            rejected,
         })),
         Err(e) => FusionOutcome::Error {
             message: format!("fusion task panicked: {e}"),
@@ -2064,6 +2181,7 @@ async fn api_fusion(
             "found": true,
             "graph_source": found.graph_source,
             "fused": found.fused,
+            "provenance_rejected": rejected_evidence_to_json(&found.rejected),
         })),
     }
 }
@@ -2147,6 +2265,7 @@ async fn api_decision(
                 "graph_source": found.graph_source,
                 "recommendation": recommendation,
                 "fused": found.fused,
+                "provenance_rejected": rejected_evidence_to_json(&found.rejected),
             }))
         }
     }
@@ -2187,24 +2306,27 @@ async fn api_contract(
         FusionOutcome::Found(found) => {
             let registry = fornax_verify::contract_satisfaction::default_registry();
             let claim_class = ClaimClassId::new(found.claim.subject.clone(), 1);
-            // FORNX-441: this previously called `assess` directly against
-            // `found.evidence_pool`, which is `evidence_for_session`'s raw,
-            // unfiltered contents (see `compute_fusion` above) -- forged
-            // trust-class labels, unregistered sensors, and cross-session
-            // evidence all reached contract satisfaction with no provenance
-            // check at all, exactly the fornx380-01/-11 attack shape. The
-            // guarded entry point already exists and is already proven by
-            // `fornax-verify`'s attack_1..5 tests; this endpoint simply
-            // wasn't calling it.
-            match fornax_verify::contract_satisfaction::assess_with_provenance_guard(
+            // FORNX-441: `found.evidence_pool` is now `compute_fusion`'s own
+            // `admitted_evidence_for_claim` output -- already filtered by
+            // the one canonical, origin-aware admission rule (forged
+            // trust-class labels, unregistered sensors, cross-session rows,
+            // and cross-claim replays all excluded before this endpoint
+            // ever sees them, same fornx380-01/-11 attack shape the
+            // previous `assess_with_provenance_guard` call tried and failed
+            // to close -- that function had no concept of `EvidenceOrigin`,
+            // so it incorrectly rejected legitimate `DaemonAcquisition`/
+            // `PrivilegedExecutor` evidence, which has no `source` by
+            // design). Plain `assess` is now the right call: the guard
+            // already ran upstream, once, for every consumer -- not a
+            // second, endpoint-local guard with its own, narrower rule.
+            match fornax_verify::contract_satisfaction::assess(
                 &registry,
                 &claim_class,
                 &found.claim,
                 &found.evidence_pool,
                 &[],
-                &provenance_guard::CollectorAuthority::known_sensors(),
             ) {
-                Ok((report, provenance_violations)) => Json(serde_json::json!({
+                Ok(report) => Json(serde_json::json!({
                     "claim": q.claim,
                     "session": q.session,
                     "found": true,
@@ -2215,10 +2337,7 @@ async fn api_contract(
                         "shared_with_requirement_id": v.shared_with_requirement_id,
                         "evidence_id": v.evidence_id,
                     })).collect::<Vec<_>>(),
-                    "provenance_violations": provenance_violations.iter().map(|v| serde_json::json!({
-                        "evidence_id": v.evidence_id,
-                        "reason": v.reason,
-                    })).collect::<Vec<_>>(),
+                    "provenance_violations": rejected_evidence_to_json(&found.rejected),
                 })),
                 Err(e) => Json(serde_json::json!({
                     "claim": q.claim,
@@ -2298,6 +2417,7 @@ async fn api_judge(
                 claim,
                 graph,
                 evidence_pool,
+                rejected,
             } = *found;
             let input = JudgeInput::from_claim_and_graph(
                 &claim,
@@ -2332,10 +2452,21 @@ async fn api_judge(
                 }
             };
 
+            // FORNX-441: `graph.links` is the persisted claim_evidence_links
+            // graph, not filtered by admission -- it can still name an
+            // evidence id that `admitted_evidence_for_claim` has since
+            // rejected (forged provenance, cross-session, already
+            // consumed by a different claim). `judge_evidence` must never
+            // claim derivation from a row the admission guard excluded,
+            // so this is intersected with the already-admitted
+            // `evidence_pool`, not `graph.links` alone.
+            let admitted_ids: std::collections::BTreeSet<uuid::Uuid> =
+                evidence_pool.iter().map(|ev| ev.id).collect();
             let derived_from_ids: Vec<uuid::Uuid> = graph
                 .links
                 .iter()
                 .map(|l| l.evidence_id)
+                .filter(|id| admitted_ids.contains(id))
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
                 .collect();
@@ -2354,6 +2485,7 @@ async fn api_judge(
                 "judge": output,
                 "judge_evidence": judge_evidence,
                 "fused": fused,
+                "provenance_rejected": rejected_evidence_to_json(&rejected),
             }))
         }
     }
@@ -2472,6 +2604,7 @@ async fn api_evidence_plan(
                 "recommendation": recommendation,
                 "fused": found.fused,
                 "plan": plan,
+                "provenance_rejected": rejected_evidence_to_json(&found.rejected),
             }))
         }
     }
@@ -2654,22 +2787,7 @@ async fn api_acquire_evidence(
             .get(&q.session)
             .cloned()
             .unwrap_or_else(default_unknown_caps);
-        let evidence_after = match state.store.evidence_for_session(&q.session).await {
-            Ok(read) => read.evidence,
-            Err(e) => {
-                return Json(serde_json::json!({
-                    "claim": q.claim,
-                    "session": q.session,
-                    "found": true,
-                    "outcome": outcome_kind,
-                    "error": format!("failed to re-read evidence after acquisition: {e}"),
-                    "fused_before": fused_before,
-                }))
-            }
-        };
-        if let Err(e) =
-            run_verifiers_and_persist_findings(&state, &found.claim, &evidence_after, &caps).await
-        {
+        if let Err(e) = run_verifiers_and_persist_findings(&state, &found.claim, &caps).await {
             return Json(serde_json::json!({
                 "claim": q.claim,
                 "session": q.session,
@@ -2747,19 +2865,6 @@ async fn api_reverify(
     };
     let fused_before = found.fused.clone();
 
-    let evidence = match state.store.evidence_for_session(&q.session).await {
-        Ok(read) => read.evidence,
-        Err(e) => {
-            return Json(serde_json::json!({
-                "claim": q.claim,
-                "session": q.session,
-                "found": true,
-                "error": format!("failed to read evidence: {e}"),
-                "fused_before": fused_before,
-            }))
-        }
-    };
-
     let caps = state
         .caps
         .lock()
@@ -2768,8 +2873,7 @@ async fn api_reverify(
         .cloned()
         .unwrap_or_else(default_unknown_caps);
 
-    if let Err(e) = run_verifiers_and_persist_findings(&state, &found.claim, &evidence, &caps).await
-    {
+    if let Err(e) = run_verifiers_and_persist_findings(&state, &found.claim, &caps).await {
         return Json(serde_json::json!({
             "claim": q.claim,
             "session": q.session,
@@ -4700,7 +4804,7 @@ mod tests {
             .expect("insert claim");
         state
             .store
-            .insert_evidence(&evidence)
+            .insert_evidence_with_origin(&evidence, EvidenceOrigin::DaemonAcquisition)
             .await
             .expect("insert evidence");
         let link = fornax_types::EvidenceLink {
@@ -4805,7 +4909,7 @@ mod tests {
             };
             state
                 .store
-                .insert_evidence(&evidence)
+                .insert_evidence_with_origin(&evidence, EvidenceOrigin::DaemonAcquisition)
                 .await
                 .expect("insert adversarial evidence");
             prior_ids.push(id);
@@ -4823,7 +4927,7 @@ mod tests {
             .expect("insert clean claim");
         state
             .store
-            .insert_evidence(&clean_evidence)
+            .insert_evidence_with_origin(&clean_evidence, EvidenceOrigin::DaemonAcquisition)
             .await
             .expect("insert clean evidence");
         let clean_link = fornax_types::EvidenceLink {
@@ -4920,7 +5024,7 @@ mod tests {
             .expect("insert claim");
         state
             .store
-            .insert_evidence(&evidence)
+            .insert_evidence_with_origin(&evidence, EvidenceOrigin::DaemonAcquisition)
             .await
             .expect("insert evidence");
         let finding = Finding {
@@ -4997,7 +5101,7 @@ mod tests {
             .expect("insert claim");
         state
             .store
-            .insert_evidence(&evidence)
+            .insert_evidence_with_origin(&evidence, EvidenceOrigin::DaemonAcquisition)
             .await
             .expect("insert evidence");
         let link = fornax_types::EvidenceLink {
@@ -5074,7 +5178,7 @@ mod tests {
             .expect("insert claim");
         state
             .store
-            .insert_evidence(&evidence)
+            .insert_evidence_with_origin(&evidence, EvidenceOrigin::DaemonAcquisition)
             .await
             .expect("insert evidence");
         // A Contradicts link: Corroborated+Contradicted blocks under
@@ -5346,7 +5450,7 @@ mod tests {
             .expect("insert claim");
         state
             .store
-            .insert_evidence(&evidence)
+            .insert_evidence_with_origin(&evidence, EvidenceOrigin::DaemonAcquisition)
             .await
             .expect("insert evidence");
         let link = fornax_types::EvidenceLink {
@@ -5406,7 +5510,7 @@ mod tests {
             .expect("insert claim");
         state
             .store
-            .insert_evidence(&evidence)
+            .insert_evidence_with_origin(&evidence, EvidenceOrigin::DaemonAcquisition)
             .await
             .expect("insert evidence");
         let link = fornax_types::EvidenceLink {
@@ -5562,7 +5666,7 @@ mod tests {
         };
         state
             .store
-            .insert_evidence(&file_diff)
+            .insert_evidence_with_origin(&file_diff, EvidenceOrigin::DaemonAcquisition)
             .await
             .expect("insert file diff evidence");
 
@@ -5697,7 +5801,7 @@ mod tests {
             };
             state
                 .store
-                .insert_evidence(&file_diff)
+                .insert_evidence_with_origin(&file_diff, EvidenceOrigin::DaemonAcquisition)
                 .await
                 .expect("insert file diff evidence");
 
@@ -5935,7 +6039,7 @@ mod tests {
             .expect("insert claim");
         state
             .store
-            .insert_evidence(&evidence)
+            .insert_evidence_with_origin(&evidence, EvidenceOrigin::DaemonAcquisition)
             .await
             .expect("insert evidence");
         let link = fornax_types::EvidenceLink {
@@ -6510,14 +6614,17 @@ mod tests {
 
         let state = test_state().await;
 
-        // FORNX-441: `api_contract` now calls `assess_with_provenance_guard`
-        // (previously plain `assess`), which only admits evidence from a
-        // sensor `CollectorAuthority::known_sensors()` actually registers at
-        // the trust class it claims -- "test_sensor" (used throughout this
-        // test before this fix) is not a registered sensor at all, so every
-        // fixture below is updated to a real sensor name matching its trust
-        // class, proving the guard admits genuine evidence rather than
-        // merely proving it rejects nothing.
+        // FORNX-441: `api_contract` reads `compute_fusion`'s own
+        // `admitted_evidence_for_claim` output, which only admits evidence
+        // from a sensor `CollectorAuthority::known_sensors()` actually
+        // registers at the trust class it claims -- "test_sensor" (used
+        // throughout this test before this fix) is not a registered sensor
+        // at all, so every fixture below is updated to a real sensor name
+        // matching its trust class, proving the guard admits genuine
+        // evidence rather than merely proving it rejects nothing. Each
+        // fixture is also stamped `EvidenceOrigin::UdsIngest` (not plain
+        // `insert_evidence`, which reads back `Unknown` and would be
+        // rejected before the sensor-trust check ever runs).
         fn real_sensor_for(trust_class: &TrustClass) -> Option<&'static str> {
             match trust_class {
                 TrustClass::HostObserved => Some("claude_file_write_confirmed_sensor_v1"),
@@ -6578,7 +6685,7 @@ mod tests {
             };
             state
                 .store
-                .insert_evidence(&evidence)
+                .insert_evidence_with_origin(&evidence, EvidenceOrigin::UdsIngest)
                 .await
                 .expect("insert evidence");
             claim
@@ -6746,7 +6853,7 @@ mod tests {
             };
             state
                 .store
-                .insert_evidence(&evidence)
+                .insert_evidence_with_origin(&evidence, EvidenceOrigin::UdsIngest)
                 .await
                 .expect("insert evidence");
         }
@@ -6842,7 +6949,7 @@ mod tests {
         };
         state
             .store
-            .insert_evidence(&forged)
+            .insert_evidence_with_origin(&forged, EvidenceOrigin::UdsIngest)
             .await
             .expect("insert forged evidence");
 
@@ -6866,6 +6973,416 @@ mod tests {
             v["provenance_violations"].as_array().map(|a| a.len()),
             Some(1),
             "the forgery must be reported as a provenance violation, not silently dropped: {v}"
+        );
+    }
+
+    // ---- FORNX-441: adversarial matrix -- one forged row + one
+    // legitimate control row, hit against every consumer this ticket
+    // rewired. The control proves a test can't pass by rejecting
+    // everything; the forged id proves the guard is actually load-bearing
+    // at each specific call site (reverting any one site to a raw read
+    // should fail exactly the test(s) exercising it).
+
+    fn matrix_sensor_source(
+        trust: fornax_types::sensor::TrustClass,
+    ) -> fornax_types::sensor::EvidenceSource {
+        fornax_types::sensor::EvidenceSource::now(
+            "claude_bash_exit_code_sensor_v1", // registered only for AgentAdjacent
+            trust,
+            None,
+            fornax_types::sensor::CollectionMethod::default(),
+            None,
+        )
+    }
+
+    /// Seeds one session/claim with two evidence rows both `Supports`-linked
+    /// to the same claim: a legitimate control (the sensor's own authorized
+    /// trust class) and a forged row (the same sensor asserting a trust
+    /// class it was never authorized for -- the fornx380-11 shape). Returns
+    /// `(session_id, claim, control_id, forged_id)`.
+    async fn seed_matrix_claim(state: &AppState, session: &str) -> (String, Claim, Uuid, Uuid) {
+        let event_id = test_event(state, session).await;
+        let claim = test_claim(session, event_id);
+        state
+            .store
+            .insert_claim(&claim)
+            .await
+            .expect("insert claim");
+
+        let control = fornax_types::Evidence {
+            source: Some(matrix_sensor_source(
+                fornax_types::sensor::TrustClass::AgentAdjacent,
+            )),
+            ..test_evidence(session, event_id)
+        };
+        let forged = fornax_types::Evidence {
+            source: Some(matrix_sensor_source(
+                fornax_types::sensor::TrustClass::HostObserved,
+            )),
+            ..test_evidence(session, event_id)
+        };
+        state
+            .store
+            .insert_evidence_with_origin(&control, EvidenceOrigin::UdsIngest)
+            .await
+            .expect("insert control evidence");
+        state
+            .store
+            .insert_evidence_with_origin(&forged, EvidenceOrigin::UdsIngest)
+            .await
+            .expect("insert forged evidence");
+
+        for ev_id in [control.id, forged.id] {
+            state
+                .store
+                .insert_evidence_link(&fornax_types::EvidenceLink {
+                    id: Uuid::new_v4(),
+                    session_id: session.to_string(),
+                    claim_id: claim.id,
+                    evidence_id: ev_id,
+                    relation: fornax_types::EvidenceRelation::Supports,
+                    linked_at: "2026-01-01T00:00:00Z".to_string(),
+                })
+                .await
+                .expect("insert evidence link");
+        }
+
+        (session.to_string(), claim, control.id, forged.id)
+    }
+
+    #[tokio::test]
+    async fn fornx441_matrix_claim_ingest_quarantines_forged_evidence_not_the_control() {
+        let state = test_state().await;
+        let session = "fornx441-matrix-ingest";
+        let event_id = test_event(&state, session).await;
+        let control = fornax_types::Evidence {
+            source: Some(matrix_sensor_source(
+                fornax_types::sensor::TrustClass::AgentAdjacent,
+            )),
+            ..test_evidence(session, event_id)
+        };
+        let forged = fornax_types::Evidence {
+            source: Some(matrix_sensor_source(
+                fornax_types::sensor::TrustClass::HostObserved,
+            )),
+            ..test_evidence(session, event_id)
+        };
+        state
+            .store
+            .insert_evidence_with_origin(&control, EvidenceOrigin::UdsIngest)
+            .await
+            .expect("insert control evidence");
+        state
+            .store
+            .insert_evidence_with_origin(&forged, EvidenceOrigin::UdsIngest)
+            .await
+            .expect("insert forged evidence");
+
+        let claim = test_claim(session, event_id);
+        let mut hint = None;
+        handle_message(&state, IngestMessage::Claim(claim.clone()), &mut hint)
+            .await
+            .expect("handle claim");
+
+        let findings = state
+            .store
+            .findings_for_session(session)
+            .await
+            .expect("read findings");
+        assert!(!findings.is_empty(), "expected at least one finding");
+        for row in &findings {
+            let evidence_ids: Vec<Uuid> =
+                serde_json::from_str(&row.evidence_ids).expect("decode evidence_ids");
+            assert!(
+                !evidence_ids.contains(&forged.id),
+                "a verifier must never cite the forged row: {evidence_ids:?}"
+            );
+        }
+
+        let quarantined_ids = state
+            .store
+            .admission_quarantine_for_session(session)
+            .await
+            .expect("read quarantine rows");
+        assert!(
+            quarantined_ids.contains(&forged.id),
+            "the forged row must be durably recorded as quarantined: {quarantined_ids:?}"
+        );
+        assert!(
+            !quarantined_ids.contains(&control.id),
+            "the control row must never be quarantined: {quarantined_ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fornx441_matrix_fusion_decision_judge_plan_exclude_forged_but_count_control() {
+        let state = test_state().await;
+        let (session, claim, control_id, forged_id) =
+            seed_matrix_claim(&state, "fornx441-matrix-fusion").await;
+
+        let fusion_v = api_fusion(
+            State(state.clone()),
+            Query(FusionQuery {
+                claim: claim.id.to_string(),
+                session: session.clone(),
+            }),
+        )
+        .await
+        .0;
+        let counted: Vec<String> = fusion_v["fused"]["counted_link_ids"]
+            .as_array()
+            .expect("counted_link_ids array")
+            .iter()
+            .map(|v| v.as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            !counted.iter().any(|id| id == &forged_id.to_string()),
+            "/api/fusion must never count the forged evidence's link: {fusion_v}"
+        );
+        let rejected = fusion_v["provenance_rejected"]
+            .as_array()
+            .expect("provenance_rejected array");
+        assert!(
+            rejected
+                .iter()
+                .any(|r| r["evidence_id"] == serde_json::json!(forged_id)),
+            "/api/fusion must surface the forged id as rejected: {fusion_v}"
+        );
+        assert_ne!(
+            fusion_v["fused"]["verdict"],
+            serde_json::json!("unverified"),
+            "the control evidence must still be enough to reach a real verdict, proving this \
+             test cannot pass by rejecting everything: {fusion_v}"
+        );
+
+        let decision_v = api_decision(
+            State(state.clone()),
+            Query(DecisionQuery {
+                claim: claim.id.to_string(),
+                session: session.clone(),
+                risk: None,
+            }),
+        )
+        .await
+        .0;
+        assert!(
+            decision_v["provenance_rejected"]
+                .as_array()
+                .expect("provenance_rejected array")
+                .iter()
+                .any(|r| r["evidence_id"] == serde_json::json!(forged_id)),
+            "/api/decision must surface the forged id as rejected: {decision_v}"
+        );
+
+        let judge_v = api_judge(
+            State(state.clone()),
+            Query(JudgeQuery {
+                claim: claim.id.to_string(),
+                session: session.clone(),
+                allow_raw_evidence: false,
+            }),
+        )
+        .await
+        .0;
+        let derived_from = judge_v["judge_evidence"]["payload"]["derived_from"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !derived_from
+                .iter()
+                .any(|id| id == &serde_json::json!(forged_id)),
+            "/api/judge's judge_evidence must never claim derivation from the forged id: {judge_v}"
+        );
+        assert!(
+            judge_v["provenance_rejected"]
+                .as_array()
+                .expect("provenance_rejected array")
+                .iter()
+                .any(|r| r["evidence_id"] == serde_json::json!(forged_id)),
+            "/api/judge must surface the forged id as rejected: {judge_v}"
+        );
+
+        let plan_v = api_evidence_plan(
+            State(state.clone()),
+            Query(EvidencePlanQuery {
+                claim: claim.id.to_string(),
+                session: session.clone(),
+                risk: None,
+            }),
+        )
+        .await
+        .0;
+        assert!(
+            plan_v["provenance_rejected"]
+                .as_array()
+                .expect("provenance_rejected array")
+                .iter()
+                .any(|r| r["evidence_id"] == serde_json::json!(forged_id)),
+            "/api/evidence-plan must surface the forged id as rejected: {plan_v}"
+        );
+
+        // Sanity: the control id is real and distinct from the forged one --
+        // guards against a vacuous test where both ids are accidentally the
+        // same value.
+        assert_ne!(control_id, forged_id);
+    }
+
+    #[tokio::test]
+    async fn fornx441_matrix_evidence_graph_annotates_the_rejected_link_without_dropping_it() {
+        let state = test_state().await;
+        let (session, claim, control_id, forged_id) =
+            seed_matrix_claim(&state, "fornx441-matrix-graph").await;
+
+        let v = api_evidence_graph(
+            State(state),
+            Query(EvidenceGraphQuery {
+                claim: claim.id.to_string(),
+                session,
+            }),
+        )
+        .await
+        .0;
+        let links = v["links"].as_array().expect("links array");
+        assert_eq!(links.len(), 2, "both links must still be present: {v}");
+
+        let forged_link = links
+            .iter()
+            .find(|l| l["evidence_id"] == serde_json::json!(forged_id))
+            .expect("forged link present");
+        assert_eq!(
+            forged_link["provenance_rejected"],
+            serde_json::json!(true),
+            "the forged link must be annotated, not silently dropped: {forged_link}"
+        );
+
+        let control_link = links
+            .iter()
+            .find(|l| l["evidence_id"] == serde_json::json!(control_id))
+            .expect("control link present");
+        assert_eq!(
+            control_link["provenance_rejected"],
+            serde_json::json!(false),
+            "the control link must not be marked rejected: {control_link}"
+        );
+    }
+
+    /// Per the independent security review of this PR: `api_contract` had no
+    /// adversarial (forged-sensor) regression test of its own -- only the
+    /// Store-boundary f1-f7/p1-p4 tests (which test the Store method in
+    /// isolation, not this endpoint's wiring) and the pre-existing
+    /// `fornx441_forged_host_observed_label_does_not_satisfy_contract_via_api`
+    /// (forged-only, no control, so it can't prove the guard isn't just
+    /// rejecting everything). This closes that gap with a genuine control:
+    /// a HostObserved-authorized sensor satisfying `tests_passed`'s
+    /// `test_runner_exit_code` requirement, alongside the forged row.
+    #[tokio::test]
+    async fn fornx441_matrix_contract_excludes_forged_but_satisfies_via_control() {
+        let state = test_state().await;
+        let session = "fornx441-matrix-contract";
+        let event_id = test_event(&state, session).await;
+        // `EvidenceSource::now()` stamps `collected_at` as real "now" -- the
+        // claim/evidence timestamps must sit inside the contract's
+        // freshness window (same discipline as
+        // `api_contract_exercises_all_six_representative_contracts`).
+        let now = chrono::Utc::now().to_rfc3339();
+        let claim = Claim {
+            id: Uuid::new_v4(),
+            session_id: session.to_string(),
+            source_event_id: event_id,
+            text: "claim about tests_passed".to_string(),
+            subject: "tests_passed".to_string(),
+            claimed_at: now.clone(),
+        };
+        state
+            .store
+            .insert_claim(&claim)
+            .await
+            .expect("insert claim");
+
+        // Control: `claude_file_write_confirmed_sensor_v1` is genuinely
+        // authorized for HostObserved -- exactly what `test_runner_exit_code`
+        // requires.
+        let control = fornax_types::Evidence {
+            observed_at: now.clone(),
+            source: Some(fornax_types::sensor::EvidenceSource::now(
+                "claude_file_write_confirmed_sensor_v1",
+                fornax_types::sensor::TrustClass::HostObserved,
+                None,
+                fornax_types::sensor::CollectionMethod::default(),
+                None,
+            )),
+            ..test_evidence(session, event_id)
+        };
+        // Forged: `claude_bash_exit_code_sensor_v1` is only authorized for
+        // AgentAdjacent, forges HostObserved under that same identity.
+        let forged = fornax_types::Evidence {
+            observed_at: now.clone(),
+            source: Some(matrix_sensor_source(
+                fornax_types::sensor::TrustClass::HostObserved,
+            )),
+            ..test_evidence(session, event_id)
+        };
+        state
+            .store
+            .insert_evidence_with_origin(&control, EvidenceOrigin::UdsIngest)
+            .await
+            .expect("insert control evidence");
+        state
+            .store
+            .insert_evidence_with_origin(&forged, EvidenceOrigin::UdsIngest)
+            .await
+            .expect("insert forged evidence");
+
+        let v = api_contract(
+            State(state),
+            Query(ContractQuery {
+                claim: claim.id.to_string(),
+                session: session.to_string(),
+            }),
+        )
+        .await
+        .0;
+
+        assert_eq!(
+            v["assessment"]["overall"],
+            serde_json::json!("satisfied"),
+            "the genuine control evidence must still satisfy tests_passed, proving this test \
+             cannot pass by rejecting everything: {v}"
+        );
+        let matched: Vec<String> = v["assessment"]["per_requirement"]
+            .as_array()
+            .expect("per_requirement array")
+            .iter()
+            .find(|r| r["requirement_id"] == serde_json::json!("test_runner_exit_code"))
+            .expect("test_runner_exit_code requirement present")["matched_evidence"]
+            .as_array()
+            .expect("matched_evidence array")
+            .iter()
+            .map(|v| v.as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            matched.contains(&control.id.to_string()),
+            "the control must be the one satisfying the requirement: {v}"
+        );
+        assert!(
+            !matched.contains(&forged.id.to_string()),
+            "the forged row must never be counted as matched evidence: {v}"
+        );
+        let violations = v["provenance_violations"]
+            .as_array()
+            .expect("provenance_violations array");
+        assert!(
+            violations
+                .iter()
+                .any(|p| p["evidence_id"] == serde_json::json!(forged.id)),
+            "the forged row must be surfaced as a provenance violation: {v}"
+        );
+        assert!(
+            !violations
+                .iter()
+                .any(|p| p["evidence_id"] == serde_json::json!(control.id)),
+            "the control row must never be flagged as a provenance violation: {v}"
         );
     }
 
