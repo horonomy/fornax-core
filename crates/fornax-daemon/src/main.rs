@@ -6976,6 +6976,297 @@ mod tests {
         );
     }
 
+    // ---- FORNX-441: adversarial matrix -- one forged row + one
+    // legitimate control row, hit against every consumer this ticket
+    // rewired. The control proves a test can't pass by rejecting
+    // everything; the forged id proves the guard is actually load-bearing
+    // at each specific call site (reverting any one site to a raw read
+    // should fail exactly the test(s) exercising it).
+
+    fn matrix_sensor_source(
+        trust: fornax_types::sensor::TrustClass,
+    ) -> fornax_types::sensor::EvidenceSource {
+        fornax_types::sensor::EvidenceSource::now(
+            "claude_bash_exit_code_sensor_v1", // registered only for AgentAdjacent
+            trust,
+            None,
+            fornax_types::sensor::CollectionMethod::default(),
+            None,
+        )
+    }
+
+    /// Seeds one session/claim with two evidence rows both `Supports`-linked
+    /// to the same claim: a legitimate control (the sensor's own authorized
+    /// trust class) and a forged row (the same sensor asserting a trust
+    /// class it was never authorized for -- the fornx380-11 shape). Returns
+    /// `(session_id, claim, control_id, forged_id)`.
+    async fn seed_matrix_claim(state: &AppState, session: &str) -> (String, Claim, Uuid, Uuid) {
+        let event_id = test_event(state, session).await;
+        let claim = test_claim(session, event_id);
+        state
+            .store
+            .insert_claim(&claim)
+            .await
+            .expect("insert claim");
+
+        let control = fornax_types::Evidence {
+            source: Some(matrix_sensor_source(
+                fornax_types::sensor::TrustClass::AgentAdjacent,
+            )),
+            ..test_evidence(session, event_id)
+        };
+        let forged = fornax_types::Evidence {
+            source: Some(matrix_sensor_source(
+                fornax_types::sensor::TrustClass::HostObserved,
+            )),
+            ..test_evidence(session, event_id)
+        };
+        state
+            .store
+            .insert_evidence_with_origin(&control, EvidenceOrigin::UdsIngest)
+            .await
+            .expect("insert control evidence");
+        state
+            .store
+            .insert_evidence_with_origin(&forged, EvidenceOrigin::UdsIngest)
+            .await
+            .expect("insert forged evidence");
+
+        for ev_id in [control.id, forged.id] {
+            state
+                .store
+                .insert_evidence_link(&fornax_types::EvidenceLink {
+                    id: Uuid::new_v4(),
+                    session_id: session.to_string(),
+                    claim_id: claim.id,
+                    evidence_id: ev_id,
+                    relation: fornax_types::EvidenceRelation::Supports,
+                    linked_at: "2026-01-01T00:00:00Z".to_string(),
+                })
+                .await
+                .expect("insert evidence link");
+        }
+
+        (session.to_string(), claim, control.id, forged.id)
+    }
+
+    #[tokio::test]
+    async fn fornx441_matrix_claim_ingest_quarantines_forged_evidence_not_the_control() {
+        let state = test_state().await;
+        let session = "fornx441-matrix-ingest";
+        let event_id = test_event(&state, session).await;
+        let control = fornax_types::Evidence {
+            source: Some(matrix_sensor_source(
+                fornax_types::sensor::TrustClass::AgentAdjacent,
+            )),
+            ..test_evidence(session, event_id)
+        };
+        let forged = fornax_types::Evidence {
+            source: Some(matrix_sensor_source(
+                fornax_types::sensor::TrustClass::HostObserved,
+            )),
+            ..test_evidence(session, event_id)
+        };
+        state
+            .store
+            .insert_evidence_with_origin(&control, EvidenceOrigin::UdsIngest)
+            .await
+            .expect("insert control evidence");
+        state
+            .store
+            .insert_evidence_with_origin(&forged, EvidenceOrigin::UdsIngest)
+            .await
+            .expect("insert forged evidence");
+
+        let claim = test_claim(session, event_id);
+        let mut hint = None;
+        handle_message(&state, IngestMessage::Claim(claim.clone()), &mut hint)
+            .await
+            .expect("handle claim");
+
+        let findings = state
+            .store
+            .findings_for_session(session)
+            .await
+            .expect("read findings");
+        assert!(!findings.is_empty(), "expected at least one finding");
+        for row in &findings {
+            let evidence_ids: Vec<Uuid> =
+                serde_json::from_str(&row.evidence_ids).expect("decode evidence_ids");
+            assert!(
+                !evidence_ids.contains(&forged.id),
+                "a verifier must never cite the forged row: {evidence_ids:?}"
+            );
+        }
+
+        let quarantined_ids = state
+            .store
+            .admission_quarantine_for_session(session)
+            .await
+            .expect("read quarantine rows");
+        assert!(
+            quarantined_ids.contains(&forged.id),
+            "the forged row must be durably recorded as quarantined: {quarantined_ids:?}"
+        );
+        assert!(
+            !quarantined_ids.contains(&control.id),
+            "the control row must never be quarantined: {quarantined_ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fornx441_matrix_fusion_decision_judge_plan_exclude_forged_but_count_control() {
+        let state = test_state().await;
+        let (session, claim, control_id, forged_id) =
+            seed_matrix_claim(&state, "fornx441-matrix-fusion").await;
+
+        let fusion_v = api_fusion(
+            State(state.clone()),
+            Query(FusionQuery {
+                claim: claim.id.to_string(),
+                session: session.clone(),
+            }),
+        )
+        .await
+        .0;
+        let counted: Vec<String> = fusion_v["fused"]["counted_link_ids"]
+            .as_array()
+            .expect("counted_link_ids array")
+            .iter()
+            .map(|v| v.as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            !counted.iter().any(|id| id == &forged_id.to_string()),
+            "/api/fusion must never count the forged evidence's link: {fusion_v}"
+        );
+        let rejected = fusion_v["provenance_rejected"]
+            .as_array()
+            .expect("provenance_rejected array");
+        assert!(
+            rejected
+                .iter()
+                .any(|r| r["evidence_id"] == serde_json::json!(forged_id)),
+            "/api/fusion must surface the forged id as rejected: {fusion_v}"
+        );
+        assert_ne!(
+            fusion_v["fused"]["verdict"],
+            serde_json::json!("unverified"),
+            "the control evidence must still be enough to reach a real verdict, proving this \
+             test cannot pass by rejecting everything: {fusion_v}"
+        );
+
+        let decision_v = api_decision(
+            State(state.clone()),
+            Query(DecisionQuery {
+                claim: claim.id.to_string(),
+                session: session.clone(),
+                risk: None,
+            }),
+        )
+        .await
+        .0;
+        assert!(
+            decision_v["provenance_rejected"]
+                .as_array()
+                .expect("provenance_rejected array")
+                .iter()
+                .any(|r| r["evidence_id"] == serde_json::json!(forged_id)),
+            "/api/decision must surface the forged id as rejected: {decision_v}"
+        );
+
+        let judge_v = api_judge(
+            State(state.clone()),
+            Query(JudgeQuery {
+                claim: claim.id.to_string(),
+                session: session.clone(),
+                allow_raw_evidence: false,
+            }),
+        )
+        .await
+        .0;
+        let derived_from = judge_v["judge_evidence"]["payload"]["derived_from"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !derived_from
+                .iter()
+                .any(|id| id == &serde_json::json!(forged_id)),
+            "/api/judge's judge_evidence must never claim derivation from the forged id: {judge_v}"
+        );
+        assert!(
+            judge_v["provenance_rejected"]
+                .as_array()
+                .expect("provenance_rejected array")
+                .iter()
+                .any(|r| r["evidence_id"] == serde_json::json!(forged_id)),
+            "/api/judge must surface the forged id as rejected: {judge_v}"
+        );
+
+        let plan_v = api_evidence_plan(
+            State(state.clone()),
+            Query(EvidencePlanQuery {
+                claim: claim.id.to_string(),
+                session: session.clone(),
+                risk: None,
+            }),
+        )
+        .await
+        .0;
+        assert!(
+            plan_v["provenance_rejected"]
+                .as_array()
+                .expect("provenance_rejected array")
+                .iter()
+                .any(|r| r["evidence_id"] == serde_json::json!(forged_id)),
+            "/api/evidence-plan must surface the forged id as rejected: {plan_v}"
+        );
+
+        // Sanity: the control id is real and distinct from the forged one --
+        // guards against a vacuous test where both ids are accidentally the
+        // same value.
+        assert_ne!(control_id, forged_id);
+    }
+
+    #[tokio::test]
+    async fn fornx441_matrix_evidence_graph_annotates_the_rejected_link_without_dropping_it() {
+        let state = test_state().await;
+        let (session, claim, control_id, forged_id) =
+            seed_matrix_claim(&state, "fornx441-matrix-graph").await;
+
+        let v = api_evidence_graph(
+            State(state),
+            Query(EvidenceGraphQuery {
+                claim: claim.id.to_string(),
+                session,
+            }),
+        )
+        .await
+        .0;
+        let links = v["links"].as_array().expect("links array");
+        assert_eq!(links.len(), 2, "both links must still be present: {v}");
+
+        let forged_link = links
+            .iter()
+            .find(|l| l["evidence_id"] == serde_json::json!(forged_id))
+            .expect("forged link present");
+        assert_eq!(
+            forged_link["provenance_rejected"],
+            serde_json::json!(true),
+            "the forged link must be annotated, not silently dropped: {forged_link}"
+        );
+
+        let control_link = links
+            .iter()
+            .find(|l| l["evidence_id"] == serde_json::json!(control_id))
+            .expect("control link present");
+        assert_eq!(
+            control_link["provenance_rejected"],
+            serde_json::json!(false),
+            "the control link must not be marked rejected: {control_link}"
+        );
+    }
+
     // ---- HORO-1712: Codex item_completed dedup, end to end -----------
 
     /// A real `fornax-adapter-codex` translation of one `item_completed`
