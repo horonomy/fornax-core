@@ -103,6 +103,26 @@ impl Verifier for TestResultVerifier {
         let exit_code = ev.payload.get("exit_code").and_then(|v| v.as_i64());
 
         match exit_code {
+            // FORNX-433 follow-up: a heuristic `exit_code=0` (no real exit
+            // code observed — see `is_heuristic_evidence`'s doc comment for
+            // why "no stderr" never proves success) must not reach Verified.
+            // A real test-runner exit code (`heuristic` absent/false) still
+            // does.
+            Some(0) if is_heuristic_evidence(ev) => Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Review,
+                evidence_ids: vec![ev.id],
+                verifier_name: self.name().to_string(),
+                rationale: format!(
+                    "claim states tests passed; the only signal observed is a heuristic \
+                     exit_code=0 (no stderr/failure marker seen), which does not prove the \
+                     test runner actually succeeded -- flagged for review, not verified \
+                     ({})",
+                    ev.provenance
+                ),
+                computed_at: now,
+            },
             Some(0) => Finding {
                 id: Uuid::new_v4(),
                 claim_id: claim.id,
@@ -348,6 +368,24 @@ impl Verifier for CommandSuccessVerifier {
         let exit_code = ev.payload.get("exit_code").and_then(|v| v.as_i64());
 
         match exit_code {
+            // Same reasoning as `TestResultVerifier`'s mirror branch above:
+            // a heuristic `exit_code=0` does not prove the command actually
+            // succeeded.
+            Some(0) if is_heuristic_evidence(ev) => Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Review,
+                evidence_ids: vec![ev.id],
+                verifier_name: self.name().to_string(),
+                rationale: format!(
+                    "claim states the command succeeded; the only signal observed is a \
+                     heuristic exit_code=0 (no stderr/failure marker seen), which does not \
+                     prove the command actually succeeded -- flagged for review, not \
+                     verified ({})",
+                    ev.provenance
+                ),
+                computed_at: now,
+            },
             Some(0) => Finding {
                 id: Uuid::new_v4(),
                 claim_id: claim.id,
@@ -892,6 +930,27 @@ fn is_test_runner_evidence(e: &Evidence) -> bool {
             || cmd.contains("jest"))
 }
 
+/// True when `e.payload["heuristic"]` is `true` — the evidence's `exit_code`
+/// was inferred, not observed from a real exit code (set by
+/// `fornax-adapter-claude`'s `ClaudeBashExitCodeSensor` and
+/// `fornax-adapter-codex`'s `CodexCustomToolCallOutputSensor`'s
+/// `script_completed` fallback branch; absent, or `false`, for every sensor
+/// that parses a genuine literal exit code).
+///
+/// FORNX-433 follow-up (found while adversarially testing FORNX-433's native
+/// ingress tests against a realistic Claude `pytest -q` failure shape):
+/// `heuristic:stderr_empty`'s original assumption — "empty stderr implies
+/// exit_code 0 is reliable" — is backwards. It is unreliable in exactly the
+/// direction that matters: a real `pytest`/`cargo test`/etc. failure writes
+/// its failure summary to **stdout**, not stderr, so "stderr is empty"
+/// proves nothing about success. Both match arms above that gate on this
+/// function exist so a bare heuristic `exit_code=0` downgrades to `Review`
+/// rather than reaching `Verified` — the false-VERIFIED path this ticket's
+/// own doc comment used to claim didn't exist.
+fn is_heuristic_evidence(e: &Evidence) -> bool {
+    e.payload.get("heuristic").and_then(|v| v.as_bool()) == Some(true)
+}
+
 /// True when `e`'s nonzero `exit_code` was synthesized by
 /// `fornax-adapter-claude`'s `ClaudeBashExitCodeSensor` from the
 /// `stderr_nonempty` heuristic (`"heuristic": true` and provenance ending in
@@ -901,10 +960,10 @@ fn is_test_runner_evidence(e: &Evidence) -> bool {
 /// exit code field; the adapter falls back to inferring failure from
 /// non-empty stderr, which is wrong whenever a command writes to stderr
 /// (a warning, a progress message, ...) but still exits 0. Deliberately
-/// narrow: `heuristic:interrupted` (an explicit signal that the user killed
-/// the command) and `heuristic:stderr_empty` (which only ever produces
-/// exit_code 0) are excluded — only this specific heuristic reason is
-/// unreliable in the failure direction.
+/// narrow to the *nonzero* heuristic reason: the zero/success heuristic
+/// branch (`heuristic:stderr_empty` / Codex's `heuristic:script_completed`)
+/// is handled separately by [`is_heuristic_evidence`] above, which downgrades
+/// it to `Review` unconditionally rather than treating it as reliable.
 fn is_stderr_heuristic_evidence(e: &Evidence) -> bool {
     e.payload.get("heuristic").and_then(|v| v.as_bool()) == Some(true)
         && e.provenance.ends_with("heuristic:stderr_nonempty")
@@ -1047,6 +1106,26 @@ mod tests {
         let ev = vec![evidence_with_exit_code(0)];
         let f = v.verify(&c, &ev, &caps());
         assert_eq!(f.verdict, Verdict::Verified);
+    }
+
+    /// FORNX-433 follow-up regression: a *heuristic* `exit_code=0` (e.g.
+    /// `fornax-adapter-claude`'s `ClaudeBashExitCodeSensor` inferring success
+    /// purely from "stderr is empty", which a real `pytest -q` failure that
+    /// writes its summary to stdout also satisfies) must never reach
+    /// `Verified` -- that was the exact false-VERIFIED path FORNX-433's own
+    /// native-ingress tests surfaced. `verified_when_exit_code_zero` above is
+    /// the authoritative-evidence control proving this fix discriminates by
+    /// the `heuristic` flag, not by the exit code value.
+    #[test]
+    fn heuristic_exit_code_zero_is_review_not_verified() {
+        let v = TestResultVerifier;
+        let c = claim("All tests passed.");
+        let mut ev = evidence_with_exit_code(0);
+        ev.payload["heuristic"] = serde_json::json!(true);
+        ev.provenance = "claude_code:PostToolUse:Bash#heuristic:stderr_empty".into();
+        let f = v.verify(&c, &[ev.clone()], &caps());
+        assert_eq!(f.verdict, Verdict::Review);
+        assert_eq!(f.evidence_ids, vec![ev.id]);
     }
 
     #[test]
@@ -1446,6 +1525,22 @@ mod command_success_verifier_tests {
         let f = v.verify(&c, &ev, &caps());
         assert_eq!(f.verdict, Verdict::Contradicted);
         assert_eq!(f.evidence_ids, vec![ev[0].id]);
+    }
+
+    /// FORNX-433 follow-up regression — see `TestResultVerifier`'s
+    /// `heuristic_exit_code_zero_is_review_not_verified` for the full
+    /// rationale: a heuristic `exit_code=0` must not reach `Verified` here
+    /// either.
+    #[test]
+    fn heuristic_named_command_exit_code_zero_is_review_not_verified() {
+        let v = CommandSuccessVerifier;
+        let c = crate::tests::claim_for("command_succeeded", "The `npm install` succeeded.");
+        let mut ev = crate::tests::evidence_for_command(&["npm", "install"], 0);
+        ev.payload["heuristic"] = serde_json::json!(true);
+        ev.provenance = "claude_code:PostToolUse:Bash#heuristic:stderr_empty".into();
+        let f = v.verify(&c, &[ev.clone()], &caps());
+        assert_eq!(f.verdict, Verdict::Review);
+        assert_eq!(f.evidence_ids, vec![ev.id]);
     }
 
     #[test]
