@@ -29,3 +29,7 @@ uuid.workspace = true
 # suppressing the real per-command exit code, not re-deriving that logic
 # here. No cycle: fornax-verify does not depend on this crate.
 fornax-verify = { path = "../fornax-verify" }
+# FORNX-433: live_transport.rs polls the real on-disk store the real
+# fornax-daemon it spawns reads/writes, same precedent as
+# fornax-adapter-opencode's live_transport.rs.
+fornax-store = { path = "../fornax-store" }

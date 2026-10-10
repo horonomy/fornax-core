@@ -917,6 +917,7 @@ version = "0.0.8"
 dependencies = [
  "anyhow",
  "chrono",
+ "fornax-store",
  "fornax-types",
  "fornax-vcs",
  "gix",
@@ -932,6 +933,7 @@ version = "0.0.8"
 dependencies = [
  "anyhow",
  "chrono",
+ "fornax-store",
  "fornax-types",
  "fornax-verify",
  "serde",
