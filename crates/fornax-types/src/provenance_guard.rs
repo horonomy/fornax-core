@@ -144,6 +144,18 @@ impl CollectorAuthority {
                 "opencode_command_duration_sensor_v1",
                 TrustClass::AgentAdjacent,
             )
+            // FORNX-441: fornax-ci's GitHubCiStatusSensor -- same bug class
+            // as the Codex item_completed miss (FORNX-431): a real, shipped
+            // sensor (crates/fornax-ci/src/lib.rs) was simply never added
+            // here. Its own trust_class() declares IndependentExternal, the
+            // only sensor in this repo that does -- without this entry,
+            // contract classes requiring IndependentExternal evidence
+            // (e.g. deployment_healthy) could never be legitimately
+            // satisfied through the provenance-guarded path at all.
+            .authorize_sensor(
+                "github_ci_status_sensor_v1",
+                TrustClass::IndependentExternal,
+            )
     }
 
     /// True only if `sensor_name` is registered under this exact
@@ -891,6 +903,24 @@ mod tests {
         assert!(authority.is_authorized(
             "codex_item_completed_command_execution_sensor_v1",
             &TrustClass::AgentAdjacent
+        ));
+    }
+
+    #[test]
+    fn github_ci_status_sensor_is_authorized() {
+        // Regression: fornax-ci's GitHubCiStatusSensor (crates/fornax-ci/
+        // src/lib.rs) declares TrustClass::IndependentExternal but was
+        // missing from known_sensors() -- found independently reviewing
+        // FORNX-441's fix, which had wrongly assumed no sensor existed for
+        // this trust class at all. Without this entry, deployment_healthy
+        // (and any other contract requiring IndependentExternal evidence)
+        // could never be legitimately satisfied through the
+        // provenance-guarded path, regardless of how genuine the CI status
+        // check actually was.
+        let authority = CollectorAuthority::known_sensors();
+        assert!(authority.is_authorized(
+            "github_ci_status_sensor_v1",
+            &TrustClass::IndependentExternal
         ));
     }
 

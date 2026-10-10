@@ -2187,14 +2187,24 @@ async fn api_contract(
         FusionOutcome::Found(found) => {
             let registry = fornax_verify::contract_satisfaction::default_registry();
             let claim_class = ClaimClassId::new(found.claim.subject.clone(), 1);
-            match fornax_verify::contract_satisfaction::assess(
+            // FORNX-441: this previously called `assess` directly against
+            // `found.evidence_pool`, which is `evidence_for_session`'s raw,
+            // unfiltered contents (see `compute_fusion` above) -- forged
+            // trust-class labels, unregistered sensors, and cross-session
+            // evidence all reached contract satisfaction with no provenance
+            // check at all, exactly the fornx380-01/-11 attack shape. The
+            // guarded entry point already exists and is already proven by
+            // `fornax-verify`'s attack_1..5 tests; this endpoint simply
+            // wasn't calling it.
+            match fornax_verify::contract_satisfaction::assess_with_provenance_guard(
                 &registry,
                 &claim_class,
                 &found.claim,
                 &found.evidence_pool,
                 &[],
+                &provenance_guard::CollectorAuthority::known_sensors(),
             ) {
-                Ok(report) => Json(serde_json::json!({
+                Ok((report, provenance_violations)) => Json(serde_json::json!({
                     "claim": q.claim,
                     "session": q.session,
                     "found": true,
@@ -2204,6 +2214,10 @@ async fn api_contract(
                         "requirement_id": v.requirement_id,
                         "shared_with_requirement_id": v.shared_with_requirement_id,
                         "evidence_id": v.evidence_id,
+                    })).collect::<Vec<_>>(),
+                    "provenance_violations": provenance_violations.iter().map(|v| serde_json::json!({
+                        "evidence_id": v.evidence_id,
+                        "reason": v.reason,
                     })).collect::<Vec<_>>(),
                 })),
                 Err(e) => Json(serde_json::json!({
@@ -6496,6 +6510,32 @@ mod tests {
 
         let state = test_state().await;
 
+        // FORNX-441: `api_contract` now calls `assess_with_provenance_guard`
+        // (previously plain `assess`), which only admits evidence from a
+        // sensor `CollectorAuthority::known_sensors()` actually registers at
+        // the trust class it claims -- "test_sensor" (used throughout this
+        // test before this fix) is not a registered sensor at all, so every
+        // fixture below is updated to a real sensor name matching its trust
+        // class, proving the guard admits genuine evidence rather than
+        // merely proving it rejects nothing.
+        fn real_sensor_for(trust_class: &TrustClass) -> Option<&'static str> {
+            match trust_class {
+                TrustClass::HostObserved => Some("claude_file_write_confirmed_sensor_v1"),
+                TrustClass::AgentAdjacent => Some("claude_bash_exit_code_sensor_v1"),
+                // fornax-ci's GitHubCiStatusSensor (crates/fornax-ci) --
+                // initially missed from known_sensors() too (fixed
+                // alongside this test, see provenance_guard.rs).
+                TrustClass::IndependentExternal => Some("github_ci_status_sensor_v1"),
+                // No sensor is registered for this trust class yet -- see
+                // the security_defect_fixed fixture below, which asserts
+                // the real (not fabricated) consequence of that gap rather
+                // than assuming a sensor exists.
+                TrustClass::HumanReviewed
+                | TrustClass::ModelInternal
+                | TrustClass::Unrecognized(_) => None,
+            }
+        }
+
         async fn insert_claim_and_evidence(
             state: &AppState,
             session_id: &str,
@@ -6527,7 +6567,7 @@ mod tests {
                 payload: serde_json::json!({}),
                 provenance: "test".to_string(),
                 source: Some(EvidenceSource::now(
-                    "test_sensor",
+                    real_sensor_for(&trust_class).unwrap_or("no_sensor_registered_for_this_class"),
                     trust_class,
                     None,
                     CollectionMethod::default(),
@@ -6642,7 +6682,12 @@ mod tests {
         );
 
         // 5. deployment_healthy (must be IndependentExternal, never
-        // agent-adjacent self-report)
+        // agent-adjacent self-report). Genuinely satisfied via
+        // fornax-ci's GitHubCiStatusSensor, the real registered
+        // IndependentExternal sensor -- an independent review of this same
+        // fix caught that an earlier version of this test wrongly assumed
+        // no sensor existed for this trust class at all (it did; it was
+        // just missing from known_sensors(), fixed alongside this test).
         let session = "fornx378-deployment-healthy";
         let claim = insert_claim_and_evidence(
             &state,
@@ -6690,7 +6735,7 @@ mod tests {
                 payload: serde_json::json!({}),
                 provenance: "test".to_string(),
                 source: Some(EvidenceSource::now(
-                    "test_sensor",
+                    real_sensor_for(&trust).unwrap_or("no_sensor_registered_for_this_class"),
                     trust,
                     None,
                     CollectionMethod::default(),
@@ -6706,10 +6751,19 @@ mod tests {
                 .expect("insert evidence");
         }
         let v = assess_via_api(state.clone(), &claim, session).await;
-        assert_eq!(
+        // FORNX-441: this requirement needs BOTH a HostObserved exit code
+        // AND a HumanReviewed disposition. No sensor is registered for
+        // HumanReviewed yet (see `real_sensor_for`), so the guard correctly
+        // quarantines that half -- the honest result today is Unavailable,
+        // never a fabricated Satisfied. This is a real, disclosed gap
+        // (no human-review sensor exists), not a test weakening: it proves
+        // the guard fails closed exactly where production has no
+        // legitimate way to satisfy this requirement yet.
+        assert_ne!(
             v["assessment"]["overall"],
             serde_json::json!("satisfied"),
-            "security_defect_fixed: {v}"
+            "security_defect_fixed must not be satisfied while no sensor is registered for \
+             TrustClass::HumanReviewed -- a fabricated pass here would be worse than this gap: {v}"
         );
 
         // Adversarial spot-check reusing this same fixture set: an
@@ -6730,6 +6784,88 @@ mod tests {
             v["assessment"]["overall"],
             serde_json::json!("satisfied"),
             "deployment_healthy must never be satisfied by an agent self-report: {v}"
+        );
+    }
+
+    /// FORNX-441: `/api/contract` called `assess` directly against
+    /// `evidence_for_session`'s raw, unfiltered pool, with no provenance
+    /// check at all -- the exact fornx380-11 attack shape
+    /// (`fornx380_11_forged_host_observed_label_from_an_agent_only_sensor_is_quarantined`
+    /// in `fornax-types::provenance_guard`, which only proves this at the
+    /// pure `authorize_evidence_source` unit level, never through this
+    /// live endpoint). This is the live-endpoint proof the escape is
+    /// closed: a registered-but-unauthorized sensor forging a HostObserved
+    /// label must not satisfy `tests_passed`, which only HostObserved
+    /// evidence should ever satisfy.
+    #[tokio::test]
+    async fn fornx441_forged_host_observed_label_does_not_satisfy_contract_via_api() {
+        use fornax_types::sensor::{CollectionMethod, EvidenceSource};
+        use fornax_types::{Evidence, EvidenceKind, TrustClass};
+
+        let state = test_state().await;
+        let session = "fornx441-forged-label";
+        let event_id = test_event(&state, session).await;
+        let claim = Claim {
+            id: Uuid::new_v4(),
+            session_id: session.to_string(),
+            source_event_id: event_id,
+            text: "claim about tests_passed".to_string(),
+            subject: "tests_passed".to_string(),
+            claimed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        state
+            .store
+            .insert_claim(&claim)
+            .await
+            .expect("insert claim");
+
+        // claude_bash_exit_code_sensor_v1 is a real registered sensor --
+        // but only at TrustClass::AgentAdjacent. This evidence forges
+        // HostObserved under that same identity, the fornx380-11 shape.
+        let forged = Evidence {
+            id: Uuid::new_v4(),
+            session_id: session.to_string(),
+            source_event_id: event_id,
+            kind: EvidenceKind::ExitCode,
+            observed_at: chrono::Utc::now().to_rfc3339(),
+            payload: serde_json::json!({}),
+            provenance: "test".to_string(),
+            source: Some(EvidenceSource::now(
+                "claude_bash_exit_code_sensor_v1",
+                TrustClass::HostObserved,
+                None,
+                CollectionMethod::default(),
+                None,
+            )),
+            extension: None,
+            evidence_purged: false,
+        };
+        state
+            .store
+            .insert_evidence(&forged)
+            .await
+            .expect("insert forged evidence");
+
+        let v = api_contract(
+            State(state),
+            Query(ContractQuery {
+                claim: claim.id.to_string(),
+                session: session.to_string(),
+            }),
+        )
+        .await
+        .0;
+
+        assert_ne!(
+            v["assessment"]["overall"],
+            serde_json::json!("satisfied"),
+            "a forged HostObserved label from an AgentAdjacent-only sensor must never satisfy \
+             tests_passed via /api/contract -- FORNX-441: {v}"
+        );
+        assert_eq!(
+            v["provenance_violations"].as_array().map(|a| a.len()),
+            Some(1),
+            "the forgery must be reported as a provenance violation, not silently dropped: {v}"
         );
     }
 
