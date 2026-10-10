@@ -1605,12 +1605,19 @@ async fn api_evidence_graph(
             // `fuse` wrapping, above) so a poisoned session's family
             // construction cannot stall a concurrent request for a
             // different session on the async runtime's worker threads.
+            // FORNX-441: `rejected_ids` is carried out of this match so the
+            // `links_json` annotation loop below can mark a link to a
+            // since-rejected evidence row explicitly, rather than silently
+            // rendering it identically to an admitted one.
+            let mut rejected_ids: std::collections::HashSet<uuid::Uuid> =
+                std::collections::HashSet::new();
             let (family_map, independence_status): (
                 Option<fornax_verify::independence::SourceFamilyMap>,
                 Option<serde_json::Value>,
             ) = match state.store.admitted_evidence_for_session(&q.session).await {
                 Ok(read) => {
                     let admitted = read.admitted;
+                    rejected_ids.extend(read.rejected.iter().map(|r| r.evidence_id));
                     let build_result = tokio::task::spawn_blocking(move || {
                         fornax_verify::independence::SourceFamilyMap::try_build(
                             &admitted,
@@ -1668,6 +1675,16 @@ async fn api_evidence_graph(
             // happen for a real evidence id) degrades to `false` — never
             // fabricate "expired" for a row this call couldn't actually
             // read.
+            //
+            // FORNX-441: `graph.links` is the persisted claim_evidence_links
+            // graph, not filtered by admission -- a link can name an
+            // evidence id `admitted_evidence_for_session` has since
+            // rejected (forged provenance, unregistered sensor, an
+            // `Unknown` origin). Rather than silently dropping that link
+            // (which would make a real, persisted link vanish with no
+            // explanation), it stays in the response annotated
+            // `provenance_rejected: true` so a caller can see the
+            // provenance boundary was crossed, not just a smaller count.
             let mut links_json = Vec::with_capacity(graph.links.len());
             for link in &graph.links {
                 let purged = state
@@ -1686,6 +1703,10 @@ async fn api_evidence_graph(
                             .get(&link.evidence_id)
                             .map(|i| serde_json::json!(i))
                             .unwrap_or(serde_json::Value::Null),
+                    );
+                    map.insert(
+                        "provenance_rejected".to_string(),
+                        serde_json::json!(rejected_ids.contains(&link.evidence_id)),
                     );
                 }
                 links_json.push(value);
@@ -1803,7 +1824,7 @@ async fn run_verifiers_and_persist_findings(
                 rejection.evidence_id,
                 claim.id,
                 &anchor,
-                &format!("{:?}", rejection.reason),
+                &admission_rejection_to_persisted_reason(&rejection.reason),
             )
             .await
         {
@@ -1897,6 +1918,41 @@ async fn run_verifiers_and_persist_findings(
         state.store.insert_finding(&finding).await?;
     }
     Ok(())
+}
+
+/// A stable, durable string for `record_admission_quarantine` -- never
+/// `{:?}` (FORNX-441): before this module existed, `admission_decision`
+/// handed `run_verifiers_and_persist_findings` a bare `reason: String`
+/// straight from `authorize_evidence_source`, and every row already
+/// persisted holds exactly that text. `Debug`-formatting the new
+/// `AdmissionRejection` enum would silently change the shape of every
+/// future row (`Provenance { reason: "..." }` instead of the bare
+/// string) while old rows keep the old shape -- a durable-storage format
+/// is not something `Debug`'s "whatever derive happens to produce today"
+/// guarantee is allowed to own. `Provenance` keeps the exact pre-existing
+/// text; the other two variants (only reachable here because this
+/// session-scoped call site has no replay scope, so `ReplayedAcrossClaims`
+/// never fires from this caller, but `CrossSession` can) get their own
+/// explicit, stable wording.
+fn admission_rejection_to_persisted_reason(
+    reason: &fornax_types::provenance_guard::AdmissionRejection,
+) -> String {
+    use fornax_types::provenance_guard::AdmissionRejection;
+    match reason {
+        AdmissionRejection::Provenance { reason } => reason.clone(),
+        AdmissionRejection::CrossSession {
+            evidence_session_id,
+        } => format!(
+            "cross-session attribution: evidence session '{evidence_session_id}' does not \
+             match the session this read is scoped to"
+        ),
+        AdmissionRejection::ReplayedAcrossClaims {
+            originally_consumed_by,
+        } => format!(
+            "evidence already durably consumed by claim {originally_consumed_by} from a \
+             genuinely different turn"
+        ),
+    }
 }
 
 /// Outcome of [`compute_fusion`] — the shared claim-lookup/graph-resolution/
@@ -2396,10 +2452,21 @@ async fn api_judge(
                 }
             };
 
+            // FORNX-441: `graph.links` is the persisted claim_evidence_links
+            // graph, not filtered by admission -- it can still name an
+            // evidence id that `admitted_evidence_for_claim` has since
+            // rejected (forged provenance, cross-session, already
+            // consumed by a different claim). `judge_evidence` must never
+            // claim derivation from a row the admission guard excluded,
+            // so this is intersected with the already-admitted
+            // `evidence_pool`, not `graph.links` alone.
+            let admitted_ids: std::collections::BTreeSet<uuid::Uuid> =
+                evidence_pool.iter().map(|ev| ev.id).collect();
             let derived_from_ids: Vec<uuid::Uuid> = graph
                 .links
                 .iter()
                 .map(|l| l.evidence_id)
+                .filter(|id| admitted_ids.contains(id))
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
                 .collect();

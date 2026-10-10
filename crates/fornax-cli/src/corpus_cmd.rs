@@ -50,14 +50,28 @@ pub async fn handle(action: CorpusAction, fornax_home: &std::path::Path) -> anyh
 
 async fn mine_session(store: &fornax_store::Store, session_id: &str) -> anyhow::Result<()> {
     let claims = store.claims_for_session(session_id).await?;
-    let evidence_outcome = store.evidence_for_session(session_id).await?;
-    if !evidence_outcome.failed.is_empty() {
+    // FORNX-441: `fornax corpus mine` persists its fused output into
+    // candidate-case documents that `fornax adjudicate` later loads and
+    // trusts without re-reading the live store -- a forged/unregistered-
+    // sensor/cross-session row admitted here would be baked permanently
+    // into that downstream review surface. Session-scoped (not
+    // claim-scoped), matching this function's own pre-existing shape: one
+    // shared pool fuses every claim in the session, same as before this
+    // fix, just origin-aware now.
+    let admitted_read = store.admitted_evidence_for_session(session_id).await?;
+    if !admitted_read.failed.is_empty() {
         println!(
             "fornax corpus mine: {} evidence row(s) failed to deserialize and were skipped",
-            evidence_outcome.failed.len()
+            admitted_read.failed.len()
         );
     }
-    let full_pool = evidence_outcome.evidence;
+    if !admitted_read.rejected.is_empty() {
+        println!(
+            "fornax corpus mine: {} evidence row(s) refused admission and were excluded",
+            admitted_read.rejected.len()
+        );
+    }
+    let full_pool = admitted_read.admitted;
     let all_findings = store.findings_for_session(session_id).await?;
 
     let mut mined = 0usize;

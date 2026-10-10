@@ -1930,13 +1930,19 @@ async fn export_spool_from_store(
 ) -> anyhow::Result<()> {
     let events = store.events_for_session(session).await?;
     let claims = store.claims_for_session(session).await?;
-    let evidence_read = store.evidence_for_session(session).await?;
-    if !evidence_read.failed.is_empty() {
+    // FORNX-441: this spool is what `fornax-cloud`'s sync pipeline
+    // ultimately ingests -- a forged, unregistered-sensor, or
+    // `Unknown`-origin row synced here would reach the cloud worker's own
+    // verdict computation with no provenance check ever having run on it.
+    // Session-scoped admission (not claim-scoped): export is per-session,
+    // not per-claim.
+    let admitted_read = store.admitted_evidence_for_session(session).await?;
+    if !admitted_read.failed.is_empty() {
         eprintln!(
             "fornax: {} of {} evidence rows for session {session} failed to deserialize and were not exported: {}",
-            evidence_read.failed.len(),
-            evidence_read.evidence.len() + evidence_read.failed.len(),
-            evidence_read
+            admitted_read.failed.len(),
+            admitted_read.admitted.len() + admitted_read.failed.len(),
+            admitted_read
                 .failed
                 .iter()
                 .map(|f| format!("{} ({})", f.id, f.error))
@@ -1944,7 +1950,13 @@ async fn export_spool_from_store(
                 .join(", ")
         );
     }
-    let evidence = evidence_read.evidence;
+    if !admitted_read.rejected.is_empty() {
+        eprintln!(
+            "fornax: {} evidence row(s) for session {session} refused admission and were not exported",
+            admitted_read.rejected.len()
+        );
+    }
+    let evidence = admitted_read.admitted;
     let capabilities = store.capabilities_for_session(session).await?;
 
     let pending_dir = out.join("pending");
@@ -3514,7 +3526,10 @@ mod tests {
                 evidence_purged: false,
             };
             store
-                .insert_evidence(&evidence)
+                .insert_evidence_with_origin(
+                    &evidence,
+                    fornax_types::provenance_guard::EvidenceOrigin::DaemonAcquisition,
+                )
                 .await
                 .expect("insert evidence");
 
@@ -3793,7 +3808,10 @@ mod tests {
                 evidence_purged: false,
             };
             store
-                .insert_evidence(&evidence)
+                .insert_evidence_with_origin(
+                    &evidence,
+                    fornax_types::provenance_guard::EvidenceOrigin::DaemonAcquisition,
+                )
                 .await
                 .expect("insert evidence");
 
@@ -3879,7 +3897,10 @@ mod tests {
                 evidence_purged: false,
             };
             store
-                .insert_evidence(&evidence)
+                .insert_evidence_with_origin(
+                    &evidence,
+                    fornax_types::provenance_guard::EvidenceOrigin::DaemonAcquisition,
+                )
                 .await
                 .expect("insert evidence");
 

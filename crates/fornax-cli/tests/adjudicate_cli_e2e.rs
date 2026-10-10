@@ -79,8 +79,23 @@ async fn seed_contradiction_sessions(home: &std::path::Path, n: usize) -> Vec<St
             extension: None,
             evidence_purged: false,
         };
-        store.insert_evidence(&ev1).await.unwrap();
-        store.insert_evidence(&ev2).await.unwrap();
+        // FORNX-441: `fornax corpus mine` (invoked below) now reads
+        // `admitted_evidence_for_session`, which rejects
+        // `EvidenceOrigin::Unknown` (what plain `insert_evidence` stamps).
+        store
+            .insert_evidence_with_origin(
+                &ev1,
+                fornax_types::provenance_guard::EvidenceOrigin::DaemonAcquisition,
+            )
+            .await
+            .unwrap();
+        store
+            .insert_evidence_with_origin(
+                &ev2,
+                fornax_types::provenance_guard::EvidenceOrigin::DaemonAcquisition,
+            )
+            .await
+            .unwrap();
 
         store
             .insert_evidence_link(&fornax_types::EvidenceLink {
