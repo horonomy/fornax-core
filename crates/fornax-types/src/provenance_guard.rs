@@ -133,6 +133,10 @@ impl CollectorAuthority {
                 TrustClass::AgentAdjacent,
             )
             .authorize_sensor(
+                "codex_item_completed_command_execution_sensor_v1",
+                TrustClass::AgentAdjacent,
+            )
+            .authorize_sensor(
                 "opencode_tool_exit_code_sensor_v1",
                 TrustClass::AgentAdjacent,
             )
@@ -870,6 +874,25 @@ mod tests {
     }
 
     // --- FORNX-431: EvidenceOrigin / admission_decision -------------------
+
+    #[test]
+    fn codex_item_completed_sensor_is_authorized() {
+        // Regression: fornax-adapter-codex's 0.160+ `item_completed`
+        // translation (translate_item_completed) tags its evidence with
+        // this exact sensor name. It was missing from known_sensors() --
+        // every real Codex 0.160+ command was quarantined as an unknown
+        // sensor, so a passing run could never be Verified and a failing
+        // one could never be Contradicted, regardless of how correct the
+        // rest of the admission logic was. Found via FORNX-433's planning
+        // pass, not by this test -- this test exists so the next adapter
+        // change that renames or drops the sensor fails loudly here
+        // instead of silently reaching this same dead end again.
+        let authority = CollectorAuthority::known_sensors();
+        assert!(authority.is_authorized(
+            "codex_item_completed_command_execution_sensor_v1",
+            &TrustClass::AgentAdjacent
+        ));
+    }
 
     #[test]
     fn unknown_origin_is_always_quarantined() {
