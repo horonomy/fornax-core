@@ -1210,18 +1210,34 @@ impl EvidenceSensor for ClaudeGitWorkingTreeSensor {
 
 fn translate(
     adapter: &ClaudeAdapter,
-    session_hint: &str,
+    // FORNX-433 AC3: no longer used as a fallback session id (see below) --
+    // kept in the signature so `normalize`'s call site and this function's
+    // tests don't need a mechanical signature-only edit; still worth a
+    // named parameter (not `_raw2` or similar) so a future reader isn't
+    // left guessing what the unused slot used to mean.
+    _session_hint: &str,
     raw: &serde_json::Value,
 ) -> NormalizationOutcome {
     let hook_event = raw
         .get("hook_event_name")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let session_id = raw
+    // FORNX-433 AC3: a payload with no real provider-native session id must
+    // never fall back to `session_hint` ("unknown") -- every such payload,
+    // from any session, would land in one shared fake session and verify
+    // each other's claims. Fail closed instead: no identity, no event.
+    let session_id = match raw
         .get("session_id")
         .and_then(|v| v.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| session_hint.to_string());
+        .filter(|s| !s.is_empty())
+    {
+        Some(s) => s.to_string(),
+        None => {
+            return NormalizationOutcome::Ignored {
+                reason: "no provider session identity",
+            }
+        }
+    };
     let now = chrono::Utc::now().to_rfc3339();
 
     let kind = match hook_event {
@@ -1445,6 +1461,44 @@ mod tests {
         assert!(legacy.supports_session_stop_event);
         assert!(legacy.supports_transcript_tail);
         assert!(legacy.supports_subagent_lifecycle);
+    }
+
+    /// FORNX-433 AC3: a payload with no provider-native `session_id` must
+    /// never fall back to the adapter's `session_hint` -- that would let
+    /// any session with no real identity collapse into one shared fake
+    /// session and verify each other's claims. Fail closed instead: no
+    /// messages emitted at all, not even a `Capabilities` message.
+    #[test]
+    fn missing_session_id_is_ignored_not_hint_fallback() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "pytest"},
+            "tool_response": {"exit_code": 0}
+        });
+        match normalize(&raw) {
+            NormalizationOutcome::Ignored { .. } => {}
+            other => panic!("expected Ignored, got {other:?}"),
+        }
+        assert!(normalize(&raw).into_messages().is_empty());
+    }
+
+    /// Same as above, for an explicitly empty `session_id` string -- must
+    /// be treated identically to a missing field, not accepted as a
+    /// literal empty-string session identity.
+    #[test]
+    fn empty_session_id_is_ignored_not_accepted() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "",
+            "tool_name": "Bash",
+            "tool_input": {"command": "pytest"},
+            "tool_response": {"exit_code": 0}
+        });
+        match normalize(&raw) {
+            NormalizationOutcome::Ignored { .. } => {}
+            other => panic!("expected Ignored, got {other:?}"),
+        }
     }
 
     #[test]

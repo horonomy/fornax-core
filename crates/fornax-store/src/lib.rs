@@ -114,6 +114,16 @@ pub enum StoreError {
     /// it, the same path a genuinely unprocessable line already takes.
     #[error("claim id {id} collides with an existing row whose content differs -- not a legitimate retry")]
     ClaimIdCollision { id: String },
+    /// FORNX-433 AC3: a blank/empty `session_id` must never be silently
+    /// accepted -- that is exactly the shape that used to let multiple real
+    /// sessions collide into one shared fake "unknown" session upstream
+    /// (now fixed at the adapter layer, see `fornax-adapter-claude`/
+    /// `-opencode`'s `translate` functions). This is the fail-closed
+    /// boundary for any other caller of this store, including a UDS client
+    /// that bypasses an adapter entirely: propagate as an error so
+    /// `process_line` quarantines it, same as `ClaimIdCollision`.
+    #[error("{kind} row has a blank session_id -- refusing to persist, this cannot be scoped to any real session")]
+    MissingSessionIdentity { kind: &'static str },
 }
 
 /// Outcome of an idempotent insert (`Store::insert_event`/
@@ -319,6 +329,11 @@ impl Store {
     /// `retention::retention_class_for_table`'s doc comment for the same
     /// choice applied uniformly across all four insert paths.
     pub async fn insert_event(&self, e: &AgentEvent) -> Result<InsertOutcome> {
+        if e.session_id.is_empty() {
+            return Err(StoreError::MissingSessionIdentity {
+                kind: "agent_events",
+            });
+        }
         let provider_tag = tag(&e.provider)?;
         let kind_tag = tag(&e.kind)?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -420,6 +435,9 @@ impl Store {
     /// re-verifying an already-known claim is worth doing — this method
     /// only answers "is this new or not").
     pub async fn insert_claim_idempotent(&self, c: &Claim) -> Result<bool> {
+        if c.session_id.is_empty() {
+            return Err(StoreError::MissingSessionIdentity { kind: "claims" });
+        }
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let result = sqlx::query(
             "INSERT INTO claims (id, session_id, source_event_id, text, subject, claimed_at)
@@ -521,6 +539,9 @@ impl Store {
         ev: &Evidence,
         ingress_origin: Option<&'static str>,
     ) -> Result<InsertOutcome> {
+        if ev.session_id.is_empty() {
+            return Err(StoreError::MissingSessionIdentity { kind: "evidence" });
+        }
         let source = ev.source.as_ref().map(serde_json::to_string).transpose()?;
         let extension = ev
             .extension
@@ -1375,6 +1396,40 @@ mod tests {
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].verdict, "contradicted");
         assert_eq!(recent[0].claim_text, "All tests passed.");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// FORNX-433 AC3: an empty `session_id` must never be silently
+    /// accepted -- it cannot be scoped to any real session, and an
+    /// adapter-side bug (or a UDS client bypassing an adapter entirely)
+    /// must fail closed here rather than persist an unscoped row.
+    #[tokio::test]
+    async fn insert_event_with_blank_session_id_is_rejected_not_persisted() {
+        let path = tmp_db_path("event-blank-session-id");
+        let store = Store::open(&path).await.expect("open db");
+
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "".into(),
+            provider: Provider::Codex,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("exec_command".into()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({"type": "item_completed"}),
+        };
+        let result = store.insert_event(&event).await;
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::MissingSessionIdentity {
+                    kind: "agent_events"
+                })
+            ),
+            "expected MissingSessionIdentity, got {result:?}"
+        );
 
         std::fs::remove_file(&path).ok();
     }
