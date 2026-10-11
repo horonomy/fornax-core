@@ -852,18 +852,26 @@ fn negative_fixtures_would_have_verified_without_the_guard() {
 }
 
 /// FORNX-433 AC2 mutation-test proof, specifically for FORNX-441's
-/// canonical `admit_evidence_rows` entry point (the function
-/// `run_verifiers_and_persist_findings` actually calls on the live
-/// daemon path) -- distinct from the test above, which proves the raw
-/// `Verifier` would be fooled (bypass-and-verify), and distinct from
-/// `fornax_types::provenance_guard`'s own `authorize_evidence_source`
-/// unit tests, which only exercise one sub-check in isolation. This test
-/// proves the *whole* admission entry point rejects each fixture: the
-/// same evidence that `negative_fixtures_would_have_verified_without_the_guard`
-/// just showed would reach `Verified` unguarded is, when passed through
-/// `admit_evidence_rows`, excluded from `admitted` every time -- i.e. the
-/// guard is load-bearing specifically at the call site the live daemon
-/// actually uses, not merely correct as an isolated pure function.
+/// canonical `admit_evidence_rows` entry point -- one level more removed
+/// from the live path than the live-daemon tests above: the real daemon's
+/// `run_verifiers_and_persist_findings` calls `Store::
+/// admitted_evidence_for_session` (`fornax-store/src/admitted_evidence.rs`),
+/// which is the function that actually calls `admit_evidence_rows`. This
+/// test calls `admit_evidence_rows` directly rather than going through the
+/// store (no DB needed), so it is a proof about the guard's own real
+/// entry-point function, not a full end-to-end proof through every
+/// intervening layer -- the live-daemon tests above already cover that
+/// end-to-end path for these same fixtures. Distinct from the test above,
+/// which proves the raw `Verifier` would be fooled (bypass-and-verify), and
+/// distinct from `fornax_types::provenance_guard`'s own
+/// `authorize_evidence_source` unit tests, which only exercise one
+/// sub-check in isolation. Note: all three fixtures below are rejected
+/// before `admit_evidence_rows`'s session-owner comparison is ever reached
+/// (no-source fails the missing-source check; the other two fail inside
+/// `authorize_evidence_source`), so this test's hardcoded
+/// `SessionOwner::Single(..)` is a safe stand-in here but does not itself
+/// exercise the owner-mismatch branch -- that branch has its own coverage
+/// elsewhere (see `fornax_types::provenance_guard`'s own module tests).
 #[test]
 fn admit_evidence_rows_rejects_every_fixture_that_would_have_verified_without_it() {
     use fornax_types::provenance_guard::{
@@ -986,9 +994,21 @@ fn insert_finding_has_exactly_one_production_call_site() {
 /// influencing trust.
 #[test]
 fn adapter_registry_has_zero_references_in_the_verdict_computing_daemon() {
-    let main_rs_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
-    let contents =
-        std::fs::read_to_string(&main_rs_path).expect("read fornax-daemon's src/main.rs");
+    let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let source_files: Vec<PathBuf> = std::fs::read_dir(&src_dir)
+        .expect("read fornax-daemon's src/ directory")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("rs"))
+        .collect();
+    assert!(
+        source_files.len() >= 4,
+        "sanity check: expected to find at least main.rs plus the three mod files \
+         declared in it (audit_checkpoint_submit, policy_poll, retention_sweep) -- \
+         found {source_files:?}. If fornax-daemon's module layout changed, this \
+         directory scan still finds every .rs file in src/ automatically; this \
+         assertion only guards against read_dir itself silently returning nothing."
+    );
 
     let registry_markers = [
         "adapter_registry",
@@ -999,23 +1019,43 @@ fn adapter_registry_has_zero_references_in_the_verdict_computing_daemon() {
         "RegistryEntry",
     ];
 
-    let hits: Vec<(usize, &str, &str)> = contents
-        .lines()
-        .enumerate()
-        .flat_map(|(i, line)| {
-            registry_markers
-                .iter()
-                .filter(move |m| line.contains(**m))
-                .map(move |m| (i + 1, *m, line))
-        })
-        .collect();
+    let mut hits: Vec<(PathBuf, usize, &str, String)> = Vec::new();
+    for path in &source_files {
+        let contents = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+        // Exclude each file's own `#[cfg(test)] mod tests` block, same
+        // precedent as `insert_finding_has_exactly_one_production_call_site`
+        // above -- a future unit test inside one of these files may need to
+        // reference the registry's type names for an unrelated reason
+        // (e.g. testing that THIS test's own scan logic works) without that
+        // being a real production wiring.
+        let test_mod_start = contents
+            .lines()
+            .position(|line| line.trim() == "mod tests {")
+            .map(|i| i + 1)
+            .unwrap_or(usize::MAX);
+
+        for (i, line) in contents.lines().enumerate() {
+            let lineno = i + 1;
+            if lineno >= test_mod_start {
+                break;
+            }
+            for marker in &registry_markers {
+                if line.contains(marker) {
+                    hits.push((path.clone(), lineno, marker, line.to_string()));
+                }
+            }
+        }
+    }
 
     assert!(
         hits.is_empty(),
-        "fornax-daemon's src/main.rs must contain zero references to the adapter \
-         registry -- found {hits:?}. A descriptor's mere existence in the registry \
-         must never be able to influence verdict computation; if this now needs to \
-         change, it needs its own explicit trust-semantics design, not an incidental \
-         import."
+        "fornax-daemon's production source (every .rs file in src/, excluding each \
+         file's own #[cfg(test)] mod tests block) must contain zero references to \
+         the adapter registry -- found {hits:?}. A descriptor's mere existence in \
+         the registry must never be able to influence verdict computation; if this \
+         now needs to change, it needs its own explicit trust-semantics design, not \
+         an incidental import."
     );
 }
