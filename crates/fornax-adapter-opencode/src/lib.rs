@@ -482,7 +482,10 @@ fn session_id_from_event_payload(payload: &serde_json::Value) -> Option<String> 
 
 fn translate(
     adapter: &mut OpenCodeAdapter,
-    session_hint: &str,
+    // FORNX-433 AC3: no longer used as a fallback session id -- kept named
+    // (not just dropped) so a future reader isn't left guessing what the
+    // unused slot used to mean.
+    _session_hint: &str,
     native: &serde_json::Value,
 ) -> NormalizationOutcome {
     let Some(hook) = native.get("hook").and_then(|v| v.as_str()) else {
@@ -498,11 +501,19 @@ fn translate(
 
     match hook {
         "tool.execute.before" => {
-            let session_id = payload
+            // FORNX-433 AC3: never fall back to `session_hint` ("unknown")
+            // -- a payload with no real provider-native session id would
+            // otherwise land in one shared fake session with every other
+            // such payload, across every real session. Fail closed.
+            let Some(session_id) = payload
                 .pointer("/input/sessionID")
                 .and_then(|v| v.as_str())
                 .map(String::from)
-                .unwrap_or_else(|| session_hint.to_string());
+            else {
+                return NormalizationOutcome::Ignored {
+                    reason: "no provider session identity",
+                };
+            };
             adapter.session_id = Some(session_id.clone());
             let tool_name = payload
                 .pointer("/input/tool")
@@ -528,12 +539,22 @@ fn translate(
             ])
         }
         "tool.execute.after" => {
-            let session_id = payload
+            // FORNX-433 AC3: the `adapter.session_id` fallback is this same
+            // process's own remembered state from an earlier event in this
+            // stream -- a legitimate same-process continuity mechanism, not
+            // a cross-session leak. Only the final `session_hint` fallback
+            // (neither this event nor any prior one in this process carried
+            // a real session id) is the leak; fail closed there instead.
+            let Some(session_id) = payload
                 .pointer("/input/sessionID")
                 .and_then(|v| v.as_str())
                 .map(String::from)
                 .or_else(|| adapter.session_id.clone())
-                .unwrap_or_else(|| session_hint.to_string());
+            else {
+                return NormalizationOutcome::Ignored {
+                    reason: "no provider session identity",
+                };
+            };
             adapter.session_id = Some(session_id.clone());
             let tool_name = payload
                 .pointer("/input/tool")
@@ -606,9 +627,16 @@ fn translate(
                     };
                 }
             };
-            let session_id = session_id_from_event_payload(&payload)
-                .or_else(|| adapter.session_id.clone())
-                .unwrap_or_else(|| session_hint.to_string());
+            // FORNX-433 AC3: same reasoning as the `tool.execute.after`
+            // branch above -- `adapter.session_id` is legitimate same-
+            // process continuity, `session_hint` is the leak. Fail closed.
+            let Some(session_id) =
+                session_id_from_event_payload(&payload).or_else(|| adapter.session_id.clone())
+            else {
+                return NormalizationOutcome::Ignored {
+                    reason: "no provider session identity",
+                };
+            };
             adapter.session_id = Some(session_id.clone());
 
             let event = AgentEvent {
@@ -661,6 +689,56 @@ mod tests {
             caps.state_of(&SignalClass::FinalResponse),
             SignalAvailability::Unavailable
         );
+    }
+
+    /// FORNX-433 AC3: a `tool.execute.before` payload with no provider
+    /// `sessionID` must never fall back to the adapter's `session_hint`
+    /// -- that would collapse every such payload, across every real
+    /// session, into one shared fake session.
+    #[test]
+    fn tool_execute_before_with_no_session_id_is_ignored_not_hint_fallback() {
+        let native = serde_json::json!({
+            "hook": "tool.execute.before",
+            "payload": {
+                "input": {"tool": "bash", "callID": "call_1", "args": {"command": "ls"}}
+            }
+        });
+        match normalize(&native) {
+            NormalizationOutcome::Ignored { .. } => {}
+            other => panic!("expected Ignored, got {other:?}"),
+        }
+    }
+
+    /// Same fail-closed requirement for `tool.execute.after`, on a fresh
+    /// adapter with no same-process `session_id` continuity to fall back
+    /// to either.
+    #[test]
+    fn tool_execute_after_with_no_session_id_and_no_prior_continuity_is_ignored() {
+        let native = serde_json::json!({
+            "hook": "tool.execute.after",
+            "payload": {
+                "input": {"tool": "bash", "callID": "call_1", "args": {"command": "ls"}},
+                "output": {"metadata": {"exit": 0}}
+            }
+        });
+        match normalize(&native) {
+            NormalizationOutcome::Ignored { .. } => {}
+            other => panic!("expected Ignored, got {other:?}"),
+        }
+    }
+
+    /// Same fail-closed requirement for the `event` branch (e.g.
+    /// `session.created`), on a fresh adapter with no prior continuity.
+    #[test]
+    fn event_hook_with_no_session_id_and_no_prior_continuity_is_ignored() {
+        let native = serde_json::json!({
+            "hook": "event",
+            "payload": {"type": "session.created"}
+        });
+        match normalize(&native) {
+            NormalizationOutcome::Ignored { .. } => {}
+            other => panic!("expected Ignored, got {other:?}"),
+        }
     }
 
     #[test]

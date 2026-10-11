@@ -657,6 +657,32 @@ async fn adversarial_corpus_against_live_daemon() {
         assert_valid_processing_still_works(&daemon, &store, "probe-02").await;
     }
 
+    // -- Case 2b (FORNX-433 AC3): a well-formed hook payload with a real
+    // `hook_event_name` but no provider-native `session_id` at all -- must
+    // be quarantined (Ignored), not fall back to a shared "unknown"
+    // session that would let unrelated real sessions verify each other's
+    // claims through it.
+    {
+        let res = send_hook(
+            &daemon,
+            serde_json::json!({
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": "echo hi"},
+                "tool_response": {"exit_code": 0}
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        assert_eq!(res.status, 0, "hook must exit 0 (see module doc)");
+        assert_no_data_for_session(&store, "unknown").await;
+        assert!(
+            daemon.is_alive(),
+            "daemon died on a well-formed hook with no session_id"
+        );
+        assert_valid_processing_still_works(&daemon, &store, "probe-02b").await;
+    }
+
     // -- Case 3: null values where a field is expected non-null -----------
     {
         let session = "case-03-nulls";
