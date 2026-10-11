@@ -821,6 +821,11 @@ impl Store {
         session_id: &str,
         caps: &RuntimeCapabilities,
     ) -> Result<()> {
+        if session_id.is_empty() {
+            return Err(StoreError::MissingSessionIdentity {
+                kind: "runtime_capabilities",
+            });
+        }
         let legacy = LegacyCapabilitiesWire::from(caps);
         sqlx::query(
             "INSERT INTO runtime_capabilities
@@ -1426,6 +1431,89 @@ mod tests {
                 result,
                 Err(StoreError::MissingSessionIdentity {
                     kind: "agent_events"
+                })
+            ),
+            "expected MissingSessionIdentity, got {result:?}"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// FORNX-433 AC3 follow-up: `insert_claim_idempotent`'s guard was added
+    /// alongside `insert_event`'s but had no dedicated test of its own.
+    #[tokio::test]
+    async fn insert_claim_idempotent_with_blank_session_id_is_rejected_not_persisted() {
+        let path = tmp_db_path("claim-blank-session-id");
+        let store = Store::open(&path).await.expect("open db");
+
+        let claim = Claim {
+            id: Uuid::new_v4(),
+            session_id: "".into(),
+            source_event_id: Uuid::new_v4(),
+            text: "All tests passed.".into(),
+            subject: "test_result".into(),
+            claimed_at: "2026-01-01T00:00:00Z".into(),
+        };
+        let result = store.insert_claim_idempotent(&claim).await;
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::MissingSessionIdentity { kind: "claims" })
+            ),
+            "expected MissingSessionIdentity, got {result:?}"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// FORNX-433 AC3 follow-up: `insert_evidence`'s guard (shared body with
+    /// `insert_evidence_with_origin`, via `insert_evidence_with_origin_opt`)
+    /// was added alongside `insert_event`'s but had no dedicated test.
+    #[tokio::test]
+    async fn insert_evidence_with_blank_session_id_is_rejected_not_persisted() {
+        let path = tmp_db_path("evidence-blank-session-id");
+        let store = Store::open(&path).await.expect("open db");
+
+        let evidence = Evidence {
+            id: Uuid::new_v4(),
+            session_id: "".into(),
+            source_event_id: Uuid::new_v4(),
+            kind: EvidenceKind::ExitCode,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            payload: serde_json::json!({"exit_code": 0}),
+            provenance: "test".into(),
+            source: None,
+            extension: None,
+            evidence_purged: false,
+        };
+        let result = store.insert_evidence(&evidence).await;
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::MissingSessionIdentity { kind: "evidence" })
+            ),
+            "expected MissingSessionIdentity, got {result:?}"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// FORNX-433 AC3 follow-up: `upsert_capabilities` previously had no
+    /// blank-session-id guard at all -- an opencode payload with
+    /// `sessionID: ""` could persist an inert but inconsistent capabilities
+    /// row even after the adapter-level and other store-level guards.
+    #[tokio::test]
+    async fn upsert_capabilities_with_blank_session_id_is_rejected_not_persisted() {
+        let path = tmp_db_path("capabilities-blank-session-id");
+        let store = Store::open(&path).await.expect("open db");
+
+        let caps = sample_capabilities();
+        let result = store.upsert_capabilities("", &caps).await;
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::MissingSessionIdentity {
+                    kind: "runtime_capabilities"
                 })
             ),
             "expected MissingSessionIdentity, got {result:?}"
