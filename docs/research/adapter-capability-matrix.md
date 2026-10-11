@@ -105,7 +105,7 @@ is JSON on stdin with common fields `session_id`, `transcript_path`, `cwd`,
 | Event | Event-specific fields | Evidence obtainable |
 |---|---|---|
 | `PreToolUse` | `tool_name`, `tool_input` | Exact tool name + args before execution; can block/rewrite input |
-| `PostToolUse` | `tool_name`, `tool_input`, `tool_response` | Provider-serialized result (exit-code-ish data for Bash) — CC's own summarized view, may be truncated; no independent raw stdout capture |
+| `PostToolUse` | `tool_name`, `tool_input`, `tool_response`, **`agent_id`/`agent_type` when the call originates inside a Task subagent** | Provider-serialized result (exit-code-ish data for Bash) — CC's own summarized view, may be truncated; no independent raw stdout capture |
 | `SessionStart` | `source` (`startup`/`resume`/`clear`/`compact`) | Session lifecycle only, no tool evidence |
 | `UserPromptSubmit` | `prompt` | Raw user prompt text |
 | `SubagentStart`/`SubagentStop` | `agent_id`, `agent_type` | Exact subagent lifecycle |
@@ -116,6 +116,26 @@ Known gaps even with hooks fully wired: no hook fires when a *backgrounded*
 shell/Monitor/Workflow tool call actually completes; no raw unbuffered stdout
 tap independent of `tool_response`; no PreToolUse/PostToolUse for Edit/Write/
 Read/WebFetch/Task unless a matcher is added.
+
+### `agent_id`/`agent_type` on `PostToolUse` (FORNX-433 AC3 Step 0)
+
+**Live-verified 2026-10-11** (this machine, installed Claude Code CLI
+version not separately recorded — re-check if this matters for a future
+decision): a temporary, local-only capture hook confirmed that a Task
+subagent's `PostToolUse` payload carries `"agent_id":"<id>"` and
+`"agent_type":"general-purpose"` alongside the usual `session_id`/
+`transcript_path`/`cwd`/`prompt_id` fields, while the main session's own
+`PostToolUse` calls carry neither field at all. Only `PostToolUse` was
+captured this way — `SubagentStart`/`SubagentStop`'s own `agent_id`/
+`agent_type` fields (row above) are documented per Anthropic's hooks docs
+but were not independently re-verified by this same live-capture method.
+Codex and opencode's equivalents were not checked here.
+
+This resolved the FORNX-433 AC3 Slice B/C "Step 0" decision gate (does
+`agent_id` exist to capture at all) — see that ticket for the resulting
+design decision (no schema change yet: the cross-agent leak this would
+guard against is currently hypothetical, since no code path mints a claim
+from a subagent's own output).
 
 ## Codex CLI
 

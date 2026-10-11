@@ -420,6 +420,170 @@ async fn legitimate_evidence_still_reaches_verified() {
     );
 }
 
+/// FORNX-433 AC3 Slice B fixtures: a test-runner-shaped event/evidence
+/// pair carrying `agent_id`/`agent_type` in `raw`, mirroring the real
+/// shape confirmed live this session -- a Task subagent's PostToolUse
+/// hook payload carries both fields, while the main session's own calls
+/// carry neither.
+fn subagent_test_evidence_event(session_id: &str) -> AgentEvent {
+    AgentEvent {
+        id: Uuid::new_v4(),
+        session_id: session_id.to_string(),
+        provider: Provider::ClaudeCode,
+        kind: EventKind::PostToolUse,
+        observed_at: chrono::Utc::now().to_rfc3339(),
+        tool_name: Some("Bash".to_string()),
+        tool_input: Some(serde_json::json!({"command": "pytest -q"})),
+        tool_response: Some(serde_json::json!({"exit_code": 0})),
+        raw: serde_json::json!({
+            "agent_id": "fornx433-sliceb-subagent",
+            "agent_type": "general-purpose",
+        }),
+    }
+}
+
+fn test_runner_evidence(session_id: &str, source_event_id: Uuid) -> Evidence {
+    Evidence {
+        id: Uuid::new_v4(),
+        session_id: session_id.to_string(),
+        source_event_id,
+        kind: EvidenceKind::ExitCode,
+        observed_at: chrono::Utc::now().to_rfc3339(),
+        payload: serde_json::json!({"command": "pytest -q", "exit_code": 0}),
+        provenance: "fornx433-sliceb-fixture".to_string(),
+        source: Some(EvidenceSource::now(
+            "claude_bash_exit_code_sensor_v1",
+            TrustClass::AgentAdjacent,
+            Some(Provider::ClaudeCode),
+            CollectionMethod::HookCallback,
+            None,
+        )),
+        extension: None,
+        evidence_purged: false,
+    }
+}
+
+/// The main session's own event (no `agent_id`) that produces the claim --
+/// e.g. a `Stop`-derived summary reporting "tests passed", a different
+/// event than whichever one actually produced the passing evidence.
+fn main_session_summary_event(session_id: &str) -> AgentEvent {
+    let mut ev = command_success_event(session_id);
+    ev.kind = EventKind::SessionEnd;
+    ev
+}
+
+fn test_result_claim(session_id: &str, source_event_id: Uuid) -> Claim {
+    Claim {
+        id: Uuid::new_v4(),
+        session_id: session_id.to_string(),
+        source_event_id,
+        text: "All tests passed.".to_string(),
+        subject: "test_result".to_string(),
+        claimed_at: chrono::Utc::now().to_rfc3339(),
+    }
+}
+
+/// FORNX-433 AC3 Slice B: a claim minted from the main session (no
+/// `agent_id` -- e.g. a `Stop`-derived summary) must still reach Verified
+/// against test-runner evidence that originated from a *different* event
+/// in the same session (e.g. a Task subagent that actually ran the tests).
+/// `fornax-verify`'s `TestResultVerifier` pools all evidence for the
+/// session rather than filtering by which event produced it -- confirmed
+/// by the FORNX-433 AC3 architecture review to be the intended "subagent
+/// runs the tests, main agent reports the result" delegation pattern, not
+/// a cross-agent leak (no code path today mints a claim *from* a
+/// subagent's own output, so there is nothing yet for a wrong agent's
+/// claim to wrongly borrow another agent's evidence). This test pins
+/// delegation pooling as intended behavior, so a future agent-scoping
+/// change (FORNX-433 Slice C, gated on a real subagent-originated claim
+/// existing) can't silently break it while fixing an actual leak elsewhere.
+#[tokio::test]
+async fn main_session_claim_is_verified_by_subagent_originated_test_evidence() {
+    let daemon = start_daemon().await;
+    let store = Store::open(daemon.home.join("fornax.db"))
+        .await
+        .expect("open store db");
+    let session_id = format!("fornx433-sliceb-pooling-{}", short_id());
+    let sock_path = daemon.home.join("fornax.sock");
+
+    let subagent_event = subagent_test_evidence_event(&session_id);
+    let evidence = test_runner_evidence(&session_id, subagent_event.id);
+
+    let main_event = main_session_summary_event(&session_id);
+    let claim = test_result_claim(&session_id, main_event.id);
+
+    send_line(&sock_path, &capability_announcement(&session_id)).await;
+    send_line(&sock_path, &IngestMessage::Event(subagent_event)).await;
+    send_line(&sock_path, &IngestMessage::Event(main_event)).await;
+    send_line(&sock_path, &IngestMessage::Evidence(evidence)).await;
+    send_line(&sock_path, &IngestMessage::Claim(claim.clone())).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let verdict = loop {
+        if let Ok(findings) = store.findings_for_session(&session_id).await {
+            if let Some(f) = findings.iter().find(|f| f.claim_id == claim.id.to_string()) {
+                break Some(f.verdict.clone());
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break None;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    assert_eq!(
+        verdict,
+        Some("verified".to_string()),
+        "the main session's claim must be verified by test evidence a \
+         subagent produced in the same session -- delegation pooling is \
+         intended behavior, not a leak; daemon log:\n{}",
+        daemon.log_contents()
+    );
+}
+
+/// Mutation proof for the sibling test above: with no test-runner evidence
+/// anywhere in the session (the subagent's event/evidence deliberately
+/// omitted), the same claim must NOT reach Verified -- proving the
+/// sibling's Verified result genuinely depends on the pooled evidence,
+/// not a vacuously-passing claim.
+#[tokio::test]
+async fn main_session_claim_without_any_test_evidence_stays_unverified() {
+    let daemon = start_daemon().await;
+    let store = Store::open(daemon.home.join("fornax.db"))
+        .await
+        .expect("open store db");
+    let session_id = format!("fornx433-sliceb-nopool-{}", short_id());
+    let sock_path = daemon.home.join("fornax.sock");
+
+    let main_event = main_session_summary_event(&session_id);
+    let claim = test_result_claim(&session_id, main_event.id);
+
+    send_line(&sock_path, &capability_announcement(&session_id)).await;
+    send_line(&sock_path, &IngestMessage::Event(main_event)).await;
+    send_line(&sock_path, &IngestMessage::Claim(claim.clone())).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let verdict = loop {
+        if let Ok(findings) = store.findings_for_session(&session_id).await {
+            if let Some(f) = findings.iter().find(|f| f.claim_id == claim.id.to_string()) {
+                break Some(f.verdict.clone());
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break None;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    assert_ne!(
+        verdict,
+        Some("verified".to_string()),
+        "with no test-runner evidence anywhere in the session, the claim \
+         must not reach Verified; daemon log:\n{}",
+        daemon.log_contents()
+    );
+}
+
 /// AC2: two claims minted from the *same* turn (same anchor) both reach
 /// Verified against the same evidence row -- the anchor rule's whole
 /// point, not a false cross-claim replay.
