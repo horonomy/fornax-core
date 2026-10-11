@@ -420,6 +420,139 @@ async fn legitimate_evidence_still_reaches_verified() {
     );
 }
 
+/// FORNX-437's disclosed residual: `adapter_registry_has_zero_references_in_
+/// the_verdict_computing_daemon` proves the registry is structurally
+/// unreachable from the daemon's source code, but that is not the same as a
+/// runtime behavioral proof that an active *disabled* registration in the
+/// same `FORNAX_HOME` the live daemon is running against has zero effect on
+/// real verdict computation. This test closes that gap: registers a host
+/// adapter descriptor via the real `fornax` CLI binary (not a copy of its
+/// logic), disables it, then submits an ordinary legitimate claim over the
+/// real daemon's UDS socket in that exact `FORNAX_HOME` and asserts it still
+/// reaches `Verified` -- identical to `legitimate_evidence_still_reaches_verified`
+/// above, just with a disabled registration sitting in the same home
+/// directory the whole time.
+#[tokio::test]
+async fn disabled_adapter_registration_does_not_affect_live_verdict_computation() {
+    let daemon = start_daemon().await;
+
+    let manifest_path = daemon.home.join("fornx437-fixture-manifest.json");
+    let adapter_id = format!("fornx437-disabled-fixture-{}", short_id());
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "id": adapter_id,
+            "display_name": "FORNX-437 disabled-registration fixture",
+            "summary": "A synthetic data-only adapter proving registry state is inert",
+            "min_fornax_version": "0.0.1",
+            "provenance": "https://example.com/fornx437-fixture",
+            "capabilities": ["plan", "install", "uninstall"],
+            "target": {"format": "json", "path": "~/.not-created/settings.json"},
+            "operations": [{
+                "kind": "ensure_marked_array_element",
+                "pointer": "/hooks/PostToolUse",
+                "marker_key": "command",
+                "marker_value": "fornx437-fixture",
+                "element": {"type": "command", "command": "fornx437-fixture"}
+            }]
+        }))
+        .expect("serialize fixture manifest"),
+    )
+    .expect("write fixture manifest");
+
+    let run_cli = |args: &[&str]| {
+        Command::new(workspace_bin("fornax"))
+            .env("FORNAX_HOME", &daemon.home)
+            .args(args)
+            .output()
+            .expect("run fornax CLI")
+    };
+
+    let review = run_cli(&[
+        "adapter",
+        "register",
+        "--manifest",
+        manifest_path.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(
+        review.status.success(),
+        "adapter register (review) failed: {}",
+        String::from_utf8_lossy(&review.stderr)
+    );
+    let reviewed: serde_json::Value =
+        serde_json::from_slice(&review.stdout).expect("parse review JSON");
+    let digest = reviewed["digest"].as_str().expect("digest field present");
+
+    let confirmed = run_cli(&[
+        "adapter",
+        "register",
+        "--manifest",
+        manifest_path.to_str().unwrap(),
+        "--confirm-digest",
+        digest,
+    ]);
+    assert!(
+        confirmed.status.success(),
+        "adapter register (confirm) failed: {}",
+        String::from_utf8_lossy(&confirmed.stderr)
+    );
+
+    let disabled = run_cli(&["adapter", "disable", &adapter_id]);
+    assert!(
+        disabled.status.success(),
+        "adapter disable failed: {}",
+        String::from_utf8_lossy(&disabled.stderr)
+    );
+
+    // Sanity: the registration really is disabled in this exact FORNAX_HOME
+    // before we trust the verdict-computation assertion below.
+    let registry_path = daemon.home.join("adapters/registry.json");
+    let registry: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&registry_path).expect("read registry.json"))
+            .expect("parse registry.json");
+    let entry = registry["entries"]
+        .as_array()
+        .expect("entries array")
+        .iter()
+        .find(|e| e["id"] == serde_json::json!(adapter_id))
+        .expect("fixture entry present in registry");
+    assert_eq!(
+        entry["enabled"],
+        serde_json::json!(false),
+        "fixture registration must actually be disabled before this test's \
+         assertion means anything"
+    );
+
+    let store = Store::open(daemon.home.join("fornax.db"))
+        .await
+        .expect("open store db");
+    let session_id = format!("fornx437-disabled-registry-{}", short_id());
+    let event = command_success_event(&session_id);
+    let event_id = event.id;
+    let claim = command_success_claim(&session_id, event_id);
+    let evidence = legitimate_evidence(&session_id, event_id);
+
+    let verdict = submit_and_await_verdict(
+        &daemon.home.join("fornax.sock"),
+        &store,
+        event,
+        evidence,
+        claim,
+    )
+    .await;
+
+    assert_eq!(
+        verdict,
+        Some("verified".to_string()),
+        "a disabled host-adapter registration present in the same FORNAX_HOME \
+         must have zero effect on live verdict computation for an unrelated, \
+         legitimate claim -- daemon log:\n{}",
+        daemon.log_contents()
+    );
+}
+
 /// FORNX-433 AC3 Slice B fixtures: a test-runner-shaped event/evidence
 /// pair carrying `agent_id`/`agent_type` in `raw`, mirroring the real
 /// shape confirmed live this session -- a Task subagent's PostToolUse

@@ -715,7 +715,14 @@ fn no_source_or_doc_overclaims_what_audit_verification_proves() {
 /// small, dependency-free walker (no `walkdir` crate) mirroring this
 /// crate's existing style of doing filesystem scans with `std::fs` alone.
 fn walk_source_and_doc_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
-    const SKIP_DIRS: &[&str] = &["target", ".git", "node_modules", ".codegraph"];
+    // `.claude` can contain nested agent worktrees (`.claude/worktrees/<id>`)
+    // checked out at an older commit -- their copy of this very file, or any
+    // other source/doc file, must never be scanned as if it were this repo's
+    // real tree. Found live: a stray locked worktree sitting under
+    // `.claude/worktrees/` made this scan fail on phrasing that didn't exist
+    // in the actual current source, purely because the walker had no reason
+    // to skip it.
+    const SKIP_DIRS: &[&str] = &["target", ".git", ".claude", "node_modules", ".codegraph"];
 
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
