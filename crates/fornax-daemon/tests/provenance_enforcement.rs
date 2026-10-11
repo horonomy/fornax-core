@@ -851,6 +851,85 @@ fn negative_fixtures_would_have_verified_without_the_guard() {
     }
 }
 
+/// FORNX-433 AC2 mutation-test proof, specifically for FORNX-441's
+/// canonical `admit_evidence_rows` entry point (the function
+/// `run_verifiers_and_persist_findings` actually calls on the live
+/// daemon path) -- distinct from the test above, which proves the raw
+/// `Verifier` would be fooled (bypass-and-verify), and distinct from
+/// `fornax_types::provenance_guard`'s own `authorize_evidence_source`
+/// unit tests, which only exercise one sub-check in isolation. This test
+/// proves the *whole* admission entry point rejects each fixture: the
+/// same evidence that `negative_fixtures_would_have_verified_without_the_guard`
+/// just showed would reach `Verified` unguarded is, when passed through
+/// `admit_evidence_rows`, excluded from `admitted` every time -- i.e. the
+/// guard is load-bearing specifically at the call site the live daemon
+/// actually uses, not merely correct as an isolated pure function.
+#[test]
+fn admit_evidence_rows_rejects_every_fixture_that_would_have_verified_without_it() {
+    use fornax_types::provenance_guard::{
+        admit_evidence_rows, CollectorAuthority, EvidenceOrigin, SessionOwner,
+    };
+
+    let session_id = "fornx441-matrix-potency";
+    let event_id = Uuid::new_v4();
+    let authority = CollectorAuthority::known_sensors();
+
+    for (name, evidence) in [
+        (
+            "forged_host_observed",
+            evidence_with_forged_trust_class(session_id, event_id),
+        ),
+        (
+            "unregistered_sensor",
+            evidence_with_unregistered_sensor(session_id, event_id),
+        ),
+        ("no_source", evidence_with_no_source(session_id, event_id)),
+    ] {
+        let evidence_id = evidence.id;
+        let outcome = admit_evidence_rows(
+            vec![(evidence, EvidenceOrigin::UdsIngest)],
+            session_id,
+            SessionOwner::Single(Provider::ClaudeCode),
+            &authority,
+            None,
+        );
+        assert!(
+            outcome.admitted.is_empty(),
+            "fixture {name:?} must never reach `admitted` -- got {:?}",
+            outcome.admitted
+        );
+        assert!(
+            outcome
+                .rejected
+                .iter()
+                .any(|r| r.evidence_id == evidence_id),
+            "fixture {name:?}'s evidence id must appear in `rejected`, named by id, \
+             not silently dropped: {:?}",
+            outcome.rejected
+        );
+    }
+
+    // Sanity control, mirroring the potency test above: legitimate evidence
+    // through the same entry point must be admitted, proving this test
+    // cannot pass by rejecting everything indiscriminately.
+    let legit = legitimate_evidence(session_id, event_id);
+    let legit_id = legit.id;
+    let outcome = admit_evidence_rows(
+        vec![(legit, EvidenceOrigin::UdsIngest)],
+        session_id,
+        SessionOwner::Single(Provider::ClaudeCode),
+        &authority,
+        None,
+    );
+    assert_eq!(
+        outcome.admitted.len(),
+        1,
+        "legitimate evidence must be admitted: {:?}",
+        outcome.rejected
+    );
+    assert_eq!(outcome.admitted[0].id, legit_id);
+}
+
 /// AC4 source-scan: `fornax-daemon`'s production code (excluding its own
 /// `#[cfg(test)] mod tests` block and this `tests/` integration dir) must
 /// contain exactly one call to `insert_finding` -- the one inside
@@ -888,5 +967,55 @@ fn insert_finding_has_exactly_one_production_call_site() {
          run_verifiers_and_persist_findings) before `mod tests` at line {test_mod_start}, \
          found: {production_call_sites:?} -- a second unguarded path would bypass \
          FORNX-431's admission/consumption enforcement entirely"
+    );
+}
+
+/// FORNX-433 AC4 source-scan: registering a synthetic/passive adapter
+/// descriptor (`fornax adapter register`, `fornax-store::adapter_registry`)
+/// must never, by construction, be able to influence verdict computation --
+/// "no PR considered green merely because a synthetic adapter descriptor
+/// exists". The registry is designed to be inert bookkeeping (digest
+/// confirmation only, explicitly "does not establish registration, trust,
+/// or active capability" per `fornax-adapter-claude::host_binding`'s own
+/// doc comment) -- this test makes that a structural, regression-proof
+/// fact rather than only a convention: `fornax-daemon`'s production code
+/// (the only crate that computes/persists a `Verdict`) contains zero
+/// references to the registry's types/functions at all. If a future change
+/// ever wires a registry lookup into the verdict path, this test fails
+/// loudly rather than silently letting a descriptor's mere existence start
+/// influencing trust.
+#[test]
+fn adapter_registry_has_zero_references_in_the_verdict_computing_daemon() {
+    let main_rs_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
+    let contents =
+        std::fs::read_to_string(&main_rs_path).expect("read fornax-daemon's src/main.rs");
+
+    let registry_markers = [
+        "adapter_registry",
+        "AdapterRegistry",
+        "RegistrySnapshot",
+        "register_host_descriptor",
+        "register_config",
+        "RegistryEntry",
+    ];
+
+    let hits: Vec<(usize, &str, &str)> = contents
+        .lines()
+        .enumerate()
+        .flat_map(|(i, line)| {
+            registry_markers
+                .iter()
+                .filter(move |m| line.contains(**m))
+                .map(move |m| (i + 1, *m, line))
+        })
+        .collect();
+
+    assert!(
+        hits.is_empty(),
+        "fornax-daemon's src/main.rs must contain zero references to the adapter \
+         registry -- found {hits:?}. A descriptor's mere existence in the registry \
+         must never be able to influence verdict computation; if this now needs to \
+         change, it needs its own explicit trust-semantics design, not an incidental \
+         import."
     );
 }
