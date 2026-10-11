@@ -477,6 +477,7 @@ fn session_id_from_event_payload(payload: &serde_json::Value) -> Option<String> 
     payload
         .pointer("/properties/sessionID")
         .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
         .map(String::from)
 }
 
@@ -508,6 +509,7 @@ fn translate(
             let Some(session_id) = payload
                 .pointer("/input/sessionID")
                 .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
                 .map(String::from)
             else {
                 return NormalizationOutcome::Ignored {
@@ -548,6 +550,7 @@ fn translate(
             let Some(session_id) = payload
                 .pointer("/input/sessionID")
                 .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
                 .map(String::from)
                 .or_else(|| adapter.session_id.clone())
             else {
@@ -689,6 +692,23 @@ mod tests {
             caps.state_of(&SignalClass::FinalResponse),
             SignalAvailability::Unavailable
         );
+    }
+
+    /// FORNX-433 AC3 follow-up: an explicitly empty `sessionID` string
+    /// must be treated identically to a missing field, not accepted as a
+    /// literal empty-string session identity.
+    #[test]
+    fn tool_execute_before_with_empty_string_session_id_is_ignored_not_accepted() {
+        let native = serde_json::json!({
+            "hook": "tool.execute.before",
+            "payload": {
+                "input": {"tool": "bash", "sessionID": "", "callID": "call_1", "args": {"command": "ls"}}
+            }
+        });
+        match normalize(&native) {
+            NormalizationOutcome::Ignored { .. } => {}
+            other => panic!("expected Ignored, got {other:?}"),
+        }
     }
 
     /// FORNX-433 AC3: a `tool.execute.before` payload with no provider
