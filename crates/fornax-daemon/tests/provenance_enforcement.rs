@@ -851,6 +851,93 @@ fn negative_fixtures_would_have_verified_without_the_guard() {
     }
 }
 
+/// FORNX-433 AC2 mutation-test proof, specifically for FORNX-441's
+/// canonical `admit_evidence_rows` entry point -- one level more removed
+/// from the live path than the live-daemon tests above: the real daemon's
+/// `run_verifiers_and_persist_findings` calls `Store::
+/// admitted_evidence_for_session` (`fornax-store/src/admitted_evidence.rs`),
+/// which is the function that actually calls `admit_evidence_rows`. This
+/// test calls `admit_evidence_rows` directly rather than going through the
+/// store (no DB needed), so it is a proof about the guard's own real
+/// entry-point function, not a full end-to-end proof through every
+/// intervening layer -- the live-daemon tests above already cover that
+/// end-to-end path for these same fixtures. Distinct from the test above,
+/// which proves the raw `Verifier` would be fooled (bypass-and-verify), and
+/// distinct from `fornax_types::provenance_guard`'s own
+/// `authorize_evidence_source` unit tests, which only exercise one
+/// sub-check in isolation. Note: all three fixtures below are rejected
+/// before `admit_evidence_rows`'s session-owner comparison is ever reached
+/// (no-source fails the missing-source check; the other two fail inside
+/// `authorize_evidence_source`), so this test's hardcoded
+/// `SessionOwner::Single(..)` is a safe stand-in here but does not itself
+/// exercise the owner-mismatch branch -- that branch has its own coverage
+/// elsewhere (see `fornax_types::provenance_guard`'s own module tests).
+#[test]
+fn admit_evidence_rows_rejects_every_fixture_that_would_have_verified_without_it() {
+    use fornax_types::provenance_guard::{
+        admit_evidence_rows, CollectorAuthority, EvidenceOrigin, SessionOwner,
+    };
+
+    let session_id = "fornx441-matrix-potency";
+    let event_id = Uuid::new_v4();
+    let authority = CollectorAuthority::known_sensors();
+
+    for (name, evidence) in [
+        (
+            "forged_host_observed",
+            evidence_with_forged_trust_class(session_id, event_id),
+        ),
+        (
+            "unregistered_sensor",
+            evidence_with_unregistered_sensor(session_id, event_id),
+        ),
+        ("no_source", evidence_with_no_source(session_id, event_id)),
+    ] {
+        let evidence_id = evidence.id;
+        let outcome = admit_evidence_rows(
+            vec![(evidence, EvidenceOrigin::UdsIngest)],
+            session_id,
+            SessionOwner::Single(Provider::ClaudeCode),
+            &authority,
+            None,
+        );
+        assert!(
+            outcome.admitted.is_empty(),
+            "fixture {name:?} must never reach `admitted` -- got {:?}",
+            outcome.admitted
+        );
+        assert!(
+            outcome
+                .rejected
+                .iter()
+                .any(|r| r.evidence_id == evidence_id),
+            "fixture {name:?}'s evidence id must appear in `rejected`, named by id, \
+             not silently dropped: {:?}",
+            outcome.rejected
+        );
+    }
+
+    // Sanity control, mirroring the potency test above: legitimate evidence
+    // through the same entry point must be admitted, proving this test
+    // cannot pass by rejecting everything indiscriminately.
+    let legit = legitimate_evidence(session_id, event_id);
+    let legit_id = legit.id;
+    let outcome = admit_evidence_rows(
+        vec![(legit, EvidenceOrigin::UdsIngest)],
+        session_id,
+        SessionOwner::Single(Provider::ClaudeCode),
+        &authority,
+        None,
+    );
+    assert_eq!(
+        outcome.admitted.len(),
+        1,
+        "legitimate evidence must be admitted: {:?}",
+        outcome.rejected
+    );
+    assert_eq!(outcome.admitted[0].id, legit_id);
+}
+
 /// AC4 source-scan: `fornax-daemon`'s production code (excluding its own
 /// `#[cfg(test)] mod tests` block and this `tests/` integration dir) must
 /// contain exactly one call to `insert_finding` -- the one inside
@@ -888,5 +975,87 @@ fn insert_finding_has_exactly_one_production_call_site() {
          run_verifiers_and_persist_findings) before `mod tests` at line {test_mod_start}, \
          found: {production_call_sites:?} -- a second unguarded path would bypass \
          FORNX-431's admission/consumption enforcement entirely"
+    );
+}
+
+/// FORNX-433 AC4 source-scan: registering a synthetic/passive adapter
+/// descriptor (`fornax adapter register`, `fornax-store::adapter_registry`)
+/// must never, by construction, be able to influence verdict computation --
+/// "no PR considered green merely because a synthetic adapter descriptor
+/// exists". The registry is designed to be inert bookkeeping (digest
+/// confirmation only, explicitly "does not establish registration, trust,
+/// or active capability" per `fornax-adapter-claude::host_binding`'s own
+/// doc comment) -- this test makes that a structural, regression-proof
+/// fact rather than only a convention: `fornax-daemon`'s production code
+/// (the only crate that computes/persists a `Verdict`) contains zero
+/// references to the registry's types/functions at all. If a future change
+/// ever wires a registry lookup into the verdict path, this test fails
+/// loudly rather than silently letting a descriptor's mere existence start
+/// influencing trust.
+#[test]
+fn adapter_registry_has_zero_references_in_the_verdict_computing_daemon() {
+    let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let source_files: Vec<PathBuf> = std::fs::read_dir(&src_dir)
+        .expect("read fornax-daemon's src/ directory")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("rs"))
+        .collect();
+    assert!(
+        source_files.len() >= 4,
+        "sanity check: expected to find at least main.rs plus the three mod files \
+         declared in it (audit_checkpoint_submit, policy_poll, retention_sweep) -- \
+         found {source_files:?}. If fornax-daemon's module layout changed, this \
+         directory scan still finds every .rs file in src/ automatically; this \
+         assertion only guards against read_dir itself silently returning nothing."
+    );
+
+    let registry_markers = [
+        "adapter_registry",
+        "AdapterRegistry",
+        "RegistrySnapshot",
+        "register_host_descriptor",
+        "register_config",
+        "RegistryEntry",
+    ];
+
+    let mut hits: Vec<(PathBuf, usize, &str, String)> = Vec::new();
+    for path in &source_files {
+        let contents = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+        // Exclude each file's own `#[cfg(test)] mod tests` block, same
+        // precedent as `insert_finding_has_exactly_one_production_call_site`
+        // above -- a future unit test inside one of these files may need to
+        // reference the registry's type names for an unrelated reason
+        // (e.g. testing that THIS test's own scan logic works) without that
+        // being a real production wiring.
+        let test_mod_start = contents
+            .lines()
+            .position(|line| line.trim() == "mod tests {")
+            .map(|i| i + 1)
+            .unwrap_or(usize::MAX);
+
+        for (i, line) in contents.lines().enumerate() {
+            let lineno = i + 1;
+            if lineno >= test_mod_start {
+                break;
+            }
+            for marker in &registry_markers {
+                if line.contains(marker) {
+                    hits.push((path.clone(), lineno, marker, line.to_string()));
+                }
+            }
+        }
+    }
+
+    assert!(
+        hits.is_empty(),
+        "fornax-daemon's production source (every .rs file in src/, excluding each \
+         file's own #[cfg(test)] mod tests block) must contain zero references to \
+         the adapter registry -- found {hits:?}. A descriptor's mere existence in \
+         the registry must never be able to influence verdict computation; if this \
+         now needs to change, it needs its own explicit trust-semantics design, not \
+         an incidental import."
     );
 }
