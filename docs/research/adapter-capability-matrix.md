@@ -60,6 +60,39 @@ Notes:
   for the opencode architecture-fitness proof this matrix's third column
   substantiates.
 
+### `test_result` claim verdict ceiling, by default provider configuration (FORNX-442/443)
+
+The `ProcessResult` row above describes *signal availability*; this note
+states the resulting, product-visible *verdict* consequence for a
+`test_result` claim (e.g. "all tests passed") checked by
+`TestResultVerifier`/`CommandSuccessVerifier` (`fornax-verify`), since that
+distinction matters more to anyone reading this doc for product claims than
+the signal taxonomy alone:
+
+| Provider (default config) | Can reach `Verified`? | Can reach `Contradicted`? | Why |
+|---|---|---|---|
+| Claude Code | **No** | Only via the `stderr_nonempty` heuristic path, and even then capped at `Review` by `is_stderr_heuristic_evidence`, never `Contradicted` | `ProcessResult` is `Unsupported` — no literal exit code exists in this adapter's evidence at all |
+| Codex (default: `unified_exec`/`tools.exec_command`) | **No** | No | The "Script completed" fallback carries no exit status in either direction — not even heuristically distinguishable |
+| Codex (`--disable unified_exec`, i.e. `tools.shell_command`) | **Yes** | **Yes** | Literal, parseable `"Exit code: <n>"` text — genuinely authoritative, `heuristic: false` |
+| opencode | **Yes** | **Yes** | `tool.execute.after`'s `output.metadata.exit` is a literal integer |
+
+**This is deliberate, safety-correct behavior, not a defect** (FORNX-442):
+before that fix, Claude Code and default-config Codex could *falsely* reach
+`Verified` via a heuristic `exit_code=0` inferred from "stderr is empty" — a
+real test-runner failure writes its summary to stdout, not stderr, so that
+heuristic could not actually distinguish pass from fail. The fix downgrades
+that heuristic `exit_code=0` to `Review` unconditionally. The founder has
+accepted this `Review`/`Unverified` ceiling as a disclosed v0.0.9 limitation
+for heuristic-only evidence (see FORNX-443) — it must not be "fixed" by
+inventing a new unproven heuristic (e.g. parsing stdout text and trusting
+it as if it were authoritative); FORNX-443 is the tracked owner for adding a
+genuinely authoritative signal, preferring independently trustworthy process
+exit evidence, controlled runner receipts, or verified CI evidence over
+parsing arbitrary stdout text. **Do not market default-provider test-result
+verification as already available** — only the two non-default/opt-in paths
+above (Codex with `unified_exec` disabled, or opencode) currently carry an
+authoritative signal.
+
 ## Claude Code
 
 Source: this machine's `~/.claude/settings.json` + `~/.claude/statusline.py` +
