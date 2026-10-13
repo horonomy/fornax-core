@@ -313,6 +313,183 @@ fn real_codex_shell_command_success_reaches_a_verified_finding_end_to_end() {
     );
 }
 
+/// HORO-1712 part B acceptance: "hook + rollout together do not double
+/// count". Feeds the real rollout path for a genuinely failing
+/// `item_completed` `CommandExecution` (the real 0.160+ shape, HORO-1712
+/// comments 27283/27302), reaching a real Contradicted finding exactly
+/// like the test above, then separately runs the real, compiled
+/// `fornax-hook-codex-event` binary with a `PostToolUse` hook payload for
+/// the SAME native call id against the SAME session. The hook path must
+/// insert its own `AgentEvent` row (proving it does not silently no-op or
+/// collide/quarantine against the rollout's row for the same native id)
+/// while adding zero `Evidence` and leaving the finding's verdict and
+/// evidence set byte-identical to the rollout-only baseline.
+#[test]
+fn hook_and_rollout_for_the_same_call_do_not_double_count_evidence() {
+    let tmp = tempdir("double-count");
+    let fornax_home = tmp.clone();
+    let db_path = fornax_home.join("fornax.db");
+    let rollout_path = tmp.join("rollout.jsonl");
+    let session_id = "fx1712-double-count-session";
+    let native_call_id = "exec-fx1712-double-count-001";
+
+    let (daemon_guard, daemon_log_path) = spawn_daemon(&fornax_home);
+
+    let lines = vec![
+        serde_json::json!({
+            "timestamp": "2026-10-13T00:00:00.000Z",
+            "type": "session_meta",
+            "payload": {"id": session_id, "session_id": session_id}
+        }),
+        serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "type": "CommandExecution",
+                    "id": native_call_id,
+                    "status": "failed",
+                    "exit_code": 1,
+                    "command": ["/bin/zsh", "-lc", "pytest -q"],
+                    "source": "unified_exec_startup"
+                }
+            }
+        }),
+        task_complete_line("All tests passed."),
+    ];
+
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    run_hook_codex_over_rollout(&fornax_home, &rollout_path, &lines, || {
+        rt.block_on(async {
+            let store = match fornax_store::Store::open(&db_path).await {
+                Ok(s) => s,
+                Err(_) => return false,
+            };
+            matches!(store.evidence_for_session(session_id).await, Ok(e) if !e.evidence.is_empty())
+        })
+    });
+
+    let baseline_finding = poll_until(
+        Duration::from_secs(5),
+        "waiting for the rollout-only baseline Finding",
+        || tail_log(&daemon_log_path),
+        || {
+            rt.block_on(async {
+                let store = fornax_store::Store::open(&db_path).await.ok()?;
+                store
+                    .findings_for_session(session_id)
+                    .await
+                    .ok()?
+                    .into_iter()
+                    .next()
+            })
+        },
+    );
+    let baseline_evidence_count = rt.block_on(async {
+        fornax_store::Store::open(&db_path)
+            .await
+            .expect("open store")
+            .evidence_for_session(session_id)
+            .await
+            .expect("query evidence")
+            .evidence
+            .len()
+    });
+
+    // Now the real hook binary, same native call id, same session.
+    let hook_bin = env!("CARGO_BIN_EXE_fornax-hook-codex-event");
+    let hook_payload = serde_json::json!({
+        "session_id": session_id,
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "pytest -q"},
+        "tool_response": "",
+        "tool_use_id": native_call_id
+    });
+    let mut child = Command::new(hook_bin)
+        .env("FORNAX_HOME", &fornax_home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn fornax-hook-codex-event");
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(hook_payload.to_string().as_bytes())
+            .expect("write hook payload");
+    }
+    let status = child.wait().expect("wait for fornax-hook-codex-event");
+    assert!(
+        status.success(),
+        "fornax-hook-codex-event must always exit 0"
+    );
+
+    // Give the daemon a moment to persist the hook-sourced event, then
+    // assert: a new Event row exists (not silently dropped), evidence
+    // count is unchanged, and the finding is unchanged.
+    let events_after = poll_until(
+        Duration::from_secs(5),
+        "waiting for the hook-sourced AgentEvent to persist",
+        || tail_log(&daemon_log_path),
+        || {
+            rt.block_on(async {
+                let store = fornax_store::Store::open(&db_path).await.ok()?;
+                let events = store.events_for_session(session_id).await.ok()?;
+                (events.len() > 1).then_some(events)
+            })
+        },
+    );
+    assert!(
+        events_after
+            .iter()
+            .any(|e| e.raw.get("hook_event_name").and_then(|v| v.as_str()) == Some("PostToolUse")),
+        "the hook-sourced PostToolUse event must actually be present, not merely counted"
+    );
+
+    let evidence_after = rt.block_on(async {
+        fornax_store::Store::open(&db_path)
+            .await
+            .expect("open store")
+            .evidence_for_session(session_id)
+            .await
+            .expect("query evidence")
+            .evidence
+    });
+    assert_eq!(
+        evidence_after.len(),
+        baseline_evidence_count,
+        "the hook path must add zero Evidence -- any growth here is double counting"
+    );
+
+    let finding_after = rt.block_on(async {
+        fornax_store::Store::open(&db_path)
+            .await
+            .expect("open store")
+            .findings_for_session(session_id)
+            .await
+            .expect("query findings")
+            .into_iter()
+            .next()
+            .expect("finding still present")
+    });
+    assert_eq!(
+        finding_after.verdict, baseline_finding.verdict,
+        "the hook-sourced event must not change the verdict"
+    );
+    assert_eq!(
+        finding_after.evidence_ids, baseline_finding.evidence_ids,
+        "the hook-sourced event must not change which evidence the finding cites"
+    );
+    assert_eq!(baseline_finding.verdict, "contradicted");
+
+    drop(daemon_guard);
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
 #[test]
 fn real_codex_shell_command_failure_contradicts_a_false_success_claim_end_to_end() {
     // The adversarial negative control (FORNX-433 AC1): FORNX-16's real,
