@@ -271,38 +271,43 @@ pub fn plan_install_all(
     script_path: &std::path::Path,
     hooks_path: &std::path::Path,
 ) -> anyhow::Result<AdapterActionResult> {
-    let hooks_plan = crate::codex_hooks::plan_install_at(hooks_path)?;
+    let (hooks_changed, hooks_message) = match crate::codex_hooks::plan_install_at(hooks_path) {
+        Ok(plan) => (plan.changed, plan.message),
+        Err(e) => (false, format!("hooks: refused — {e}")),
+    };
     let (notify_changed, notify_message) = match plan_install_at(config_path, script_path) {
         Ok(plan) => (plan.changed, plan.message),
         Err(e) => (false, format!("notify: refused — {e}")),
     };
-    let changed = notify_changed || hooks_plan.changed;
-    let message = format!("{} | {}", notify_message, hooks_plan.message);
+    let changed = notify_changed || hooks_changed;
+    let message = format!("{notify_message} | {hooks_message}");
     Ok(mk(config_path, changed, message))
 }
 
 /// Installs both the `notify` wiring and the lifecycle-hook wiring.
-/// Independent capabilities, installed independently: a notify refusal
-/// (see [`plan_install_all`]) never blocks the hooks install, and vice
-/// versa — each half's own failure is folded into the result message as a
-/// warning rather than aborting the other. Writes `hooks.json` first, then
-/// attempts `config.toml`: if a later I/O error occurs, rerunning
-/// `install_all` is idempotent (both halves detect "already installed" and
-/// no-op), so this is safely resumable rather than silently half-applied
-/// forever.
+/// Independent capabilities, installed independently: a refusal or hard
+/// error on either side (see [`plan_install_all`]) never blocks the other
+/// — each half's own failure is caught and folded into the result message
+/// as a warning rather than propagated. Attempts `hooks.json` then
+/// `config.toml`; if a later I/O error occurs, rerunning `install_all` is
+/// idempotent (both halves detect "already installed" and no-op), so this
+/// is safely resumable rather than silently half-applied forever.
 pub fn install_all(
     config_path: &std::path::Path,
     script_path: &std::path::Path,
     hooks_path: &std::path::Path,
 ) -> anyhow::Result<AdapterActionResult> {
-    let hooks_result = crate::codex_hooks::install_at(hooks_path)?;
+    let (hooks_changed, hooks_message) = match crate::codex_hooks::install_at(hooks_path) {
+        Ok(result) => (result.changed, result.message),
+        Err(e) => (false, format!("hooks: refused — {e}")),
+    };
     let (notify_changed, notify_message) = match install_at(config_path, script_path) {
         Ok(result) => (result.changed, result.message),
         Err(e) => (false, format!("notify: refused — {e}")),
     };
 
-    let changed = hooks_result.changed || notify_changed;
-    let message = format!("{} | {}", notify_message, hooks_result.message);
+    let changed = hooks_changed || notify_changed;
+    let message = format!("{notify_message} | {hooks_message}");
     Ok(mk(config_path, changed, message))
 }
 
@@ -370,6 +375,38 @@ mod tests {
         assert_eq!(
             config_contents, "notify = [\"/usr/bin/some-other-tool\"]\n",
             "foreign notify must be left untouched"
+        );
+
+        std::fs::remove_file(&config_path).ok();
+        std::fs::remove_file(&hooks_path).ok();
+    }
+
+    /// Symmetric case: a malformed `hooks.json` (hooks is a hard error, not
+    /// a safety refusal, but must still be scoped to its own half) must not
+    /// block installing the independent `notify` wiring.
+    #[test]
+    fn malformed_hooks_json_does_not_block_notify_install() {
+        let config_path = tmp_config_path("malformed-hooks-composite");
+        let hooks_path = tmp_hooks_path("malformed-hooks-composite");
+        std::fs::write(&hooks_path, "[]").unwrap();
+
+        let result = install_all(&config_path, &fake_script(), &hooks_path).expect("install_all");
+        assert!(
+            result.changed,
+            "notify install alone must still report changed"
+        );
+        assert!(
+            result.message.contains("refused"),
+            "message must surface the hooks refusal"
+        );
+
+        let doc = load_codex_config(&config_path).expect("load");
+        assert!(notify_is_fornax(doc.get("notify").unwrap()));
+
+        let hooks_contents = std::fs::read_to_string(&hooks_path).unwrap();
+        assert_eq!(
+            hooks_contents, "[]",
+            "malformed hooks.json must be left untouched"
         );
 
         std::fs::remove_file(&config_path).ok();
