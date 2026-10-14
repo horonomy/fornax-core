@@ -158,7 +158,9 @@ claim input" pattern `fornax-verify`'s own unit tests use.
 ## Cleanup
 
 ```bash
-kill "$HOOK_PID" "$DAEMON_PID"
+# $HOOK_PID was already killed in the readiness probe above (load-bearing,
+# not redundant) -- only $DAEMON_PID remains here.
+kill "$DAEMON_PID"
 rm -rf "$FORNAX_HOME" "$SCRATCH"
 ```
 
