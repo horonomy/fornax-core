@@ -14,6 +14,9 @@ use fornax_types::{
 use std::collections::HashMap;
 use uuid::Uuid;
 
+pub mod hook;
+pub use hook::CodexHookAdapter;
+
 /// This adapter implementation's own version — independent of the Codex CLI
 /// runtime version, which belongs in a `CapabilitySignal::detail` string
 /// (see `CodexAdapter::probe`). Attached to every capability declaration via
