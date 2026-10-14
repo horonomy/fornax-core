@@ -6,13 +6,13 @@
     {
       "name": "fornax-core",
       "owner": "horonomy",
-      "sha": "f17bdd372158988e9958470dc9e6365a450d90f0",
+      "sha": "13e80468bac2fe721a35137bfa5e6202cb182468",
       "publishes_artifact": true
     },
     {
       "name": "fornax-cloud",
       "owner": "horonomy",
-      "sha": "fbdea93af4ecbd42257069a6a4643f7918a03f6a",
+      "sha": "c0cf247f4ac8f6fa3f2898fd7945f996e2eeb7b0",
       "publishes_artifact": true
     }
   ],
