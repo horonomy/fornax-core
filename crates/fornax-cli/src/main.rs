@@ -12,6 +12,7 @@ mod adapter_store;
 mod adjudicate_cmd;
 mod claude_adapter;
 mod codex_adapter;
+mod codex_hooks;
 mod corpus_cmd;
 mod evidence_plan_cmd;
 mod experiment_ux;

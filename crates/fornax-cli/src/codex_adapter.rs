@@ -258,6 +258,67 @@ pub fn uninstall_at(config_path: &std::path::Path) -> anyhow::Result<AdapterActi
     })
 }
 
+/// Composite plan covering both the `notify` wiring (`config.toml`) and the
+/// lifecycle-hook wiring (`hooks.json`, HORO-1712 part B). The two are
+/// independent capabilities with no shared state, so a refusal on one side
+/// (most commonly a foreign `notify` already wired to something else — e.g.
+/// Codex's own built-in computer-use client, confirmed live on a real
+/// dogfood machine) is folded into the message as a warning rather than
+/// failing the whole plan; `hooks.json` installability must still be
+/// reported even when `notify` cannot be touched.
+pub fn plan_install_all(
+    config_path: &std::path::Path,
+    script_path: &std::path::Path,
+    hooks_path: &std::path::Path,
+) -> anyhow::Result<AdapterActionResult> {
+    let hooks_plan = crate::codex_hooks::plan_install_at(hooks_path)?;
+    let (notify_changed, notify_message) = match plan_install_at(config_path, script_path) {
+        Ok(plan) => (plan.changed, plan.message),
+        Err(e) => (false, format!("notify: refused — {e}")),
+    };
+    let changed = notify_changed || hooks_plan.changed;
+    let message = format!("{} | {}", notify_message, hooks_plan.message);
+    Ok(mk(config_path, changed, message))
+}
+
+/// Installs both the `notify` wiring and the lifecycle-hook wiring.
+/// Independent capabilities, installed independently: a notify refusal
+/// (see [`plan_install_all`]) never blocks the hooks install, and vice
+/// versa — each half's own failure is folded into the result message as a
+/// warning rather than aborting the other. Writes `hooks.json` first, then
+/// attempts `config.toml`: if a later I/O error occurs, rerunning
+/// `install_all` is idempotent (both halves detect "already installed" and
+/// no-op), so this is safely resumable rather than silently half-applied
+/// forever.
+pub fn install_all(
+    config_path: &std::path::Path,
+    script_path: &std::path::Path,
+    hooks_path: &std::path::Path,
+) -> anyhow::Result<AdapterActionResult> {
+    let hooks_result = crate::codex_hooks::install_at(hooks_path)?;
+    let (notify_changed, notify_message) = match install_at(config_path, script_path) {
+        Ok(result) => (result.changed, result.message),
+        Err(e) => (false, format!("notify: refused — {e}")),
+    };
+
+    let changed = hooks_result.changed || notify_changed;
+    let message = format!("{} | {}", notify_message, hooks_result.message);
+    Ok(mk(config_path, changed, message))
+}
+
+/// Uninstalls both the lifecycle-hook wiring and the `notify` wiring. Each
+/// half no-ops safely if it was never installed.
+pub fn uninstall_all(
+    config_path: &std::path::Path,
+    hooks_path: &std::path::Path,
+) -> anyhow::Result<AdapterActionResult> {
+    let hooks_result = crate::codex_hooks::uninstall_at(hooks_path)?;
+    let notify_result = uninstall_at(config_path)?;
+    let changed = hooks_result.changed || notify_result.changed;
+    let message = format!("{} | {}", notify_result.message, hooks_result.message);
+    Ok(mk(config_path, changed, message))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,6 +332,48 @@ mod tests {
 
     fn fake_script() -> std::path::PathBuf {
         std::path::PathBuf::from("/opt/fornax/scripts/fornax-codex-notify.sh")
+    }
+
+    fn tmp_hooks_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "fornax-cli-test-codex-composite-{name}-{}.json",
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    /// A foreign `notify` (e.g. Codex's own built-in computer-use client —
+    /// confirmed live on a real dogfood machine) must not block installing
+    /// Fornax's independent hooks.json capability. Regression test for the
+    /// original bundled design, which propagated the notify refusal via `?`
+    /// and aborted the whole `install_all` before touching hooks.json.
+    #[test]
+    fn foreign_notify_does_not_block_hooks_install() {
+        let config_path = tmp_config_path("foreign-notify-composite");
+        let hooks_path = tmp_hooks_path("foreign-notify-composite");
+        std::fs::write(&config_path, "notify = [\"/usr/bin/some-other-tool\"]\n").unwrap();
+
+        let result = install_all(&config_path, &fake_script(), &hooks_path).expect("install_all");
+        assert!(
+            result.changed,
+            "hooks.json install alone must still report changed"
+        );
+        assert!(
+            hooks_path.exists(),
+            "hooks.json must be written despite notify refusal"
+        );
+        assert!(
+            result.message.contains("refused"),
+            "message must surface the notify refusal"
+        );
+
+        let config_contents = std::fs::read_to_string(&config_path).unwrap();
+        assert_eq!(
+            config_contents, "notify = [\"/usr/bin/some-other-tool\"]\n",
+            "foreign notify must be left untouched"
+        );
+
+        std::fs::remove_file(&config_path).ok();
+        std::fs::remove_file(&hooks_path).ok();
     }
 
     #[test]

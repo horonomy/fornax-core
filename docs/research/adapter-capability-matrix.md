@@ -145,11 +145,48 @@ docs read directly — re-verify against the actually-installed Codex version).
 
 | Capability | Codex CLI | Notes |
 |---|---|---|
-| Hooks (`PreToolUse`/`PostToolUse`/`Stop`/`SessionStart`/`SessionEnd`/`SubagentStart`/`SubagentStop`/`PermissionRequest`/`UserPromptSubmit`/`PreCompact`/`PostCompact`/`Interrupt`) | Exists, JSON on stdin | **Opt-in**: requires `[features].codex_hooks = true` in `~/.codex/config.toml`; `Stage::UnderDevelopment`; schema actively changing; org admin can force `allow_managed_hooks_only = true` in `requirements.toml` to lock it out entirely |
+| Hooks (`PreToolUse`/`PostToolUse`/`Stop`/`SessionStart`/`SessionEnd`/`SubagentStart`/`SubagentStop`/`PermissionRequest`/`UserPromptSubmit`/`PreCompact`/`PostCompact`/`Interrupt`) | Exists, JSON on stdin | **Corrected 2026-10-14 (HORO-1712, codex-cli 0.160.0 installed on this machine, confirmed against live source)**: hooks are now **on by default**, not opt-in — the feature key is `[features] hooks` (`codex_hooks` is a deprecated alias for the same flag); org admin can still force `allow_managed_hooks_only = true` in `requirements.toml` to lock them out entirely. New hooks are untrusted until the user approves them via Codex's own `/hooks` command — "registered" and "executing" are different states; see the registration/trust subsection below. |
 | PreToolUse blocking | Partial | Bash/shell + reportedly `apply_patch`/MCP; Read-style ops reportedly don't fire it; **no `updatedInput` rewrite support** (rejected at runtime, open FR #18491) |
 | Legacy `notify`/`notify_command` | Yes, user-config only (`~/.codex/config.toml`, project-local ignored) | Single coarse `agent-turn-complete` event, JSON-string arg (`type`, `thread-id`, `turn-id`, `cwd`, `client`, `input-messages`, `last-assistant-message`); being deprecated in favor of `Stop` hook — don't build new integrations on it |
 | On-disk session transcript | **Yes — "rollout" files**, `~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<uuid>.jsonl` | Always-on (not feature-flagged), JSONL, one `RolloutLine` (`{type, timestamp, payload:RolloutItem}`) per line — user msg / assistant reply / shell invocation / patch proposal / sandbox response. World-readable (mode 0644, issue #21660). Can grow 700MB–2GB (issue #24948) — a tailing reader must handle rotation/size. **This is the primary integration point**, not hooks. |
 | Tool-call args/results (cmd, exit code, diffs) | Observable via rollout JSONL (and hooks if enabled) | Exact field names (e.g. an `exit_code` key) not confirmed against a live file in this pass — **must dump a real rollout-*.jsonl and confirm field names empirically before FORNX-29 codes the parser** |
+
+### `hooks.json` registration and trust (HORO-1712 part B, 2026-10-14)
+
+Confirmed against the live file on this machine (which already carries
+`libra-governor` entries in `PostToolUse`/`Stop`/`UserPromptSubmit`) plus
+Codex source (`codex-rs/hooks/src/engine/discovery.rs`,
+`codex-rs/config/src/hook_config.rs`, `codex-rs/hooks/src/engine/command_runner.rs`,
+`codex-rs/hooks/src/events/pre_tool_use.rs`):
+
+- **Format**: `{"description"?: str, "hooks": {"<Event>": [{"matcher"?: str, "hooks": [{"type":"command","command":str,"timeout"?:int,"async"?:bool,"statusMessage"?:str}]}]}}`.
+- **`deny_unknown_fields`**: Codex's `HooksFile` struct rejects any unknown
+  top-level key — the *entire file* fails to load, breaking every other
+  tool's hooks too. This is why Fornax's registration (`fornax-cli`'s
+  `codex_hooks` module) identifies its own entries by the basename of
+  `command` rather than adding a marker field.
+- **Trust is positional, not content-addressed by file order**: Codex
+  records `trusted_hash` in `~/.codex/config.toml` under
+  `[hooks.state."<file>:<event_snake>:<group_idx>:<handler_idx>"]`, keyed by
+  the hook's *index* in `hooks.json`, not by its content. The hash itself
+  (`hook_hash`) covers only the hook's normalized fields (command, timeout,
+  async, …) serialized to TOML, not file formatting or key order — so
+  reformatting `hooks.json` never invalidates trust, but **inserting,
+  reordering, or removing a group ahead of another tool's does**: it shifts
+  that tool's `group_idx`/`handler_idx` and Codex reports it as
+  Modified/Untrusted until re-approved. A consequence: a safe install only
+  ever appends a new group to each event's array, and a safe uninstall
+  either removes its own trailing group or leaves a `"hooks": []`
+  tombstone in place if a foreign group was appended after it.
+- **New hooks start untrusted**: registering a hook (via `hooks.json`
+  alone) does not make Codex execute it. The user must approve it via
+  Codex's own `/hooks` command (or run with
+  `--dangerously-bypass-hook-trust`) before it fires.
+- **Runtime behavior**: hook commands run through `sh -lc` (a login shell),
+  so a bare command name resolves via `PATH`. On `PreToolUse`, only exit
+  code `2` blocks the tool call — a timeout, a non-zero/non-2 exit, or any
+  other error is non-blocking (logged as a Failed entry) since Codex fails
+  open. The default timeout is 600s per hook if none is specified.
 
 ### Explicit UNAVAILABLE / capability gaps for Codex (report, never infer around)
 

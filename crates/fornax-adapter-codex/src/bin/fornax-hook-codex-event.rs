@@ -19,13 +19,13 @@
 //! an allow/block decision for the tool call; this adapter has no opinion
 //! on that and must never accidentally express one.
 //!
-//! Not installed by `fornax install codex` (that remains notify-only, see
-//! `fornax-cli`'s adapter registry) — registering this binary into
-//! `~/.codex/hooks.json` is a separate, not-yet-built install target
-//! (HORO-1712 part B's own follow-up scope), since that file is shared
-//! with other tools (confirmed live: `libra-governor` already has entries
-//! there) and needs additive-only, position-preserving merge semantics
-//! this binary does not implement.
+//! Registered into `~/.codex/hooks.json` by `fornax install codex`
+//! (`fornax-cli`'s `codex_hooks` module, HORO-1712 part B) alongside the
+//! pre-existing `notify` wiring — additive-only, position-preserving, since
+//! that file is shared with other tools (confirmed live: `libra-governor`
+//! already has entries there). Installing does not make Codex trust the
+//! new hooks automatically; the user approves them via Codex's own
+//! `/hooks` command.
 
 use fornax_adapter_codex::CodexHookAdapter;
 use fornax_types::{AgentAdapter, NormalizationOutcome};

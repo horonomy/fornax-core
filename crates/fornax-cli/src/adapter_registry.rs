@@ -123,8 +123,9 @@ impl AdapterPlugin for CodexAdapter {
     }
 
     fn summary(&self) -> &str {
-        "Wires Fornax's ambient-status notify script into \
-         ~/.codex/config.toml's `notify` entry."
+        "Wires Fornax's ambient-status notify script into ~/.codex/config.toml's \
+         `notify` entry, and the lifecycle-hook binding (PreToolUse, PostToolUse, \
+         SessionStart) into ~/.codex/hooks.json."
     }
 
     fn target_path(&self) -> PathBuf {
@@ -132,21 +133,26 @@ impl AdapterPlugin for CodexAdapter {
     }
 
     fn plan(&self) -> anyhow::Result<AdapterActionResult> {
-        crate::codex_adapter::plan_install_at(
+        crate::codex_adapter::plan_install_all(
             &self.target_path(),
             &crate::codex_adapter::default_notify_script(),
+            &crate::codex_hooks::default_path(),
         )
     }
 
     fn install(&self) -> anyhow::Result<AdapterActionResult> {
-        crate::codex_adapter::install_at(
+        crate::codex_adapter::install_all(
             &self.target_path(),
             &crate::codex_adapter::default_notify_script(),
+            &crate::codex_hooks::default_path(),
         )
     }
 
     fn uninstall(&self) -> anyhow::Result<AdapterActionResult> {
-        crate::codex_adapter::uninstall_at(&self.target_path())
+        crate::codex_adapter::uninstall_all(
+            &self.target_path(),
+            &crate::codex_hooks::default_path(),
+        )
     }
 }
 
