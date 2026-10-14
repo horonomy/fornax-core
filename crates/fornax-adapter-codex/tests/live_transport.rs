@@ -36,28 +36,82 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-fn sibling_workspace_bin(name: &str) -> PathBuf {
+/// Resolves the real, guaranteed-fresh `fornax-daemon` binary for this test
+/// run. `env!("CARGO_BIN_EXE_*")` only resolves binaries that live in *this*
+/// crate (`fornax-hook-codex` does; `fornax-daemon` does not — a separate
+/// crate, and bin-only with no lib target, so it cannot even be added as a
+/// dev-dependency to get Cargo to set that env var for it), so this must be
+/// resolved by hand.
+///
+/// This used to walk up from `current_exe()` looking for a sibling file
+/// literally named `fornax-daemon` and trust whatever it found. Found
+/// 2026-10-14 (HORO-1712) to be a real hazard: on a machine whose default
+/// `CARGO_TARGET_DIR` is a dir shared across many unrelated checkouts (this
+/// repo's own `~/.claude/CLAUDE.md` documents exactly this, and tells
+/// contributors to override it with `CARGO_TARGET_DIR=./target` for that
+/// reason), the walk could silently find a `fornax-daemon` built from a
+/// different, much older commit rather than failing to find one at all — a
+/// *wrong* binary, not a missing one, so `is_file()` alone can't catch it.
+///
+/// An mtime-based staleness check was tried and rejected: `cargo build
+/// --workspace` legitimately skips rebuilding `fornax-daemon` when its own
+/// sources haven't changed, so a perfectly correct binary can be "old"
+/// relative to a freshly relinked test binary — that produced a false
+/// positive on this very machine during this fix's own verification.
+///
+/// Instead: find `target/<profile>/` the same way as before (there is no
+/// avoiding *some* walk — this is how every binary in this workspace is
+/// ever located), then explicitly `cargo build -p fornax-daemon` into that
+/// exact target dir before returning its path. This is correct regardless
+/// of whether `CARGO_TARGET_DIR` is shared or isolated: a build that is
+/// already up to date is a fast no-op; a stale or foreign binary gets
+/// genuinely rebuilt, every time, rather than guessed about.
+fn fresh_daemon_bin() -> PathBuf {
     let mut dir = std::env::current_exe().expect("current_exe");
-    loop {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return candidate;
-        }
+    let profile_dir = loop {
         let is_profile_dir = dir
             .file_name()
             .map(|f| f == "debug" || f == "release")
             .unwrap_or(false);
         if is_profile_dir {
-            panic!(
-                "could not find sibling binary `{name}` under {}; build the workspace first \
-                 (`cargo build --workspace`)",
-                dir.display()
-            );
+            break dir;
         }
         if !dir.pop() {
-            panic!("walked past filesystem root looking for `{name}`");
+            panic!("walked past filesystem root looking for target/<profile>/");
         }
+    };
+    let profile = profile_dir
+        .file_name()
+        .and_then(|f| f.to_str())
+        .expect("profile dir has a name");
+    let target_dir = profile_dir.parent().expect("profile dir has a parent");
+
+    // CARGO_MANIFEST_DIR is this crate's own dir (crates/fornax-adapter-codex),
+    // always correct at compile time regardless of how the test was invoked
+    // — the workspace root is two levels up.
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(&workspace_root)
+        .args(["build", "-p", "fornax-daemon", "--bin", "fornax-daemon"])
+        .arg("--target-dir")
+        .arg(target_dir);
+    if profile == "release" {
+        cmd.arg("--release");
     }
+    let status = cmd.status().expect("spawn cargo build -p fornax-daemon");
+    assert!(
+        status.success(),
+        "cargo build -p fornax-daemon failed (exit {status}) — see output above"
+    );
+
+    let bin = profile_dir.join("fornax-daemon");
+    assert!(
+        bin.is_file(),
+        "cargo build -p fornax-daemon reported success but {} does not exist",
+        bin.display()
+    );
+    bin
 }
 
 fn fixture_native_events(name: &str) -> Vec<serde_json::Value> {
@@ -172,7 +226,7 @@ impl Drop for KillOnDrop {
 }
 
 fn spawn_daemon(fornax_home: &Path) -> (KillOnDrop, PathBuf) {
-    let daemon_bin = sibling_workspace_bin("fornax-daemon");
+    let daemon_bin = fresh_daemon_bin();
     let http_port = free_tcp_port();
     let sock_path = fornax_home.join("fornax.sock");
     let daemon_log_path = fornax_home.join("daemon.log");
