@@ -1002,6 +1002,9 @@ async fn process_line(state: &AppState, line: &str, session_hint: &mut Option<St
                         session_hint.as_deref().unwrap_or("unknown")
                     ))
                 }
+                Some(fornax_store::StoreError::ClaimSourceMismatch { id }) => {
+                    std::borrow::Cow::Owned(format!("claim_source_mismatch: id={id}"))
+                }
                 _ => std::borrow::Cow::Borrowed(line),
             };
         if let Err(store_err) = state
@@ -1169,7 +1172,12 @@ async fn handle_message(
             // really just network retries). A duplicate skips
             // re-verification: harmless either way since the claim content
             // is identical, but pointless repeated work otherwise.
-            let is_new_claim = state.store.insert_claim_idempotent(&claim).await?;
+            let is_new_claim = state
+                .store
+                .insert_claim_idempotent_checked(&claim, |source| {
+                    fornax_adapter_codex::claim_matches_completion(source, &claim)
+                })
+                .await?;
             if !is_new_claim {
                 return Ok(());
             }
@@ -3329,6 +3337,10 @@ mod tests {
         let store = fornax_store::Store::open(&db_path)
             .await
             .expect("open test store");
+        test_state_with_store(store)
+    }
+
+    fn test_state_with_store(store: fornax_store::Store) -> AppState {
         AppState {
             store,
             caps: Arc::new(Mutex::new(HashMap::new())),
@@ -7387,6 +7399,670 @@ mod tests {
     }
 
     // ---- HORO-1712: Codex item_completed dedup, end to end -----------
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct PersistedFindingSnapshot {
+        id: String,
+        claim_id: String,
+        verdict: String,
+        evidence_ids: String,
+        rationale: String,
+        verifier_name: String,
+        computed_at: String,
+        claim_text: String,
+        session_id: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct CodexCompletionSnapshot {
+        event_ids: Vec<Uuid>,
+        evidence_ids: Vec<Uuid>,
+        claims: Vec<(Uuid, Uuid, String)>,
+        findings: Vec<PersistedFindingSnapshot>,
+        quarantine: i64,
+    }
+
+    async fn codex_completion_snapshot(
+        state: &AppState,
+        session_id: &str,
+    ) -> CodexCompletionSnapshot {
+        let mut event_ids: Vec<_> = state
+            .store
+            .events_for_session(session_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        event_ids.sort();
+        let mut evidence_ids: Vec<_> = state
+            .store
+            .evidence_for_session(session_id)
+            .await
+            .unwrap()
+            .evidence
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        evidence_ids.sort();
+        let claims = state
+            .store
+            .claims_for_session(session_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.id, row.source_event_id, row.text))
+            .collect();
+        let mut findings: Vec<_> = state
+            .store
+            .findings_for_session(session_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| PersistedFindingSnapshot {
+                id: row.id,
+                claim_id: row.claim_id,
+                verdict: row.verdict,
+                evidence_ids: row.evidence_ids,
+                rationale: row.rationale,
+                verifier_name: row.verifier_name,
+                computed_at: row.computed_at,
+                claim_text: row.claim_text,
+                session_id: row.session_id,
+            })
+            .collect();
+        findings.sort_by(|left, right| left.id.cmp(&right.id));
+        CodexCompletionSnapshot {
+            event_ids,
+            evidence_ids,
+            claims,
+            findings,
+            quarantine: state.store.quarantine_count().await.unwrap(),
+        }
+    }
+
+    /// Translate actual Codex native line shapes with a fresh adapter; the
+    /// capability announcement follows format observation, then is delivered first.
+    fn codex_native_completion_messages(
+        session_id: &str,
+        turn_id: &str,
+        last_agent_message: &str,
+    ) -> Vec<IngestMessage> {
+        use fornax_adapter_codex::{stamped_capabilities, CodexAdapter};
+        use fornax_types::{AgentAdapter, NormalizationOutcome};
+        let mut adapter = CodexAdapter::new();
+        let _ = adapter.normalize(
+            "hint",
+            &serde_json::json!({
+                "type":"session_meta","payload":{"session_id":session_id,"cli_version":"0.160.0"}
+            }),
+        );
+        let entries = [
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "id":"item_fornx446_command","type":"CommandExecution","status":"completed",
+                "exit_code":0,"command":["pytest"],"source":"agent"
+            }}}),
+            serde_json::json!({"type":"event_msg","ordinal":20,"timestamp":"2026-10-15T12:00:00Z",
+                "payload":{"type":"task_complete","turn_id":turn_id,"last_agent_message":last_agent_message,
+                "started_at":"2026-10-15T11:59:00Z","completed_at":"2026-10-15T12:00:00Z",
+                "duration_ms":60000}}),
+        ];
+        let mut messages = Vec::new();
+        for entry in entries {
+            let NormalizationOutcome::Messages(normalized) = adapter.normalize("hint", &entry)
+            else {
+                panic!("expected adapter messages for native entry: {entry}");
+            };
+            messages.extend(normalized);
+        }
+        messages.insert(
+            0,
+            IngestMessage::Capabilities(stamped_capabilities(&adapter, session_id)),
+        );
+        messages
+    }
+
+    fn set_codex_arrival_time(messages: &mut [IngestMessage], at: &str) {
+        for message in messages {
+            match message {
+                IngestMessage::Event(row) => row.observed_at = at.to_string(),
+                IngestMessage::Claim(row) => row.claimed_at = at.to_string(),
+                _ => {}
+            }
+        }
+    }
+
+    async fn process_codex_completion(
+        state: &AppState,
+        session_id: &str,
+        turn_id: &str,
+        claim_text: &str,
+        arrival: &str,
+        hint: &mut Option<String>,
+    ) {
+        let mut messages = codex_native_completion_messages(session_id, turn_id, claim_text);
+        set_codex_arrival_time(&mut messages, arrival);
+        for message in messages {
+            process_line(state, &serde_json::to_string(&message).unwrap(), hint).await;
+        }
+    }
+
+    async fn persistent_codex_test_state() -> (PathBuf, AppState) {
+        let path = std::env::temp_dir().join(format!("fornax-fornx446-{}.db", Uuid::new_v4()));
+        let store = fornax_store::Store::open(&path)
+            .await
+            .expect("open test store");
+        (path, test_state_with_store(store))
+    }
+
+    fn remove_codex_test_store(path: &PathBuf) {
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            let _ = std::fs::remove_file(PathBuf::from(sidecar));
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn codex_task_complete_replay_is_idempotent_across_store_reopen() {
+        let session = "sess-fornx446-replay";
+        let turn = "turn-fornx446-same";
+        let (path, state) = persistent_codex_test_state().await;
+        let mut hint = None;
+        process_codex_completion(
+            &state,
+            session,
+            turn,
+            "All tests passed.",
+            "2026-10-15T12:00:00Z",
+            &mut hint,
+        )
+        .await;
+        let first = codex_completion_snapshot(&state, session).await;
+        assert_eq!(
+            (
+                first.event_ids.len(),
+                first.evidence_ids.len(),
+                first.claims.len()
+            ),
+            (2, 1, 1)
+        );
+        assert_eq!(first.findings.len(), 1);
+        assert_eq!(first.findings[0].verdict, "verified");
+
+        process_codex_completion(
+            &state,
+            session,
+            turn,
+            "All tests passed.",
+            "2026-10-15T13:00:00Z",
+            &mut hint,
+        )
+        .await;
+        assert_eq!(codex_completion_snapshot(&state, session).await, first);
+        drop(state);
+
+        let store = fornax_store::Store::open(&path)
+            .await
+            .expect("reopen store");
+        let reopened = test_state_with_store(store);
+        process_codex_completion(
+            &reopened,
+            session,
+            turn,
+            "All tests passed.",
+            "2026-10-15T14:00:00Z",
+            &mut None,
+        )
+        .await;
+        assert_eq!(codex_completion_snapshot(&reopened, session).await, first);
+        drop(reopened);
+        remove_codex_test_store(&path);
+    }
+
+    #[tokio::test]
+    async fn codex_task_complete_collision_and_later_turn_fail_closed() {
+        let session = "sess-fornx446-negative";
+        let first_turn = "turn-fornx446-first";
+        let (path, state) = persistent_codex_test_state().await;
+        let mut hint = None;
+        process_codex_completion(
+            &state,
+            session,
+            first_turn,
+            "All tests passed.",
+            "2026-10-15T12:00:00Z",
+            &mut hint,
+        )
+        .await;
+        let first = codex_completion_snapshot(&state, session).await;
+        assert_eq!(
+            (
+                first.event_ids.len(),
+                first.evidence_ids.len(),
+                first.claims.len()
+            ),
+            (2, 1, 1)
+        );
+        assert_eq!(first.findings.len(), 1);
+        assert_eq!(first.findings[0].verdict, "verified");
+
+        process_codex_completion(
+            &state,
+            session,
+            first_turn,
+            "Task complete; details changed.",
+            "2026-10-15T13:00:00Z",
+            &mut hint,
+        )
+        .await;
+        let mut collision = first.clone();
+        collision.quarantine += 1;
+        assert_eq!(codex_completion_snapshot(&state, session).await, collision);
+
+        process_codex_completion(
+            &state,
+            session,
+            "turn-fornx446-later",
+            "All tests passed.",
+            "2026-10-15T14:00:00Z",
+            &mut hint,
+        )
+        .await;
+        let later = codex_completion_snapshot(&state, session).await;
+        assert_eq!(
+            (
+                later.event_ids.len(),
+                later.evidence_ids.len(),
+                later.claims.len()
+            ),
+            (3, 1, 2)
+        );
+        assert_eq!(later.evidence_ids, first.evidence_ids);
+        assert_eq!(later.claims[0].2, later.claims[1].2);
+        assert_ne!(later.claims[0].0, later.claims[1].0);
+        assert_ne!(later.claims[0].1, later.claims[1].1);
+        assert_eq!(later.findings.len(), 2);
+        let later_claim = later
+            .claims
+            .iter()
+            .find(|row| row.0 != first.claims[0].0)
+            .unwrap();
+        let later_finding = later
+            .findings
+            .iter()
+            .find(|row| row.claim_id == later_claim.0.to_string())
+            .unwrap();
+        assert_eq!(later_finding.verdict, "review");
+        assert!(later_finding.rationale.contains("already consumed"));
+        assert!(later_finding
+            .rationale
+            .contains(&first.claims[0].0.to_string()));
+        assert_eq!(later.quarantine, 1);
+        drop(state);
+        remove_codex_test_store(&path);
+    }
+
+    #[tokio::test]
+    async fn codex_changed_completion_cannot_introduce_claim_after_reopen() {
+        let session = "sess-fornx446-nonclaim-to-claim";
+        let turn = "turn-fornx446-conflict";
+        let (path, state) = persistent_codex_test_state().await;
+        process_codex_completion(
+            &state,
+            session,
+            turn,
+            "Done.",
+            "2026-10-15T12:00:00Z",
+            &mut None,
+        )
+        .await;
+        let first = codex_completion_snapshot(&state, session).await;
+        assert_eq!(
+            (
+                first.event_ids.len(),
+                first.evidence_ids.len(),
+                first.claims.len(),
+                first.findings.len()
+            ),
+            (2, 1, 0, 0)
+        );
+        drop(state);
+        let reopened = test_state_with_store(fornax_store::Store::open(&path).await.unwrap());
+        process_codex_completion(
+            &reopened,
+            session,
+            turn,
+            "All tests passed.",
+            "2026-10-15T13:00:00Z",
+            &mut None,
+        )
+        .await;
+        let mut expected = first;
+        expected.quarantine = 2; // Both conflicting source and its new claim must be rejected.
+        assert_eq!(
+            codex_completion_snapshot(&reopened, session).await,
+            expected
+        );
+        drop(reopened);
+        remove_codex_test_store(&path);
+    }
+
+    #[tokio::test]
+    async fn codex_claim_retry_recovers_after_source_arrives_and_store_reopens() {
+        let session = "sess-fornx446-partial";
+        let turn = "turn-fornx446-partial";
+        let (path, state) = persistent_codex_test_state().await;
+        let messages = codex_native_completion_messages(session, turn, "All tests passed.");
+        let claim = messages
+            .iter()
+            .find(|msg| matches!(msg, IngestMessage::Claim(_)))
+            .unwrap();
+        process_line(&state, &serde_json::to_string(claim).unwrap(), &mut None).await;
+        assert_eq!(state.store.quarantine_count().await.unwrap(), 1);
+        for message in messages
+            .iter()
+            .filter(|msg| !matches!(msg, IngestMessage::Claim(_)))
+        {
+            process_line(&state, &serde_json::to_string(message).unwrap(), &mut None).await;
+        }
+        assert!(state
+            .store
+            .claims_for_session(session)
+            .await
+            .unwrap()
+            .is_empty());
+        drop(state);
+        let reopened = test_state_with_store(fornax_store::Store::open(&path).await.unwrap());
+        process_codex_completion(
+            &reopened,
+            session,
+            turn,
+            "All tests passed.",
+            "2026-10-15T14:00:00Z",
+            &mut None,
+        )
+        .await;
+        let first = codex_completion_snapshot(&reopened, session).await;
+        assert_eq!(
+            (
+                first.event_ids.len(),
+                first.evidence_ids.len(),
+                first.claims.len(),
+                first.findings.len()
+            ),
+            (2, 1, 1, 1)
+        );
+        assert_eq!(first.findings[0].verdict, "verified");
+        assert_eq!(first.quarantine, 1);
+        process_codex_completion(
+            &reopened,
+            session,
+            turn,
+            "All tests passed.",
+            "2026-10-15T15:00:00Z",
+            &mut None,
+        )
+        .await;
+        assert_eq!(codex_completion_snapshot(&reopened, session).await, first);
+        drop(reopened);
+        remove_codex_test_store(&path);
+    }
+
+    #[tokio::test]
+    async fn codex_completion_redaction_preserves_claim_identity_across_reopen() {
+        let session = "sess-fornx446-redaction";
+        let turn = Uuid::new_v4().to_string();
+        let canary = format!("FORNX446{}", Uuid::new_v4().simple());
+        let claim_text = format!("All tests passed. {canary}");
+        let (path, state) = persistent_codex_test_state().await;
+        process_codex_completion(
+            &state,
+            session,
+            &turn,
+            &claim_text,
+            "2026-10-15T12:00:00Z",
+            &mut None,
+        )
+        .await;
+
+        let before = codex_completion_snapshot(&state, session).await;
+        assert_eq!(before.claims.len(), 1);
+        assert_eq!(before.findings.len(), 1);
+        assert_eq!(before.findings[0].verdict, "verified");
+        assert!(!before.claims[0].2.contains(&canary));
+        assert!(before.claims[0].2.starts_with("All tests passed."));
+        let event = state
+            .store
+            .events_for_session(session)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.kind == fornax_types::EventKind::SessionEnd)
+            .unwrap();
+        assert_eq!(event.raw["payload"]["turn_id"], "[REDACTED]");
+        assert!(!event.raw["payload"]["last_agent_message"]
+            .as_str()
+            .unwrap()
+            .contains(&canary));
+        assert_eq!(
+            event.raw["payload"]["last_agent_message"],
+            before.claims[0].2
+        );
+
+        drop(state);
+        let reopened = test_state_with_store(fornax_store::Store::open(&path).await.unwrap());
+        process_codex_completion(
+            &reopened,
+            session,
+            &turn,
+            &claim_text,
+            "2026-10-15T13:00:00Z",
+            &mut None,
+        )
+        .await;
+        assert_eq!(codex_completion_snapshot(&reopened, session).await, before);
+        drop(reopened);
+        remove_codex_test_store(&path);
+    }
+
+    #[tokio::test]
+    async fn claim_ingress_preserves_legacy_identity_compatibility() {
+        use fornax_types::{AgentEvent, EventKind, Provider};
+
+        let cases = [
+            (
+                "identified-legacy-ids",
+                Provider::Codex,
+                true,
+                "test_result",
+            ),
+            (
+                "unidentified-completion",
+                Provider::Codex,
+                false,
+                "test_result",
+            ),
+            ("custom-raw", Provider::Codex, false, "test_result"),
+            ("other-provider", Provider::ClaudeCode, true, "test_result"),
+            ("other-subject", Provider::Codex, true, "command_succeeded"),
+        ];
+        for (case, provider, identified, subject) in cases {
+            let session = format!("sess-fornx446-{case}");
+            let state = test_state().await;
+            let event_id = Uuid::new_v4();
+            let claim_id = Uuid::new_v4();
+            let turn = Uuid::new_v4().to_string();
+            let raw = if case == "custom-raw" {
+                serde_json::json!({"type":"custom","payload":{"message":"done"}})
+            } else {
+                let mut payload = serde_json::json!({
+                    "type":"task_complete",
+                    "turn_id":turn,
+                    "last_agent_message":"All tests passed."
+                });
+                if !identified {
+                    payload.as_object_mut().unwrap().remove("turn_id");
+                }
+                serde_json::json!({"type":"event_msg","payload":payload})
+            };
+            let event = AgentEvent {
+                id: event_id,
+                session_id: session.clone(),
+                provider,
+                kind: EventKind::SessionEnd,
+                observed_at: "2026-10-15T12:00:00Z".to_string(),
+                tool_name: None,
+                tool_input: None,
+                tool_response: None,
+                raw,
+            };
+            let claim = Claim {
+                id: claim_id,
+                session_id: session.clone(),
+                source_event_id: event_id,
+                text: if case == "identified-legacy-ids" {
+                    "All tests passed."
+                } else {
+                    "All tests passed. Different canonical wording."
+                }
+                .to_string(),
+                subject: subject.to_string(),
+                claimed_at: "2026-10-15T12:00:00Z".to_string(),
+            };
+            process_line(
+                &state,
+                &serde_json::to_string(&IngestMessage::Event(event)).unwrap(),
+                &mut None,
+            )
+            .await;
+            process_line(
+                &state,
+                &serde_json::to_string(&IngestMessage::Claim(claim)).unwrap(),
+                &mut None,
+            )
+            .await;
+
+            let claims = state.store.claims_for_session(&session).await.unwrap();
+            assert_eq!(claims.len(), 1, "case {case}");
+            assert_eq!(claims[0].id, claim_id, "case {case}");
+            assert_eq!(claims[0].source_event_id, event_id, "case {case}");
+            assert_eq!(
+                state.store.quarantine_count().await.unwrap(),
+                0,
+                "case {case}"
+            );
+            let findings = state.store.findings_for_session(&session).await.unwrap();
+            assert!(findings
+                .iter()
+                .all(|finding| finding.claim_id == claim_id.to_string()));
+            assert!(findings.iter().all(|finding| finding.verdict != "verified"));
+            if subject == "test_result" {
+                assert_eq!(findings.len(), 1, "case {case}");
+                assert_eq!(findings[0].verdict, "unavailable", "case {case}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_source_consistency_does_not_reextract_redacted_claims() {
+        let session = "sess-fornx446-redacted-trigger";
+        let turn = Uuid::new_v4().to_string();
+        let text = "PASSWORD=synthetic-private-value All tests passed.";
+        let (path, state) = persistent_codex_test_state().await;
+        process_codex_completion(
+            &state,
+            session,
+            &turn,
+            text,
+            "2026-10-15T12:00:00Z",
+            &mut None,
+        )
+        .await;
+        let first = codex_completion_snapshot(&state, session).await;
+        assert_eq!(first.claims.len(), 1);
+        assert_eq!(first.claims[0].2, "[REDACTED: possible secret assignment]");
+        assert!(!first.claims[0].2.to_lowercase().contains("tests passed"));
+        assert_eq!(first.quarantine, 0);
+        let event = state
+            .store
+            .events_for_session(session)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|event| event.kind == fornax_types::EventKind::SessionEnd)
+            .unwrap();
+        assert_eq!(event.raw["payload"]["turn_id"], "[REDACTED]");
+        assert_eq!(
+            event.raw["payload"]["last_agent_message"],
+            first.claims[0].2
+        );
+        drop(state);
+        let reopened = test_state_with_store(fornax_store::Store::open(&path).await.unwrap());
+        process_codex_completion(
+            &reopened,
+            session,
+            &turn,
+            text,
+            "2026-10-15T13:00:00Z",
+            &mut None,
+        )
+        .await;
+        assert_eq!(codex_completion_snapshot(&reopened, session).await, first);
+        drop(reopened);
+        remove_codex_test_store(&path);
+    }
+
+    #[tokio::test]
+    async fn codex_rejected_claim_quarantine_retains_metadata_only() {
+        let session = "sess-fornx446-private";
+        let (path, state) = persistent_codex_test_state().await;
+        let turn = Uuid::new_v4().to_string();
+        process_codex_completion(
+            &state,
+            session,
+            &turn,
+            "Done.",
+            "2026-10-15T12:00:00Z",
+            &mut None,
+        )
+        .await;
+        let private_text = "All tests passed. PRIVATE-COMPLETION-CANARY";
+        process_codex_completion(
+            &state,
+            session,
+            &turn,
+            private_text,
+            "2026-10-15T13:00:00Z",
+            &mut None,
+        )
+        .await;
+        let rows = state.store.list_quarantine(10).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows
+            .iter()
+            .any(|row| row.raw_line.starts_with("claim_source_mismatch: id=")));
+        for row in rows {
+            assert!(!row.raw_line.contains("PRIVATE-COMPLETION-CANARY"));
+            assert!(!row.reason.contains("PRIVATE-COMPLETION-CANARY"));
+            assert!(!row.raw_line.contains("All tests passed."));
+        }
+        assert!(state
+            .store
+            .claims_for_session(session)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(state
+            .store
+            .findings_for_session(session)
+            .await
+            .unwrap()
+            .is_empty());
+        drop(state);
+        remove_codex_test_store(&path);
+    }
 
     /// A real `fornax-adapter-codex` translation of one `item_completed`
     /// CommandExecution, replayed through `process_line` a second time

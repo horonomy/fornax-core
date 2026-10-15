@@ -78,6 +78,33 @@ pub fn dedup_id(session_id: &str, phase: &str, native_id: &str) -> Uuid {
     )
 }
 
+// New completion keys use framed fields: opaque IDs can contain delimiters.
+// Keep the released command-key encoding unchanged for existing evidence links.
+fn completion_id(session_id: &str, phase: &str, turn_id: &str) -> Uuid {
+    let key = serde_json::json!(["codex:completion:v1", session_id, phase, turn_id]).to_string();
+    Uuid::new_v5(&CODEX_NS, key.as_bytes())
+}
+
+/// Check a claim against the retained completion after both pass redaction.
+/// This checks source consistency, not sender authentication or extraction.
+/// Legacy random IDs remain valid; redacted native IDs cannot be recomputed.
+pub fn claim_matches_completion(source: &AgentEvent, claim: &Claim) -> bool {
+    let payload = &source.raw["payload"];
+    let identified_completion = source.provider == Provider::Codex
+        && source.kind == EventKind::SessionEnd
+        && source.raw["type"] == "event_msg"
+        && payload["type"] == "task_complete"
+        && payload["turn_id"]
+            .as_str()
+            .is_some_and(|turn| !turn.trim().is_empty());
+    if !identified_completion || claim.subject != "test_result" {
+        return true;
+    }
+    source.id == claim.source_event_id
+        && source.session_id == claim.session_id
+        && payload["last_agent_message"].as_str() == Some(claim.text.as_str())
+}
+
 /// Best-effort `major.minor.patch` parse of a Codex CLI version string
 /// (e.g. `"0.160.1"`, `"0.160.0-beta.2"`). Any pre-release/build suffix
 /// after the first `-` or `+` is dropped for the comparison -- this is used
@@ -848,6 +875,13 @@ fn translate_line(
         }
         "item_completed" => translate_item_completed(payload, entry, session_id, &now, cli_version),
         "task_complete" => {
+            let turn_id = payload
+                .get("turn_id")
+                .and_then(|value| value.as_str())
+                .filter(|id| !id.trim().is_empty());
+            let event_id = turn_id
+                .map(|id| completion_id(session_id, "task_complete", id))
+                .unwrap_or(event_id);
             let event = AgentEvent {
                 id: event_id,
                 session_id: session_id.to_string(),
@@ -863,7 +897,11 @@ fn translate_line(
             if let Some(text) = payload.get("last_agent_message").and_then(|v| v.as_str()) {
                 if claims_tests_passed(text) {
                     out.push(IngestMessage::Claim(Claim {
-                        id: Uuid::new_v4(),
+                        id: turn_id
+                            .map(|id| {
+                                completion_id(session_id, "task_complete:claim:test_result", id)
+                            })
+                            .unwrap_or_else(Uuid::new_v4),
                         session_id: session_id.to_string(),
                         source_event_id: event_id,
                         text: text.to_string(),
@@ -1219,6 +1257,120 @@ mod tests {
     }
 
     #[test]
+    fn completion_source_check_uses_retained_text_and_preserves_legacy_ids() {
+        let entry = serde_json::json!({"type":"event_msg","payload":{
+            "type":"task_complete","turn_id":"native-turn","last_agent_message":"All tests passed."
+        }});
+        let messages = normalize(&mut CodexAdapter::new(), &entry).into_messages();
+        let [IngestMessage::Event(event), IngestMessage::Claim(claim)] = messages.as_slice() else {
+            panic!("expected completion and claim");
+        };
+        let mut event = event.clone();
+        let mut claim = claim.clone();
+        event.id = Uuid::new_v4();
+        claim.id = Uuid::new_v4();
+        claim.source_event_id = event.id;
+        event.raw["payload"]["turn_id"] = serde_json::json!("<redacted-native-id>");
+        event.raw["payload"]["last_agent_message"] = serde_json::json!("<redacted>");
+        claim.text = "<redacted>".into();
+        assert!(claim_matches_completion(&event, &claim));
+        claim.text = "All tests passed.".into();
+        assert!(!claim_matches_completion(&event, &claim));
+        claim.text = "<redacted>".into();
+        claim.session_id.push_str("-other");
+        assert!(!claim_matches_completion(&event, &claim));
+        claim.session_id = event.session_id.clone();
+        claim.source_event_id = Uuid::new_v4();
+        assert!(!claim_matches_completion(&event, &claim));
+        claim.source_event_id = event.id;
+        event.raw["payload"]["last_agent_message"] = serde_json::Value::Null;
+        assert!(!claim_matches_completion(&event, &claim));
+        event.raw["payload"]["turn_id"] = serde_json::Value::Null;
+        assert!(claim_matches_completion(&event, &claim));
+        event.raw["payload"]["turn_id"] = serde_json::json!("native-turn");
+        event.provider = Provider::ClaudeCode;
+        assert!(claim_matches_completion(&event, &claim));
+    }
+
+    #[test]
+    fn identified_completion_replay_preserves_event_and_claim_identity() {
+        let entry = serde_json::json!({
+            "type": "event_msg",
+            "timestamp": "2026-10-15T05:00:00Z",
+            "ordinal": 19,
+            "payload": {
+                "type": "task_complete",
+                "turn_id": "native-turn-completion",
+                "last_agent_message": "All tests passed."
+            }
+        });
+        let first = normalize(&mut CodexAdapter::new(), &entry).into_messages();
+        let replay = normalize(&mut CodexAdapter::new(), &entry).into_messages();
+        match (first.as_slice(), replay.as_slice()) {
+            (
+                [IngestMessage::Event(event), IngestMessage::Claim(claim)],
+                [IngestMessage::Event(replayed_event), IngestMessage::Claim(replayed_claim)],
+            ) => {
+                assert_eq!(event.id, replayed_event.id);
+                assert_eq!(claim.id, replayed_claim.id);
+                assert_eq!(claim.source_event_id, event.id);
+                assert_eq!(replayed_claim.source_event_id, replayed_event.id);
+                assert_ne!(event.id, claim.id);
+            }
+            _ => panic!("expected a completion event and passing-test claim"),
+        }
+    }
+
+    #[test]
+    fn identified_completions_keep_opaque_sessions_turns_and_phases_distinct() {
+        let mut identities = std::collections::HashSet::new();
+        for (session, turn) in [
+            ("a", "b:task_complete:c"),
+            ("a:task_complete:b", "c"),
+            ("a", "same-turn"),
+            ("other-session", "same-turn"),
+            ("a", " same-turn "),
+            ("session:\"\\雪", "turn:\"\\雪"),
+        ] {
+            let entry = serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "turn_id": turn,
+                    "call_id": "same-turn",
+                    "last_agent_message": "All tests passed."
+                }
+            });
+            let first = CodexAdapter::new()
+                .normalize(session, &entry)
+                .into_messages();
+            let replay = CodexAdapter::new()
+                .normalize(session, &entry)
+                .into_messages();
+            match (first.as_slice(), replay.as_slice()) {
+                (
+                    [IngestMessage::Event(event), IngestMessage::Claim(claim)],
+                    [IngestMessage::Event(replayed_event), IngestMessage::Claim(replayed_claim)],
+                ) => {
+                    assert_eq!(event.id, replayed_event.id);
+                    assert_eq!(claim.id, replayed_claim.id);
+                    assert!(
+                        identities.insert(event.id),
+                        "completion event aliased another occurrence"
+                    );
+                    assert!(
+                        identities.insert(claim.id),
+                        "completion claim aliased another phase or occurrence"
+                    );
+                    assert_ne!(event.id, dedup_id(session, "event", "same-turn"));
+                    assert_ne!(claim.id, dedup_id(session, "tool_after", "same-turn"));
+                }
+                _ => panic!("expected an identified completion and claim"),
+            }
+        }
+    }
+
+    #[test]
     fn task_complete_without_a_claim_producing_message_is_event_only() {
         let entry = serde_json::json!({
             "type": "event_msg",
@@ -1226,6 +1378,61 @@ mod tests {
         });
         let msgs = normalize(&mut CodexAdapter::new(), &entry).into_messages();
         assert_eq!(msgs.len(), 1);
+    }
+
+    #[test]
+    fn identified_completion_without_a_claim_replays_as_one_event_identity() {
+        let entry = serde_json::json!({
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "turn_id": "event-only-turn", "last_agent_message": "Done."}
+        });
+        let first = normalize(&mut CodexAdapter::new(), &entry).into_messages();
+        let replay = normalize(&mut CodexAdapter::new(), &entry).into_messages();
+        match (first.as_slice(), replay.as_slice()) {
+            ([IngestMessage::Event(event)], [IngestMessage::Event(replayed_event)]) => {
+                assert_eq!(event.id, replayed_event.id);
+                assert_eq!(event.kind, EventKind::SessionEnd);
+            }
+            _ => panic!("a non-claim completion must remain event-only"),
+        }
+    }
+
+    #[test]
+    fn unidentified_completions_do_not_merge_distinct_legacy_assertions() {
+        for turn in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!(42)),
+            Some(serde_json::json!(true)),
+            Some(serde_json::json!({"id": "turn"})),
+            Some(serde_json::json!("")),
+            Some(serde_json::json!(" \t\n")),
+        ] {
+            let mut entry = serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "last_agent_message": "All tests passed."
+                }
+            });
+            if let Some(turn) = turn {
+                entry["payload"]["turn_id"] = turn;
+            }
+            let first = normalize(&mut CodexAdapter::new(), &entry).into_messages();
+            let second = normalize(&mut CodexAdapter::new(), &entry).into_messages();
+            match (first.as_slice(), second.as_slice()) {
+                (
+                    [IngestMessage::Event(event), IngestMessage::Claim(claim)],
+                    [IngestMessage::Event(other_event), IngestMessage::Claim(other_claim)],
+                ) => {
+                    assert_ne!(event.id, other_event.id);
+                    assert_ne!(claim.id, other_claim.id);
+                    assert_eq!(claim.source_event_id, event.id);
+                    assert_eq!(other_claim.source_event_id, other_event.id);
+                }
+                _ => panic!("expected the legacy completion and claim shape"),
+            }
+        }
     }
 
     #[test]

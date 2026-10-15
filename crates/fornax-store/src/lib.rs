@@ -114,6 +114,8 @@ pub enum StoreError {
     /// it, the same path a genuinely unprocessable line already takes.
     #[error("claim id {id} collides with an existing row whose content differs -- not a legitimate retry")]
     ClaimIdCollision { id: String },
+    #[error("claim id {id} does not match its persisted source event")]
+    ClaimSourceMismatch { id: String },
     /// FORNX-433 AC3: a blank/empty `session_id` must never be silently
     /// accepted -- that is exactly the shape that used to let multiple real
     /// sessions collide into one shared fake "unknown" session upstream
@@ -435,10 +437,43 @@ impl Store {
     /// re-verifying an already-known claim is worth doing — this method
     /// only answers "is this new or not").
     pub async fn insert_claim_idempotent(&self, c: &Claim) -> Result<bool> {
+        self.insert_claim_inner(c, None::<fn(&AgentEvent) -> bool>)
+            .await
+    }
+
+    /// Validate adapter-specific source consistency in the insertion transaction.
+    /// Keep the source read atomic with insertion across reconnects and retention;
+    /// the original insertion API keeps its existing contract.
+    pub async fn insert_claim_idempotent_checked<F>(&self, c: &Claim, check: F) -> Result<bool>
+    where
+        F: FnOnce(&AgentEvent) -> bool + Send,
+    {
+        self.insert_claim_inner(c, Some(check)).await
+    }
+
+    async fn insert_claim_inner<F>(&self, c: &Claim, check: Option<F>) -> Result<bool>
+    where
+        F: FnOnce(&AgentEvent) -> bool + Send,
+    {
         if c.session_id.is_empty() {
             return Err(StoreError::MissingSessionIdentity { kind: "claims" });
         }
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(check) = check {
+            let row = sqlx::query_as::<_, EventRow>(
+                "SELECT id, session_id, provider, kind, observed_at, tool_name, tool_input, tool_response, raw
+                 FROM agent_events WHERE id = ?1",
+            )
+            .bind(c.source_event_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+            let source: Option<AgentEvent> = row.map(TryInto::try_into).transpose()?;
+            if !source.as_ref().is_some_and(check) {
+                return Err(StoreError::ClaimSourceMismatch {
+                    id: c.id.to_string(),
+                });
+            }
+        }
         let result = sqlx::query(
             "INSERT INTO claims (id, session_id, source_event_id, text, subject, claimed_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
