@@ -7556,6 +7556,63 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[tokio::test]
+    async fn codex_task_complete_replay_is_idempotent_across_store_reopen() {
+        let session = "sess-fornx446-replay";
+        let turn = "turn-fornx446-same";
+        let (path, state) = persistent_codex_test_state().await;
+        let mut hint = None;
+        process_codex_completion(
+            &state,
+            session,
+            turn,
+            "All tests passed.",
+            "2026-10-15T12:00:00Z",
+            &mut hint,
+        )
+        .await;
+        let first = codex_completion_snapshot(&state, session).await;
+        assert_eq!(
+            (
+                first.event_ids.len(),
+                first.evidence_ids.len(),
+                first.claims.len()
+            ),
+            (2, 1, 1)
+        );
+        assert_eq!(first.findings.len(), 1);
+        assert_eq!(first.findings[0].verdict, "verified");
+
+        process_codex_completion(
+            &state,
+            session,
+            turn,
+            "All tests passed.",
+            "2026-10-15T13:00:00Z",
+            &mut hint,
+        )
+        .await;
+        assert_eq!(codex_completion_snapshot(&state, session).await, first);
+        drop(state);
+
+        let store = fornax_store::Store::open(&path)
+            .await
+            .expect("reopen store");
+        let reopened = test_state_with_store(store);
+        process_codex_completion(
+            &reopened,
+            session,
+            turn,
+            "All tests passed.",
+            "2026-10-15T14:00:00Z",
+            &mut None,
+        )
+        .await;
+        assert_eq!(codex_completion_snapshot(&reopened, session).await, first);
+        drop(reopened);
+        remove_codex_test_store(&path);
+    }
+
     /// A real `fornax-adapter-codex` translation of one `item_completed`
     /// CommandExecution, replayed through `process_line` a second time
     /// (simulating the rollout tailer re-reading from offset 0 after a
