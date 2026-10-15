@@ -1325,6 +1325,23 @@ mod tests {
     }
 
     #[test]
+    fn identified_completion_without_a_claim_replays_as_one_event_identity() {
+        let entry = serde_json::json!({
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "turn_id": "event-only-turn", "last_agent_message": "Done."}
+        });
+        let first = normalize(&mut CodexAdapter::new(), &entry).into_messages();
+        let replay = normalize(&mut CodexAdapter::new(), &entry).into_messages();
+        match (first.as_slice(), replay.as_slice()) {
+            ([IngestMessage::Event(event)], [IngestMessage::Event(replayed_event)]) => {
+                assert_eq!(event.id, replayed_event.id);
+                assert_eq!(event.kind, EventKind::SessionEnd);
+            }
+            _ => panic!("a non-claim completion must remain event-only"),
+        }
+    }
+
+    #[test]
     fn unidentified_completions_do_not_merge_distinct_legacy_assertions() {
         for turn in [
             None,
