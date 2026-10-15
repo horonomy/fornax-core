@@ -1,0 +1,163 @@
+{
+  "ready": false,
+  "version": "v0.0.9",
+  "checks": [
+    {
+      "name": "manifest.version",
+      "status": "pass",
+      "detail": "v0.0.9"
+    },
+    {
+      "name": "manifest.gates.presence",
+      "status": "pass",
+      "detail": "qa, security, docs, stage all present"
+    },
+    {
+      "name": "repo.horonomy/fornax-core.sha_exists",
+      "status": "pass",
+      "detail": "commit 13e80468bac2fe721a35137bfa5e6202cb182468 found"
+    },
+    {
+      "name": "repo.horonomy/fornax-core.sha_on_main",
+      "status": "pass",
+      "detail": "sha is on main (compare status: behind)"
+    },
+    {
+      "name": "repo.horonomy/fornax-core.workspace_version_matches_candidate",
+      "status": "pass",
+      "detail": "workspace version 0.0.9 matches candidate v0.0.9"
+    },
+    {
+      "name": "repo.horonomy/fornax-cloud.sha_exists",
+      "status": "pass",
+      "detail": "commit c0cf247f4ac8f6fa3f2898fd7945f996e2eeb7b0 found"
+    },
+    {
+      "name": "repo.horonomy/fornax-cloud.sha_on_main",
+      "status": "pass",
+      "detail": "sha is on main (compare status: identical)"
+    },
+    {
+      "name": "evidence.qa.FORNX-434.exists",
+      "status": "pass",
+      "detail": "ticket found"
+    },
+    {
+      "name": "evidence.qa.FORNX-434.done",
+      "status": "fail",
+      "detail": "ticket FORNX-434 is not Done (status: In Progress)"
+    },
+    {
+      "name": "evidence.qa.FORNX-434.not_blocked",
+      "status": "pass",
+      "detail": "no BLOCK verdict found"
+    },
+    {
+      "name": "evidence.qa.FORNX-434.candidate_reference",
+      "status": "pass",
+      "detail": "ticket references candidate version v0.0.9"
+    },
+    {
+      "name": "evidence.security.FORNX-437.exists",
+      "status": "pass",
+      "detail": "ticket found"
+    },
+    {
+      "name": "evidence.security.FORNX-437.done",
+      "status": "pass",
+      "detail": "status: Done"
+    },
+    {
+      "name": "evidence.security.FORNX-437.not_blocked",
+      "status": "pass",
+      "detail": "no BLOCK verdict found"
+    },
+    {
+      "name": "evidence.security.FORNX-437.candidate_reference",
+      "status": "pass",
+      "detail": "ticket references candidate version v0.0.9"
+    },
+    {
+      "name": "evidence.docs.FORNX-430.exists",
+      "status": "pass",
+      "detail": "ticket found"
+    },
+    {
+      "name": "evidence.docs.FORNX-430.done",
+      "status": "pass",
+      "detail": "status: Done"
+    },
+    {
+      "name": "evidence.docs.FORNX-430.not_blocked",
+      "status": "pass",
+      "detail": "no BLOCK verdict found"
+    },
+    {
+      "name": "evidence.docs.FORNX-430.candidate_reference",
+      "status": "pass",
+      "detail": "ticket references candidate version v0.0.9"
+    },
+    {
+      "name": "evidence.stage.FORNX-438.exists",
+      "status": "pass",
+      "detail": "ticket found"
+    },
+    {
+      "name": "evidence.stage.FORNX-438.done",
+      "status": "fail",
+      "detail": "ticket FORNX-438 is not Done (status: In Progress)"
+    },
+    {
+      "name": "evidence.stage.FORNX-438.not_blocked",
+      "status": "pass",
+      "detail": "no BLOCK verdict found"
+    },
+    {
+      "name": "evidence.stage.FORNX-438.candidate_reference",
+      "status": "pass",
+      "detail": "ticket references candidate version v0.0.9"
+    }
+  ],
+  "candidate": {
+    "repos": [
+      {
+        "name": "fornax-core",
+        "owner": "horonomy",
+        "sha": "13e80468bac2fe721a35137bfa5e6202cb182468",
+        "publishes_artifact": true
+      },
+      {
+        "name": "fornax-cloud",
+        "owner": "horonomy",
+        "sha": "c0cf247f4ac8f6fa3f2898fd7945f996e2eeb7b0",
+        "publishes_artifact": true
+      }
+    ],
+    "evidence": [
+      {
+        "gate": "qa",
+        "jira_key": "FORNX-434",
+        "jira_url": "https://lightning-dust-mite.atlassian.net/browse/FORNX-434",
+        "applies_to_repos": []
+      },
+      {
+        "gate": "security",
+        "jira_key": "FORNX-437",
+        "jira_url": "https://lightning-dust-mite.atlassian.net/browse/FORNX-437",
+        "applies_to_repos": []
+      },
+      {
+        "gate": "docs",
+        "jira_key": "FORNX-430",
+        "jira_url": "https://lightning-dust-mite.atlassian.net/browse/FORNX-430",
+        "applies_to_repos": []
+      },
+      {
+        "gate": "stage",
+        "jira_key": "FORNX-438",
+        "jira_url": "https://lightning-dust-mite.atlassian.net/browse/FORNX-438",
+        "applies_to_repos": []
+      }
+    ]
+  }
+}
