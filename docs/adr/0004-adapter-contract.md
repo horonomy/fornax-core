@@ -192,6 +192,23 @@ as a placeholder when no adapter has announced yet) — see that function's
 doc comment for why the two candidate fixes are each worse than the bug;
 tracked as a FORNX-138 follow-up.
 
+### Retained completion consistency at ingress (FORNX-446, 2026-10-15)
+
+The daemon may invoke the Codex adapter's pure retained-completion consistency
+check before inserting a linked claim. This is a narrow exception to the concrete
+adapter dependency rule: the callback accepts canonical `AgentEvent`/`Claim`
+values, performs no I/O, and keeps all native-shape interpretation in the adapter.
+The store invokes it inside the existing insertion transaction through a
+provider-neutral checked-insert API; the legacy insertion API is unchanged.
+
+The exception prevents a rejected changed completion from introducing a claim
+against a different retained final message. It validates already-redacted source
+consistency, not sender authentication, semantic truth, or a new authority grant.
+Matching partial-ingest retries and legacy random IDs remain valid; unrelated
+providers and canonical message shapes retain their existing behavior. It does
+not authorize provider-specific parsing in storage or verification, or a general
+adapter registry/plugin abstraction.
+
 ### Conformance harness
 
 `crates/fornax-adapter-conformance` is a test-only crate: its `src/lib.rs`
