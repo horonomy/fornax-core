@@ -7966,6 +7966,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_source_consistency_does_not_reextract_redacted_claims() {
+        let session = "sess-fornx446-redacted-trigger";
+        let turn = Uuid::new_v4().to_string();
+        let text = "PASSWORD=synthetic-private-value All tests passed.";
+        let (path, state) = persistent_codex_test_state().await;
+        process_codex_completion(
+            &state,
+            session,
+            &turn,
+            text,
+            "2026-10-15T12:00:00Z",
+            &mut None,
+        )
+        .await;
+        let first = codex_completion_snapshot(&state, session).await;
+        assert_eq!(first.claims.len(), 1);
+        assert_eq!(first.claims[0].2, "[REDACTED: possible secret assignment]");
+        assert!(!first.claims[0].2.to_lowercase().contains("tests passed"));
+        assert_eq!(first.quarantine, 0);
+        let event = state
+            .store
+            .events_for_session(session)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|event| event.kind == fornax_types::EventKind::SessionEnd)
+            .unwrap();
+        assert_eq!(event.raw["payload"]["turn_id"], "[REDACTED]");
+        assert_eq!(
+            event.raw["payload"]["last_agent_message"],
+            first.claims[0].2
+        );
+        drop(state);
+        let reopened = test_state_with_store(fornax_store::Store::open(&path).await.unwrap());
+        process_codex_completion(
+            &reopened,
+            session,
+            &turn,
+            text,
+            "2026-10-15T13:00:00Z",
+            &mut None,
+        )
+        .await;
+        assert_eq!(codex_completion_snapshot(&reopened, session).await, first);
+        drop(reopened);
+        remove_codex_test_store(&path);
+    }
+
+    #[tokio::test]
     async fn codex_rejected_claim_quarantine_retains_metadata_only() {
         let session = "sess-fornx446-private";
         let (path, state) = persistent_codex_test_state().await;
