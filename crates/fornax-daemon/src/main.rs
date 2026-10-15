@@ -7392,6 +7392,170 @@ mod tests {
 
     // ---- HORO-1712: Codex item_completed dedup, end to end -----------
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct PersistedFindingSnapshot {
+        id: String,
+        claim_id: String,
+        verdict: String,
+        evidence_ids: String,
+        rationale: String,
+        verifier_name: String,
+        computed_at: String,
+        claim_text: String,
+        session_id: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct CodexCompletionSnapshot {
+        event_ids: Vec<Uuid>,
+        evidence_ids: Vec<Uuid>,
+        claims: Vec<(Uuid, Uuid, String)>,
+        findings: Vec<PersistedFindingSnapshot>,
+        quarantine: i64,
+    }
+
+    async fn codex_completion_snapshot(
+        state: &AppState,
+        session_id: &str,
+    ) -> CodexCompletionSnapshot {
+        let mut event_ids: Vec<_> = state
+            .store
+            .events_for_session(session_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        event_ids.sort();
+        let mut evidence_ids: Vec<_> = state
+            .store
+            .evidence_for_session(session_id)
+            .await
+            .unwrap()
+            .evidence
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        evidence_ids.sort();
+        let claims = state
+            .store
+            .claims_for_session(session_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.id, row.source_event_id, row.text))
+            .collect();
+        let mut findings: Vec<_> = state
+            .store
+            .findings_for_session(session_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| PersistedFindingSnapshot {
+                id: row.id,
+                claim_id: row.claim_id,
+                verdict: row.verdict,
+                evidence_ids: row.evidence_ids,
+                rationale: row.rationale,
+                verifier_name: row.verifier_name,
+                computed_at: row.computed_at,
+                claim_text: row.claim_text,
+                session_id: row.session_id,
+            })
+            .collect();
+        findings.sort_by(|left, right| left.id.cmp(&right.id));
+        CodexCompletionSnapshot {
+            event_ids,
+            evidence_ids,
+            claims,
+            findings,
+            quarantine: state.store.quarantine_count().await.unwrap(),
+        }
+    }
+
+    /// Translate actual Codex native line shapes with a fresh adapter; the
+    /// capability announcement follows format observation, then is delivered first.
+    fn codex_native_completion_messages(
+        session_id: &str,
+        turn_id: &str,
+        last_agent_message: &str,
+    ) -> Vec<IngestMessage> {
+        use fornax_adapter_codex::{stamped_capabilities, CodexAdapter};
+        use fornax_types::{AgentAdapter, NormalizationOutcome};
+        let mut adapter = CodexAdapter::new();
+        let _ = adapter.normalize(
+            "hint",
+            &serde_json::json!({
+                "type":"session_meta","payload":{"session_id":session_id,"cli_version":"0.160.0"}
+            }),
+        );
+        let entries = [
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "id":"item_fornx446_command","type":"CommandExecution","status":"completed",
+                "exit_code":0,"command":["pytest"],"source":"agent"
+            }}}),
+            serde_json::json!({"type":"event_msg","ordinal":20,"timestamp":"2026-10-15T12:00:00Z",
+                "payload":{"type":"task_complete","turn_id":turn_id,"last_agent_message":last_agent_message,
+                "started_at":"2026-10-15T11:59:00Z","completed_at":"2026-10-15T12:00:00Z",
+                "duration_ms":60000}}),
+        ];
+        let mut messages = Vec::new();
+        for entry in entries {
+            let NormalizationOutcome::Messages(normalized) = adapter.normalize("hint", &entry)
+            else {
+                panic!("expected adapter messages for native entry: {entry}");
+            };
+            messages.extend(normalized);
+        }
+        messages.insert(
+            0,
+            IngestMessage::Capabilities(stamped_capabilities(&adapter, session_id)),
+        );
+        messages
+    }
+
+    fn set_codex_arrival_time(messages: &mut [IngestMessage], at: &str) {
+        for message in messages {
+            match message {
+                IngestMessage::Event(row) => row.observed_at = at.to_string(),
+                IngestMessage::Claim(row) => row.claimed_at = at.to_string(),
+                _ => {}
+            }
+        }
+    }
+
+    async fn process_codex_completion(
+        state: &AppState,
+        session_id: &str,
+        turn_id: &str,
+        claim_text: &str,
+        arrival: &str,
+        hint: &mut Option<String>,
+    ) {
+        let mut messages = codex_native_completion_messages(session_id, turn_id, claim_text);
+        set_codex_arrival_time(&mut messages, arrival);
+        for message in messages {
+            process_line(state, &serde_json::to_string(&message).unwrap(), hint).await;
+        }
+    }
+
+    async fn persistent_codex_test_state() -> (PathBuf, AppState) {
+        let path = std::env::temp_dir().join(format!("fornax-fornx446-{}.db", Uuid::new_v4()));
+        let store = fornax_store::Store::open(&path)
+            .await
+            .expect("open test store");
+        (path, test_state_with_store(store))
+    }
+
+    fn remove_codex_test_store(path: &PathBuf) {
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            let _ = std::fs::remove_file(PathBuf::from(sidecar));
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
     /// A real `fornax-adapter-codex` translation of one `item_completed`
     /// CommandExecution, replayed through `process_line` a second time
     /// (simulating the rollout tailer re-reading from offset 0 after a
