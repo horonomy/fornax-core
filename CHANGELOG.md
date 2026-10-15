@@ -69,6 +69,10 @@ Jira epic FORNX-20.
   the same session-scoped completion and claim identities across tailer
   replay and restart. Distinct turns remain distinct even with identical
   prose; conflicting content under one identity is still quarantined.
+  Linked claims must match the retained completion in the insertion transaction;
+  a rejected changed completion cannot introduce a new verified claim. Quarantine
+  records retain metadata only for this rejection. Matching partial-ingest retries
+  remain eligible after reconnect or restart.
   Existing tool/evidence IDs and the evidence-consumption guard are unchanged.
   Historical random-ID rows are retained: the first replay after upgrading
   can add one stable-ID occurrence beside them; no migration rewrites history.
