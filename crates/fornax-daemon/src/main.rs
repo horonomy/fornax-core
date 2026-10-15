@@ -7811,6 +7811,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_completion_redaction_preserves_claim_identity_across_reopen() {
+        let session = "sess-fornx446-redaction";
+        let turn = Uuid::new_v4().to_string();
+        let canary = format!("FORNX446{}", Uuid::new_v4().simple());
+        let claim_text = format!("All tests passed. {canary}");
+        let (path, state) = persistent_codex_test_state().await;
+        process_codex_completion(
+            &state,
+            session,
+            &turn,
+            &claim_text,
+            "2026-10-15T12:00:00Z",
+            &mut None,
+        )
+        .await;
+
+        let before = codex_completion_snapshot(&state, session).await;
+        assert_eq!(before.claims.len(), 1);
+        assert_eq!(before.findings.len(), 1);
+        assert_eq!(before.findings[0].verdict, "verified");
+        assert!(!before.claims[0].2.contains(&canary));
+        assert!(before.claims[0].2.starts_with("All tests passed."));
+        let event = state
+            .store
+            .events_for_session(session)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.kind == fornax_types::EventKind::SessionEnd)
+            .unwrap();
+        assert_eq!(event.raw["payload"]["turn_id"], "[REDACTED]");
+        assert!(!event.raw["payload"]["last_agent_message"]
+            .as_str()
+            .unwrap()
+            .contains(&canary));
+        assert_eq!(
+            event.raw["payload"]["last_agent_message"],
+            before.claims[0].2
+        );
+
+        drop(state);
+        let reopened = test_state_with_store(fornax_store::Store::open(&path).await.unwrap());
+        process_codex_completion(
+            &reopened,
+            session,
+            &turn,
+            &claim_text,
+            "2026-10-15T13:00:00Z",
+            &mut None,
+        )
+        .await;
+        assert_eq!(codex_completion_snapshot(&reopened, session).await, before);
+        drop(reopened);
+        remove_codex_test_store(&path);
+    }
+
+    #[tokio::test]
     async fn codex_rejected_claim_quarantine_retains_metadata_only() {
         let session = "sess-fornx446-private";
         let (path, state) = persistent_codex_test_state().await;
