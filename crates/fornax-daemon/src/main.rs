@@ -7613,6 +7613,89 @@ mod tests {
         remove_codex_test_store(&path);
     }
 
+    #[tokio::test]
+    async fn codex_task_complete_collision_and_later_turn_fail_closed() {
+        let session = "sess-fornx446-negative";
+        let first_turn = "turn-fornx446-first";
+        let (path, state) = persistent_codex_test_state().await;
+        let mut hint = None;
+        process_codex_completion(
+            &state,
+            session,
+            first_turn,
+            "All tests passed.",
+            "2026-10-15T12:00:00Z",
+            &mut hint,
+        )
+        .await;
+        let first = codex_completion_snapshot(&state, session).await;
+        assert_eq!(
+            (
+                first.event_ids.len(),
+                first.evidence_ids.len(),
+                first.claims.len()
+            ),
+            (2, 1, 1)
+        );
+        assert_eq!(first.findings.len(), 1);
+        assert_eq!(first.findings[0].verdict, "verified");
+
+        process_codex_completion(
+            &state,
+            session,
+            first_turn,
+            "Task complete; details changed.",
+            "2026-10-15T13:00:00Z",
+            &mut hint,
+        )
+        .await;
+        let mut collision = first.clone();
+        collision.quarantine += 1;
+        assert_eq!(codex_completion_snapshot(&state, session).await, collision);
+
+        process_codex_completion(
+            &state,
+            session,
+            "turn-fornx446-later",
+            "All tests passed.",
+            "2026-10-15T14:00:00Z",
+            &mut hint,
+        )
+        .await;
+        let later = codex_completion_snapshot(&state, session).await;
+        assert_eq!(
+            (
+                later.event_ids.len(),
+                later.evidence_ids.len(),
+                later.claims.len()
+            ),
+            (3, 1, 2)
+        );
+        assert_eq!(later.evidence_ids, first.evidence_ids);
+        assert_eq!(later.claims[0].2, later.claims[1].2);
+        assert_ne!(later.claims[0].0, later.claims[1].0);
+        assert_ne!(later.claims[0].1, later.claims[1].1);
+        assert_eq!(later.findings.len(), 2);
+        let later_claim = later
+            .claims
+            .iter()
+            .find(|row| row.0 != first.claims[0].0)
+            .unwrap();
+        let later_finding = later
+            .findings
+            .iter()
+            .find(|row| row.claim_id == later_claim.0.to_string())
+            .unwrap();
+        assert_eq!(later_finding.verdict, "review");
+        assert!(later_finding.rationale.contains("already consumed"));
+        assert!(later_finding
+            .rationale
+            .contains(&first.claims[0].0.to_string()));
+        assert_eq!(later.quarantine, 1);
+        drop(state);
+        remove_codex_test_store(&path);
+    }
+
     /// A real `fornax-adapter-codex` translation of one `item_completed`
     /// CommandExecution, replayed through `process_line` a second time
     /// (simulating the rollout tailer re-reading from offset 0 after a
