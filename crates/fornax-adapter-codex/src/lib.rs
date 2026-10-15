@@ -1266,6 +1266,55 @@ mod tests {
     }
 
     #[test]
+    fn identified_completions_keep_opaque_sessions_turns_and_phases_distinct() {
+        let mut identities = std::collections::HashSet::new();
+        for (session, turn) in [
+            ("a", "b:task_complete:c"),
+            ("a:task_complete:b", "c"),
+            ("a", "same-turn"),
+            ("other-session", "same-turn"),
+            ("a", " same-turn "),
+            ("session:\"\\雪", "turn:\"\\雪"),
+        ] {
+            let entry = serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "turn_id": turn,
+                    "call_id": "same-turn",
+                    "last_agent_message": "All tests passed."
+                }
+            });
+            let first = CodexAdapter::new()
+                .normalize(session, &entry)
+                .into_messages();
+            let replay = CodexAdapter::new()
+                .normalize(session, &entry)
+                .into_messages();
+            match (first.as_slice(), replay.as_slice()) {
+                (
+                    [IngestMessage::Event(event), IngestMessage::Claim(claim)],
+                    [IngestMessage::Event(replayed_event), IngestMessage::Claim(replayed_claim)],
+                ) => {
+                    assert_eq!(event.id, replayed_event.id);
+                    assert_eq!(claim.id, replayed_claim.id);
+                    assert!(
+                        identities.insert(event.id),
+                        "completion event aliased another occurrence"
+                    );
+                    assert!(
+                        identities.insert(claim.id),
+                        "completion claim aliased another phase or occurrence"
+                    );
+                    assert_ne!(event.id, dedup_id(session, "event", "same-turn"));
+                    assert_ne!(claim.id, dedup_id(session, "tool_after", "same-turn"));
+                }
+                _ => panic!("expected an identified completion and claim"),
+            }
+        }
+    }
+
+    #[test]
     fn task_complete_without_a_claim_producing_message_is_event_only() {
         let entry = serde_json::json!({
             "type": "event_msg",
