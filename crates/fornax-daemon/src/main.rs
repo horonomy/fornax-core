@@ -3329,6 +3329,10 @@ mod tests {
         let store = fornax_store::Store::open(&db_path)
             .await
             .expect("open test store");
+        test_state_with_store(store)
+    }
+
+    fn test_state_with_store(store: fornax_store::Store) -> AppState {
         AppState {
             store,
             caps: Arc::new(Mutex::new(HashMap::new())),
