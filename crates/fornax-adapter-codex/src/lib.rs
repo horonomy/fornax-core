@@ -1257,6 +1257,42 @@ mod tests {
     }
 
     #[test]
+    fn completion_source_check_uses_retained_text_and_preserves_legacy_ids() {
+        let entry = serde_json::json!({"type":"event_msg","payload":{
+            "type":"task_complete","turn_id":"native-turn","last_agent_message":"All tests passed."
+        }});
+        let messages = normalize(&mut CodexAdapter::new(), &entry).into_messages();
+        let [IngestMessage::Event(event), IngestMessage::Claim(claim)] = messages.as_slice() else {
+            panic!("expected completion and claim");
+        };
+        let mut event = event.clone();
+        let mut claim = claim.clone();
+        event.id = Uuid::new_v4();
+        claim.id = Uuid::new_v4();
+        claim.source_event_id = event.id;
+        event.raw["payload"]["turn_id"] = serde_json::json!("<redacted-native-id>");
+        event.raw["payload"]["last_agent_message"] = serde_json::json!("<redacted>");
+        claim.text = "<redacted>".into();
+        assert!(claim_matches_completion(&event, &claim));
+        claim.text = "All tests passed.".into();
+        assert!(!claim_matches_completion(&event, &claim));
+        claim.text = "<redacted>".into();
+        claim.session_id.push_str("-other");
+        assert!(!claim_matches_completion(&event, &claim));
+        claim.session_id = event.session_id.clone();
+        claim.source_event_id = Uuid::new_v4();
+        assert!(!claim_matches_completion(&event, &claim));
+        claim.source_event_id = event.id;
+        event.raw["payload"]["last_agent_message"] = serde_json::Value::Null;
+        assert!(!claim_matches_completion(&event, &claim));
+        event.raw["payload"]["turn_id"] = serde_json::Value::Null;
+        assert!(claim_matches_completion(&event, &claim));
+        event.raw["payload"]["turn_id"] = serde_json::json!("native-turn");
+        event.provider = Provider::ClaudeCode;
+        assert!(claim_matches_completion(&event, &claim));
+    }
+
+    #[test]
     fn identified_completion_replay_preserves_event_and_claim_identity() {
         let entry = serde_json::json!({
             "type": "event_msg",
