@@ -7749,6 +7749,67 @@ mod tests {
         remove_codex_test_store(&path);
     }
 
+    #[tokio::test]
+    async fn codex_claim_retry_recovers_after_source_arrives_and_store_reopens() {
+        let session = "sess-fornx446-partial";
+        let turn = "turn-fornx446-partial";
+        let (path, state) = persistent_codex_test_state().await;
+        let messages = codex_native_completion_messages(session, turn, "All tests passed.");
+        let claim = messages
+            .iter()
+            .find(|msg| matches!(msg, IngestMessage::Claim(_)))
+            .unwrap();
+        process_line(&state, &serde_json::to_string(claim).unwrap(), &mut None).await;
+        assert_eq!(state.store.quarantine_count().await.unwrap(), 1);
+        for message in messages
+            .iter()
+            .filter(|msg| !matches!(msg, IngestMessage::Claim(_)))
+        {
+            process_line(&state, &serde_json::to_string(message).unwrap(), &mut None).await;
+        }
+        assert!(state
+            .store
+            .claims_for_session(session)
+            .await
+            .unwrap()
+            .is_empty());
+        drop(state);
+        let reopened = test_state_with_store(fornax_store::Store::open(&path).await.unwrap());
+        process_codex_completion(
+            &reopened,
+            session,
+            turn,
+            "All tests passed.",
+            "2026-10-15T14:00:00Z",
+            &mut None,
+        )
+        .await;
+        let first = codex_completion_snapshot(&reopened, session).await;
+        assert_eq!(
+            (
+                first.event_ids.len(),
+                first.evidence_ids.len(),
+                first.claims.len(),
+                first.findings.len()
+            ),
+            (2, 1, 1, 1)
+        );
+        assert_eq!(first.findings[0].verdict, "verified");
+        assert_eq!(first.quarantine, 1);
+        process_codex_completion(
+            &reopened,
+            session,
+            turn,
+            "All tests passed.",
+            "2026-10-15T15:00:00Z",
+            &mut None,
+        )
+        .await;
+        assert_eq!(codex_completion_snapshot(&reopened, session).await, first);
+        drop(reopened);
+        remove_codex_test_store(&path);
+    }
+
     /// A real `fornax-adapter-codex` translation of one `item_completed`
     /// CommandExecution, replayed through `process_line` a second time
     /// (simulating the rollout tailer re-reading from offset 0 after a
