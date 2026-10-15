@@ -64,6 +64,11 @@ Jira epic FORNX-20.
 
 ### Fixed
 
+- **rustls security advisories** (FORNX-447). Updated rustls from 0.23.45 to
+  0.23.46, which fixes RUSTSEC-2026-0346, RUSTSEC-2026-0347,
+  RUSTSEC-2026-0348, and RUSTSEC-2026-0349. This records the upstream fixes;
+  it does not assert exploitability or reachability in Fornax.
+
 - **Heuristic `exit_code=0` could reach `Verified` for a `test_result`
   claim** (FORNX-442, found during FORNX-433's native-ingress testing).
   `TestResultVerifier`/`CommandSuccessVerifier` treated any `exit_code=0`
