@@ -1325,6 +1325,44 @@ mod tests {
     }
 
     #[test]
+    fn unidentified_completions_do_not_merge_distinct_legacy_assertions() {
+        for turn in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!(42)),
+            Some(serde_json::json!(true)),
+            Some(serde_json::json!({"id": "turn"})),
+            Some(serde_json::json!("")),
+            Some(serde_json::json!(" \t\n")),
+        ] {
+            let mut entry = serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "last_agent_message": "All tests passed."
+                }
+            });
+            if let Some(turn) = turn {
+                entry["payload"]["turn_id"] = turn;
+            }
+            let first = normalize(&mut CodexAdapter::new(), &entry).into_messages();
+            let second = normalize(&mut CodexAdapter::new(), &entry).into_messages();
+            match (first.as_slice(), second.as_slice()) {
+                (
+                    [IngestMessage::Event(event), IngestMessage::Claim(claim)],
+                    [IngestMessage::Event(other_event), IngestMessage::Claim(other_claim)],
+                ) => {
+                    assert_ne!(event.id, other_event.id);
+                    assert_ne!(claim.id, other_claim.id);
+                    assert_eq!(claim.source_event_id, event.id);
+                    assert_eq!(other_claim.source_event_id, other_event.id);
+                }
+                _ => panic!("expected the legacy completion and claim shape"),
+            }
+        }
+    }
+
+    #[test]
     fn session_meta_line_is_ignored_not_unrecognized() {
         let entry = serde_json::json!({"type": "session_meta", "payload": {"session_id": "s"}});
         match normalize(&mut CodexAdapter::new(), &entry) {
