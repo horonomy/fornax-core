@@ -64,6 +64,16 @@ Jira epic FORNX-20.
 
 ### Fixed
 
+- **Codex completion replay creates duplicate events and claims** (FORNX-446).
+  Rollout `task_complete` records with a nonblank native `turn_id` now retain
+  the same session-scoped completion and claim identities across tailer
+  replay and restart. Distinct turns remain distinct even with identical
+  prose; conflicting content under one identity is still quarantined.
+  Existing tool/evidence IDs and the evidence-consumption guard are unchanged.
+  Historical random-ID rows are retained: the first replay after upgrading
+  can add one stable-ID occurrence beside them; no migration rewrites history.
+  Completions without a usable turn ID preserve their prior behavior.
+
 - **Heuristic `exit_code=0` could reach `Verified` for a `test_result`
   claim** (FORNX-442, found during FORNX-433's native-ingress testing).
   `TestResultVerifier`/`CommandSuccessVerifier` treated any `exit_code=0`
