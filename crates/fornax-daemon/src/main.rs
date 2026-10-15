@@ -7868,6 +7868,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claim_ingress_preserves_legacy_identity_compatibility() {
+        use fornax_types::{AgentEvent, EventKind, Provider};
+
+        let cases = [
+            (
+                "identified-legacy-ids",
+                Provider::Codex,
+                true,
+                "test_result",
+            ),
+            (
+                "unidentified-completion",
+                Provider::Codex,
+                false,
+                "test_result",
+            ),
+            ("custom-raw", Provider::Codex, false, "test_result"),
+            ("other-provider", Provider::ClaudeCode, true, "test_result"),
+            ("other-subject", Provider::Codex, true, "command_succeeded"),
+        ];
+        for (case, provider, identified, subject) in cases {
+            let session = format!("sess-fornx446-{case}");
+            let state = test_state().await;
+            let event_id = Uuid::new_v4();
+            let claim_id = Uuid::new_v4();
+            let turn = Uuid::new_v4().to_string();
+            let raw = if case == "custom-raw" {
+                serde_json::json!({"type":"custom","payload":{"message":"done"}})
+            } else {
+                let mut payload = serde_json::json!({
+                    "type":"task_complete",
+                    "turn_id":turn,
+                    "last_agent_message":"All tests passed."
+                });
+                if !identified {
+                    payload.as_object_mut().unwrap().remove("turn_id");
+                }
+                serde_json::json!({"type":"event_msg","payload":payload})
+            };
+            let event = AgentEvent {
+                id: event_id,
+                session_id: session.clone(),
+                provider,
+                kind: EventKind::SessionEnd,
+                observed_at: "2026-10-15T12:00:00Z".to_string(),
+                tool_name: None,
+                tool_input: None,
+                tool_response: None,
+                raw,
+            };
+            let claim = Claim {
+                id: claim_id,
+                session_id: session.clone(),
+                source_event_id: event_id,
+                text: if case == "identified-legacy-ids" {
+                    "All tests passed."
+                } else {
+                    "All tests passed. Different canonical wording."
+                }
+                .to_string(),
+                subject: subject.to_string(),
+                claimed_at: "2026-10-15T12:00:00Z".to_string(),
+            };
+            process_line(
+                &state,
+                &serde_json::to_string(&IngestMessage::Event(event)).unwrap(),
+                &mut None,
+            )
+            .await;
+            process_line(
+                &state,
+                &serde_json::to_string(&IngestMessage::Claim(claim)).unwrap(),
+                &mut None,
+            )
+            .await;
+
+            let claims = state.store.claims_for_session(&session).await.unwrap();
+            assert_eq!(claims.len(), 1, "case {case}");
+            assert_eq!(claims[0].id, claim_id, "case {case}");
+            assert_eq!(claims[0].source_event_id, event_id, "case {case}");
+            assert_eq!(
+                state.store.quarantine_count().await.unwrap(),
+                0,
+                "case {case}"
+            );
+            let findings = state.store.findings_for_session(&session).await.unwrap();
+            assert!(findings
+                .iter()
+                .all(|finding| finding.claim_id == claim_id.to_string()));
+            assert!(findings.iter().all(|finding| finding.verdict != "verified"));
+            if subject == "test_result" {
+                assert_eq!(findings.len(), 1, "case {case}");
+                assert_eq!(findings[0].verdict, "unavailable", "case {case}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn codex_rejected_claim_quarantine_retains_metadata_only() {
         let session = "sess-fornx446-private";
         let (path, state) = persistent_codex_test_state().await;
