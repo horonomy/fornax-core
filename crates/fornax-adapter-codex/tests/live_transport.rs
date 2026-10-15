@@ -450,6 +450,29 @@ fn hook_and_rollout_for_the_same_call_do_not_double_count_evidence() {
             .len()
     });
 
+    let has_hook_event = |events: &[fornax_types::AgentEvent]| {
+        events.iter().any(|event| {
+            event.raw.get("hook_event_name").and_then(|v| v.as_str()) == Some("PostToolUse")
+        })
+    };
+    let baseline_events = rt.block_on(async {
+        fornax_store::Store::open(&db_path)
+            .await
+            .expect("open baseline store")
+            .events_for_session(session_id)
+            .await
+            .expect("query baseline events")
+    });
+    assert_eq!(
+        baseline_events.len(),
+        2,
+        "rollout event and completion baseline"
+    );
+    assert!(
+        !has_hook_event(&baseline_events),
+        "two rollout-only events must not satisfy the hook-presence wait"
+    );
+
     // Now the real hook binary, same native call id, same session.
     let hook_bin = env!("CARGO_BIN_EXE_fornax-hook-codex-event");
     let hook_payload = serde_json::json!({
@@ -482,9 +505,8 @@ fn hook_and_rollout_for_the_same_call_do_not_double_count_evidence() {
         "fornax-hook-codex-event must always exit 0"
     );
 
-    // Give the daemon a moment to persist the hook-sourced event, then
-    // assert: a new Event row exists (not silently dropped), evidence
-    // count is unchanged, and the finding is unchanged.
+    // The rollout already created two events. Wait for the actual hook
+    // origin; a count threshold can return before that connection drains.
     let events_after = poll_until(
         Duration::from_secs(5),
         "waiting for the hook-sourced AgentEvent to persist",
@@ -493,14 +515,12 @@ fn hook_and_rollout_for_the_same_call_do_not_double_count_evidence() {
             rt.block_on(async {
                 let store = fornax_store::Store::open(&db_path).await.ok()?;
                 let events = store.events_for_session(session_id).await.ok()?;
-                (events.len() > 1).then_some(events)
+                has_hook_event(&events).then_some(events)
             })
         },
     );
     assert!(
-        events_after
-            .iter()
-            .any(|e| e.raw.get("hook_event_name").and_then(|v| v.as_str()) == Some("PostToolUse")),
+        has_hook_event(&events_after),
         "the hook-sourced PostToolUse event must actually be present, not merely counted"
     );
 
