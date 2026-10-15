@@ -7810,6 +7810,56 @@ mod tests {
         remove_codex_test_store(&path);
     }
 
+    #[tokio::test]
+    async fn codex_rejected_claim_quarantine_retains_metadata_only() {
+        let session = "sess-fornx446-private";
+        let (path, state) = persistent_codex_test_state().await;
+        let turn = Uuid::new_v4().to_string();
+        process_codex_completion(
+            &state,
+            session,
+            &turn,
+            "Done.",
+            "2026-10-15T12:00:00Z",
+            &mut None,
+        )
+        .await;
+        let private_text = "All tests passed. PRIVATE-COMPLETION-CANARY";
+        process_codex_completion(
+            &state,
+            session,
+            &turn,
+            private_text,
+            "2026-10-15T13:00:00Z",
+            &mut None,
+        )
+        .await;
+        let rows = state.store.list_quarantine(10).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows
+            .iter()
+            .any(|row| row.raw_line.starts_with("claim_source_mismatch: id=")));
+        for row in rows {
+            assert!(!row.raw_line.contains("PRIVATE-COMPLETION-CANARY"));
+            assert!(!row.reason.contains("PRIVATE-COMPLETION-CANARY"));
+            assert!(!row.raw_line.contains("All tests passed."));
+        }
+        assert!(state
+            .store
+            .claims_for_session(session)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(state
+            .store
+            .findings_for_session(session)
+            .await
+            .unwrap()
+            .is_empty());
+        drop(state);
+        remove_codex_test_store(&path);
+    }
+
     /// A real `fornax-adapter-codex` translation of one `item_completed`
     /// CommandExecution, replayed through `process_line` a second time
     /// (simulating the rollout tailer re-reading from offset 0 after a
