@@ -78,6 +78,13 @@ pub fn dedup_id(session_id: &str, phase: &str, native_id: &str) -> Uuid {
     )
 }
 
+// New completion keys use framed fields: opaque IDs can contain delimiters.
+// Keep the released command-key encoding unchanged for existing evidence links.
+fn completion_id(session_id: &str, phase: &str, turn_id: &str) -> Uuid {
+    let key = serde_json::json!(["codex:completion:v1", session_id, phase, turn_id]).to_string();
+    Uuid::new_v5(&CODEX_NS, key.as_bytes())
+}
+
 /// Best-effort `major.minor.patch` parse of a Codex CLI version string
 /// (e.g. `"0.160.1"`, `"0.160.0-beta.2"`). Any pre-release/build suffix
 /// after the first `-` or `+` is dropped for the comparison -- this is used
@@ -848,6 +855,13 @@ fn translate_line(
         }
         "item_completed" => translate_item_completed(payload, entry, session_id, &now, cli_version),
         "task_complete" => {
+            let turn_id = payload
+                .get("turn_id")
+                .and_then(|value| value.as_str())
+                .filter(|id| !id.trim().is_empty());
+            let event_id = turn_id
+                .map(|id| completion_id(session_id, "task_complete", id))
+                .unwrap_or(event_id);
             let event = AgentEvent {
                 id: event_id,
                 session_id: session_id.to_string(),
@@ -863,7 +877,11 @@ fn translate_line(
             if let Some(text) = payload.get("last_agent_message").and_then(|v| v.as_str()) {
                 if claims_tests_passed(text) {
                     out.push(IngestMessage::Claim(Claim {
-                        id: Uuid::new_v4(),
+                        id: turn_id
+                            .map(|id| {
+                                completion_id(session_id, "task_complete:claim:test_result", id)
+                            })
+                            .unwrap_or_else(Uuid::new_v4),
                         session_id: session_id.to_string(),
                         source_event_id: event_id,
                         text: text.to_string(),
@@ -1216,6 +1234,35 @@ mod tests {
         let msgs = normalize(&mut CodexAdapter::new(), &entry).into_messages();
         assert_eq!(msgs.len(), 2);
         assert!(matches!(&msgs[1], IngestMessage::Claim(c) if c.subject == "test_result"));
+    }
+
+    #[test]
+    fn identified_completion_replay_preserves_event_and_claim_identity() {
+        let entry = serde_json::json!({
+            "type": "event_msg",
+            "timestamp": "2026-10-15T05:00:00Z",
+            "ordinal": 19,
+            "payload": {
+                "type": "task_complete",
+                "turn_id": "native-turn-completion",
+                "last_agent_message": "All tests passed."
+            }
+        });
+        let first = normalize(&mut CodexAdapter::new(), &entry).into_messages();
+        let replay = normalize(&mut CodexAdapter::new(), &entry).into_messages();
+        match (first.as_slice(), replay.as_slice()) {
+            (
+                [IngestMessage::Event(event), IngestMessage::Claim(claim)],
+                [IngestMessage::Event(replayed_event), IngestMessage::Claim(replayed_claim)],
+            ) => {
+                assert_eq!(event.id, replayed_event.id);
+                assert_eq!(claim.id, replayed_claim.id);
+                assert_eq!(claim.source_event_id, event.id);
+                assert_eq!(replayed_claim.source_event_id, replayed_event.id);
+                assert_ne!(event.id, claim.id);
+            }
+            _ => panic!("expected a completion event and passing-test claim"),
+        }
     }
 
     #[test]
