@@ -1002,6 +1002,9 @@ async fn process_line(state: &AppState, line: &str, session_hint: &mut Option<St
                         session_hint.as_deref().unwrap_or("unknown")
                     ))
                 }
+                Some(fornax_store::StoreError::ClaimSourceMismatch { id }) => {
+                    std::borrow::Cow::Owned(format!("claim_source_mismatch: id={id}"))
+                }
                 _ => std::borrow::Cow::Borrowed(line),
             };
         if let Err(store_err) = state
@@ -1169,7 +1172,12 @@ async fn handle_message(
             // really just network retries). A duplicate skips
             // re-verification: harmless either way since the claim content
             // is identical, but pointless repeated work otherwise.
-            let is_new_claim = state.store.insert_claim_idempotent(&claim).await?;
+            let is_new_claim = state
+                .store
+                .insert_claim_idempotent_checked(&claim, |source| {
+                    fornax_adapter_codex::claim_matches_completion(source, &claim)
+                })
+                .await?;
             if !is_new_claim {
                 return Ok(());
             }
@@ -7693,6 +7701,51 @@ mod tests {
             .contains(&first.claims[0].0.to_string()));
         assert_eq!(later.quarantine, 1);
         drop(state);
+        remove_codex_test_store(&path);
+    }
+
+    #[tokio::test]
+    async fn codex_changed_completion_cannot_introduce_claim_after_reopen() {
+        let session = "sess-fornx446-nonclaim-to-claim";
+        let turn = "turn-fornx446-conflict";
+        let (path, state) = persistent_codex_test_state().await;
+        process_codex_completion(
+            &state,
+            session,
+            turn,
+            "Done.",
+            "2026-10-15T12:00:00Z",
+            &mut None,
+        )
+        .await;
+        let first = codex_completion_snapshot(&state, session).await;
+        assert_eq!(
+            (
+                first.event_ids.len(),
+                first.evidence_ids.len(),
+                first.claims.len(),
+                first.findings.len()
+            ),
+            (2, 1, 0, 0)
+        );
+        drop(state);
+        let reopened = test_state_with_store(fornax_store::Store::open(&path).await.unwrap());
+        process_codex_completion(
+            &reopened,
+            session,
+            turn,
+            "All tests passed.",
+            "2026-10-15T13:00:00Z",
+            &mut None,
+        )
+        .await;
+        let mut expected = first;
+        expected.quarantine = 2; // Both conflicting source and its new claim must be rejected.
+        assert_eq!(
+            codex_completion_snapshot(&reopened, session).await,
+            expected
+        );
+        drop(reopened);
         remove_codex_test_store(&path);
     }
 

@@ -10,6 +10,9 @@ fornax-store = { path = "../fornax-store" }
 fornax-verify = { path = "../fornax-verify" }
 fornax-experiment-runner = { path = "../fornax-experiment-runner" }
 fornax-acquire = { path = "../fornax-acquire" }
+# The adapter owns interpretation of its retained completion shape; the store
+# supplies transactional source validation without knowing provider formats.
+fornax-adapter-codex = { path = "../fornax-adapter-codex" }
 tokio.workspace = true
 axum.workspace = true
 serde.workspace = true
@@ -34,9 +37,3 @@ ed25519-dalek.workspace = true
 sqlx.workspace = true
 sha2.workspace = true
 hex.workspace = true
-# HORO-1712: the idempotent-dedup integration test feeds a real
-# `fornax-adapter-codex` translation (dedup_id-stamped Event/Evidence)
-# through `process_line` twice, exercising the actual id scheme end to
-# end rather than hand-rolling ids that merely resemble it. No cycle:
-# fornax-adapter-codex does not depend on this crate.
-fornax-adapter-codex = { path = "../fornax-adapter-codex" }

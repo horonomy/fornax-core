@@ -85,6 +85,26 @@ fn completion_id(session_id: &str, phase: &str, turn_id: &str) -> Uuid {
     Uuid::new_v5(&CODEX_NS, key.as_bytes())
 }
 
+/// Check a claim against the retained completion after both pass redaction.
+/// This checks source consistency, not sender authentication or extraction.
+/// Legacy random IDs remain valid; redacted native IDs cannot be recomputed.
+pub fn claim_matches_completion(source: &AgentEvent, claim: &Claim) -> bool {
+    let payload = &source.raw["payload"];
+    let identified_completion = source.provider == Provider::Codex
+        && source.kind == EventKind::SessionEnd
+        && source.raw["type"] == "event_msg"
+        && payload["type"] == "task_complete"
+        && payload["turn_id"]
+            .as_str()
+            .is_some_and(|turn| !turn.trim().is_empty());
+    if !identified_completion || claim.subject != "test_result" {
+        return true;
+    }
+    source.id == claim.source_event_id
+        && source.session_id == claim.session_id
+        && payload["last_agent_message"].as_str() == Some(claim.text.as_str())
+}
+
 /// Best-effort `major.minor.patch` parse of a Codex CLI version string
 /// (e.g. `"0.160.1"`, `"0.160.0-beta.2"`). Any pre-release/build suffix
 /// after the first `-` or `+` is dropped for the comparison -- this is used
