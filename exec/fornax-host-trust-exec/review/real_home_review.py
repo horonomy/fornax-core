@@ -100,11 +100,6 @@ ALLOWED_EVIDENCE_KEYS = {
     "process_leak_check",
 }
 
-# Depth-1 entries get a full per-file record; anything nested deeper is
-# aggregated per top-level directory instead (minimization requirement #1).
-ALWAYS_FULL_RECORD_NAMES = CONTENT_EQUALITY_ONLY | NEVER_READ_CONTENTS
-
-
 def sanitize(text: str, home: Path) -> str:
     return text.replace(str(home), "<home>")
 
@@ -159,7 +154,16 @@ def codex_app_server_count() -> int:
     return len(lines)
 
 
-def file_record(path: Path, root: Path) -> dict:
+def file_record(path: Path, root: Path, allow_content_equality: bool = False) -> dict:
+    """`allow_content_equality` must be true ONLY for the canonical
+    top-level file (depth 1) -- never for a same-named file found deeper
+    in the tree. Matching by filename alone, at any depth, would read the
+    bytes of -- and record the full nested path of -- an unrelated file
+    that happens to share a name with `config.toml`/`hooks.json`/
+    `installation_id` (e.g. a session log under `sessions/<project>/`),
+    defeating the directory-aggregation minimization above it. This was a
+    real bug in an earlier revision of this script, caught by an
+    automated security review before any real-home run."""
     rel = path.relative_to(root)
     try:
         st = path.lstat()
@@ -174,7 +178,7 @@ def file_record(path: Path, root: Path) -> dict:
         "mode": oct(st.st_mode & 0o777),
     }
     name = path.name
-    if name in CONTENT_EQUALITY_ONLY and kind == "file":
+    if allow_content_equality and name in CONTENT_EQUALITY_ONLY and kind == "file":
         assert name not in NEVER_READ_CONTENTS, f"refusing to read {name}'s contents -- it is a credential file"
         try:
             record["_contents_for_internal_diff_only"] = path.read_bytes()
@@ -184,10 +188,12 @@ def file_record(path: Path, root: Path) -> dict:
 
 
 def snapshot(codex_home: Path) -> list[dict]:
-    """Full records for depth-1 entries (and the four named files
-    wherever they appear); everything else collapses into one aggregate
-    record per top-level directory -- see module docstring, minimization
-    requirement #1."""
+    """Full records for depth-1 entries only; everything nested deeper
+    collapses into one aggregate record per top-level directory -- see
+    module docstring, minimization requirement #1. Depth-1-only is
+    deliberate: matching the four named files by filename regardless of
+    depth was the privacy-minimization bypass fixed alongside this
+    docstring (see `file_record`'s `allow_content_equality` note)."""
     if not codex_home.is_dir():
         return []
     records: list[dict] = []
@@ -196,8 +202,8 @@ def snapshot(codex_home: Path) -> list[dict]:
         rel = p.relative_to(codex_home)
         depth = len(rel.parts)
         name = p.name
-        if depth == 1 or name in ALWAYS_FULL_RECORD_NAMES:
-            records.append(file_record(p, codex_home))
+        if depth == 1:
+            records.append(file_record(p, codex_home, allow_content_equality=name in CONTENT_EQUALITY_ONLY))
             continue
         top = rel.parts[0]
         try:
