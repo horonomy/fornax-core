@@ -51,14 +51,17 @@ impl Scratch {
         Scratch { home, codex }
     }
 
+    #[cfg(target_os = "macos")]
     fn set_mode(&self, mode: &str) {
         fs::write(self.codex.parent().unwrap().join("mode"), mode).unwrap();
     }
 
+    #[cfg(target_os = "macos")]
     fn set_version(&self, version: &str) {
         fs::write(self.codex.parent().unwrap().join("version"), version).unwrap();
     }
 
+    #[cfg(target_os = "macos")]
     fn install_fornax_hooks(&self) {
         let codex_dir = self.home.join(".codex");
         fs::create_dir_all(&codex_dir).unwrap();
