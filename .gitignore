@@ -16,3 +16,9 @@ dist/
 # to the global git excludes automatically on first write — this entry is
 # defense in depth, see docs/dogfooding-status-line.md).
 .claude/settings.local.json
+
+# FORNX-450: real_home_review.py writes evidence from the OPERATOR'S ACTUAL
+# ~/.codex, not a synthetic fixture. Even sanitized/minimized, this must
+# never be auto-committed by a broad `git add` — a human decides, per run,
+# whether a specific evidence file is safe to attach to the PR record.
+docs/security/evidence/*.json

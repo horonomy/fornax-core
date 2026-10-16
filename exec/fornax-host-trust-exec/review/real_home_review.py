@@ -37,12 +37,34 @@ What this script does and does not do:
   boolean, and `reasons` survive per hook -- enough to confirm the
   verdict, nothing that could leak another tool's hook configuration.
 - Evidence written to disk is checked against an explicit top-level key
-  allowlist (`ALLOWED_EVIDENCE_KEYS`) right before the write -- an
-  unexpected key fails the run instead of silently writing it.
-- Checks owned-child process cleanup after EVERY run (not just once at
-  the end): records the live `codex.*app-server` process count after each
-  of the 21 runs and fails loudly if it ever grows, i.e. if
-  `launch::teardown()` ever leaked a process.
+  allowlist (`ALLOWED_EVIDENCE_KEYS`) AND a nested per-run/per-hook
+  allowlist (`ALLOWED_RUN_RESULT_KEYS`/`ALLOWED_HOOK_KEYS`, via
+  `assert_run_result_allowed`) right before the write -- an unexpected key
+  at either level fails the run instead of silently writing it.
+- Tracks owned-process cleanup by PID SET, not a raw system-wide count
+  (`codex_app_server_pids`): takes a `codex.*app-server` PID snapshot
+  immediately before and after EVERY one of the 21 calls and flags any
+  PID that appeared in that call's window and is still alive afterward --
+  i.e. a `launch::teardown()` leak -- regardless of unrelated `codex`
+  processes (an IDE, a desktop app) that may also be running.
+- If the outer `verify-codex` call itself times out, this script cannot
+  assume `launch::teardown()` ran, so it takes over: kills any PID that
+  appeared during that call's window, records it as a leak, and ABORTS
+  the remaining runs rather than piling more invocations onto a host that
+  just misbehaved. The same abort-rather-than-continue rule applies if a
+  run ever returns non-JSON stdout on `--json` (anomalous by spec).
+- A raw-stdout fallback (only reachable if `--json` output somehow fails
+  to parse) is `$HOME`-sanitized and hard-capped at 500 characters before
+  being recorded -- it is unstructured text we did not choose, so it is
+  bounded rather than trusted outright, and its appearance itself aborts
+  the remaining runs (see above).
+- Per-hook `reasons`/`global_reasons` strings (our own Rust enum
+  `Display` output, some variants of which carry a host- or RPC-sourced
+  payload) are `$HOME`-sanitized and length-capped the same way, even
+  though they come from our own structured output.
+- `docs/security/evidence/*.json` is gitignored -- this script's output
+  is never auto-committed by a broad `git add`; attaching a specific
+  evidence file to the PR record is a deliberate, separate human action.
 - Never writes a trust pin into the real `config.toml`. The positive/
   negative verdict matrix is covered by the synthetic CI suite
   (`tests/verify_codex_e2e.rs`) already; this script only observes
@@ -100,8 +122,44 @@ ALLOWED_EVIDENCE_KEYS = {
     "process_leak_check",
 }
 
-def sanitize(text: str, home: Path) -> str:
-    return text.replace(str(home), "<home>")
+UNPARSEABLE_STDOUT_MAX_CHARS = 500
+REASON_STRING_MAX_CHARS = 300
+# Nested keys this review's redaction is allowed to leave inside a run's
+# `result` block -- checked in addition to the top-level allowlist, so a
+# future field added to `redact_verify_result`'s output can't silently
+# widen what gets exported without a reviewer noticing here too.
+ALLOWED_RUN_RESULT_KEYS = {
+    "schema_version",
+    "operation",
+    "adapter_id",
+    "outcome",
+    "codex_version",
+    "host_trust",
+    "global_reasons",
+    "hooks",
+    "timing_ms",
+    "_unparseable_stdout",
+    "_unparseable_stdout_truncated",
+}
+ALLOWED_HOOK_KEYS = {"event", "trust", "host_trust_status", "hash_present", "reasons"}
+
+
+def sanitize(text: str, home: Path, max_chars: int | None = None) -> str:
+    """Strips the real $HOME out of arbitrary text, then caps length.
+    Used for every string that did not come from our own closed,
+    structured redaction -- raw stdout fallbacks and host/RPC-origin
+    reason strings -- since those can carry text we did not choose and
+    cannot otherwise bound."""
+    out = text.replace(str(home), "<home>")
+    if max_chars is not None and len(out) > max_chars:
+        out = out[:max_chars] + f"...<truncated, {len(text)} chars total>"
+    return out
+
+
+def sanitize_reasons(reasons, home: Path):
+    if reasons is None:
+        return None
+    return [sanitize(str(r), home, REASON_STRING_MAX_CHARS) for r in reasons]
 
 
 def assert_allowed_keys(obj: dict, allowed: set, _path: str = "evidence") -> None:
@@ -109,13 +167,33 @@ def assert_allowed_keys(obj: dict, allowed: set, _path: str = "evidence") -> Non
     assert not extra, f"evidence-output allowlist violated at {_path}: unexpected key(s) {sorted(extra)}"
 
 
-def redact_verify_result(parsed: dict) -> dict:
+def assert_run_result_allowed(parsed: dict, _path: str) -> None:
+    """Nested counterpart to `assert_allowed_keys` -- the top-level
+    allowlist alone would pass a `runs: [...]` list containing anything,
+    since `runs` itself is an allowed key. This walks into each run's
+    redacted result (and each hook inside it) so a field added to
+    `redact_verify_result` without a matching allowlist update fails the
+    write instead of silently exporting it."""
+    if "_timeout" in parsed:
+        assert_allowed_keys(parsed, {"_timeout"}, _path)
+        return
+    if "_unparseable_stdout" in parsed:
+        assert_allowed_keys(parsed, {"_unparseable_stdout", "_unparseable_stdout_truncated"}, _path)
+        return
+    assert_allowed_keys(parsed, ALLOWED_RUN_RESULT_KEYS, _path)
+    for i, h in enumerate(parsed.get("hooks") or []):
+        assert_allowed_keys(h, ALLOWED_HOOK_KEYS, f"{_path}.hooks[{i}]")
+
+
+def redact_verify_result(parsed: dict, home: Path) -> dict:
     """Keeps only what's needed to confirm the trust verdict from one
     `verify-codex --json` run. Drops per-hook `command`/`sourcePath`/`key`
     -- those describe the operator's OWN configured hooks for any tool,
-    not just Fornax's, and must not be exported verbatim."""
-    if "_unparseable_stdout" in parsed:
-        return parsed
+    not just Fornax's, and must not be exported verbatim. Any surviving
+    free-text (`reasons`) is sanitized and length-capped -- those strings
+    originate from our own Rust enum `Display`, but some variants carry a
+    host- or RPC-sourced payload (e.g. `UnrecognizedTrustStatus(String)`,
+    `HostRpcError(String)`), so they are not treated as fully trusted."""
     result = parsed.get("result") or {}
     redacted_hooks = []
     for h in result.get("hooks") or []:
@@ -125,7 +203,7 @@ def redact_verify_result(parsed: dict) -> dict:
                 "trust": h.get("trust"),
                 "host_trust_status": h.get("host_trust_status"),
                 "hash_present": bool(h.get("current_hash")),
-                "reasons": h.get("reasons"),
+                "reasons": sanitize_reasons(h.get("reasons"), home),
             }
         )
     return {
@@ -135,23 +213,75 @@ def redact_verify_result(parsed: dict) -> dict:
         "outcome": parsed.get("outcome"),
         "codex_version": (parsed.get("codex") or {}).get("version"),
         "host_trust": result.get("host_trust"),
-        "global_reasons": result.get("global_reasons"),
+        "global_reasons": sanitize_reasons(result.get("global_reasons"), home),
         "hooks": redacted_hooks,
         "timing_ms": parsed.get("timing_ms"),
     }
+
+
+class ChildProcessTimeout(Exception):
+    """Raised when the outer `fornax-host-trust-exec verify-codex` call
+    itself times out. Distinct from a normal non-zero exit: a timeout
+    means we cannot trust that `launch::teardown()` ran, so any sandboxed
+    `codex` descendant may have been orphaned rather than reaped -- see
+    `run_verify_once`."""
 
 
 def run(cmd: list[str], timeout: int = 10) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
 
 
-def codex_app_server_count() -> int:
+def codex_app_server_pids() -> set[int]:
+    """PID set, not just a count -- a count alone cannot distinguish 'our
+    run leaked a process' from 'an unrelated codex app-server (e.g. the
+    operator's IDE) happened to start or stop at the same moment'. Taking
+    a before/after PID-set difference around each individual run, rather
+    than one global before/after total, is the actual ownership proof
+    requirement 3 asks for: it flags exactly the PIDs that appeared
+    during THIS run's window and are still alive afterward, regardless of
+    what else is running on the machine."""
     try:
         out = run(["pgrep", "-f", "codex.*app-server"], timeout=5)
     except Exception:
-        return -1
-    lines = [l for l in out.stdout.splitlines() if l.strip()]
-    return len(lines)
+        return set()
+    pids = set()
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        if line.isdigit():
+            pids.add(int(line))
+    return pids
+
+
+def kill_pids(pids: set[int]) -> None:
+    import signal
+
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def run_verify_once(binary: str, timeout: int = 30) -> tuple[subprocess.CompletedProcess | None, set[int]]:
+    """Runs one `verify-codex --json` invocation with PID-set-based leak
+    detection and timeout cleanup (requirement 4): if the outer process
+    itself times out, `launch::teardown()` never ran, so this takes over
+    reaping duty -- kills any `codex app-server` PID that appeared during
+    this call's window -- and raises `ChildProcessTimeout` rather than
+    silently moving on to the next of the 21 runs."""
+    pids_before = codex_app_server_pids()
+    try:
+        proc = run([binary, "verify-codex", "--json"], timeout=timeout)
+    except subprocess.TimeoutExpired:
+        pids_after = codex_app_server_pids()
+        leaked = pids_after - pids_before
+        kill_pids(leaked)
+        raise ChildProcessTimeout(
+            f"verify-codex timed out after {timeout}s; killed {len(leaked)} orphaned descendant(s)"
+        )
+    pids_after = codex_app_server_pids()
+    leaked = pids_after - pids_before
+    return proc, leaked
 
 
 def file_record(path: Path, root: Path, allow_content_equality: bool = False) -> dict:
@@ -344,45 +474,72 @@ def main() -> int:
     }
 
     codex_on_path = shutil.which("codex")
+    pids_before_anything = codex_app_server_pids()
     evidence["preconditions"] = {
         "codex_on_path": bool(codex_on_path),
         "codex_version": sanitize(run([codex_on_path, "--version"]).stdout.strip(), home)
         if codex_on_path
         else None,
-        "app_server_process_count_before": codex_app_server_count(),
+        "app_server_process_count_before": len(pids_before_anything),
     }
 
     before = snapshot(codex_home)
 
     runs = []
-    process_counts = [evidence["preconditions"]["app_server_process_count_before"]]
-    leaked = False
+    leaked_pid_counts = []
+    timed_out = False
     for i in range(args.runs):
         start = datetime.datetime.now()
-        proc = run([binary, "verify-codex", "--json"], timeout=30)
+        try:
+            proc, leaked_pids = run_verify_once(binary, timeout=30)
+        except ChildProcessTimeout as e:
+            timed_out = True
+            runs.append({"index": i, "exit_code": None, "wall_clock_ms": None, "result": {"_timeout": True}})
+            print(f"ABORTING remaining runs: {e}", file=sys.stderr)
+            break
         elapsed_ms = (datetime.datetime.now() - start).total_seconds() * 1000
         try:
-            parsed = redact_verify_result(json.loads(proc.stdout))
+            raw_parsed = json.loads(proc.stdout)
+            parsed = redact_verify_result(raw_parsed, home)
+            parsed_ok = True
         except json.JSONDecodeError:
-            parsed = {"_unparseable_stdout": sanitize(proc.stdout, home)}
-        count_after_run = codex_app_server_count()
-        if count_after_run > max(process_counts):
-            leaked = True
-        process_counts.append(count_after_run)
+            # Anomalous: verify-codex is specified to always emit JSON on
+            # --json. Treat this as a finding worth human review, not a
+            # silently-accepted fallback -- capped and $HOME-sanitized
+            # since it is raw, unstructured text we did not choose.
+            parsed = {
+                "_unparseable_stdout": sanitize(proc.stdout, home, UNPARSEABLE_STDOUT_MAX_CHARS),
+                "_unparseable_stdout_truncated": len(proc.stdout) > UNPARSEABLE_STDOUT_MAX_CHARS,
+            }
+            parsed_ok = False
+        assert_run_result_allowed(parsed, f"evidence.runs[{i}].result")
+        leaked_pid_counts.append(len(leaked_pids))
         runs.append(
             {
                 "index": i,
                 "exit_code": proc.returncode,
                 "wall_clock_ms": round(elapsed_ms, 1),
                 "result": parsed,
-                "app_server_process_count_after_this_run": count_after_run,
+                "leaked_pid_count_this_run": len(leaked_pids),
             }
         )
+        if not parsed_ok:
+            # Don't keep hammering a host that just returned something we
+            # can't parse -- that's exactly the situation requirement 4/6
+            # guard against piling 20 more invocations on top of.
+            print("ABORTING remaining runs: verify-codex returned non-JSON stdout", file=sys.stderr)
+            break
 
     after = snapshot(codex_home)
-    evidence["app_server_process_count_after"] = codex_app_server_count()
+    pids_after_all = codex_app_server_pids()
+    evidence["app_server_process_count_after"] = len(pids_after_all)
+    total_leaked = sum(leaked_pid_counts)
+    leaked = total_leaked > 0 or timed_out
     evidence["process_leak_check"] = {
-        "samples": process_counts,
+        "runs_completed": len(leaked_pid_counts),
+        "leaked_pid_count_per_run": leaked_pid_counts,
+        "total_leaked_pids": total_leaked,
+        "timed_out": timed_out,
         "leak_detected": leaked,
     }
     evidence["runs"] = runs
@@ -403,7 +560,7 @@ def main() -> int:
     evidence["snapshot_diff"] = diff
     evidence["snapshot_before"] = strip_internal_contents(before)
     evidence["snapshot_after"] = strip_internal_contents(after)
-    evidence["violations_found"] = len(diff["violations"]) > 0 or leaked
+    evidence["violations_found"] = len(diff["violations"]) > 0 or leaked or len(runs) < args.runs
 
     assert_no_raw_bytes(evidence)
     assert_allowed_keys(evidence, ALLOWED_EVIDENCE_KEYS)
@@ -425,12 +582,18 @@ def main() -> int:
     print(f"Evidence written to {out_path}")
     if leaked:
         print(
-            f"PROCESS LEAK DETECTED: app-server count samples {process_counts} grew mid-run",
+            f"PROCESS LEAK DETECTED: {total_leaked} orphaned PID(s) across "
+            f"{len(leaked_pid_counts)} completed run(s); timed_out={timed_out}",
+            file=sys.stderr,
+        )
+    if len(runs) < args.runs:
+        print(
+            f"ABORTED EARLY: only {len(runs)}/{args.runs} runs completed -- see the last run's result",
             file=sys.stderr,
         )
     if diff["violations"]:
         print(f"VIOLATIONS FOUND ({len(diff['violations'])}): {diff['violations']}", file=sys.stderr)
-    if diff["violations"] or leaked:
+    if diff["violations"] or leaked or len(runs) < args.runs:
         return 1
     print("No violations found. accepted_residual writes:", diff["accepted_residual"])
     return 0
