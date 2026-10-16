@@ -235,4 +235,70 @@ mod tests {
             Err(IdentityError::InvalidJson(_))
         ));
     }
+
+    /// Cross-check against `crates/fornax-cli`'s own golden-fixture test
+    /// (`codex_install_golden_e2e.rs`), which pins that the fixture below
+    /// still matches what `fornax install codex` really writes. This test
+    /// proves the *other* half: that this crate's independently duplicated
+    /// identity predicate selects exactly the three Fornax groups out of
+    /// that real install output, at the indices the RPC `key` field would
+    /// need. If `codex_hooks.rs`'s install shape ever changes, the
+    /// `fornax-cli` test catches a stale fixture; this test catches this
+    /// crate's predicate silently drifting looser or tighter than it.
+    #[test]
+    fn predicate_matches_real_install_output_golden_fixture() {
+        let golden = include_str!(
+            "../../../crates/fornax-cli/tests/fixtures/codex-hooks-install-golden.json"
+        );
+        let dir =
+            std::env::temp_dir().join(format!("fht-identity-golden-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = write_hooks_json(&dir, golden);
+
+        let found = read_expected_hooks(&path).unwrap();
+        assert_eq!(
+            found.len(),
+            3,
+            "expected exactly the three installed Fornax hooks"
+        );
+        for event in EVENTS {
+            let hit = found.iter().find(|h| h.event_pascal == event);
+            assert!(
+                hit.is_some(),
+                "missing expected event {event} in golden fixture"
+            );
+            let hit = hit.unwrap();
+            assert_eq!(hit.group_idx, 0);
+            assert_eq!(hit.handler_idx, 0);
+        }
+    }
+
+    /// A foreign tool's group, merged alongside Fornax's own, must never be
+    /// picked up — proves the predicate stays scoped to `HOOK_BIN` even
+    /// against a file shaped like the real multi-tool `hooks.json` this
+    /// machine has (per `codex_hooks.rs`'s own module doc: `hooks.json` is
+    /// shared with other tools, e.g. `libra-governor`).
+    #[test]
+    fn ignores_foreign_tool_groups_merged_into_the_same_file() {
+        let dir = std::env::temp_dir().join(format!("fht-identity-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = write_hooks_json(
+            &dir,
+            r#"{
+                "hooks": {
+                    "PostToolUse": [
+                        {"hooks": [{"type": "command", "command": "libra-governor-hook", "timeout": 5}]},
+                        {"hooks": [{"type": "command", "command": "fornax-hook-codex-event", "timeout": 5}]}
+                    ],
+                    "Stop": [
+                        {"hooks": [{"type": "command", "command": "libra-governor-hook", "timeout": 5}]}
+                    ]
+                }
+            }"#,
+        );
+        let found = read_expected_hooks(&path).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].event_pascal, "PostToolUse");
+        assert_eq!(found[0].group_idx, 1);
+    }
 }
