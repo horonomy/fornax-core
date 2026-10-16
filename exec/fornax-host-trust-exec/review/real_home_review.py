@@ -11,9 +11,16 @@ half).
 
 What this script does and does not do:
 
-- Reads filesystem METADATA only for every file under `~/.codex`
-  (relative path, type, size, mtime, mode). Never reads file contents,
-  with three narrow, declared exceptions below.
+- Reads filesystem METADATA only, and minimizes even that: full per-file
+  records (relative path, type, size, mtime, mode) are collected only for
+  `~/.codex`'s TOP-LEVEL entries (depth 1) plus the four named files this
+  review cares about. Anything nested deeper (session logs, rollouts,
+  caches -- which can encode project/session-identifying names in their
+  filenames) is collapsed to a per-top-level-directory aggregate (file
+  count, total size, latest mtime) instead of being listed file-by-file.
+  This still catches any new/removed top-level entry or bulk size/count
+  change under a directory, without exporting individual nested filenames.
+- Never reads file contents, with three narrow, declared exceptions below.
 - `config.toml`/`hooks.json`/`installation_id`: compares content for
   byte-equality between two snapshots and records only a boolean
   ("unchanged"/"changed"), never the bytes themselves.
@@ -21,9 +28,21 @@ What this script does and does not do:
   the global "never inspect secret plaintext" rule -- this is a
   credential file.
 - Runs `fornax-host-trust-exec verify-codex --json` 21 times against the
-  real home and real `codex` binary on PATH, and records the JSON output
-  (which itself contains no secrets -- see `docs/adr/0026-...md`'s
-  "Output secrecy" row) plus timing.
+  real home and real `codex` binary on PATH. The RPC-derived parts of that
+  JSON are REDACTED before being added to evidence (see
+  `redact_verify_result`): per-hook `command`/`sourcePath`/`key` strings
+  (which belong to whatever hooks the operator has configured for ANY
+  tool, not just Fornax's, and can contain arbitrary paths/arguments) are
+  dropped. Only `event`, `trust`, `host_trust_status`, a `hash_present`
+  boolean, and `reasons` survive per hook -- enough to confirm the
+  verdict, nothing that could leak another tool's hook configuration.
+- Evidence written to disk is checked against an explicit top-level key
+  allowlist (`ALLOWED_EVIDENCE_KEYS`) right before the write -- an
+  unexpected key fails the run instead of silently writing it.
+- Checks owned-child process cleanup after EVERY run (not just once at
+  the end): records the live `codex.*app-server` process count after each
+  of the 21 runs and fails loudly if it ever grows, i.e. if
+  `launch::teardown()` ever leaked a process.
 - Never writes a trust pin into the real `config.toml`. The positive/
   negative verdict matrix is covered by the synthetic CI suite
   (`tests/verify_codex_e2e.rs`) already; this script only observes
@@ -31,6 +50,8 @@ What this script does and does not do:
 - Writes its output to `docs/security/evidence/fornx-450-host-trust-real-home-<date>.json`,
   with the real `$HOME` path replaced by the literal `<home>` everywhere
   it would otherwise appear.
+- Makes no network call, no model/LLM call, and no credential-store
+  mutation anywhere in this file -- there is no code path to one.
 
 This script requires explicit operator confirmation to run (see `main`'s
 `--i-understand-this-touches-my-real-home` flag) -- it is never invoked
@@ -60,9 +81,69 @@ ACCEPTED_RESIDUAL_WRITE_PATTERNS = (
 NEVER_READ_CONTENTS = {"auth.json"}
 CONTENT_EQUALITY_ONLY = {"config.toml", "hooks.json", "installation_id"}
 
+# Explicit evidence-output allowlist (minimization requirement #2). Any key
+# that shows up in `evidence` outside this set fails the write rather than
+# being silently persisted.
+ALLOWED_EVIDENCE_KEYS = {
+    "schema_version",
+    "generated_at_utc",
+    "macos_version",
+    "preconditions",
+    "app_server_process_count_after",
+    "runs",
+    "first_run",
+    "latency_ms",
+    "snapshot_diff",
+    "snapshot_before",
+    "snapshot_after",
+    "violations_found",
+    "process_leak_check",
+}
+
+# Depth-1 entries get a full per-file record; anything nested deeper is
+# aggregated per top-level directory instead (minimization requirement #1).
+ALWAYS_FULL_RECORD_NAMES = CONTENT_EQUALITY_ONLY | NEVER_READ_CONTENTS
+
 
 def sanitize(text: str, home: Path) -> str:
     return text.replace(str(home), "<home>")
+
+
+def assert_allowed_keys(obj: dict, allowed: set, _path: str = "evidence") -> None:
+    extra = set(obj.keys()) - allowed
+    assert not extra, f"evidence-output allowlist violated at {_path}: unexpected key(s) {sorted(extra)}"
+
+
+def redact_verify_result(parsed: dict) -> dict:
+    """Keeps only what's needed to confirm the trust verdict from one
+    `verify-codex --json` run. Drops per-hook `command`/`sourcePath`/`key`
+    -- those describe the operator's OWN configured hooks for any tool,
+    not just Fornax's, and must not be exported verbatim."""
+    if "_unparseable_stdout" in parsed:
+        return parsed
+    result = parsed.get("result") or {}
+    redacted_hooks = []
+    for h in result.get("hooks") or []:
+        redacted_hooks.append(
+            {
+                "event": h.get("event"),
+                "trust": h.get("trust"),
+                "host_trust_status": h.get("host_trust_status"),
+                "hash_present": bool(h.get("current_hash")),
+                "reasons": h.get("reasons"),
+            }
+        )
+    return {
+        "schema_version": parsed.get("schema_version"),
+        "operation": parsed.get("operation"),
+        "adapter_id": parsed.get("adapter_id"),
+        "outcome": parsed.get("outcome"),
+        "codex_version": (parsed.get("codex") or {}).get("version"),
+        "host_trust": result.get("host_trust"),
+        "global_reasons": result.get("global_reasons"),
+        "hooks": redacted_hooks,
+        "timing_ms": parsed.get("timing_ms"),
+    }
 
 
 def run(cmd: list[str], timeout: int = 10) -> subprocess.CompletedProcess:
@@ -103,11 +184,34 @@ def file_record(path: Path, root: Path) -> dict:
 
 
 def snapshot(codex_home: Path) -> list[dict]:
+    """Full records for depth-1 entries (and the four named files
+    wherever they appear); everything else collapses into one aggregate
+    record per top-level directory -- see module docstring, minimization
+    requirement #1."""
     if not codex_home.is_dir():
         return []
-    records = []
+    records: list[dict] = []
+    aggregates: dict[str, dict] = {}
     for p in sorted(codex_home.rglob("*")):
-        records.append(file_record(p, codex_home))
+        rel = p.relative_to(codex_home)
+        depth = len(rel.parts)
+        name = p.name
+        if depth == 1 or name in ALWAYS_FULL_RECORD_NAMES:
+            records.append(file_record(p, codex_home))
+            continue
+        top = rel.parts[0]
+        try:
+            st = p.lstat()
+        except OSError:
+            continue
+        bucket = aggregates.setdefault(
+            top, {"path": f"{top}/*", "type": "aggregate", "file_count": 0, "total_size": 0, "max_mtime_ns": 0}
+        )
+        if not p.is_dir():
+            bucket["file_count"] += 1
+            bucket["total_size"] += st.st_size
+        bucket["max_mtime_ns"] = max(bucket["max_mtime_ns"], st.st_mtime_ns)
+    records.extend(aggregates.values())
     return records
 
 
@@ -148,6 +252,13 @@ def diff_snapshots(before: list[dict], after: list[dict]) -> dict:
     for path in sorted(set(before_by_path) & set(after_by_path)):
         b, a = before_by_path[path], after_by_path[path]
         name = Path(path).name
+        if b.get("type") == "aggregate" or a.get("type") == "aggregate":
+            if (
+                b.get("file_count") != a.get("file_count")
+                or b.get("total_size") != a.get("total_size")
+            ):
+                changed.append({"path": path, "kind": "aggregate_changed"})
+            continue
         if name in CONTENT_EQUALITY_ONLY:
             if b.get("_contents_for_internal_diff_only") != a.get("_contents_for_internal_diff_only"):
                 changed.append({"path": path, "kind": "content_changed"})
@@ -238,25 +349,36 @@ def main() -> int:
     before = snapshot(codex_home)
 
     runs = []
+    process_counts = [evidence["preconditions"]["app_server_process_count_before"]]
+    leaked = False
     for i in range(args.runs):
         start = datetime.datetime.now()
         proc = run([binary, "verify-codex", "--json"], timeout=30)
         elapsed_ms = (datetime.datetime.now() - start).total_seconds() * 1000
         try:
-            parsed = json.loads(proc.stdout)
+            parsed = redact_verify_result(json.loads(proc.stdout))
         except json.JSONDecodeError:
             parsed = {"_unparseable_stdout": sanitize(proc.stdout, home)}
+        count_after_run = codex_app_server_count()
+        if count_after_run > max(process_counts):
+            leaked = True
+        process_counts.append(count_after_run)
         runs.append(
             {
                 "index": i,
                 "exit_code": proc.returncode,
                 "wall_clock_ms": round(elapsed_ms, 1),
                 "result": parsed,
+                "app_server_process_count_after_this_run": count_after_run,
             }
         )
 
     after = snapshot(codex_home)
     evidence["app_server_process_count_after"] = codex_app_server_count()
+    evidence["process_leak_check"] = {
+        "samples": process_counts,
+        "leak_detected": leaked,
+    }
     evidence["runs"] = runs
     evidence["first_run"] = runs[0] if runs else None
     timings = [r["result"].get("timing_ms", {}).get("total_ms") for r in runs if "result" in r]
@@ -275,9 +397,10 @@ def main() -> int:
     evidence["snapshot_diff"] = diff
     evidence["snapshot_before"] = strip_internal_contents(before)
     evidence["snapshot_after"] = strip_internal_contents(after)
-    evidence["violations_found"] = len(diff["violations"]) > 0
+    evidence["violations_found"] = len(diff["violations"]) > 0 or leaked
 
     assert_no_raw_bytes(evidence)
+    assert_allowed_keys(evidence, ALLOWED_EVIDENCE_KEYS)
 
     out_dir = Path(__file__).resolve().parents[3] / "docs" / "security" / "evidence"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -294,8 +417,14 @@ def main() -> int:
     out_path.write_text(json.dumps(evidence, indent=2))
 
     print(f"Evidence written to {out_path}")
+    if leaked:
+        print(
+            f"PROCESS LEAK DETECTED: app-server count samples {process_counts} grew mid-run",
+            file=sys.stderr,
+        )
     if diff["violations"]:
         print(f"VIOLATIONS FOUND ({len(diff['violations'])}): {diff['violations']}", file=sys.stderr)
+    if diff["violations"] or leaked:
         return 1
     print("No violations found. accepted_residual writes:", diff["accepted_residual"])
     return 0
