@@ -1101,6 +1101,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fornax-host-trust-exec"
+version = "0.0.9"
+dependencies = [
+ "clap",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "uuid",
+]
+
+[[package]]
 name = "fornax-load-harness"
 version = "0.0.9"
 dependencies = [
