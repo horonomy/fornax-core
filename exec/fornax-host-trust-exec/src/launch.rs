@@ -163,22 +163,20 @@ fn spawn_sandboxed(
 /// Runs `codex --version` under the same sandbox and parses the reviewed
 /// version string. `app-server` is never started if this doesn't resolve
 /// to an entry in [`REVIEWED_CODEX_VERSIONS`].
+///
+/// FORNX-451: an earlier revision did a blocking `stdout.read_to_string`
+/// followed by a blocking `child.wait()`, checking `timeout` only AFTER
+/// both returned -- a child that keeps stdout open and never writes, or
+/// one that closes stdout but never exits, could block this function
+/// indefinitely despite the `timeout` parameter. `timeout` is now a real
+/// deadline shared across both the read and the wait, enforced by
+/// `read_to_string_and_wait_bounded` without ever blocking past it.
 pub fn check_reviewed_version(plan: &LaunchPlan, timeout: Duration) -> Result<String, ReasonCode> {
     let mut child =
         spawn_sandboxed(plan, &["--version"], true).map_err(|_| ReasonCode::CodexBinaryNotFound)?;
-    let mut stdout = child.stdout.take().expect("piped stdout");
+    let stdout = child.stdout.take().expect("piped stdout");
     let deadline = Instant::now() + timeout;
-    let mut buf = String::new();
-    // A bounded, blocking read is acceptable here: `--version` under this
-    // sandbox is observed to answer in well under a second, and this
-    // function's caller (`main.rs`) applies its own overall deadline
-    // around the whole verification run, not just this step.
-    let read_result = stdout.read_to_string(&mut buf);
-    let _ = child.wait();
-    if Instant::now() > deadline {
-        return Err(ReasonCode::CodexVersionUnreadable);
-    }
-    read_result.map_err(|_| ReasonCode::CodexVersionUnreadable)?;
+    let buf = read_to_string_and_wait_bounded(child, stdout, deadline)?;
     let version = buf
         .trim()
         .strip_prefix("codex-cli ")
@@ -188,6 +186,71 @@ pub fn check_reviewed_version(plan: &LaunchPlan, timeout: Duration) -> Result<St
         Ok(version)
     } else {
         Err(ReasonCode::CodexVersionUnreviewed(version))
+    }
+}
+
+/// Reads `stdout` to completion and waits for `child` to exit, both
+/// bounded by `deadline` -- neither step can block past it.
+///
+/// The read runs on a dedicated thread. If the deadline passes while it
+/// is still blocked (a child holding stdout open without writing EOF),
+/// this function does not join that thread -- it kills `child` below,
+/// which closes the child's end of the pipe and lets the blocked read
+/// return on its own (as EOF) shortly after; nothing is leaked, it is
+/// simply not waited on.
+///
+/// The wait is a non-blocking `try_wait()` poll loop (`wait_bounded`),
+/// never a blocking `wait()` -- a child that closes stdout but never
+/// exits must time out here too, which a blocking `wait()` could not do.
+///
+/// If either step is still unfinished when `deadline` passes, this kills
+/// and reaps the EXACT `child` it was given -- never a PID discovered by
+/// scanning other processes -- and returns `Err`.
+fn read_to_string_and_wait_bounded(
+    mut child: Child,
+    mut stdout: ChildStdout,
+    deadline: Instant,
+) -> Result<String, ReasonCode> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = String::new();
+        let result = stdout.read_to_string(&mut buf);
+        let _ = tx.send(result.map(|_| buf));
+    });
+
+    let read_outcome = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+    let exited_in_time = wait_bounded(&mut child, deadline.saturating_duration_since(Instant::now()));
+
+    if !exited_in_time {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(ReasonCode::CodexVersionUnreadable);
+    }
+
+    match read_outcome {
+        Ok(Ok(buf)) => Ok(buf),
+        _ => Err(ReasonCode::CodexVersionUnreadable),
+    }
+}
+
+/// Polls `child.try_wait()` (non-blocking) until it exits or `remaining`
+/// is exhausted. Never calls the blocking `Child::wait()` -- that is the
+/// one change that makes a "closes stdout but never exits" child
+/// time out instead of hanging this function forever.
+fn wait_bounded(child: &mut Child, mut remaining: Duration) -> bool {
+    let step = Duration::from_millis(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => return true,
+            Ok(None) => {}
+            Err(_) => return false,
+        }
+        if remaining.is_zero() {
+            return false;
+        }
+        let sleep_for = step.min(remaining);
+        std::thread::sleep(sleep_for);
+        remaining = remaining.saturating_sub(sleep_for);
     }
 }
 
@@ -320,5 +383,108 @@ mod tests {
             scratch.path.clone()
         };
         assert!(!path.exists());
+    }
+
+    // FORNX-451: positive/negative controls for the bounded read+wait fix.
+    // These spawn plain `/bin/sh` children directly -- no sandbox-exec, no
+    // real codex, no macOS-only gating -- because what's under test is the
+    // generic "never block past deadline" behavior of
+    // `read_to_string_and_wait_bounded`/`wait_bounded`, not the sandbox.
+
+    fn spawn_piped(shell_cmd: &str) -> (Child, ChildStdout) {
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(shell_cmd)
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("failed to spawn test child");
+        let stdout = child.stdout.take().expect("piped stdout");
+        (child, stdout)
+    }
+
+    /// True once the OS confirms no process with this PID exists --
+    /// checks the EXACT PID this test spawned, never a name-based scan,
+    /// matching FORNX-451's "retain authoritative PID ownership, never
+    /// signal globally enumerated processes" requirement.
+    fn pid_is_gone(pid: u32) -> bool {
+        !Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn positive_prompt_child_returns_within_deadline() {
+        let (child, stdout) = spawn_piped("printf 'codex-cli 0.160.0'");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let start = Instant::now();
+        let result = read_to_string_and_wait_bounded(child, stdout, deadline);
+        assert_eq!(result.unwrap(), "codex-cli 0.160.0");
+        assert!(start.elapsed() < Duration::from_secs(2), "should return promptly, not wait for the deadline");
+    }
+
+    #[test]
+    fn negative_open_pipe_nonexiting_child_refuses_within_bounded_margin() {
+        // Keeps stdout open (inherited, never written to or closed) and
+        // never exits within the deadline.
+        let (child, stdout) = spawn_piped("sleep 5");
+        let pid = child.id();
+        let timeout = Duration::from_millis(200);
+        let deadline = Instant::now() + timeout;
+        let start = Instant::now();
+        let result = read_to_string_and_wait_bounded(child, stdout, deadline);
+        let elapsed = start.elapsed();
+        assert!(result.is_err(), "a silently hanging child must refuse, not succeed");
+        assert!(
+            elapsed < timeout + Duration::from_secs(2),
+            "must refuse within a bounded margin of the deadline, took {elapsed:?}"
+        );
+        // Owned-only cleanup: the exact child this call spawned must be
+        // reaped -- never left running, never a sibling/peer touched.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(pid_is_gone(pid), "owned child must be terminated, not leaked, after a timeout");
+    }
+
+    #[test]
+    fn negative_closed_stdout_nonexiting_child_also_refuses() {
+        // Closes fd 1 immediately (so the read side sees EOF almost at
+        // once) but then sleeps well past the deadline without exiting --
+        // the bounded *wait*, not the bounded read, must catch this.
+        let (child, stdout) = spawn_piped("exec 1>&-; sleep 5");
+        let pid = child.id();
+        let timeout = Duration::from_millis(200);
+        let deadline = Instant::now() + timeout;
+        let start = Instant::now();
+        let result = read_to_string_and_wait_bounded(child, stdout, deadline);
+        let elapsed = start.elapsed();
+        assert!(result.is_err(), "a child that closes stdout but never exits must also refuse");
+        assert!(
+            elapsed < timeout + Duration::from_secs(2),
+            "must refuse within a bounded margin of the deadline, took {elapsed:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(pid_is_gone(pid), "owned child must be terminated, not leaked, after a timeout");
+    }
+
+    #[test]
+    fn negative_never_signals_a_sibling_process() {
+        // A peer process that is NOT the child passed to this call must
+        // survive untouched -- proves the fix never does anything
+        // resembling a name/pattern-based peer scan.
+        let (mut peer, _peer_stdout) = spawn_piped("sleep 5");
+        let peer_pid = peer.id();
+
+        let (child, stdout) = spawn_piped("sleep 5");
+        let timeout = Duration::from_millis(200);
+        let deadline = Instant::now() + timeout;
+        let _ = read_to_string_and_wait_bounded(child, stdout, deadline);
+
+        assert!(!pid_is_gone(peer_pid), "an unrelated peer process must never be signaled");
+
+        // cleanup: this test owns `peer` directly, so it reaps it itself.
+        let _ = peer.kill();
+        let _ = peer.wait();
     }
 }
