@@ -119,6 +119,15 @@ fn run_verify(
         Some(h) => PathBuf::from(h),
         None => finish!(refuse(ReasonCode::CodexBinaryNotFound), None),
     };
+    // Canonicalize before anything derives a Seatbelt literal-path param
+    // from it: macOS's sandbox literal-path match compares against the
+    // kernel-resolved path, and `$HOME` commonly sits under a symlinked
+    // prefix (`/tmp` -> `/private/tmp`, `/var` -> `/private/var`) that a
+    // non-canonical `HOME` would silently fail to match, making the
+    // write-deny clauses in `launch.rs` quietly no-ops. Empirically
+    // confirmed: without this, a tamper attempt against `hooks.json`
+    // succeeded instead of being denied.
+    let home = std::fs::canonicalize(&home).unwrap_or(home);
     let codex_home = snapshot::codex_home_dir(&home);
     let hooks_json_path = codex_home.join("hooks.json");
 

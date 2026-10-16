@@ -191,6 +191,7 @@ or a `crates/` → `exec/` dependency in either direction.
 | Bounds / timeouts | Line-length and total-bytes caps on the RPC stream; one overall deadline; hard process teardown (`SIGTERM` then `SIGKILL`) |
 | Orphaned child processes | Process-group spawn + group-kill teardown |
 | Platform scope | macOS only; every other platform fails closed at step 1, not attempted |
+| Symlinked `$HOME` prefix | `$HOME` is canonicalized before any Seatbelt literal-path param is derived from it. Empirically required, not defensive paranoia: macOS resolves a Seatbelt `(literal ...)` match against the kernel-level canonical path, and `$HOME` commonly sits under a symlinked prefix (`/tmp`→`/private/tmp`, `/var`→`/private/var`); without this, a real tamper attempt against `hooks.json` succeeded instead of being denied — caught by this feature's own e2e test (`tests/verify_codex_e2e.rs::tamper_attempts_are_blocked_and_files_stay_byte_identical`), not assumed |
 
 ## Founder-decision callout
 
@@ -225,6 +226,19 @@ trigger fired. This real-home run requires the operator's own machine and
 is not part of the synthetic CI suite — it is deliberately held out of the
 commits that make up the bulk of this ticket's implementation (see PR
 description) pending that explicit run.
+
+## Test infrastructure note
+
+The real-shim e2e layer (`tests/verify_codex_e2e.rs`) uses a compiled
+helper binary (`tests/fixtures/fake_codex.rs`, built as
+`fornax-host-trust-exec-fake-codex`), not a shell script. Empirically
+confirmed: macOS's Seatbelt `(allow process-exec (literal ...))` rule does
+not match a `#!/bin/sh` shebang-interpreted script through
+`sandbox-exec`, even when the literal path matches exactly — only a real
+compiled (even relocated/copied) binary. `tests/fixtures/fake-codex.sh`
+still exists and is used by `tests/session_streams.rs`, which exercises
+`protocol::Session` directly over raw pipes and never goes through the
+sandbox at all.
 
 ## Consequences
 
