@@ -20,6 +20,8 @@
 //!   from unit tests; see `tests/session_streams.rs` and
 //!   `tests/verify_codex_e2e.rs` for how the spawn boundary is tested.
 
+pub mod identity;
 pub mod protocol;
+pub mod verdict;
 
-// identity, verdict, snapshot, launch land in later FORNX-450 commits.
+// snapshot, launch land in later FORNX-450 commits.
