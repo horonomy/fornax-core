@@ -94,6 +94,7 @@ def file_record(path: Path, root: Path) -> dict:
     }
     name = path.name
     if name in CONTENT_EQUALITY_ONLY and kind == "file":
+        assert name not in NEVER_READ_CONTENTS, f"refusing to read {name}'s contents -- it is a credential file"
         try:
             record["_contents_for_internal_diff_only"] = path.read_bytes()
         except OSError:
@@ -108,6 +109,22 @@ def snapshot(codex_home: Path) -> list[dict]:
     for p in sorted(codex_home.rglob("*")):
         records.append(file_record(p, codex_home))
     return records
+
+
+def assert_no_raw_bytes(obj, _path: str = "evidence") -> None:
+    """Fails loudly, before any write, if a raw `bytes` value survived into
+    the evidence tree -- the one shape `_contents_for_internal_diff_only`
+    can take and the one thing that must never reach disk. Recurses
+    through dicts/lists only, which is everything `evidence` is built
+    from."""
+    if isinstance(obj, bytes):
+        raise AssertionError(f"raw bytes found at {_path} -- refusing to write evidence containing file contents")
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            assert_no_raw_bytes(v, f"{_path}.{k}")
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            assert_no_raw_bytes(v, f"{_path}[{i}]")
 
 
 def strip_internal_contents(records: list[dict]) -> list[dict]:
@@ -260,10 +277,21 @@ def main() -> int:
     evidence["snapshot_after"] = strip_internal_contents(after)
     evidence["violations_found"] = len(diff["violations"]) > 0
 
+    assert_no_raw_bytes(evidence)
+
     out_dir = Path(__file__).resolve().parents[3] / "docs" / "security" / "evidence"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"fornx-450-host-trust-real-home-{datetime.date.today().isoformat()}.json"
-    out_path.write_text(json.dumps(evidence, indent=2, default=str))
+    # No `default=str` fallback: this evidence file may have had
+    # config.toml/hooks.json/installation_id bytes pass through earlier
+    # processing (see `_contents_for_internal_diff_only`). `default=str`
+    # would silently stringify any stray `bytes` object that escaped
+    # `strip_internal_contents` instead of failing loudly -- exactly the
+    # "fails open" shape this campaign has already found and fixed twice
+    # elsewhere (HORO-1902/HORO-1903). A strict dump turns that class of
+    # bug into an immediate `TypeError` here, caught by
+    # `assert_no_raw_bytes` just above with a clearer message first.
+    out_path.write_text(json.dumps(evidence, indent=2))
 
     print(f"Evidence written to {out_path}")
     if diff["violations"]:
