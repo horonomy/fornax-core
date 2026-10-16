@@ -38,6 +38,18 @@ pub enum ReasonCode {
     HookDisabledByHost,
     HostReportedHookErrors,
     HostStateChangedDuringVerification,
+    // Global/launch-level refusals (internal-docs ADR-0015 R6: every one of
+    // these ends the run at `unknown`, never falls through to a spawn).
+    SandboxUnavailable,
+    HooksJsonUnreadable,
+    CodexBinaryNotFound,
+    CodexVersionUnreadable,
+    CodexVersionUnreviewed(String),
+    CodexHomeMismatch,
+    CodexVersionConflict,
+    HostUnreachable,
+    Timeout,
+    HostRpcError(String),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -209,6 +221,16 @@ fn verdict_for_one(
         current_hash: Some(hook.current_hash.clone()),
         reasons,
     }
+}
+
+/// Pushes a global reason discovered after reconciliation already ran
+/// (version conflict, home mismatch, a non-empty RPC `errors` array, or a
+/// tripped file tripwire) and forces the aggregate to `Unknown` -- any
+/// global reason always wins, by the same rule `aggregate` already
+/// applies internally.
+pub fn downgrade_to_unknown_with(verdict: &mut AggregateVerdict, reason: ReasonCode) {
+    verdict.global_reasons.push(reason);
+    verdict.host_trust = Trust::Unknown;
 }
 
 /// Never `.all(...)` over a possibly-empty collection — callers that reach
