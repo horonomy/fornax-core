@@ -219,7 +219,10 @@ fn read_to_string_and_wait_bounded(
     });
 
     let read_outcome = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
-    let exited_in_time = wait_bounded(&mut child, deadline.saturating_duration_since(Instant::now()));
+    let exited_in_time = wait_bounded(
+        &mut child,
+        deadline.saturating_duration_since(Instant::now()),
+    );
 
     if !exited_in_time {
         let _ = child.kill();
@@ -422,7 +425,10 @@ mod tests {
         let start = Instant::now();
         let result = read_to_string_and_wait_bounded(child, stdout, deadline);
         assert_eq!(result.unwrap(), "codex-cli 0.160.0");
-        assert!(start.elapsed() < Duration::from_secs(2), "should return promptly, not wait for the deadline");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "should return promptly, not wait for the deadline"
+        );
     }
 
     #[test]
@@ -436,7 +442,10 @@ mod tests {
         let start = Instant::now();
         let result = read_to_string_and_wait_bounded(child, stdout, deadline);
         let elapsed = start.elapsed();
-        assert!(result.is_err(), "a silently hanging child must refuse, not succeed");
+        assert!(
+            result.is_err(),
+            "a silently hanging child must refuse, not succeed"
+        );
         assert!(
             elapsed < timeout + Duration::from_secs(2),
             "must refuse within a bounded margin of the deadline, took {elapsed:?}"
@@ -444,7 +453,10 @@ mod tests {
         // Owned-only cleanup: the exact child this call spawned must be
         // reaped -- never left running, never a sibling/peer touched.
         std::thread::sleep(Duration::from_millis(50));
-        assert!(pid_is_gone(pid), "owned child must be terminated, not leaked, after a timeout");
+        assert!(
+            pid_is_gone(pid),
+            "owned child must be terminated, not leaked, after a timeout"
+        );
     }
 
     #[test]
@@ -459,13 +471,19 @@ mod tests {
         let start = Instant::now();
         let result = read_to_string_and_wait_bounded(child, stdout, deadline);
         let elapsed = start.elapsed();
-        assert!(result.is_err(), "a child that closes stdout but never exits must also refuse");
+        assert!(
+            result.is_err(),
+            "a child that closes stdout but never exits must also refuse"
+        );
         assert!(
             elapsed < timeout + Duration::from_secs(2),
             "must refuse within a bounded margin of the deadline, took {elapsed:?}"
         );
         std::thread::sleep(Duration::from_millis(50));
-        assert!(pid_is_gone(pid), "owned child must be terminated, not leaked, after a timeout");
+        assert!(
+            pid_is_gone(pid),
+            "owned child must be terminated, not leaked, after a timeout"
+        );
     }
 
     #[test]
@@ -481,7 +499,10 @@ mod tests {
         let deadline = Instant::now() + timeout;
         let _ = read_to_string_and_wait_bounded(child, stdout, deadline);
 
-        assert!(!pid_is_gone(peer_pid), "an unrelated peer process must never be signaled");
+        assert!(
+            !pid_is_gone(peer_pid),
+            "an unrelated peer process must never be signaled"
+        );
 
         // cleanup: this test owns `peer` directly, so it reaps it itself.
         let _ = peer.kill();
