@@ -269,6 +269,24 @@ plugin) and no new Cargo dependency was introduced in
 `fornax-adapter-opencode` (all of `serde`/`serde_json`/`tokio`/`anyhow`/
 `chrono`/`uuid` are pre-existing workspace-pinned dependencies).
 
+## Related: operator-invoked host trust verification (FORNX-450)
+
+`exec/fornax-host-trust-exec` (new, FORNX-450) is a standalone binary
+outside `crates/` — same placement convention as `exec/fornax-acquire-exec`
+and `exec/fornax-host-adapter-exec` — that, only on explicit operator
+invocation, spawns a sandboxed `codex app-server` process against the
+operator's real `~/.codex` and calls its `hooks/list` RPC to authoritatively
+report Fornax's own installed hooks' trust state. This is **not** one of
+the ten `trust boundary: yes` rows above: it is not part of any release
+candidate's gated surface (it ships as its own binary, invoked manually,
+never from the daemon/CLI/hook paths the ten boundaries above cover), and
+this document is not amending the formal boundary vocabulary to add it.
+Its full design, the seven binding requirements it satisfies, and its
+dedicated security review live in `docs/adr/0026-codex-host-trust-verification.md`
+— read that document for the real content; this paragraph exists only so
+a reader of this file knows the surface exists and where its review is,
+rather than for this file to re-host it.
+
 ## Changelog
 
 | Version | Date | Candidate | Change |

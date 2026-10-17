@@ -1,0 +1,71 @@
+{
+  "id": 1,
+  "result": {
+    "data": [
+      {
+        "cwd": "<isolated-home>",
+        "hooks": [
+          {
+            "key": "<isolated-home>/.codex/hooks.json:pre_tool_use:0:0",
+            "eventName": "preToolUse",
+            "handlerType": "command",
+            "command": "fornax-hook-codex-event",
+            "async": false,
+            "matcher": null,
+            "timeoutSec": 5,
+            "statusMessage": null,
+            "additionalContextLimit": null,
+            "sourcePath": "<isolated-home>/.codex/hooks.json",
+            "source": "user",
+            "pluginId": null,
+            "displayOrder": 0,
+            "enabled": true,
+            "isManaged": false,
+            "currentHash": "sha256:2ae4c5fdc7724fdbbe43666a04473064dba9f66f45627cab46087238555abaa2",
+            "trustStatus": "trusted"
+          },
+          {
+            "key": "<isolated-home>/.codex/hooks.json:post_tool_use:0:0",
+            "eventName": "postToolUse",
+            "handlerType": "command",
+            "command": "fornax-hook-codex-event",
+            "async": false,
+            "matcher": null,
+            "timeoutSec": 5,
+            "statusMessage": null,
+            "additionalContextLimit": null,
+            "sourcePath": "<isolated-home>/.codex/hooks.json",
+            "source": "user",
+            "pluginId": null,
+            "displayOrder": 1,
+            "enabled": true,
+            "isManaged": false,
+            "currentHash": "sha256:f0d0d732bbcefc15f8527be695bcb1ba097606ffc077bc18a9c5403b9cb34f57",
+            "trustStatus": "trusted"
+          },
+          {
+            "key": "<isolated-home>/.codex/hooks.json:session_start:0:0",
+            "eventName": "sessionStart",
+            "handlerType": "command",
+            "command": "fornax-hook-codex-event",
+            "async": false,
+            "matcher": null,
+            "timeoutSec": 5,
+            "statusMessage": null,
+            "additionalContextLimit": null,
+            "sourcePath": "<isolated-home>/.codex/hooks.json",
+            "source": "user",
+            "pluginId": null,
+            "displayOrder": 2,
+            "enabled": true,
+            "isManaged": false,
+            "currentHash": "sha256:48e6ab2ab45024509cf918a140f6d324f74a30dba9eb61d1862ef7aedf1734ce",
+            "trustStatus": "trusted"
+          }
+        ],
+        "warnings": [],
+        "errors": []
+      }
+    ]
+  }
+}
