@@ -539,17 +539,17 @@ def diff_snapshots(before: list[dict], after: list[dict]) -> dict:
     violations = []
     accepted = []
     for path in added:
-        bucket = (classify(path) and accepted) or violations
+        bucket = accepted if classify(path) else violations
         bucket.append({"path": path, "change": "added"})
     for path in removed:
-        bucket = (classify(path) and accepted) or violations
+        bucket = accepted if classify(path) else violations
         bucket.append({"path": path, "change": "removed"})
     for entry in changed:
         name = Path(entry["path"]).name
         if name in CONTENT_EQUALITY_ONLY:
             violations.append({"path": entry["path"], "change": "content_changed"})
             continue
-        bucket = (classify(entry["path"]) and accepted) or violations
+        bucket = accepted if classify(entry["path"]) else violations
         bucket.append({"path": entry["path"], "change": "metadata_changed"})
 
     return {

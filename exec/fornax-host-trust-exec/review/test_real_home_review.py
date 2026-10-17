@@ -294,6 +294,58 @@ class StructuralFailClosedGuard(unittest.TestCase):
         self.assertFalse(all_ok_correctly)
 
 
+class AcceptedResidualClassificationGuard(unittest.TestCase):
+    """Guard: a benign accepted-residual write (sqlite-wal at root, tmp/**)
+    must land in snapshot_diff['accepted_residual'], not ['violations'].
+    Regression (FORNX-450 R3 run against the real ~/.codex, head 644c726):
+    `bucket = (classify(path) and accepted) or violations` always chose
+    `violations` while `accepted` was still empty, because Python's `or`
+    picks by truthiness and an empty list is falsy -- so every accepted-
+    residual entry was silently misclassified as a violation."""
+
+    def test_sqlite_wal_at_root_is_accepted_not_a_violation(self):
+        before = [{"path": "logs_2.sqlite-wal", "type": "file", "size": 0, "mtime_ns": 1, "mode": "0o644"}]
+        after = [{"path": "logs_2.sqlite-wal", "type": "file", "size": 10, "mtime_ns": 2, "mode": "0o644"}]
+        diff = rhr.diff_snapshots(before, after)
+        self.assertEqual(diff["violations"], [])
+        self.assertEqual(diff["accepted_residual"], [{"path": "logs_2.sqlite-wal", "change": "metadata_changed"}])
+
+    def test_tmp_aggregate_is_accepted_not_a_violation(self):
+        before = [{"path": "tmp/*", "type": "aggregate", "file_count": 1, "total_size": 10, "max_mtime_ns": 1}]
+        after = [{"path": "tmp/*", "type": "aggregate", "file_count": 2, "total_size": 20, "max_mtime_ns": 2}]
+        diff = rhr.diff_snapshots(before, after)
+        self.assertEqual(diff["violations"], [])
+        self.assertEqual(diff["accepted_residual"], [{"path": "tmp/*", "change": "metadata_changed"}])
+
+    def test_two_accepted_entries_both_land_in_accepted_not_just_the_first(self):
+        """The bug specifically depended on `accepted` still being empty;
+        confirm a SECOND accepted-class entry is also classified
+        correctly once the list is non-empty (would have passed even
+        under the old broken logic, but pins the fix's actual shape)."""
+        before = [
+            {"path": "logs_2.sqlite-wal", "type": "file", "size": 0, "mtime_ns": 1, "mode": "0o644"},
+            {"path": "state_5.sqlite-wal", "type": "file", "size": 0, "mtime_ns": 1, "mode": "0o644"},
+        ]
+        after = [
+            {"path": "logs_2.sqlite-wal", "type": "file", "size": 10, "mtime_ns": 2, "mode": "0o644"},
+            {"path": "state_5.sqlite-wal", "type": "file", "size": 10, "mtime_ns": 2, "mode": "0o644"},
+        ]
+        diff = rhr.diff_snapshots(before, after)
+        self.assertEqual(diff["violations"], [])
+        self.assertEqual(len(diff["accepted_residual"]), 2)
+
+    def test_sessions_change_is_still_a_real_violation(self):
+        """sessions/* is NOT in the accepted-residual class (per
+        docs/security/host-trust-verification-review.md's trigger
+        conditions) -- confirm the fix doesn't over-correct into
+        accepting everything."""
+        before = [{"path": "sessions/*", "type": "aggregate", "file_count": 1, "total_size": 10, "max_mtime_ns": 1}]
+        after = [{"path": "sessions/*", "type": "aggregate", "file_count": 2, "total_size": 20, "max_mtime_ns": 2}]
+        diff = rhr.diff_snapshots(before, after)
+        self.assertEqual(diff["accepted_residual"], [])
+        self.assertEqual(diff["violations"], [{"path": "sessions/*", "change": "metadata_changed"}])
+
+
 class ProcessOwnershipGuard(unittest.TestCase):
     """Guard: never signal a `pgrep`-matched PID; only ever signal the
     exact PID this script itself forked. Mutations: (1) a concurrent
