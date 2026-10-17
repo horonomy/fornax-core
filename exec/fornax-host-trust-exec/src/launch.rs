@@ -130,9 +130,18 @@ fn sandbox_argv(plan: &LaunchPlan, extra_args: &[&str]) -> Vec<String> {
 fn configure_env(cmd: &mut Command, plan: &LaunchPlan) {
     cmd.env_clear();
     cmd.env("HOME", &plan.codex_home);
-    if let Ok(codex_home_override) = std::env::var("CODEX_HOME") {
-        cmd.env("CODEX_HOME", codex_home_override);
-    }
+    // Force, never forward: the child must land on exactly the directory
+    // this process sandboxed and snapshotted
+    // (`snapshot::codex_home_dir(&plan.codex_home)`), not whatever the
+    // operator's ambient shell happened to have in `$CODEX_HOME` at spawn
+    // time. Both read the same override through the same function, so
+    // this can never diverge from the Seatbelt deny-write params or the
+    // before/after snapshot -- see that function's doc comment for the
+    // mismatch this closes.
+    cmd.env(
+        "CODEX_HOME",
+        crate::snapshot::codex_home_dir(&plan.codex_home),
+    );
     cmd.env("PATH", "/usr/bin:/bin");
     for var in ["LANG", "LC_ALL"] {
         if let Ok(v) = std::env::var(var) {

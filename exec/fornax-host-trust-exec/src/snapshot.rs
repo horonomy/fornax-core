@@ -109,9 +109,27 @@ pub fn tripwire_tripped(before: &Snapshot, after: &Snapshot) -> Option<Vec<&'sta
 
 /// Resolves the canonical trust-bearing file paths this crate ever reads
 /// or snapshots, for a given `$HOME`-style `.codex` directory. Centralized
-/// here so `launch.rs`'s Seatbelt profile and this module's snapshot
-/// always agree on exactly which three paths matter.
+/// here so `launch.rs`'s Seatbelt profile, this module's snapshot, and the
+/// child process's own `CODEX_HOME` always agree on exactly which
+/// directory matters -- the single source of truth for "where is the
+/// real Codex home", honoring an operator-set `$CODEX_HOME` override the
+/// same way Codex itself does, rather than always assuming `$HOME/.codex`.
+/// Without this, an operator with `CODEX_HOME` pointing elsewhere would
+/// get Seatbelt deny-write params and a before/after snapshot aimed at
+/// the wrong directory while the real spawned `codex` process (which
+/// also receives `CODEX_HOME`, see `launch::configure_env`) operated on
+/// a different, unprotected one -- caught only after the fact by the
+/// `codexHome` cross-check in `main.rs`, not prevented. Canonicalized for
+/// the same symlinked-prefix reason `main.rs` canonicalizes `$HOME`
+/// (falls back to the raw path if the override doesn't exist yet, so
+/// callers that need an existence check still get one downstream).
 pub fn codex_home_dir(home: &Path) -> PathBuf {
+    if let Ok(over) = std::env::var("CODEX_HOME") {
+        if !over.trim().is_empty() {
+            let p = PathBuf::from(over);
+            return std::fs::canonicalize(&p).unwrap_or(p);
+        }
+    }
     home.join(".codex")
 }
 
@@ -173,7 +191,36 @@ mod tests {
 
     #[test]
     fn codex_home_dir_joins_dot_codex() {
+        // SAFETY (test-only): this crate's test suite is the only place
+        // that ever reads or sets `CODEX_HOME`, so these two tests racing
+        // each other is the only hazard, and the saved/restored env var
+        // confines the mutation to this test's own duration.
+        let saved = std::env::var_os("CODEX_HOME");
+        std::env::remove_var("CODEX_HOME");
         let home = Path::new("/home/op");
         assert_eq!(codex_home_dir(home), PathBuf::from("/home/op/.codex"));
+        match saved {
+            Some(v) => std::env::set_var("CODEX_HOME", v),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+    }
+
+    #[test]
+    fn codex_home_dir_honors_codex_home_override() {
+        let saved = std::env::var_os("CODEX_HOME");
+        let scratch = scratch();
+        std::env::set_var("CODEX_HOME", &scratch);
+        let home = Path::new("/home/op");
+        // The override wins outright -- `home` (what `$HOME` resolves to)
+        // is not joined onto it, matching how Codex itself treats
+        // `CODEX_HOME` as an absolute replacement, not a relative one.
+        assert_eq!(
+            codex_home_dir(home),
+            std::fs::canonicalize(&scratch).unwrap()
+        );
+        match saved {
+            Some(v) => std::env::set_var("CODEX_HOME", v),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
     }
 }
