@@ -1,6 +1,6 @@
 # ADR 0026: Codex `hooks/list`-backed host_trust verification
 
-Status: Proposed
+Status: Accepted
 Date: 2026-10-16
 Jira: FORNX-450
 
@@ -162,7 +162,7 @@ or a `crates/` → `exec/` dependency in either direction.
 |---|---|---|
 | R1 no implicit launch | `fornax` CLI structurally cannot spawn anything (existing FORNX-238 scan, unchanged). The new binary's only spawn site is the `verify-codex` handler; `--help`/`--version`/parse errors exit inside clap before reaching it. | `help_and_usage_paths_never_invoke_codex` (argv-logging shim must see zero invocations) |
 | R2 explicit action | Separate binary, one subcommand, zero other trigger paths (no daemon/hook/CLI/config/env route). | Same test, plus a dependency allowlist |
-| R3 security review | This ADR stays `Proposed` until the real-`~/.codex` evidence (§ below) and review doc are committed; the PR's `## Security / privacy` section links both. | N/A — process gate |
+| R3 security review | Complete — see "Security review record" below; the review doc and evidence SHA-256 are the binding record. | N/A — process gate |
 | R4 no trust/activation side effect | The RPC client's outgoing method set is closed (`initialize`/`initialized`/`hooks/list` only — no `thread/*`/`turn/*` exists in the type, so nothing can fire a hook). Seatbelt denies exec of anything but Codex and denies writes to the two trust-bearing files. Snapshot tripwire on both. | `protocol_can_only_emit_allowlisted_methods`; macOS tamper-shim e2e |
 | R5 no unapproved mutation | Network fully denied (blocks the plugin-sync fetch and any credential refresh). `auth.json` write-denied + metadata tripwire; `config.toml` write-denied + digest tripwire. `--disable plugins` avoids the sync attempt outright. Child env is `env_clear()`'d then allow-listed (`HOME`, `CODEX_HOME`, `PATH`, `LANG`/`LC_ALL` only) so no API key or token reaches the child. No `thread`/`turn` RPC exists, so no model spend is possible. | Same tamper-shim e2e; `env_whitelist_is_exact` |
 | R6 fail closed | Verdict aggregation rule above; version allow-list; `codexHome`/version cross-checks; tripwire. | Full negative matrix (unreachable/timeout/malformed/truncated/orphaned/duplicate/mismatch/unreviewed-version/tamper) |
@@ -197,11 +197,14 @@ or a `crates/` → `exec/` dependency in either direction.
 
 ## Founder-decision callout
 
-No founder decision is required beyond internal-docs ADR-0015's own
+No founder decision was required beyond internal-docs ADR-0015's own
 acceptance, which explicitly delegates each product's implementation and
-security review to that product (R3). This ADR's status flips to
-`Accepted` once the real-`~/.codex` review below passes with no trigger. A
-Level 2 founder packet is escalated only if the review records one of:
+security review to that product (R3), with one exception: the real-home
+run's `sessions/*` residual (see "Security review record" below) escalated
+to one Level 2 founder packet and was resolved by an explicit, narrowly
+scoped founder disposition accepting it as a one-off environmental
+residual for that run only — not a standing allowlist change. A Level 2
+founder packet is escalated for any future run that records one of:
 
 - any write/rename/unlink touching `config.toml`, `hooks.json`, or
   `auth.json`;
@@ -212,22 +215,31 @@ Level 2 founder packet is escalated only if the review records one of:
 
 ## Measured latency
 
-Recorded in `docs/security/evidence/fornx-450-host-trust-real-home-<date>.json`
-once the real-home review runs (§ below) — min/median/p95/max over repeated
-runs, against the operator's actual machine, Codex version, and concurrent
-app-server count. Not filled in by this `Proposed` revision.
+Recorded in `docs/security/evidence/fornx-450-host-trust-real-home-2026-10-17.json`
+(SHA-256 `964088d5d57c162eeff15545336ae70d55c8793ee998c3c0b7208c56b3300ebb`):
+min 86.7ms / median 89.0ms / p95 93.8ms / max 1287.2ms over the 21 real
+runs (the 1287.2ms value is the first run only, a one-time cold-start
+cost; all 21 completed within the 30s per-run bound). 19 `codex
+app-server` processes running concurrently throughout, before and after,
+0 unexplained.
 
 ## Security review record
 
-Pending. `exec/fornax-host-trust-exec/review/real_home_review.py` writes
-sanitized evidence to `docs/security/evidence/`; a human-authored review
-doc at `docs/security/host-trust-verification-review.md` records
-reviewer, date, versions, every observed write classified, and a pass/block
-verdict. This ADR is not `Accepted` until both exist and no Level 2
-trigger fired. This real-home run requires the operator's own machine and
-is not part of the synthetic CI suite — it is deliberately held out of the
-commits that make up the bulk of this ticket's implementation (see PR
-description) pending that explicit run.
+Complete: `docs/security/host-trust-verification-review.md` records
+reviewer, date, versions, every observed write classified, and verdict
+**PASS (scoped)**. `exec/fornax-host-trust-exec/review/real_home_review.py`
+wrote sanitized evidence to `docs/security/evidence/` (gitignored by
+design; SHA-256 recorded in the review doc and above). One Level 2 trigger
+fired (`sessions/*`, an append-only aggregate delta outside the documented
+accepted-residual class) and was resolved by explicit founder disposition
+for this run only — see the review doc's own "Founder disposition"
+section for the full attribution record and its stated limits. This review
+verifies real-`~/.codex` process safety; it does not exercise the positive
+host_trust-resolution path (no Fornax hooks are installed on this
+operator's real `~/.codex`), which is proven separately by
+`verdict.rs::full_match_all_trusted_is_trusted` and the sandboxed
+fake-binary e2e matrix in `tests/verify_codex_e2e.rs`, both already merged
+on this branch.
 
 ## Test infrastructure note
 
