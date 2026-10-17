@@ -210,6 +210,31 @@ jobs:
             echo "rust-cache cache-hit: \`${{ steps.rust_cache.outputs.cache-hit }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # FORNX-450: `fornax-host-trust-exec`'s real assertions (Seatbelt
+  # network/exec/write denial, tamper resistance) are `#[cfg(target_os =
+  # "macos")]`-gated — `rust` above runs on `ubuntu-latest` only and
+  # silently skips every one of them. Not a required status check (see
+  # `rust`'s own comment on why that one is): this job exists so those
+  # assertions are actually exercised somewhere other than a developer's
+  # own Mac, without risking a required merge gate on a second,
+  # independently-flaky runner platform. Scoped to one package, not
+  # `--workspace`, to keep it fast — nothing else in this repo has a
+  # macOS-only test surface.
+  rust-macos-sandbox-e2e:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: ". -> target"
+      - name: build fornax-host-trust-exec and its test fixtures
+        run: cargo build -p fornax-host-trust-exec --tests
+      - name: test fornax-host-trust-exec (includes macOS-only sandbox e2e)
+        run: cargo test -p fornax-host-trust-exec
+
   # Baseline PATCH_LOW_RISK-tier security check every higher risk tier also
   # inherits (docs/release-security-gate.md, FORNX-233). Installed via
   # `cargo install` from crates.io rather than a third-party GitHub Action,
