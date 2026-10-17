@@ -93,7 +93,7 @@ class EvidenceAllowlistGuard(unittest.TestCase):
             "adapter_id": "x",
             "outcome": "ok",
             "codex_version": "0.160.0",
-            "host_trust": "Trusted",
+            "host_trust": "trusted",
             "global_reasons": [],
             "hooks": [],
             "timing_ms": {},
@@ -109,9 +109,9 @@ class EvidenceAllowlistGuard(unittest.TestCase):
             "adapter_id": "x",
             "outcome": "ok",
             "codex_version": "0.160.0",
-            "host_trust": "Trusted",
+            "host_trust": "trusted",
             "global_reasons": [],
-            "hooks": [{"event": "PreToolUse", "trust": "Trusted", "command": "/Users/real/leaked.sh"}],
+            "hooks": [{"event": "PreToolUse", "trust": "trusted", "command": "/Users/real/leaked.sh"}],
             "timing_ms": {},
         }
         with self.assertRaises(AssertionError):
@@ -124,12 +124,12 @@ class EvidenceAllowlistGuard(unittest.TestCase):
             "adapter_id": "x",
             "outcome": "ok",
             "codex_version": "0.160.0",
-            "host_trust": "Trusted",
+            "host_trust": "trusted",
             "global_reasons": [],
             "hooks": [
                 {
                     "event": "PreToolUse",
-                    "trust": "Trusted",
+                    "trust": "trusted",
                     "host_trust_status": "trusted",
                     "hash_present": True,
                     "reasons": None,
@@ -149,12 +149,12 @@ class RedactionGuard(unittest.TestCase):
             "outcome": "ok",
             "codex": {"version": "0.160.0"},
             "result": {
-                "host_trust": "Trusted",
+                "host_trust": "trusted",
                 "global_reasons": ["host_rpc_error"],
                 "hooks": [
                     {
                         "event": "PreToolUse",
-                        "trust": "Trusted",
+                        "trust": "trusted",
                         "host_trust_status": "trusted",
                         "command": "/Users/real/secret-script.sh --token abc123",
                         "sourcePath": "/Users/real/.codex/hooks.json",
@@ -227,7 +227,7 @@ class StructuralFailClosedGuard(unittest.TestCase):
     mutation targets exactly the "only the last run is bad" gap found in
     review."""
 
-    def _well_formed(self, host_trust="Trusted", exit_code=0):
+    def _well_formed(self, host_trust="trusted", exit_code=0):
         return {
             "schema_version": 1,
             "operation": "verify-codex",
@@ -236,11 +236,11 @@ class StructuralFailClosedGuard(unittest.TestCase):
         }, exit_code
 
     def test_well_formed_trusted_passes(self):
-        raw, code = self._well_formed("Trusted", 0)
+        raw, code = self._well_formed("trusted", 0)
         self.assertIsNone(rhr.validate_run_structure(raw, code))
 
     def test_well_formed_untrusted_passes(self):
-        raw, code = self._well_formed("Untrusted", 3)
+        raw, code = self._well_formed("untrusted", 3)
         self.assertIsNone(rhr.validate_run_structure(raw, code))
 
     def test_missing_result_fails(self):
@@ -252,12 +252,23 @@ class StructuralFailClosedGuard(unittest.TestCase):
         self.assertEqual(rhr.validate_run_structure(raw, code), "invalid_trust_verdict")
 
     def test_unexpected_exit_code_fails(self):
-        raw, _ = self._well_formed("Trusted", 0)
+        raw, _ = self._well_formed("trusted", 0)
         self.assertEqual(rhr.validate_run_structure(raw, 2), "unexpected_exit_code")
+
+    def test_rejects_capitalized_verdict_matching_rust_enum_name_not_its_wire_form(self):
+        """Regression (FORNX-450 R3 run, c8d9ea1): verdict::Trust is
+        #[serde(rename_all = "snake_case")], so the real binary's JSON
+        always emits lowercase ("trusted"/"untrusted"/"unknown"). A
+        validator expecting the Rust enum's PascalCase spelling
+        ("Trusted") instead of its actual wire form fails every real
+        run with invalid_trust_verdict -- exactly what happened against
+        the real ~/.codex before this fix."""
+        raw, code = self._well_formed("Trusted", 0)
+        self.assertEqual(rhr.validate_run_structure(raw, code), "invalid_trust_verdict")
 
     def test_exit_verdict_mismatch_fails(self):
         # exit 0 is only valid when the verdict is Trusted
-        raw, _ = self._well_formed("Untrusted", 0)
+        raw, _ = self._well_formed("untrusted", 0)
         self.assertEqual(rhr.validate_run_structure(raw, 0), "exit_verdict_mismatch")
 
     def test_mutation_on_the_final_run_of_a_sequence_is_still_caught(self):
@@ -266,9 +277,9 @@ class StructuralFailClosedGuard(unittest.TestCase):
         the `all_runs_structurally_ok`-style aggregate (not a length
         check) is what catches it."""
         sequence = [
-            self._well_formed("Trusted", 0),
-            self._well_formed("Trusted", 0),
-            ({"schema_version": 1, "operation": "verify-codex", "outcome": "ok", "result": {"host_trust": "Trusted", "hooks": []}}, 3),  # mismatch
+            self._well_formed("trusted", 0),
+            self._well_formed("trusted", 0),
+            ({"schema_version": 1, "operation": "verify-codex", "outcome": "ok", "result": {"host_trust": "trusted", "hooks": []}}, 3),  # mismatch
         ]
         failures = [rhr.validate_run_structure(raw, code) for raw, code in sequence]
         self.assertIsNone(failures[0])

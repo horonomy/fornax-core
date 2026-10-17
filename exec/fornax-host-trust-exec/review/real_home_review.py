@@ -227,7 +227,9 @@ def sanitize(text: str, home: Path) -> str:
     return text.replace(str(home), "<home>")
 
 
-EXPECTED_HOST_TRUST_VALUES = {"Trusted", "Untrusted", "Unknown"}
+# verdict::Trust is #[serde(rename_all = "snake_case")], so main.rs's
+# serde_json::to_string_pretty(&envelope) emits lowercase values.
+EXPECTED_HOST_TRUST_VALUES = {"trusted", "untrusted", "unknown"}
 ALLOWED_EXIT_CODES = {0, 3}  # per main.rs: 0 iff Trusted, 3 otherwise
 
 
@@ -254,9 +256,9 @@ def validate_run_structure(raw_parsed: dict, exit_code: int) -> str | None:
         return "invalid_trust_verdict"
     if not isinstance(result.get("hooks"), list):
         return "missing_hooks_list"
-    if exit_code == 0 and host_trust != "Trusted":
+    if exit_code == 0 and host_trust != "trusted":
         return "exit_verdict_mismatch"
-    if exit_code == 3 and host_trust == "Trusted":
+    if exit_code == 3 and host_trust == "trusted":
         return "exit_verdict_mismatch"
     return None
 
