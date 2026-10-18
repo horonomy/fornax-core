@@ -492,6 +492,24 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn install_never_writes_through_a_symlink_planted_at_the_old_temp_name() {
+        let path = tmp_config_path("symlink-tmp");
+        let victim = tmp_config_path("symlink-victim");
+        std::fs::write(&victim, "untouched").unwrap();
+        std::os::unix::fs::symlink(&victim, path.with_extension("toml.tmp")).unwrap();
+
+        install_at(&path, &fake_script()).expect("install");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("fornax-codex-notify.sh"));
+        std::fs::remove_file(path.with_extension("toml.tmp")).ok();
+        std::fs::remove_file(&victim).ok();
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn install_wires_notify_into_fresh_config() {
         let path = tmp_config_path("fresh-install");
