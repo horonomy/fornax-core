@@ -102,4 +102,21 @@ mod tests {
         );
         std::fs::remove_file(&path).ok();
     }
+
+    #[test]
+    fn write_replaces_an_unchanged_file_and_leaves_no_staging_file() {
+        let dir = tmp_path("dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "original").unwrap();
+        let read = digest_of(&path).unwrap();
+        write_guarded(&path, "ours", &read).expect("write");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "ours");
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("settings.json")]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
