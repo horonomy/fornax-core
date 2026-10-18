@@ -81,12 +81,23 @@ pub fn write_guarded(
         std::fs::rename(&tmp_path, path)?;
         // ...and the rename itself must survive a crash.
         std::fs::File::open(parent)?.sync_all()?;
-        Ok(())
+        verify_written(path, contents)
     })();
     if staged.is_err() {
         std::fs::remove_file(&tmp_path).ok();
     }
     staged
+}
+
+/// Read-back: the file on disk must be exactly what was meant to be written.
+fn verify_written(path: &std::path::Path, intended: &str) -> anyhow::Result<()> {
+    let on_disk = std::fs::read_to_string(path)?;
+    anyhow::ensure!(
+        on_disk == intended,
+        "{} does not contain the intended content after the write",
+        path.display()
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -164,5 +175,14 @@ mod tests {
 
         std::fs::remove_file(&existing).ok();
         std::fs::remove_file(&fresh).ok();
+    }
+
+    #[test]
+    fn verify_written_rejects_content_that_differs_from_the_intended_text() {
+        let path = tmp_path("verify");
+        std::fs::write(&path, "on disk").unwrap();
+        assert!(verify_written(&path, "on disk").is_ok());
+        assert!(verify_written(&path, "something else").is_err());
+        std::fs::remove_file(&path).ok();
     }
 }
