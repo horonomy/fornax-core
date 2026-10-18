@@ -35,7 +35,7 @@ fn load_codex_config(path: &std::path::Path) -> anyhow::Result<toml_edit::Docume
     load_codex_config_with_digest(path).map(|(doc, _)| doc)
 }
 
-/// As [`load_codex_config`], also returning the digest of the very bytes that
+/// As `load_codex_config`, also returning the digest of the very bytes that
 /// were parsed, so `save_codex_config` can refuse if the file changed before
 /// it writes.
 fn load_codex_config_with_digest(
@@ -49,7 +49,8 @@ fn load_codex_config_with_digest(
         Err(e) => return Err(e.into()),
     };
     let digest = digest_of_bytes(&bytes);
-    let contents = String::from_utf8(bytes)?;
+    let contents = String::from_utf8(bytes)
+        .map_err(|e| anyhow::anyhow!("{} is not valid UTF-8: {e}", path.display()))?;
     let doc = contents.parse::<toml_edit::DocumentMut>().map_err(|e| {
         anyhow::anyhow!(
             "{} is not valid TOML — refusing to touch it: {e}",
