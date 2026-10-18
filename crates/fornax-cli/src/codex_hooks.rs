@@ -570,6 +570,26 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn install_keeps_a_symlinked_hooks_json_a_symlink() {
+        let target = tmp_hooks_path("dotfiles-target");
+        let link = tmp_hooks_path("dotfiles-link");
+        std::fs::write(&target, "{}").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        install_at(&link).expect("install");
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::read_to_string(&target)
+            .unwrap()
+            .contains("PreToolUse"));
+        std::fs::remove_file(&link).ok();
+        std::fs::remove_file(&target).ok();
+    }
+
     #[test]
     fn uninstall_restores_canonical_fixture_exactly() {
         let path = tmp_hooks_path("canonical-roundtrip");
