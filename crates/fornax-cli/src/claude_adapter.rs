@@ -9,6 +9,7 @@
 //! silently disagree.
 
 use crate::adapter_registry::AdapterActionResult;
+use crate::guarded_write::{digest_of_bytes, write_guarded, ContentDigest};
 
 /// The `command` value the `fornax-adapter-claude` doc comment documents for
 /// wiring into `~/.claude/settings.json` hooks.
@@ -30,12 +31,25 @@ pub fn default_path() -> std::path::PathBuf {
 }
 
 fn load_settings(path: &std::path::Path) -> anyhow::Result<serde_json::Value> {
-    if !path.exists() {
-        return Ok(serde_json::json!({}));
-    }
-    let contents = std::fs::read_to_string(path)?;
+    load_settings_with_digest(path).map(|(value, _)| value)
+}
+
+/// Parses `path` and returns the digest of the very bytes that were parsed,
+/// so `save_settings` can refuse if the file changed before it writes.
+fn load_settings_with_digest(
+    path: &std::path::Path,
+) -> anyhow::Result<(serde_json::Value, ContentDigest)> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((serde_json::json!({}), ContentDigest::absent()));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let digest = digest_of_bytes(&bytes);
+    let contents = String::from_utf8(bytes)?;
     if contents.trim().is_empty() {
-        return Ok(serde_json::json!({}));
+        return Ok((serde_json::json!({}), digest));
     }
     let value: serde_json::Value = serde_json::from_str(&contents)?;
     anyhow::ensure!(
@@ -43,22 +57,20 @@ fn load_settings(path: &std::path::Path) -> anyhow::Result<serde_json::Value> {
         "{} does not contain a JSON object at its root — refusing to touch it",
         path.display()
     );
-    Ok(value)
+    Ok((value, digest))
 }
 
-/// Atomically overwrites `path` with `settings` (write-to-temp then rename)
-/// so a crash or concurrent read never observes a half-written
-/// `~/.claude/settings.json`.
-fn save_settings(path: &std::path::Path, settings: &serde_json::Value) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+/// Replaces `path` with `settings` through `write_guarded`: refuses if the
+/// file changed since `expected` was taken, never writes through a planted
+/// temp path, keeps the file's permissions, and fsyncs (FORNX-420).
+fn save_settings(
+    path: &std::path::Path,
+    settings: &serde_json::Value,
+    expected: &ContentDigest,
+) -> anyhow::Result<()> {
     let mut json = serde_json::to_string_pretty(settings)?;
     json.push('\n');
-    let tmp_path = path.with_extension("json.tmp");
-    std::fs::write(&tmp_path, json)?;
-    std::fs::rename(&tmp_path, path)?;
-    Ok(())
+    write_guarded(path, &json, expected)
 }
 
 /// True if this hook group already carries a Fornax command entry.
@@ -183,7 +195,18 @@ fn mk(path: &std::path::Path, changed: bool, message: String) -> AdapterActionRe
 }
 
 pub fn install_at(path: &std::path::Path) -> anyhow::Result<AdapterActionResult> {
-    let before = load_settings(path)?;
+    install_at_with(path, || {})
+}
+
+/// `install_at` with a hook that runs after the file is read and the new
+/// document is planned, immediately before the write -- the window in which
+/// another editor can change the file. Tests use it to prove the writer
+/// refuses rather than clobbers.
+fn install_at_with(
+    path: &std::path::Path,
+    before_write: impl FnOnce(),
+) -> anyhow::Result<AdapterActionResult> {
+    let (before, digest) = load_settings_with_digest(path)?;
     let mut settings = before.clone();
     install_claude_hooks(&mut settings)?;
     if settings == before {
@@ -198,7 +221,8 @@ pub fn install_at(path: &std::path::Path) -> anyhow::Result<AdapterActionResult>
             path: path.display().to_string(),
         });
     }
-    save_settings(path, &settings)?;
+    before_write();
+    save_settings(path, &settings, &digest)?;
     Ok(AdapterActionResult {
         adapter: "claude-code".to_string(),
         action: "install".to_string(),
@@ -209,6 +233,13 @@ pub fn install_at(path: &std::path::Path) -> anyhow::Result<AdapterActionResult>
 }
 
 pub fn uninstall_at(path: &std::path::Path) -> anyhow::Result<AdapterActionResult> {
+    uninstall_at_with(path, || {})
+}
+
+fn uninstall_at_with(
+    path: &std::path::Path,
+    before_write: impl FnOnce(),
+) -> anyhow::Result<AdapterActionResult> {
     if !path.exists() {
         // Nothing was ever installed — leave the machine exactly as it was
         // rather than creating a settings.json the user never had.
@@ -223,7 +254,7 @@ pub fn uninstall_at(path: &std::path::Path) -> anyhow::Result<AdapterActionResul
             path: path.display().to_string(),
         });
     }
-    let before = load_settings(path)?;
+    let (before, digest) = load_settings_with_digest(path)?;
     let mut settings = before.clone();
     uninstall_claude_hooks(&mut settings);
     if settings == before {
@@ -235,7 +266,8 @@ pub fn uninstall_at(path: &std::path::Path) -> anyhow::Result<AdapterActionResul
             path: path.display().to_string(),
         });
     }
-    save_settings(path, &settings)?;
+    before_write();
+    save_settings(path, &settings, &digest)?;
     Ok(AdapterActionResult {
         adapter: "claude-code".to_string(),
         action: "uninstall".to_string(),

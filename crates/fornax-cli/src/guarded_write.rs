@@ -12,6 +12,13 @@ use sha2::{Digest, Sha256};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContentDigest(Option<[u8; 32]>);
 
+impl ContentDigest {
+    /// The digest of a file that does not exist.
+    pub fn absent() -> Self {
+        Self(None)
+    }
+}
+
 /// Digest of `path`'s current bytes, or the "absent" digest if it does not
 /// exist. Any other read error is returned, never treated as "absent".
 pub fn digest_of(path: &std::path::Path) -> std::io::Result<ContentDigest> {
