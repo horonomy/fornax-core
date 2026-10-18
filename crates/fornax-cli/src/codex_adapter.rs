@@ -440,6 +440,24 @@ mod tests {
     }
 
     #[test]
+    fn install_refuses_instead_of_clobbering_an_edit_made_after_the_read() {
+        let path = tmp_config_path("install-clobber");
+        std::fs::write(&path, "model = \"a\"\n").unwrap();
+        let edit = "model = \"edited-by-user\"\n";
+
+        let err = install_at_with(&path, &fake_script(), || {
+            std::fs::write(&path, edit).unwrap();
+        })
+        .expect_err("must refuse");
+        assert!(
+            err.to_string().contains("changed since it was read"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edit);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn install_wires_notify_into_fresh_config() {
         let path = tmp_config_path("fresh-install");
         let result = install_at(&path, &fake_script()).expect("install");
