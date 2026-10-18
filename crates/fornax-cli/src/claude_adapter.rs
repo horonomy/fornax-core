@@ -371,4 +371,20 @@ mod tests {
         assert_eq!(mode(&path), 0o600);
         std::fs::remove_file(&path).ok();
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_never_writes_through_a_symlink_planted_at_the_old_temp_name() {
+        let dir =
+            std::env::temp_dir().join(format!("fornax-cli-test-symlink-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, "untouched").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.join("settings.json.tmp")).unwrap();
+        install_at(&path).expect("install");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
+        assert!(load_settings(&path).unwrap()["hooks"]["Stop"].is_array());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
