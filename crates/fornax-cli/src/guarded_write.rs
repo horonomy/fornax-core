@@ -76,7 +76,11 @@ pub fn write_guarded(
             file.set_permissions(std::fs::Permissions::from_mode(target_mode(path)))?;
         }
         file.write_all(contents.as_bytes())?;
+        // Data must be durable before the rename makes it the live file.
+        file.sync_all()?;
         std::fs::rename(&tmp_path, path)?;
+        // ...and the rename itself must survive a crash.
+        std::fs::File::open(parent)?.sync_all()?;
         Ok(())
     })();
     if staged.is_err() {
