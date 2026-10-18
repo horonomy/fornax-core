@@ -536,6 +536,23 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn install_and_uninstall_keep_an_owner_only_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode_of =
+            |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let path = tmp_hooks_path("owner-only");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        install_at(&path).expect("install");
+        assert_eq!(mode_of(&path), 0o600);
+        uninstall_at(&path).expect("uninstall");
+        assert_eq!(mode_of(&path), 0o600);
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn uninstall_restores_canonical_fixture_exactly() {
         let path = tmp_hooks_path("canonical-roundtrip");
