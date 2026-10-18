@@ -1239,6 +1239,21 @@ mod tests {
         );
     }
 
+    /// Evidence with a caller-chosen id (the other fixtures use random ids,
+    /// but a deep union-find chain depends on id ordering).
+    fn evidence_with_id(
+        id: Uuid,
+        trust: TrustClass,
+        source_event_id: Uuid,
+        correlation_group: Option<Uuid>,
+        derived_from: Vec<Uuid>,
+    ) -> Evidence {
+        Evidence {
+            id,
+            ..evidence_with_source(trust, source_event_id, correlation_group, derived_from)
+        }
+    }
+
     // FORNX-432 PR 2: property-based proof that the speed-ups above
     // (`ancestors_of_indexed` reuse, `family_key`/`bases_by_family`
     // replacing the per-family `Vec::contains`/`evidence.iter().find`
