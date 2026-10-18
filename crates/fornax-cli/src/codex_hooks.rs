@@ -521,6 +521,22 @@ mod tests {
     }
 
     #[test]
+    fn uninstall_refuses_instead_of_clobbering_an_edit_made_after_the_read() {
+        let path = tmp_hooks_path("uninstall-clobber");
+        install_at(&path).expect("install");
+        let edit = "{\"model\": \"edited-by-user\"}";
+
+        let err = uninstall_at_with(&path, || std::fs::write(&path, edit).unwrap())
+            .expect_err("must refuse");
+        assert!(
+            err.to_string().contains("changed since it was read"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edit);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn uninstall_restores_canonical_fixture_exactly() {
         let path = tmp_hooks_path("canonical-roundtrip");
         let original = serde_json::to_string_pretty(&canonical_fixture()).unwrap();
