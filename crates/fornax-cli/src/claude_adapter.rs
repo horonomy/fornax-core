@@ -356,4 +356,19 @@ mod tests {
         );
         std::fs::remove_file(&path).ok();
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_and_uninstall_keep_an_owner_only_settings_file_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp_settings_path("mode");
+        std::fs::write(&path, r#"{"env":{"K":"v"}}"#).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        install_at(&path).expect("install");
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        uninstall_at(&path).expect("uninstall");
+        assert_eq!(mode(&path), 0o600);
+        std::fs::remove_file(&path).ok();
+    }
 }
