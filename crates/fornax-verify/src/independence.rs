@@ -1276,7 +1276,13 @@ mod tests {
             } else {
                 (TrustClass::HostObserved, Uuid::from_u128(6_000_000_000 + j))
             };
-            pool.push(evidence_with_id(root_id(j), trust, event, Some(group), vec![]));
+            pool.push(evidence_with_id(
+                root_id(j),
+                trust,
+                event,
+                Some(group),
+                vec![],
+            ));
             let derived = if j == 0 { vec![] } else { vec![root_id(j - 1)] };
             pool.push(evidence_with_id(
                 leaf_id(j),
@@ -1302,7 +1308,9 @@ mod tests {
     #[test]
     fn try_build_survives_a_deep_union_find_chain() {
         let (pool, len) = deep_union_find_chain_pool(200_000);
-        let budget = FamilyBudget { max_work_units: u64::MAX };
+        let budget = FamilyBudget {
+            max_work_units: u64::MAX,
+        };
         let map = SourceFamilyMap::try_build(&pool, &budget).expect("generous budget");
         assert_eq!(map.all_families().len(), 1);
         assert_eq!(map.all_families()[0].evidence_ids.len(), len);
