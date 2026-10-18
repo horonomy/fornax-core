@@ -35,13 +35,14 @@ pub fn digest_of_bytes(bytes: &[u8]) -> ContentDigest {
     ContentDigest(Some(Sha256::digest(bytes).into()))
 }
 
-/// The replacement keeps the existing file's permission bits, and is
+/// The replacement keeps the existing file's rwx permission bits (not
+/// setuid/setgid/sticky, which mean nothing on a config file), and is
 /// owner-only when the file is new -- the file may hold credentials.
 #[cfg(unix)]
 fn target_mode(path: &std::path::Path) -> u32 {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
-        .map(|m| m.permissions().mode() & 0o7777)
+        .map(|m| m.permissions().mode() & 0o777)
         .unwrap_or(0o600)
 }
 
