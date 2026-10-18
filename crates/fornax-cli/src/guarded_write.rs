@@ -65,12 +65,12 @@ pub fn write_guarded(
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", path.display()))?;
-    std::fs::create_dir_all(parent)?;
     anyhow::ensure!(
         digest_of(path)? == *expected,
         "{} changed since it was read -- refusing to overwrite it; re-run to retry",
         path.display()
     );
+    std::fs::create_dir_all(parent)?;
 
     let tmp_path = parent.join(format!(".fornax-tmp-{}", uuid::Uuid::new_v4()));
     let staged = (|| -> anyhow::Result<()> {
