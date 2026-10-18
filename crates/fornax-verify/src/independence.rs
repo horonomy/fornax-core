@@ -1290,6 +1290,15 @@ mod tests {
         (pool, len)
     }
 
+    /// FORNX-440: past ~90k records the recursive `find` overflowed the stack.
+    #[test]
+    fn build_survives_a_deep_union_find_chain() {
+        let (pool, len) = deep_union_find_chain_pool(200_000);
+        let map = SourceFamilyMap::build(&pool);
+        assert_eq!(map.all_families().len(), 1);
+        assert_eq!(map.all_families()[0].evidence_ids.len(), len);
+    }
+
     // FORNX-432 PR 2: property-based proof that the speed-ups above
     // (`ancestors_of_indexed` reuse, `family_key`/`bases_by_family`
     // replacing the per-family `Vec::contains`/`evidence.iter().find`
