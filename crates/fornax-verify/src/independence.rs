@@ -1254,6 +1254,42 @@ mod tests {
         }
     }
 
+    /// Pool whose union-find parent chain is `n` deep before any `find`
+    /// walks it: `R_j` (ids descending in `j`) is merged under each smaller
+    /// `R_{j+1}` by Rule 2, then one agent-channel pair (Rule 3) calls `find`
+    /// on the deepest node. Ids are plain `u128`s so ordering is explicit.
+    fn deep_union_find_chain_pool(n: u128) -> (Vec<Evidence>, usize) {
+        let root_id = |j: u128| Uuid::from_u128(1 + (n - j));
+        let leaf_id = |j: u128| Uuid::from_u128(10_000_000 + j);
+        let agent_event = Uuid::from_u128(5_000_000_000);
+        let mut pool = vec![evidence_with_id(
+            Uuid::from_u128(0),
+            TrustClass::AgentAdjacent,
+            agent_event,
+            None,
+            vec![],
+        )];
+        for j in 0..n {
+            let group = Uuid::from_u128((1 << 100) + j);
+            let (trust, event) = if j == 0 {
+                (TrustClass::AgentAdjacent, agent_event)
+            } else {
+                (TrustClass::HostObserved, Uuid::from_u128(6_000_000_000 + j))
+            };
+            pool.push(evidence_with_id(root_id(j), trust, event, Some(group), vec![]));
+            let derived = if j == 0 { vec![] } else { vec![root_id(j - 1)] };
+            pool.push(evidence_with_id(
+                leaf_id(j),
+                TrustClass::HostObserved,
+                Uuid::from_u128(7_000_000_000 + j),
+                Some(group),
+                derived,
+            ));
+        }
+        let len = pool.len();
+        (pool, len)
+    }
+
     // FORNX-432 PR 2: property-based proof that the speed-ups above
     // (`ancestors_of_indexed` reuse, `family_key`/`bases_by_family`
     // replacing the per-family `Vec::contains`/`evidence.iter().find`
