@@ -54,7 +54,9 @@ fn target_mode(path: &std::path::Path) -> u32 {
 ///
 /// Known limit: if `path` is itself a symlink, the rename replaces the link
 /// with a regular file (the previous writer behaved the same way); it does not
-/// write through to the link target.
+/// write through to the link target. The replacement is also a new inode, so
+/// file ownership, ACLs and extended attributes of the old file are not
+/// carried over (only the rwx bits are).
 ///
 /// The replacement is staged in a uniquely named sibling opened with
 /// `create_new`, so a planted file or symlink at any predictable name is
