@@ -344,13 +344,18 @@ impl SourceFamilyMap {
         }
 
         let mut parent: BTreeMap<Uuid, Uuid> = sorted.iter().map(|e| (e.id, e.id)).collect();
+        // Iterative (FORNX-440): see `build`.
         fn find(parent: &mut BTreeMap<Uuid, Uuid>, x: Uuid) -> Uuid {
-            let p = parent[&x];
-            if p == x {
-                return x;
+            let mut root = x;
+            while parent[&root] != root {
+                root = parent[&root];
             }
-            let root = find(parent, p);
-            parent.insert(x, root);
+            let mut cur = x;
+            while cur != root {
+                let next = parent[&cur];
+                parent.insert(cur, root);
+                cur = next;
+            }
             root
         }
         fn union(parent: &mut BTreeMap<Uuid, Uuid>, a: Uuid, b: Uuid) {
