@@ -126,13 +126,19 @@ impl SourceFamilyMap {
         // (fusion.rs's own R5 convention: minimum link/evidence id), so
         // union-find's compression-dependent root never leaks.
         let mut parent: BTreeMap<Uuid, Uuid> = sorted.iter().map(|e| (e.id, e.id)).collect();
+        // Iterative (FORNX-440): recursion depth tracked the parent-chain
+        // depth, so a deep union-find chain could overflow the stack.
         fn find(parent: &mut BTreeMap<Uuid, Uuid>, x: Uuid) -> Uuid {
-            let p = parent[&x];
-            if p == x {
-                return x;
+            let mut root = x;
+            while parent[&root] != root {
+                root = parent[&root];
             }
-            let root = find(parent, p);
-            parent.insert(x, root);
+            let mut cur = x;
+            while cur != root {
+                let next = parent[&cur];
+                parent.insert(cur, root);
+                cur = next;
+            }
             root
         }
         fn union(parent: &mut BTreeMap<Uuid, Uuid>, a: Uuid, b: Uuid) {
@@ -338,13 +344,18 @@ impl SourceFamilyMap {
         }
 
         let mut parent: BTreeMap<Uuid, Uuid> = sorted.iter().map(|e| (e.id, e.id)).collect();
+        // Iterative (FORNX-440): see `build`.
         fn find(parent: &mut BTreeMap<Uuid, Uuid>, x: Uuid) -> Uuid {
-            let p = parent[&x];
-            if p == x {
-                return x;
+            let mut root = x;
+            while parent[&root] != root {
+                root = parent[&root];
             }
-            let root = find(parent, p);
-            parent.insert(x, root);
+            let mut cur = x;
+            while cur != root {
+                let next = parent[&cur];
+                parent.insert(cur, root);
+                cur = next;
+            }
             root
         }
         fn union(parent: &mut BTreeMap<Uuid, Uuid>, a: Uuid, b: Uuid) {
@@ -1226,6 +1237,83 @@ mod tests {
              budget was ever checked, instead of aborting mid-traversal",
             err.work_units_at_abort
         );
+    }
+
+    /// Evidence with a caller-chosen id (the other fixtures use random ids,
+    /// but a deep union-find chain depends on id ordering).
+    fn evidence_with_id(
+        id: Uuid,
+        trust: TrustClass,
+        source_event_id: Uuid,
+        correlation_group: Option<Uuid>,
+        derived_from: Vec<Uuid>,
+    ) -> Evidence {
+        Evidence {
+            id,
+            ..evidence_with_source(trust, source_event_id, correlation_group, derived_from)
+        }
+    }
+
+    /// Pool whose union-find parent chain is `n` deep before any `find`
+    /// walks it: `R_j` (ids descending in `j`) is merged under each smaller
+    /// `R_{j+1}` by Rule 2, then one agent-channel pair (Rule 3) calls `find`
+    /// on the deepest node. Ids are plain `u128`s so ordering is explicit.
+    fn deep_union_find_chain_pool(n: u128) -> (Vec<Evidence>, usize) {
+        let root_id = |j: u128| Uuid::from_u128(1 + (n - j));
+        let leaf_id = |j: u128| Uuid::from_u128(10_000_000 + j);
+        let agent_event = Uuid::from_u128(5_000_000_000);
+        let mut pool = vec![evidence_with_id(
+            Uuid::from_u128(0),
+            TrustClass::AgentAdjacent,
+            agent_event,
+            None,
+            vec![],
+        )];
+        for j in 0..n {
+            let group = Uuid::from_u128((1 << 100) + j);
+            let (trust, event) = if j == 0 {
+                (TrustClass::AgentAdjacent, agent_event)
+            } else {
+                (TrustClass::HostObserved, Uuid::from_u128(6_000_000_000 + j))
+            };
+            pool.push(evidence_with_id(
+                root_id(j),
+                trust,
+                event,
+                Some(group),
+                vec![],
+            ));
+            let derived = if j == 0 { vec![] } else { vec![root_id(j - 1)] };
+            pool.push(evidence_with_id(
+                leaf_id(j),
+                TrustClass::HostObserved,
+                Uuid::from_u128(7_000_000_000 + j),
+                Some(group),
+                derived,
+            ));
+        }
+        let len = pool.len();
+        (pool, len)
+    }
+
+    /// FORNX-440: past ~90k records the recursive `find` overflowed the stack.
+    #[test]
+    fn build_survives_a_deep_union_find_chain() {
+        let (pool, len) = deep_union_find_chain_pool(200_000);
+        let map = SourceFamilyMap::build(&pool);
+        assert_eq!(map.all_families().len(), 1);
+        assert_eq!(map.all_families()[0].evidence_ids.len(), len);
+    }
+
+    #[test]
+    fn try_build_survives_a_deep_union_find_chain() {
+        let (pool, len) = deep_union_find_chain_pool(200_000);
+        let budget = FamilyBudget {
+            max_work_units: u64::MAX,
+        };
+        let map = SourceFamilyMap::try_build(&pool, &budget).expect("generous budget");
+        assert_eq!(map.all_families().len(), 1);
+        assert_eq!(map.all_families()[0].evidence_ids.len(), len);
     }
 
     // FORNX-432 PR 2: property-based proof that the speed-ups above
