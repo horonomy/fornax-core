@@ -22,6 +22,16 @@ pub fn digest_of(path: &std::path::Path) -> std::io::Result<ContentDigest> {
     }
 }
 
+/// The replacement keeps the existing file's permission bits, and is
+/// owner-only when the file is new -- the file may hold credentials.
+#[cfg(unix)]
+fn target_mode(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o7777)
+        .unwrap_or(0o600)
+}
+
 /// Replaces `path` with `contents` only if `path` still has the content
 /// `expected` was taken from. A mismatch means someone else changed the file
 /// since it was read; this refuses with no mutation at all instead of
@@ -50,10 +60,21 @@ pub fn write_guarded(
 
     let tmp_path = parent.join(format!(".fornax-tmp-{}", uuid::Uuid::new_v4()));
     let staged = (|| -> anyhow::Result<()> {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp_path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(target_mode(path));
+        }
+        let mut file = options.open(&tmp_path)?;
+        // Re-assert on the open handle: `mode` above is masked by the umask,
+        // and this must hold before any content is written.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(target_mode(path)))?;
+        }
         file.write_all(contents.as_bytes())?;
         std::fs::rename(&tmp_path, path)?;
         Ok(())
@@ -118,5 +139,26 @@ mod tests {
             .collect();
         assert_eq!(names, vec![std::ffi::OsString::from("settings.json")]);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_preserves_an_owner_only_mode_and_creates_new_files_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode_of =
+            |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        let existing = tmp_path("mode-existing");
+        std::fs::write(&existing, "x").unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o600)).unwrap();
+        write_guarded(&existing, "y", &digest_of(&existing).unwrap()).unwrap();
+        assert_eq!(mode_of(&existing), 0o600);
+
+        let fresh = tmp_path("mode-new");
+        write_guarded(&fresh, "y", &digest_of(&fresh).unwrap()).unwrap();
+        assert_eq!(mode_of(&fresh), 0o600);
+
+        std::fs::remove_file(&existing).ok();
+        std::fs::remove_file(&fresh).ok();
     }
 }
