@@ -17,6 +17,7 @@ mod corpus_cmd;
 mod evidence_plan_cmd;
 mod experiment_ux;
 mod feedback_cmd;
+mod guarded_write;
 mod receipt_cmd;
 mod statusline;
 mod timeline;
