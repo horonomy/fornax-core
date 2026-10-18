@@ -4,6 +4,7 @@
 //! so `install_at` and `fornax adapter plan codex` share one computation.
 
 use crate::adapter_registry::AdapterActionResult;
+use crate::guarded_write::{digest_of_bytes, ContentDigest};
 
 /// Filename marker identifying a Fornax-owned `notify` entry in
 /// `~/.codex/config.toml`. Matched by suffix (rather than requiring a
@@ -30,16 +31,31 @@ pub fn default_notify_script() -> std::path::PathBuf {
 /// that fails to parse as TOML is always a hard error — there is no
 /// sensible "treat it as empty" fallback for a file this consequential.
 fn load_codex_config(path: &std::path::Path) -> anyhow::Result<toml_edit::DocumentMut> {
-    if !path.exists() {
-        return Ok(toml_edit::DocumentMut::new());
-    }
-    let contents = std::fs::read_to_string(path)?;
-    contents.parse::<toml_edit::DocumentMut>().map_err(|e| {
+    load_codex_config_with_digest(path).map(|(doc, _)| doc)
+}
+
+/// As [`load_codex_config`], also returning the digest of the very bytes that
+/// were parsed, so `save_codex_config` can refuse if the file changed before
+/// it writes.
+fn load_codex_config_with_digest(
+    path: &std::path::Path,
+) -> anyhow::Result<(toml_edit::DocumentMut, ContentDigest)> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((toml_edit::DocumentMut::new(), ContentDigest::absent()));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let digest = digest_of_bytes(&bytes);
+    let contents = String::from_utf8(bytes)?;
+    let doc = contents.parse::<toml_edit::DocumentMut>().map_err(|e| {
         anyhow::anyhow!(
             "{} is not valid TOML — refusing to touch it: {e}",
             path.display()
         )
-    })
+    })?;
+    Ok((doc, digest))
 }
 
 /// Atomically overwrites `path` with `doc` (write-to-temp then rename).
