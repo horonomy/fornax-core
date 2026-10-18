@@ -126,13 +126,19 @@ impl SourceFamilyMap {
         // (fusion.rs's own R5 convention: minimum link/evidence id), so
         // union-find's compression-dependent root never leaks.
         let mut parent: BTreeMap<Uuid, Uuid> = sorted.iter().map(|e| (e.id, e.id)).collect();
+        // Iterative (FORNX-440): recursion depth tracked the parent-chain
+        // depth, so a deep union-find chain could overflow the stack.
         fn find(parent: &mut BTreeMap<Uuid, Uuid>, x: Uuid) -> Uuid {
-            let p = parent[&x];
-            if p == x {
-                return x;
+            let mut root = x;
+            while parent[&root] != root {
+                root = parent[&root];
             }
-            let root = find(parent, p);
-            parent.insert(x, root);
+            let mut cur = x;
+            while cur != root {
+                let next = parent[&cur];
+                parent.insert(cur, root);
+                cur = next;
+            }
             root
         }
         fn union(parent: &mut BTreeMap<Uuid, Uuid>, a: Uuid, b: Uuid) {
