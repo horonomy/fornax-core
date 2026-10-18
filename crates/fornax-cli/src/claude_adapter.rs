@@ -337,4 +337,23 @@ mod tests {
         assert!(!result.changed);
         assert!(!path.exists());
     }
+
+    #[test]
+    fn install_refuses_instead_of_clobbering_an_edit_made_after_the_read() {
+        let path = tmp_settings_path("clobber");
+        std::fs::write(&path, r#"{"model":"opus"}"#).unwrap();
+        let err = install_at_with(&path, || {
+            std::fs::write(&path, r#"{"model":"opus","env":{"USER_EDIT":"1"}}"#).unwrap();
+        })
+        .expect_err("must refuse");
+        assert!(
+            err.to_string().contains("changed since it was read"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"model":"opus","env":{"USER_EDIT":"1"}}"#
+        );
+        std::fs::remove_file(&path).ok();
+    }
 }
