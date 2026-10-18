@@ -22,7 +22,7 @@
 //! instead of removing the array entry.
 
 use crate::adapter_registry::AdapterActionResult;
-use crate::guarded_write::{digest_of_bytes, ContentDigest};
+use crate::guarded_write::{digest_of_bytes, write_guarded, ContentDigest};
 
 /// Basename `codex_owns_handler` matches against — the binary
 /// `fornax-hook-codex-event` (not the long-lived rollout tailer
@@ -128,30 +128,24 @@ fn load_hooks_with_digest(
     Ok((value, digest))
 }
 
-/// Atomically overwrites `path` with `hooks` (write-to-temp then rename),
-/// resolving a symlink first so a dotfiles-managed `hooks.json` symlink
-/// survives the write instead of being replaced by a plain file. Preserves
-/// the original file's Unix permissions; a freshly created file gets 0600
-/// (same precedent as `codex_adapter::save_codex_config`).
-fn save_hooks(path: &std::path::Path, hooks: &serde_json::Value) -> anyhow::Result<()> {
+/// Replaces `path` with `hooks` through [`write_guarded`]: refuses, changing
+/// nothing, if the file differs from what `expected` was taken from; stages
+/// in a uniquely named exclusive sibling; keeps the existing rwx bits (new
+/// files are 0600); and syncs the file and its directory.
+///
+/// A symlinked `hooks.json` (e.g. dotfiles-managed) is resolved first so the
+/// link survives and its target is what gets replaced. The limits documented
+/// on `write_guarded` otherwise apply unchanged: the final-check-to-rename
+/// window, and no ACL/xattr/ownership carry-over.
+fn save_hooks(
+    path: &std::path::Path,
+    hooks: &serde_json::Value,
+    expected: &ContentDigest,
+) -> anyhow::Result<()> {
     let real_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    if let Some(parent) = real_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let mut json = serde_json::to_string_pretty(hooks)?;
     json.push('\n');
-    let tmp_path = real_path.with_extension("json.fornax.tmp");
-    std::fs::write(&tmp_path, json)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&real_path)
-            .map(|m| m.permissions().mode())
-            .unwrap_or(0o600);
-        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(mode))?;
-    }
-    std::fs::rename(&tmp_path, &real_path)?;
-    Ok(())
+    write_guarded(&real_path, &json, expected)
 }
 
 /// Idempotently ensures each event in [`EVENTS`] has one group running
@@ -313,7 +307,16 @@ fn mk(action: &str, path: &std::path::Path, changed: bool, message: String) -> A
 /// writes nothing, if an existing `"hooks"` or per-event value is present
 /// but not the shape Codex expects.
 pub fn install_at(path: &std::path::Path) -> anyhow::Result<AdapterActionResult> {
-    let before = load_hooks(path)?;
+    install_at_with(path, || {})
+}
+
+/// `before_write` runs between planning and writing; tests use it to change
+/// the file inside the window the digest guard must catch.
+fn install_at_with(
+    path: &std::path::Path,
+    before_write: impl FnOnce(),
+) -> anyhow::Result<AdapterActionResult> {
+    let (before, digest) = load_hooks_with_digest(path)?;
     let mut hooks = before.clone();
     install_hooks(&mut hooks)?;
     if hooks == before {
@@ -324,7 +327,8 @@ pub fn install_at(path: &std::path::Path) -> anyhow::Result<AdapterActionResult>
             format!("Fornax Codex hooks already installed in {}", path.display()),
         ));
     }
-    save_hooks(path, &hooks)?;
+    before_write();
+    save_hooks(path, &hooks, &digest)?;
     let on_path = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).any(|dir| dir.join(HOOK_BIN).is_file()))
         .unwrap_or(false);
@@ -345,6 +349,13 @@ pub fn install_at(path: &std::path::Path) -> anyhow::Result<AdapterActionResult>
 /// tombstone/hand-merge rules. Never deletes `path` itself, and never
 /// touches a `path` that was never installed into.
 pub fn uninstall_at(path: &std::path::Path) -> anyhow::Result<AdapterActionResult> {
+    uninstall_at_with(path, || {})
+}
+
+fn uninstall_at_with(
+    path: &std::path::Path,
+    before_write: impl FnOnce(),
+) -> anyhow::Result<AdapterActionResult> {
     if !path.exists() {
         return Ok(mk(
             "uninstall",
@@ -356,7 +367,7 @@ pub fn uninstall_at(path: &std::path::Path) -> anyhow::Result<AdapterActionResul
             ),
         ));
     }
-    let before = load_hooks(path)?;
+    let (before, digest) = load_hooks_with_digest(path)?;
     let mut hooks = before.clone();
     let report = uninstall_hooks(&mut hooks);
     if hooks == before {
@@ -367,7 +378,8 @@ pub fn uninstall_at(path: &std::path::Path) -> anyhow::Result<AdapterActionResul
             format!("No Fornax Codex hooks found in {}", path.display()),
         ));
     }
-    save_hooks(path, &hooks)?;
+    before_write();
+    save_hooks(path, &hooks, &digest)?;
     let mut message = format!("Removed Fornax Codex hooks from {}", path.display());
     if !report.shifted.is_empty() {
         message.push_str(&format!(
@@ -510,11 +522,11 @@ mod tests {
         let path = tmp_hooks_path("tombstone");
         install_at(&path).expect("install");
         {
-            let mut hooks = load_hooks(&path).expect("load");
+            let (mut hooks, digest) = load_hooks_with_digest(&path).expect("load");
             hooks["hooks"]["PreToolUse"].as_array_mut().unwrap().push(
                 serde_json::json!({ "hooks": [{ "type": "command", "command": "foreign-tool" }] }),
             );
-            save_hooks(&path, &hooks).unwrap();
+            save_hooks(&path, &hooks, &digest).unwrap();
         }
         uninstall_at(&path).expect("uninstall");
         let after = load_hooks(&path).expect("load");
