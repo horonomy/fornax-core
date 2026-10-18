@@ -22,6 +22,48 @@ pub fn digest_of(path: &std::path::Path) -> std::io::Result<ContentDigest> {
     }
 }
 
+/// Replaces `path` with `contents` only if `path` still has the content
+/// `expected` was taken from. A mismatch means someone else changed the file
+/// since it was read; this refuses with no mutation at all instead of
+/// overwriting their edit. (A change landing between this check and the
+/// rename is not detectable without a lock; the window is a few syscalls.)
+///
+/// The replacement is staged in a uniquely named sibling opened with
+/// `create_new`, so a planted file or symlink at any predictable name is
+/// never a write target.
+pub fn write_guarded(
+    path: &std::path::Path,
+    contents: &str,
+    expected: &ContentDigest,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", path.display()))?;
+    std::fs::create_dir_all(parent)?;
+    anyhow::ensure!(
+        digest_of(path)? == *expected,
+        "{} changed since it was read -- refusing to overwrite it; re-run to retry",
+        path.display()
+    );
+
+    let tmp_path = parent.join(format!(".fornax-tmp-{}", uuid::Uuid::new_v4()));
+    let staged = (|| -> anyhow::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
+        file.write_all(contents.as_bytes())?;
+        std::fs::rename(&tmp_path, path)?;
+        Ok(())
+    })();
+    if staged.is_err() {
+        std::fs::remove_file(&tmp_path).ok();
+    }
+    staged
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -40,6 +82,24 @@ mod tests {
         assert_eq!(first, digest_of(&path).expect("again"));
         std::fs::write(&path, "b").unwrap();
         assert_ne!(first, digest_of(&path).expect("changed"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn write_refuses_and_leaves_the_file_untouched_when_it_changed_since_read() {
+        let path = tmp_path("stale");
+        std::fs::write(&path, "original").unwrap();
+        let read_earlier = digest_of(&path).unwrap();
+        std::fs::write(&path, "edited by the user meanwhile").unwrap();
+        let err = write_guarded(&path, "ours", &read_earlier).expect_err("must refuse");
+        assert!(
+            err.to_string().contains("changed since it was read"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "edited by the user meanwhile"
+        );
         std::fs::remove_file(&path).ok();
     }
 }
