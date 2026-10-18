@@ -93,14 +93,33 @@ pub fn write_guarded(
         // Data must be durable before the rename makes it the live file.
         file.sync_all()?;
         std::fs::rename(&tmp_path, path)?;
-        // ...and the rename itself must survive a crash.
-        std::fs::File::open(parent)?.sync_all()?;
-        verify_written(path, contents)
+        Ok(())
     })();
     if staged.is_err() {
         std::fs::remove_file(&tmp_path).ok();
+        return staged;
     }
-    staged
+    confirm_replaced(path, parent, contents)
+}
+
+/// Steps after the rename. The live file is already replaced here, so a
+/// failure must say so rather than read like a failed install.
+fn confirm_replaced(
+    path: &std::path::Path,
+    parent: &std::path::Path,
+    intended: &str,
+) -> anyhow::Result<()> {
+    (|| -> anyhow::Result<()> {
+        // The rename itself must survive a crash.
+        std::fs::File::open(parent)?.sync_all()?;
+        verify_written(path, intended)
+    })()
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "{} was replaced, but the result could not be confirmed: {e}",
+            path.display()
+        )
+    })
 }
 
 /// Read-back: the file on disk must be exactly what was meant to be written.
@@ -197,6 +216,16 @@ mod tests {
         std::fs::write(&path, "on disk").unwrap();
         assert!(verify_written(&path, "on disk").is_ok());
         assert!(verify_written(&path, "something else").is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_failure_after_the_rename_says_the_file_was_already_replaced() {
+        let path = tmp_path("post-rename");
+        std::fs::write(&path, "on disk").unwrap();
+        let dir = path.parent().unwrap();
+        let err = confirm_replaced(&path, dir, "different").expect_err("verify must fail");
+        assert!(err.to_string().contains("was replaced, but"), "{err}");
         std::fs::remove_file(&path).ok();
     }
 }
