@@ -22,6 +22,7 @@
 //! instead of removing the array entry.
 
 use crate::adapter_registry::AdapterActionResult;
+use crate::guarded_write::{digest_of_bytes, ContentDigest};
 
 /// Basename `codex_owns_handler` matches against — the binary
 /// `fornax-hook-codex-event` (not the long-lived rollout tailer
@@ -97,12 +98,26 @@ fn group_is_all_fornax(group: &serde_json::Value) -> bool {
 }
 
 fn load_hooks(path: &std::path::Path) -> anyhow::Result<serde_json::Value> {
-    if !path.exists() {
-        return Ok(serde_json::json!({}));
-    }
-    let contents = std::fs::read_to_string(path)?;
+    load_hooks_with_digest(path).map(|(value, _)| value)
+}
+
+/// As `load_hooks`, also returning the digest of the very bytes that were
+/// parsed, so `save_hooks` can refuse if the file changed before it writes.
+fn load_hooks_with_digest(
+    path: &std::path::Path,
+) -> anyhow::Result<(serde_json::Value, ContentDigest)> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((serde_json::json!({}), ContentDigest::absent()));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let digest = digest_of_bytes(&bytes);
+    let contents = String::from_utf8(bytes)
+        .map_err(|e| anyhow::anyhow!("{} is not valid UTF-8: {e}", path.display()))?;
     if contents.trim().is_empty() {
-        return Ok(serde_json::json!({}));
+        return Ok((serde_json::json!({}), digest));
     }
     let value: serde_json::Value = serde_json::from_str(&contents)?;
     anyhow::ensure!(
@@ -110,7 +125,7 @@ fn load_hooks(path: &std::path::Path) -> anyhow::Result<serde_json::Value> {
         "{} does not contain a JSON object at its root — refusing to touch it",
         path.display()
     );
-    Ok(value)
+    Ok((value, digest))
 }
 
 /// Atomically overwrites `path` with `hooks` (write-to-temp then rename),
