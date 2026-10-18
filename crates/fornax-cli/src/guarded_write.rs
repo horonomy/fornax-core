@@ -16,10 +16,16 @@ pub struct ContentDigest(Option<[u8; 32]>);
 /// exist. Any other read error is returned, never treated as "absent".
 pub fn digest_of(path: &std::path::Path) -> std::io::Result<ContentDigest> {
     match std::fs::read(path) {
-        Ok(bytes) => Ok(ContentDigest(Some(Sha256::digest(&bytes).into()))),
+        Ok(bytes) => Ok(digest_of_bytes(&bytes)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ContentDigest(None)),
         Err(e) => Err(e),
     }
+}
+
+/// Digest of bytes the caller already read, so the digest and whatever the
+/// caller parsed from them come from the same read.
+pub fn digest_of_bytes(bytes: &[u8]) -> ContentDigest {
+    ContentDigest(Some(Sha256::digest(bytes).into()))
 }
 
 /// The replacement keeps the existing file's permission bits, and is
