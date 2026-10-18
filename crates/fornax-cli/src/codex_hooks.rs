@@ -553,6 +553,23 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn install_never_writes_through_a_symlink_planted_at_the_old_temp_name() {
+        let path = tmp_hooks_path("symlink-tmp");
+        let victim = tmp_hooks_path("symlink-victim");
+        std::fs::write(&victim, "untouched").unwrap();
+        let old_tmp = path.with_extension("json.fornax.tmp");
+        std::os::unix::fs::symlink(&victim, &old_tmp).unwrap();
+
+        install_at(&path).expect("install");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("hooks"));
+        std::fs::remove_file(&old_tmp).ok();
+        std::fs::remove_file(&victim).ok();
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn uninstall_restores_canonical_fixture_exactly() {
         let path = tmp_hooks_path("canonical-roundtrip");
