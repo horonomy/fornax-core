@@ -4,6 +4,7 @@
 //! so `install_at` and `fornax adapter plan codex` share one computation.
 
 use crate::adapter_registry::AdapterActionResult;
+use crate::guarded_write::{digest_of_bytes, write_guarded, ContentDigest};
 
 /// Filename marker identifying a Fornax-owned `notify` entry in
 /// `~/.codex/config.toml`. Matched by suffix (rather than requiring a
@@ -29,43 +30,50 @@ pub fn default_notify_script() -> std::path::PathBuf {
 /// Unlike the Claude adapter's JSON equivalent, a `~/.codex/config.toml`
 /// that fails to parse as TOML is always a hard error — there is no
 /// sensible "treat it as empty" fallback for a file this consequential.
+#[cfg(test)]
 fn load_codex_config(path: &std::path::Path) -> anyhow::Result<toml_edit::DocumentMut> {
-    if !path.exists() {
-        return Ok(toml_edit::DocumentMut::new());
-    }
-    let contents = std::fs::read_to_string(path)?;
-    contents.parse::<toml_edit::DocumentMut>().map_err(|e| {
+    load_codex_config_with_digest(path).map(|(doc, _)| doc)
+}
+
+/// As `load_codex_config`, also returning the digest of the very bytes that
+/// were parsed, so `save_codex_config` can refuse if the file changed before
+/// it writes.
+fn load_codex_config_with_digest(
+    path: &std::path::Path,
+) -> anyhow::Result<(toml_edit::DocumentMut, ContentDigest)> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((toml_edit::DocumentMut::new(), ContentDigest::absent()));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let digest = digest_of_bytes(&bytes);
+    let contents = String::from_utf8(bytes)
+        .map_err(|e| anyhow::anyhow!("{} is not valid UTF-8: {e}", path.display()))?;
+    let doc = contents.parse::<toml_edit::DocumentMut>().map_err(|e| {
         anyhow::anyhow!(
             "{} is not valid TOML — refusing to touch it: {e}",
             path.display()
         )
-    })
+    })?;
+    Ok((doc, digest))
 }
 
-/// Atomically overwrites `path` with `doc` (write-to-temp then rename).
-/// Additionally preserves the original file's Unix permissions on the
-/// replacement — a real `~/.codex/config.toml` on this machine is mode
-/// 0600, and this repo's own capability-matrix research (FORNX-33) has
-/// found plaintext secrets in other Codex on-disk files, so silently
-/// widening this file to the process umask's default mode on rename would
-/// be a real regression, not a cosmetic one. A freshly created file gets
-/// 0600 rather than an umask-dependent default.
-fn save_codex_config(path: &std::path::Path, doc: &toml_edit::DocumentMut) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp_path = path.with_extension("toml.tmp");
-    std::fs::write(&tmp_path, doc.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(path)
-            .map(|m| m.permissions().mode())
-            .unwrap_or(0o600);
-        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(mode))?;
-    }
-    std::fs::rename(&tmp_path, path)?;
-    Ok(())
+/// Replaces `path` with `doc` through [`write_guarded`]: refuses, changing
+/// nothing, if the file differs from what `expected` was taken from; stages
+/// in a uniquely named exclusive sibling; keeps the existing file's rwx
+/// bits (new files are 0600 -- this repo's capability-matrix research,
+/// FORNX-33, found plaintext secrets in other Codex on-disk files); and
+/// syncs the file and its directory. Its documented limits (the
+/// final-check-to-rename window, a symlinked target being replaced, no
+/// ACL/xattr/ownership carry-over) apply here unchanged.
+fn save_codex_config(
+    path: &std::path::Path,
+    doc: &toml_edit::DocumentMut,
+    expected: &ContentDigest,
+) -> anyhow::Result<()> {
+    write_guarded(path, &doc.to_string(), expected)
 }
 
 /// True if `notify`'s first element is a Fornax-owned notify script.
@@ -88,7 +96,7 @@ fn notify_is_fornax(item: &toml_edit::Item) -> bool {
 
 enum InstallPlan {
     AlreadyInstalled,
-    WouldInstall(toml_edit::DocumentMut),
+    WouldInstall(Box<toml_edit::DocumentMut>, ContentDigest),
 }
 
 /// Codex's `notify` holds exactly one command — its first element is the
@@ -106,7 +114,7 @@ fn compute_install_plan(
     config_path: &std::path::Path,
     script_path: &std::path::Path,
 ) -> anyhow::Result<InstallPlan> {
-    let mut doc = load_codex_config(config_path)?;
+    let (mut doc, digest) = load_codex_config_with_digest(config_path)?;
     let script_str = script_path.to_string_lossy().into_owned();
 
     if let Some(existing) = doc.get("notify") {
@@ -134,7 +142,7 @@ fn compute_install_plan(
     let mut arr = toml_edit::Array::new();
     arr.push(script_str);
     doc["notify"] = toml_edit::Item::Value(toml_edit::Value::Array(arr));
-    Ok(InstallPlan::WouldInstall(doc))
+    Ok(InstallPlan::WouldInstall(Box::new(doc), digest))
 }
 
 pub fn plan_install_at(
@@ -149,7 +157,7 @@ pub fn plan_install_at(
                 config_path.display()
             ),
         ),
-        InstallPlan::WouldInstall(_) => (
+        InstallPlan::WouldInstall(..) => (
             true,
             format!(
                 "Would install Fornax Codex notify wiring in {}",
@@ -174,6 +182,16 @@ pub fn install_at(
     config_path: &std::path::Path,
     script_path: &std::path::Path,
 ) -> anyhow::Result<AdapterActionResult> {
+    install_at_with(config_path, script_path, || {})
+}
+
+/// `before_write` runs between planning and writing; tests use it to change
+/// the file inside the window the digest guard must catch.
+fn install_at_with(
+    config_path: &std::path::Path,
+    script_path: &std::path::Path,
+    before_write: impl FnOnce(),
+) -> anyhow::Result<AdapterActionResult> {
     match compute_install_plan(config_path, script_path)? {
         InstallPlan::AlreadyInstalled => Ok(AdapterActionResult {
             adapter: "codex".to_string(),
@@ -185,8 +203,9 @@ pub fn install_at(
             ),
             path: config_path.display().to_string(),
         }),
-        InstallPlan::WouldInstall(doc) => {
-            save_codex_config(config_path, &doc)?;
+        InstallPlan::WouldInstall(doc, digest) => {
+            before_write();
+            save_codex_config(config_path, &doc, &digest)?;
             Ok(AdapterActionResult {
                 adapter: "codex".to_string(),
                 action: "install".to_string(),
@@ -205,6 +224,13 @@ pub fn install_at(
 /// `install` added, leaving every other key/table and comment exactly as
 /// it was.
 pub fn uninstall_at(config_path: &std::path::Path) -> anyhow::Result<AdapterActionResult> {
+    uninstall_at_with(config_path, || {})
+}
+
+fn uninstall_at_with(
+    config_path: &std::path::Path,
+    before_write: impl FnOnce(),
+) -> anyhow::Result<AdapterActionResult> {
     if !config_path.exists() {
         // Nothing was ever installed — leave the machine exactly as it
         // was rather than creating a config.toml the user never had.
@@ -219,7 +245,7 @@ pub fn uninstall_at(config_path: &std::path::Path) -> anyhow::Result<AdapterActi
             path: config_path.display().to_string(),
         });
     }
-    let mut doc = load_codex_config(config_path)?;
+    let (mut doc, digest) = load_codex_config_with_digest(config_path)?;
     let Some(existing) = doc.get("notify") else {
         return Ok(AdapterActionResult {
             adapter: "codex".to_string(),
@@ -245,7 +271,8 @@ pub fn uninstall_at(config_path: &std::path::Path) -> anyhow::Result<AdapterActi
         });
     }
     doc.remove("notify");
-    save_codex_config(config_path, &doc)?;
+    before_write();
+    save_codex_config(config_path, &doc, &digest)?;
     Ok(AdapterActionResult {
         adapter: "codex".to_string(),
         action: "uninstall".to_string(),
@@ -411,6 +438,77 @@ mod tests {
 
         std::fs::remove_file(&config_path).ok();
         std::fs::remove_file(&hooks_path).ok();
+    }
+
+    #[test]
+    fn install_refuses_instead_of_clobbering_an_edit_made_after_the_read() {
+        let path = tmp_config_path("install-clobber");
+        std::fs::write(&path, "model = \"a\"\n").unwrap();
+        let edit = "model = \"edited-by-user\"\n";
+
+        let err = install_at_with(&path, &fake_script(), || {
+            std::fs::write(&path, edit).unwrap();
+        })
+        .expect_err("must refuse");
+        assert!(
+            err.to_string().contains("changed since it was read"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edit);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn uninstall_refuses_instead_of_clobbering_an_edit_made_after_the_read() {
+        let path = tmp_config_path("uninstall-clobber");
+        install_at(&path, &fake_script()).expect("install");
+        let edit = "model = \"edited-by-user\"\n";
+
+        let err = uninstall_at_with(&path, || {
+            std::fs::write(&path, edit).unwrap();
+        })
+        .expect_err("must refuse");
+        assert!(
+            err.to_string().contains("changed since it was read"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edit);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_and_uninstall_keep_an_owner_only_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode_of =
+            |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let path = tmp_config_path("owner-only");
+        std::fs::write(&path, "model = \"a\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        install_at(&path, &fake_script()).expect("install");
+        assert_eq!(mode_of(&path), 0o600);
+        uninstall_at(&path).expect("uninstall");
+        assert_eq!(mode_of(&path), 0o600);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_never_writes_through_a_symlink_planted_at_the_old_temp_name() {
+        let path = tmp_config_path("symlink-tmp");
+        let victim = tmp_config_path("symlink-victim");
+        std::fs::write(&victim, "untouched").unwrap();
+        std::os::unix::fs::symlink(&victim, path.with_extension("toml.tmp")).unwrap();
+
+        install_at(&path, &fake_script()).expect("install");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("fornax-codex-notify.sh"));
+        std::fs::remove_file(path.with_extension("toml.tmp")).ok();
+        std::fs::remove_file(&victim).ok();
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
