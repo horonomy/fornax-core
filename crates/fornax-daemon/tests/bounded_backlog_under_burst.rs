@@ -94,7 +94,10 @@ async fn start_daemon() -> DaemonHandle {
 
     wait_for(Duration::from_secs(10), || {
         let alive = handle.is_alive();
-        let ready = alive && handle.home.join("fornax.sock").exists();
+        // The socket file appears at bind(), before listen(): only a successful
+        // connect proves the daemon is accepting.
+        let ready = alive
+            && std::os::unix::net::UnixStream::connect(handle.home.join("fornax.sock")).is_ok();
         if !alive {
             panic!(
                 "daemon exited during startup; log:\n{}",
