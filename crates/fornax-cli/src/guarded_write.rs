@@ -92,11 +92,11 @@ pub fn write_guarded(
 /// reachable from the binary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
-    AfterCreate,
-    AfterWrite,
-    AfterSync,
-    AfterRename,
-    AfterDirSync,
+    Created,
+    Written,
+    Synced,
+    Renamed,
+    DirSynced,
 }
 
 fn write_guarded_inner(
@@ -133,7 +133,7 @@ fn write_guarded_inner(
             options.mode(target_mode(path));
         }
         let mut file = options.open(&tmp_path)?;
-        checkpoint(Step::AfterCreate)?;
+        checkpoint(Step::Created)?;
         // Re-assert on the open handle: `mode` above is masked by the umask,
         // and this must hold before any content is written.
         #[cfg(unix)]
@@ -142,10 +142,10 @@ fn write_guarded_inner(
             file.set_permissions(std::fs::Permissions::from_mode(target_mode(path)))?;
         }
         file.write_all(contents.as_bytes())?;
-        checkpoint(Step::AfterWrite)?;
+        checkpoint(Step::Written)?;
         // Data must be durable before the rename makes it the live file.
         file.sync_all()?;
-        checkpoint(Step::AfterSync)?;
+        checkpoint(Step::Synced)?;
         // Staging (and the fsync above) can take a while, so look again
         // right before the rename to narrow the window for a concurrent edit.
         anyhow::ensure!(
@@ -181,10 +181,10 @@ fn confirm_replaced(
     checkpoint: &mut dyn FnMut(Step) -> std::io::Result<()>,
 ) -> anyhow::Result<()> {
     let synced = (|| -> anyhow::Result<()> {
-        checkpoint(Step::AfterRename)?;
+        checkpoint(Step::Renamed)?;
         // The rename itself must survive a crash.
         std::fs::File::open(parent)?.sync_all()?;
-        checkpoint(Step::AfterDirSync)?;
+        checkpoint(Step::DirSynced)?;
         Ok(())
     })();
     // Read back even when the directory sync failed, so the message can say
@@ -301,7 +301,7 @@ mod tests {
         std::fs::write(&path, "original").unwrap();
         let read = digest_of(&path).unwrap();
         let err = write_guarded_inner(&path, "ours", &read, &mut |step| {
-            if step == Step::AfterSync {
+            if step == Step::Synced {
                 std::fs::write(&path, "edited while we staged").unwrap();
             }
             Ok(())
@@ -377,13 +377,7 @@ mod tests {
     #[test]
     fn crash_at_each_step_leaves_old_or_new_never_partial() {
         let exe = std::env::current_exe().unwrap();
-        for step in [
-            "AfterCreate",
-            "AfterWrite",
-            "AfterSync",
-            "AfterRename",
-            "AfterDirSync",
-        ] {
+        for step in ["Created", "Written", "Synced", "Renamed", "DirSynced"] {
             let dir = tmp_path(&format!("crash-{step}"));
             std::fs::create_dir_all(&dir).unwrap();
             let path = dir.join("settings.json");
@@ -428,7 +422,7 @@ mod tests {
         std::fs::write(&path, "original").unwrap();
         let read = digest_of(&path).unwrap();
         let err = write_guarded_inner(&path, "ours", &read, &mut |step| {
-            if step == Step::AfterDirSync {
+            if step == Step::DirSynced {
                 return Err(std::io::Error::other("injected directory sync failure"));
             }
             Ok(())
