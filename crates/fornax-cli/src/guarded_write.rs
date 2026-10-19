@@ -349,16 +349,31 @@ mod tests {
         // root ignores directory permissions, so the failure can't be provoked.
         let probe = dir.join("probe");
         let is_enforced = std::fs::write(&probe, "").is_err();
+        let outcome = write_guarded(&path, "ours", &read);
+        // Restore before asserting so a failed assertion cannot strand an
+        // undeletable directory in the temp dir.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         if is_enforced {
-            let err = write_guarded(&path, "ours", &read).expect_err("must fail");
-            let msg = err.to_string();
+            let msg = outcome.expect_err("must fail").to_string();
             assert!(msg.contains("settings.json was not changed"), "{msg}");
             assert!(msg.contains("could not stage the replacement"), "{msg}");
             assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
         } else {
             std::fs::remove_file(&probe).ok();
         }
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_unreadable_target_is_reported_as_unreadable_and_unchanged() {
+        // A directory at the target path makes the comparison read fail
+        // with an error that is not NotFound.
+        let dir = tmp_path("target-is-a-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = write_guarded(&dir, "ours", &ContentDigest::absent()).expect_err("must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("was not changed: could not read it"), "{msg}");
+        assert!(!msg.contains("could not stage"), "{msg}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
