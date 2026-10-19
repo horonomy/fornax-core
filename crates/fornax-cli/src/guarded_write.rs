@@ -251,6 +251,36 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_edit_during_staging_is_refused_and_leaves_no_temp_file() {
+        let dir = tmp_path("staging-edit");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "original").unwrap();
+        let read = digest_of(&path).unwrap();
+        let err = write_guarded_inner(&path, "ours", &read, &mut |step| {
+            if step == Step::AfterSync {
+                std::fs::write(&path, "edited while we staged").unwrap();
+            }
+            Ok(())
+        })
+        .expect_err("must refuse");
+        assert!(
+            err.to_string().contains("changed since it was read"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "edited while we staged"
+        );
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("settings.json")]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn verify_written_rejects_content_that_differs_from_the_intended_text() {
         let path = tmp_path("verify");
         std::fs::write(&path, "on disk").unwrap();
