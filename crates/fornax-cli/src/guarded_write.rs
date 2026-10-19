@@ -8,8 +8,9 @@
 //! for durability (fsync file, rename, fsync directory).
 //!
 //! Durability is code-reviewed ordering, not tested against power loss: the
-//! crash test kills the process, which keeps the page cache, so it proves
-//! atomicity (old or new bytes, never partial) only. A crash can leave one
+//! crash test simulates the process dying at each step, and a dead process
+//! keeps the page cache, so it proves atomicity (old or new bytes, never
+//! partial) only. A crash can leave one
 //! `.fornax-tmp-*` sibling holding the full new content with the file's mode;
 //! nothing removes it later.
 
@@ -349,55 +350,41 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Child half of the crash test: aborts the process at the step named by
-    /// `FORNAX_GW_CRASH_AT`. Ignored so it only runs when the parent test
-    /// re-executes this binary with `--ignored`.
-    #[test]
-    #[ignore = "re-executed by crash_at_each_step_leaves_old_or_new_never_partial"]
-    fn crash_child_aborts_at_the_requested_step() {
-        let (Ok(at), Ok(dir)) = (
-            std::env::var("FORNAX_GW_CRASH_AT"),
-            std::env::var("FORNAX_GW_CRASH_DIR"),
-        ) else {
-            return;
-        };
-        let path = std::path::Path::new(&dir).join("settings.json");
-        let read = digest_of(&path).unwrap();
-        let _ = write_guarded_inner(&path, "NEW-CONTENT", &read, &mut |step| {
-            if format!("{step:?}") == at {
-                std::process::abort();
-            }
-            Ok(())
-        });
-    }
-
-    /// A killed process keeps the page cache, so this proves atomicity only
-    /// (the target is the old or the new bytes, never empty or partial). It
-    /// does not prove fsync durability across power loss.
+    /// A panic in the checkpoint unwinds out of the writer without running
+    /// its error cleanup, which is what a process dying at that step leaves
+    /// behind. (A real kill keeps the page cache too, so this proves
+    /// atomicity only -- not fsync durability across power loss. It also
+    /// avoids spawning a subprocess, which production-tree code must not.)
     #[test]
     fn crash_at_each_step_leaves_old_or_new_never_partial() {
-        let exe = std::env::current_exe().unwrap();
-        for step in ["Created", "Written", "Synced", "Renamed", "DirSynced"] {
-            let dir = tmp_path(&format!("crash-{step}"));
+        for step in [
+            Step::Created,
+            Step::Written,
+            Step::Synced,
+            Step::Renamed,
+            Step::DirSynced,
+        ] {
+            let dir = tmp_path(&format!("crash-{step:?}"));
             std::fs::create_dir_all(&dir).unwrap();
             let path = dir.join("settings.json");
             std::fs::write(&path, "OLD-CONTENT").unwrap();
-            let status = std::process::Command::new(&exe)
-                .args([
-                    "--exact",
-                    "guarded_write::tests::crash_child_aborts_at_the_requested_step",
-                    "--ignored",
-                    "--nocapture",
-                ])
-                .env("FORNAX_GW_CRASH_AT", step)
-                .env("FORNAX_GW_CRASH_DIR", &dir)
-                .status()
-                .unwrap();
-            assert!(!status.success(), "{step}: child should have aborted");
+            let read = digest_of(&path).unwrap();
+            let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = write_guarded_inner(&path, "NEW-CONTENT", &read, &mut |at| {
+                    if at == step {
+                        panic!("simulated crash at {at:?}");
+                    }
+                    Ok(())
+                });
+            }));
+            assert!(
+                crashed.is_err(),
+                "{step:?}: the checkpoint should have fired"
+            );
             let on_disk = std::fs::read_to_string(&path).unwrap();
             assert!(
                 on_disk == "OLD-CONTENT" || on_disk == "NEW-CONTENT",
-                "{step}: target is neither old nor new: {on_disk:?}"
+                "{step:?}: target is neither old nor new: {on_disk:?}"
             );
             let staged = std::fs::read_dir(&dir)
                 .unwrap()
@@ -409,7 +396,7 @@ mod tests {
                         .starts_with(".fornax-tmp-")
                 })
                 .count();
-            assert!(staged <= 1, "{step}: {staged} leftover staging files");
+            assert!(staged <= 1, "{step:?}: {staged} leftover staging files");
             std::fs::remove_dir_all(&dir).ok();
         }
     }
