@@ -403,6 +403,30 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_directory_sync_reports_that_the_content_reads_back_correctly() {
+        let dir = tmp_path("dir-sync-fails");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "original").unwrap();
+        let read = digest_of(&path).unwrap();
+        let err = write_guarded_inner(&path, "ours", &read, &mut |step| {
+            if step == Step::AfterDirSync {
+                return Err(std::io::Error::other("injected directory sync failure"));
+            }
+            Ok(())
+        })
+        .expect_err("must report the failed sync");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("was replaced and reads back correctly"),
+            "{msg}"
+        );
+        assert!(msg.contains("injected directory sync failure"), "{msg}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "ours");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn verify_written_rejects_content_that_differs_from_the_intended_text() {
         let path = tmp_path("verify");
         std::fs::write(&path, "on disk").unwrap();
