@@ -35,6 +35,9 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+#[path = "../../fornax-daemon/tests/common/mod.rs"]
+mod common;
+use common::free_tcp_port;
 
 /// Resolves the real, guaranteed-fresh `fornax-daemon` binary for this test
 /// run. `env!("CARGO_BIN_EXE_*")` only resolves binaries that live in *this*
@@ -207,14 +210,6 @@ fn tempdir(label: &str) -> PathBuf {
     std::fs::remove_dir_all(&dir).ok();
     std::fs::create_dir_all(&dir).expect("mkdir tempdir");
     dir
-}
-
-fn free_tcp_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("local_addr")
-        .port()
 }
 
 struct KillOnDrop(std::process::Child);
