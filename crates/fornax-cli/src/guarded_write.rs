@@ -162,19 +162,29 @@ fn confirm_replaced(
     intended: &str,
     checkpoint: &mut dyn FnMut(Step) -> std::io::Result<()>,
 ) -> anyhow::Result<()> {
-    (|| -> anyhow::Result<()> {
+    let synced = (|| -> anyhow::Result<()> {
         checkpoint(Step::AfterRename)?;
         // The rename itself must survive a crash.
         std::fs::File::open(parent)?.sync_all()?;
         checkpoint(Step::AfterDirSync)?;
-        verify_written(path, intended)
-    })()
-    .map_err(|e| {
-        anyhow::anyhow!(
-            "{} was replaced, but the result could not be confirmed: {e}",
-            path.display()
-        )
-    })
+        Ok(())
+    })();
+    // Read back even when the directory sync failed, so the message can say
+    // whether the content on disk is right.
+    let read_back = verify_written(path, intended);
+    let shown = path.display();
+    match (synced, read_back) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(sync), Ok(())) => Err(anyhow::anyhow!(
+            "{shown} was replaced and reads back correctly, but making the rename durable failed: {sync}"
+        )),
+        (Ok(()), Err(read)) => Err(anyhow::anyhow!(
+            "{shown} was replaced, but the result could not be confirmed: {read}"
+        )),
+        (Err(sync), Err(read)) => Err(anyhow::anyhow!(
+            "{shown} was replaced, but the result could not be confirmed: {read}; making the rename durable also failed: {sync}"
+        )),
+    }
 }
 
 /// Read-back: the file on disk must be exactly what was meant to be written.
@@ -406,7 +416,8 @@ mod tests {
         let path = tmp_path("post-rename");
         std::fs::write(&path, "on disk").unwrap();
         let dir = path.parent().unwrap();
-        let err = confirm_replaced(&path, dir, "different", &mut |_| Ok(())).expect_err("verify must fail");
+        let err = confirm_replaced(&path, dir, "different", &mut |_| Ok(()))
+            .expect_err("verify must fail");
         assert!(err.to_string().contains("was replaced, but"), "{err}");
         std::fs::remove_file(&path).ok();
     }
