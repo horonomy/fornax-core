@@ -2,8 +2,17 @@
 //!
 //! The target (e.g. `~/.claude/settings.json`) also holds state Fornax does
 //! not own, so a writer must refuse rather than clobber: it checks the file
-//! is unchanged since it was read, never writes through a planted path,
-//! keeps the file's permissions, and makes the replacement durable.
+//! is unchanged since it was read, stages in a uniquely named exclusive
+//! sibling (so a planted file or symlink at a predictable temp name is never
+//! a write target), keeps the rwx permission bits, and orders the syscalls
+//! for durability (fsync file, rename, fsync directory).
+//!
+//! Durability is code-reviewed ordering, not tested against power loss: the
+//! crash test simulates the process dying at each step, and a dead process
+//! keeps the page cache, so it proves atomicity (old or new bytes, never
+//! partial) only. A crash can leave one
+//! `.fornax-tmp-*` sibling, empty or partly or fully written; its mode is the
+//! target's or narrower, never wider. Nothing removes it later.
 
 use sha2::{Digest, Sha256};
 
@@ -29,6 +38,18 @@ pub fn digest_of(path: &std::path::Path) -> std::io::Result<ContentDigest> {
     }
 }
 
+/// `digest_of` for the writer's own checks: a read failure there is not a
+/// staging failure, and the file has not been touched. The error is not an
+/// `io::Error`, so it is not re-labelled as a staging error later.
+fn current_digest(path: &std::path::Path) -> anyhow::Result<ContentDigest> {
+    digest_of(path).map_err(|e| {
+        anyhow::anyhow!(
+            "{} was not changed: could not read it to compare with what was read earlier: {e}",
+            path.display()
+        )
+    })
+}
+
 /// Digest of bytes the caller already read, so the digest and whatever the
 /// caller parsed from them come from the same read.
 pub fn digest_of_bytes(bytes: &[u8]) -> ContentDigest {
@@ -49,14 +70,24 @@ fn target_mode(path: &std::path::Path) -> u32 {
 /// Replaces `path` with `contents` only if `path` still has the content
 /// `expected` was taken from. A mismatch means someone else changed the file
 /// since it was read; this refuses with no mutation at all instead of
-/// overwriting their edit. (A change landing between this check and the
-/// rename is not detectable without a lock; the window is a few syscalls.)
+/// overwriting their edit. The check runs before anything is created and
+/// again after the staged file is synced, just before the rename. A change
+/// landing between that last check and the rename is not detectable without
+/// a lock, and Claude Code takes none on settings.json.
 ///
 /// Known limit: if `path` is itself a symlink, the rename replaces the link
 /// with a regular file (the previous writer behaved the same way); it does not
 /// write through to the link target. The replacement is also a new inode, so
 /// file ownership, ACLs and extended attributes of the old file are not
-/// carried over (only the rwx bits are).
+/// carried over (only the rwx bits are). One consequence: under `sudo` with
+/// the user's HOME, the replacement is owned by root with mode 0600 and the
+/// user's own CLI can no longer read it.
+///
+/// Platform: Unix only. Staging is a sibling of `path`, so the rename never
+/// crosses a filesystem; read-only directories, file-level bind mounts and
+/// filesystems without a working fsync fail before the rename with "was not
+/// changed", while a directory fsync that some network or FUSE filesystems
+/// reject fails after it and is reported as "was replaced".
 ///
 /// The replacement is staged in a uniquely named sibling opened with
 /// `create_new`, so a planted file or symlink at any predictable name is
@@ -66,17 +97,44 @@ pub fn write_guarded(
     contents: &str,
     expected: &ContentDigest,
 ) -> anyhow::Result<()> {
+    write_guarded_inner(path, contents, expected, &mut |_| Ok(()))
+}
+
+/// Points in `write_guarded_inner` where a test can inject a fault or a
+/// concurrent edit. The shipped writer passes a no-op, so nothing here is
+/// reachable from the binary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    Created,
+    Written,
+    Synced,
+    Renamed,
+    DirSynced,
+}
+
+fn write_guarded_inner(
+    path: &std::path::Path,
+    contents: &str,
+    expected: &ContentDigest,
+    checkpoint: &mut dyn FnMut(Step) -> std::io::Result<()>,
+) -> anyhow::Result<()> {
     use std::io::Write;
 
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", path.display()))?;
     anyhow::ensure!(
-        digest_of(path)? == *expected,
+        current_digest(path)? == *expected,
         "{} changed since it was read -- refusing to overwrite it; re-run to retry",
         path.display()
     );
-    std::fs::create_dir_all(parent)?;
+    std::fs::create_dir_all(parent).map_err(|e| {
+        anyhow::anyhow!(
+            "{} was not changed: could not create {}: {e}",
+            path.display(),
+            parent.display()
+        )
+    })?;
 
     let tmp_path = parent.join(format!(".fornax-tmp-{}", uuid::Uuid::new_v4()));
     let staged = (|| -> anyhow::Result<()> {
@@ -88,6 +146,7 @@ pub fn write_guarded(
             options.mode(target_mode(path));
         }
         let mut file = options.open(&tmp_path)?;
+        checkpoint(Step::Created)?;
         // Re-assert on the open handle: `mode` above is masked by the umask,
         // and this must hold before any content is written.
         #[cfg(unix)]
@@ -96,16 +155,34 @@ pub fn write_guarded(
             file.set_permissions(std::fs::Permissions::from_mode(target_mode(path)))?;
         }
         file.write_all(contents.as_bytes())?;
+        checkpoint(Step::Written)?;
         // Data must be durable before the rename makes it the live file.
         file.sync_all()?;
+        checkpoint(Step::Synced)?;
+        // Staging (and the fsync above) can take a while, so look again
+        // right before the rename to narrow the window for a concurrent edit.
+        anyhow::ensure!(
+            current_digest(path)? == *expected,
+            "{} changed since it was read -- refusing to overwrite it; re-run to retry",
+            path.display()
+        );
         std::fs::rename(&tmp_path, path)?;
         Ok(())
     })();
-    if staged.is_err() {
+    if let Err(e) = staged {
         std::fs::remove_file(&tmp_path).ok();
-        return staged;
+        // An io error here is a staging or rename failure, so the target was
+        // not touched; a bare "Permission denied" would not say either.
+        return Err(match e.downcast::<std::io::Error>() {
+            Ok(io) => anyhow::anyhow!(
+                "{} was not changed: could not stage the replacement in {}: {io}",
+                path.display(),
+                parent.display()
+            ),
+            Err(refusal) => refusal,
+        });
     }
-    confirm_replaced(path, parent, contents)
+    confirm_replaced(path, parent, contents, checkpoint)
 }
 
 /// Steps after the rename. The live file is already replaced here, so a
@@ -114,18 +191,31 @@ fn confirm_replaced(
     path: &std::path::Path,
     parent: &std::path::Path,
     intended: &str,
+    checkpoint: &mut dyn FnMut(Step) -> std::io::Result<()>,
 ) -> anyhow::Result<()> {
-    (|| -> anyhow::Result<()> {
+    let synced = (|| -> anyhow::Result<()> {
+        checkpoint(Step::Renamed)?;
         // The rename itself must survive a crash.
         std::fs::File::open(parent)?.sync_all()?;
-        verify_written(path, intended)
-    })()
-    .map_err(|e| {
-        anyhow::anyhow!(
-            "{} was replaced, but the result could not be confirmed: {e}",
-            path.display()
-        )
-    })
+        checkpoint(Step::DirSynced)?;
+        Ok(())
+    })();
+    // Read back even when the directory sync failed, so the message can say
+    // whether the content on disk is right.
+    let read_back = verify_written(path, intended);
+    let shown = path.display();
+    match (synced, read_back) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(sync), Ok(())) => Err(anyhow::anyhow!(
+            "{shown} was replaced and reads back correctly, but making the rename durable failed: {sync}"
+        )),
+        (Ok(()), Err(read)) => Err(anyhow::anyhow!(
+            "{shown} was replaced, but the result could not be confirmed: {read}"
+        )),
+        (Err(sync), Err(read)) => Err(anyhow::anyhow!(
+            "{shown} was replaced, but the result could not be confirmed: {read}; making the rename durable also failed: {sync}"
+        )),
+    }
 }
 
 /// Read-back: the file on disk must be exactly what was meant to be written.
@@ -217,6 +307,152 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_edit_during_staging_is_refused_and_leaves_no_temp_file() {
+        let dir = tmp_path("staging-edit");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "original").unwrap();
+        let read = digest_of(&path).unwrap();
+        let err = write_guarded_inner(&path, "ours", &read, &mut |step| {
+            if step == Step::Synced {
+                std::fs::write(&path, "edited while we staged").unwrap();
+            }
+            Ok(())
+        })
+        .expect_err("must refuse");
+        assert!(
+            err.to_string().contains("changed since it was read"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "edited while we staged"
+        );
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("settings.json")]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_parent_error_names_the_file_and_says_it_was_not_changed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp_path("read-only-parent");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "original").unwrap();
+        let read = digest_of(&path).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // root ignores directory permissions, so the failure can't be provoked.
+        let probe = dir.join("probe");
+        let is_enforced = std::fs::write(&probe, "").is_err();
+        let outcome = write_guarded(&path, "ours", &read);
+        // Restore before asserting so a failed assertion cannot strand an
+        // undeletable directory in the temp dir.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if is_enforced {
+            let msg = outcome.expect_err("must fail").to_string();
+            assert!(msg.contains("settings.json was not changed"), "{msg}");
+            assert!(msg.contains("could not stage the replacement"), "{msg}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+        } else {
+            std::fs::remove_file(&probe).ok();
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_unreadable_target_is_reported_as_unreadable_and_unchanged() {
+        // A directory at the target path makes the comparison read fail
+        // with an error that is not NotFound.
+        let dir = tmp_path("target-is-a-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = write_guarded(&dir, "ours", &ContentDigest::absent()).expect_err("must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("was not changed: could not read it"), "{msg}");
+        assert!(!msg.contains("could not stage"), "{msg}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A panic in the checkpoint unwinds out of the writer without running
+    /// its error cleanup, which is what a process dying at that step leaves
+    /// behind. (A real kill keeps the page cache too, so this proves
+    /// atomicity only -- not fsync durability across power loss. It also
+    /// avoids spawning a subprocess, which production-tree code must not.)
+    #[test]
+    fn crash_at_each_step_leaves_old_or_new_never_partial() {
+        for step in [
+            Step::Created,
+            Step::Written,
+            Step::Synced,
+            Step::Renamed,
+            Step::DirSynced,
+        ] {
+            let dir = tmp_path(&format!("crash-{step:?}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("settings.json");
+            std::fs::write(&path, "OLD-CONTENT").unwrap();
+            let read = digest_of(&path).unwrap();
+            let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = write_guarded_inner(&path, "NEW-CONTENT", &read, &mut |at| {
+                    if at == step {
+                        panic!("simulated crash at {at:?}");
+                    }
+                    Ok(())
+                });
+            }));
+            assert!(
+                crashed.is_err(),
+                "{step:?}: the checkpoint should have fired"
+            );
+            let on_disk = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                on_disk == "OLD-CONTENT" || on_disk == "NEW-CONTENT",
+                "{step:?}: target is neither old nor new: {on_disk:?}"
+            );
+            let staged = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".fornax-tmp-")
+                })
+                .count();
+            assert!(staged <= 1, "{step:?}: {staged} leftover staging files");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    #[test]
+    fn a_failed_directory_sync_reports_that_the_content_reads_back_correctly() {
+        let dir = tmp_path("dir-sync-fails");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "original").unwrap();
+        let read = digest_of(&path).unwrap();
+        let err = write_guarded_inner(&path, "ours", &read, &mut |step| {
+            if step == Step::DirSynced {
+                return Err(std::io::Error::other("injected directory sync failure"));
+            }
+            Ok(())
+        })
+        .expect_err("must report the failed sync");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("was replaced and reads back correctly"),
+            "{msg}"
+        );
+        assert!(msg.contains("injected directory sync failure"), "{msg}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "ours");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn verify_written_rejects_content_that_differs_from_the_intended_text() {
         let path = tmp_path("verify");
         std::fs::write(&path, "on disk").unwrap();
@@ -230,7 +466,8 @@ mod tests {
         let path = tmp_path("post-rename");
         std::fs::write(&path, "on disk").unwrap();
         let dir = path.parent().unwrap();
-        let err = confirm_replaced(&path, dir, "different").expect_err("verify must fail");
+        let err = confirm_replaced(&path, dir, "different", &mut |_| Ok(()))
+            .expect_err("verify must fail");
         assert!(err.to_string().contains("was replaced, but"), "{err}");
         std::fs::remove_file(&path).ok();
     }
