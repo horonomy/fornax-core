@@ -295,6 +295,32 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn read_only_parent_error_names_the_file_and_says_it_was_not_changed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp_path("read-only-parent");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "original").unwrap();
+        let read = digest_of(&path).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // root ignores directory permissions, so the failure can't be provoked.
+        let probe = dir.join("probe");
+        let is_enforced = std::fs::write(&probe, "").is_err();
+        if is_enforced {
+            let err = write_guarded(&path, "ours", &read).expect_err("must fail");
+            let msg = err.to_string();
+            assert!(msg.contains("settings.json was not changed"), "{msg}");
+            assert!(msg.contains("could not stage the replacement"), "{msg}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+        } else {
+            std::fs::remove_file(&probe).ok();
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn verify_written_rejects_content_that_differs_from_the_intended_text() {
         let path = tmp_path("verify");
