@@ -38,6 +38,18 @@ pub fn digest_of(path: &std::path::Path) -> std::io::Result<ContentDigest> {
     }
 }
 
+/// `digest_of` for the writer's own checks: a read failure there is not a
+/// staging failure, and the file has not been touched. The error is not an
+/// `io::Error`, so it is not re-labelled as a staging error later.
+fn current_digest(path: &std::path::Path) -> anyhow::Result<ContentDigest> {
+    digest_of(path).map_err(|e| {
+        anyhow::anyhow!(
+            "{} was not changed: could not read it to compare with what was read earlier: {e}",
+            path.display()
+        )
+    })
+}
+
 /// Digest of bytes the caller already read, so the digest and whatever the
 /// caller parsed from them come from the same read.
 pub fn digest_of_bytes(bytes: &[u8]) -> ContentDigest {
@@ -112,7 +124,7 @@ fn write_guarded_inner(
         .parent()
         .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", path.display()))?;
     anyhow::ensure!(
-        digest_of(path)? == *expected,
+        current_digest(path)? == *expected,
         "{} changed since it was read -- refusing to overwrite it; re-run to retry",
         path.display()
     );
@@ -150,7 +162,7 @@ fn write_guarded_inner(
         // Staging (and the fsync above) can take a while, so look again
         // right before the rename to narrow the window for a concurrent edit.
         anyhow::ensure!(
-            digest_of(path)? == *expected,
+            current_digest(path)? == *expected,
             "{} changed since it was read -- refusing to overwrite it; re-run to retry",
             path.display()
         );
