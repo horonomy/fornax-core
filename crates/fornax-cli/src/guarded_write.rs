@@ -97,7 +97,13 @@ fn write_guarded_inner(
         "{} changed since it was read -- refusing to overwrite it; re-run to retry",
         path.display()
     );
-    std::fs::create_dir_all(parent)?;
+    std::fs::create_dir_all(parent).map_err(|e| {
+        anyhow::anyhow!(
+            "{} was not changed: could not create {}: {e}",
+            path.display(),
+            parent.display()
+        )
+    })?;
 
     let tmp_path = parent.join(format!(".fornax-tmp-{}", uuid::Uuid::new_v4()));
     let staged = (|| -> anyhow::Result<()> {
@@ -132,9 +138,18 @@ fn write_guarded_inner(
         std::fs::rename(&tmp_path, path)?;
         Ok(())
     })();
-    if staged.is_err() {
+    if let Err(e) = staged {
         std::fs::remove_file(&tmp_path).ok();
-        return staged;
+        // An io error here is a staging or rename failure, so the target was
+        // not touched; a bare "Permission denied" would not say either.
+        return Err(match e.downcast::<std::io::Error>() {
+            Ok(io) => anyhow::anyhow!(
+                "{} was not changed: could not stage the replacement in {}: {io}",
+                path.display(),
+                parent.display()
+            ),
+            Err(refusal) => refusal,
+        });
     }
     confirm_replaced(path, parent, contents, checkpoint)
 }
