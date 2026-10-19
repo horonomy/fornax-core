@@ -321,6 +321,77 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Child half of the crash test: aborts the process at the step named by
+    /// `FORNAX_GW_CRASH_AT`. Ignored so it only runs when the parent test
+    /// re-executes this binary with `--ignored`.
+    #[test]
+    #[ignore = "re-executed by crash_at_each_step_leaves_old_or_new_never_partial"]
+    fn crash_child_aborts_at_the_requested_step() {
+        let (Ok(at), Ok(dir)) = (
+            std::env::var("FORNAX_GW_CRASH_AT"),
+            std::env::var("FORNAX_GW_CRASH_DIR"),
+        ) else {
+            return;
+        };
+        let path = std::path::Path::new(&dir).join("settings.json");
+        let read = digest_of(&path).unwrap();
+        let _ = write_guarded_inner(&path, "NEW-CONTENT", &read, &mut |step| {
+            if format!("{step:?}") == at {
+                std::process::abort();
+            }
+            Ok(())
+        });
+    }
+
+    /// A killed process keeps the page cache, so this proves atomicity only
+    /// (the target is the old or the new bytes, never empty or partial). It
+    /// does not prove fsync durability across power loss.
+    #[test]
+    fn crash_at_each_step_leaves_old_or_new_never_partial() {
+        let exe = std::env::current_exe().unwrap();
+        for step in [
+            "AfterCreate",
+            "AfterWrite",
+            "AfterSync",
+            "AfterRename",
+            "AfterDirSync",
+        ] {
+            let dir = tmp_path(&format!("crash-{step}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("settings.json");
+            std::fs::write(&path, "OLD-CONTENT").unwrap();
+            let status = std::process::Command::new(&exe)
+                .args([
+                    "--exact",
+                    "guarded_write::tests::crash_child_aborts_at_the_requested_step",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("FORNAX_GW_CRASH_AT", step)
+                .env("FORNAX_GW_CRASH_DIR", &dir)
+                .status()
+                .unwrap();
+            assert!(!status.success(), "{step}: child should have aborted");
+            let on_disk = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                on_disk == "OLD-CONTENT" || on_disk == "NEW-CONTENT",
+                "{step}: target is neither old nor new: {on_disk:?}"
+            );
+            let staged = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".fornax-tmp-")
+                })
+                .count();
+            assert!(staged <= 1, "{step}: {staged} leftover staging files");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
     #[test]
     fn verify_written_rejects_content_that_differs_from_the_intended_text() {
         let path = tmp_path("verify");
