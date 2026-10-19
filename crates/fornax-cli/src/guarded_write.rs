@@ -122,6 +122,13 @@ fn write_guarded_inner(
         // Data must be durable before the rename makes it the live file.
         file.sync_all()?;
         checkpoint(Step::AfterSync)?;
+        // Staging (and the fsync above) can take a while, so look again
+        // right before the rename to narrow the window for a concurrent edit.
+        anyhow::ensure!(
+            digest_of(path)? == *expected,
+            "{} changed since it was read -- refusing to overwrite it; re-run to retry",
+            path.display()
+        );
         std::fs::rename(&tmp_path, path)?;
         Ok(())
     })();
