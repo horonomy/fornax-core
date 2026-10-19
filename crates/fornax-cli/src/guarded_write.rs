@@ -2,8 +2,16 @@
 //!
 //! The target (e.g. `~/.claude/settings.json`) also holds state Fornax does
 //! not own, so a writer must refuse rather than clobber: it checks the file
-//! is unchanged since it was read, never writes through a planted path,
-//! keeps the file's permissions, and makes the replacement durable.
+//! is unchanged since it was read, stages in a uniquely named exclusive
+//! sibling (so a planted file or symlink at a predictable temp name is never
+//! a write target), keeps the rwx permission bits, and orders the syscalls
+//! for durability (fsync file, rename, fsync directory).
+//!
+//! Durability is code-reviewed ordering, not tested against power loss: the
+//! crash test kills the process, which keeps the page cache, so it proves
+//! atomicity (old or new bytes, never partial) only. A crash can leave one
+//! `.fornax-tmp-*` sibling holding the full new content with the file's mode;
+//! nothing removes it later.
 
 use sha2::{Digest, Sha256};
 
@@ -49,14 +57,24 @@ fn target_mode(path: &std::path::Path) -> u32 {
 /// Replaces `path` with `contents` only if `path` still has the content
 /// `expected` was taken from. A mismatch means someone else changed the file
 /// since it was read; this refuses with no mutation at all instead of
-/// overwriting their edit. (A change landing between this check and the
-/// rename is not detectable without a lock; the window is a few syscalls.)
+/// overwriting their edit. The check runs before anything is created and
+/// again after the staged file is synced, just before the rename. A change
+/// landing between that last check and the rename is not detectable without
+/// a lock, and Claude Code takes none on settings.json.
 ///
 /// Known limit: if `path` is itself a symlink, the rename replaces the link
 /// with a regular file (the previous writer behaved the same way); it does not
 /// write through to the link target. The replacement is also a new inode, so
 /// file ownership, ACLs and extended attributes of the old file are not
-/// carried over (only the rwx bits are).
+/// carried over (only the rwx bits are). One consequence: under `sudo` with
+/// the user's HOME, the replacement is owned by root with mode 0600 and the
+/// user's own CLI can no longer read it.
+///
+/// Platform: Unix only. Staging is a sibling of `path`, so the rename never
+/// crosses a filesystem; read-only directories, file-level bind mounts and
+/// filesystems without a working fsync fail before the rename with "was not
+/// changed", while a directory fsync that some network or FUSE filesystems
+/// reject fails after it and is reported as "was replaced".
 ///
 /// The replacement is staged in a uniquely named sibling opened with
 /// `create_new`, so a planted file or symlink at any predictable name is
