@@ -11,8 +11,8 @@
 //! crash test simulates the process dying at each step, and a dead process
 //! keeps the page cache, so it proves atomicity (old or new bytes, never
 //! partial) only. A crash can leave one
-//! `.fornax-tmp-*` sibling holding the full new content with the file's mode;
-//! nothing removes it later.
+//! `.fornax-tmp-*` sibling, empty or partly or fully written; its mode is the
+//! target's or narrower, never wider. Nothing removes it later.
 
 use sha2::{Digest, Sha256};
 
