@@ -66,6 +66,27 @@ pub fn write_guarded(
     contents: &str,
     expected: &ContentDigest,
 ) -> anyhow::Result<()> {
+    write_guarded_inner(path, contents, expected, &mut |_| Ok(()))
+}
+
+/// Points in `write_guarded_inner` where a test can inject a fault or a
+/// concurrent edit. The shipped writer passes a no-op, so nothing here is
+/// reachable from the binary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    AfterCreate,
+    AfterWrite,
+    AfterSync,
+    AfterRename,
+    AfterDirSync,
+}
+
+fn write_guarded_inner(
+    path: &std::path::Path,
+    contents: &str,
+    expected: &ContentDigest,
+    checkpoint: &mut dyn FnMut(Step) -> std::io::Result<()>,
+) -> anyhow::Result<()> {
     use std::io::Write;
 
     let parent = path
@@ -88,6 +109,7 @@ pub fn write_guarded(
             options.mode(target_mode(path));
         }
         let mut file = options.open(&tmp_path)?;
+        checkpoint(Step::AfterCreate)?;
         // Re-assert on the open handle: `mode` above is masked by the umask,
         // and this must hold before any content is written.
         #[cfg(unix)]
@@ -96,8 +118,10 @@ pub fn write_guarded(
             file.set_permissions(std::fs::Permissions::from_mode(target_mode(path)))?;
         }
         file.write_all(contents.as_bytes())?;
+        checkpoint(Step::AfterWrite)?;
         // Data must be durable before the rename makes it the live file.
         file.sync_all()?;
+        checkpoint(Step::AfterSync)?;
         std::fs::rename(&tmp_path, path)?;
         Ok(())
     })();
@@ -105,7 +129,7 @@ pub fn write_guarded(
         std::fs::remove_file(&tmp_path).ok();
         return staged;
     }
-    confirm_replaced(path, parent, contents)
+    confirm_replaced(path, parent, contents, checkpoint)
 }
 
 /// Steps after the rename. The live file is already replaced here, so a
@@ -114,10 +138,13 @@ fn confirm_replaced(
     path: &std::path::Path,
     parent: &std::path::Path,
     intended: &str,
+    checkpoint: &mut dyn FnMut(Step) -> std::io::Result<()>,
 ) -> anyhow::Result<()> {
     (|| -> anyhow::Result<()> {
+        checkpoint(Step::AfterRename)?;
         // The rename itself must survive a crash.
         std::fs::File::open(parent)?.sync_all()?;
+        checkpoint(Step::AfterDirSync)?;
         verify_written(path, intended)
     })()
     .map_err(|e| {
@@ -230,7 +257,7 @@ mod tests {
         let path = tmp_path("post-rename");
         std::fs::write(&path, "on disk").unwrap();
         let dir = path.parent().unwrap();
-        let err = confirm_replaced(&path, dir, "different").expect_err("verify must fail");
+        let err = confirm_replaced(&path, dir, "different", &mut |_| Ok(())).expect_err("verify must fail");
         assert!(err.to_string().contains("was replaced, but"), "{err}");
         std::fs::remove_file(&path).ok();
     }
