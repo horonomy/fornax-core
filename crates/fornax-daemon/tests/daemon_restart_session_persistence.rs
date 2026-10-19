@@ -29,6 +29,8 @@ use std::time::Duration;
 use fornax_store::Store;
 use fornax_types::{AgentEvent, Claim, EventKind, Finding, Provider, Verdict};
 use uuid::Uuid;
+mod common;
+use common::free_tcp_port;
 
 fn workspace_bin(name: &str) -> PathBuf {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -77,11 +79,6 @@ impl Drop for DaemonHandle {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
-}
-
-fn free_tcp_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().expect("local addr").port()
 }
 
 fn short_id() -> String {
