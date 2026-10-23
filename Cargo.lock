@@ -1247,6 +1247,7 @@ dependencies = [
  "chrono",
  "ed25519-dalek",
  "fornax-types",
+ "hex",
  "rustix",
  "serde",
  "serde_json",
