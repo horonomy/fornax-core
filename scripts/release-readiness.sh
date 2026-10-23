@@ -38,6 +38,12 @@
 #                             `origin` remote — release-execute.sh already
 #                             treats "build from this checkout" the same way.
 #
+# --changelog <path>        CHANGELOG.md checked for a "## [<version>]" section
+#                             (default CHANGELOG.md). Only consulted for the
+#                             manifest repo entry that is this checkout.
+# --release-notes <path>     Release notes file that must exist (default
+#                             docs/release/<version>-release-notes.md).
+#
 # Output: one compact JSON object on stdout:
 #   {"ready":bool,"version":"...","checks":[{"name":...,"status":"pass"|"fail","detail":...}],"candidate":{...}}
 # Exit code: 0 if ready, 1 otherwise (including usage/input errors).
@@ -55,6 +61,8 @@ MANIFEST=""
 EVIDENCE_DIR=""
 REPO_FIXTURE_DIR=""
 CARGO_TOML="Cargo.toml"
+CHANGELOG_PATH=""
+RELEASE_NOTES_PATH=""
 THIS_REPO_OWNER=""
 THIS_REPO_NAME=""
 
@@ -70,6 +78,14 @@ while [ $# -gt 0 ]; do
       ;;
     --cargo-toml)
       CARGO_TOML="${2:-}"
+      shift 2
+      ;;
+    --changelog)
+      CHANGELOG_PATH="${2:-}"
+      shift 2
+      ;;
+    --release-notes)
+      RELEASE_NOTES_PATH="${2:-}"
       shift 2
       ;;
     --this-repo-owner)
@@ -302,6 +318,24 @@ while IFS= read -r repo_json; do
       else
         add_check "repo.${owner}/${name}.workspace_version_matches_candidate" "fail" "workspace version ${workspace_version} in ${CARGO_TOML} does not match candidate ${VERSION} — bump [workspace.package].version before tagging"
       fi
+    fi
+
+    # Public version metadata (FORNX-461): the candidate must have its own
+    # CHANGELOG section and release-notes file before it can be tagged, so the
+    # published history never lags or invents the version being released.
+    changelog_file="${CHANGELOG_PATH:-CHANGELOG.md}"
+    notes_file="${RELEASE_NOTES_PATH:-docs/release/${VERSION}-release-notes.md}"
+    if [ ! -f "$changelog_file" ]; then
+      add_check "repo.${owner}/${name}.changelog_has_candidate_section" "fail" "CHANGELOG not found at ${changelog_file}"
+    elif grep -qF "## [${VERSION}]" "$changelog_file"; then
+      add_check "repo.${owner}/${name}.changelog_has_candidate_section" "pass" "${changelog_file} has a [${VERSION}] section"
+    else
+      add_check "repo.${owner}/${name}.changelog_has_candidate_section" "fail" "${changelog_file} has no \"## [${VERSION}]\" section — promote [Unreleased] before tagging"
+    fi
+    if [ -f "$notes_file" ]; then
+      add_check "repo.${owner}/${name}.release_notes_exist" "pass" "${notes_file} exists"
+    else
+      add_check "repo.${owner}/${name}.release_notes_exist" "fail" "release notes not found at ${notes_file}"
     fi
   fi
 done < "$REPO_SHA_MAP"
