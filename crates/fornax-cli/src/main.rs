@@ -14,6 +14,7 @@ mod claude_adapter;
 mod codex_adapter;
 mod codex_hooks;
 mod corpus_cmd;
+mod egress_cmd;
 mod evidence_plan_cmd;
 mod experiment_ux;
 mod feedback_cmd;
@@ -379,6 +380,15 @@ enum Commands {
     Adjudicate {
         #[command(subcommand)]
         action: adjudicate_cmd::AdjudicateAction,
+    },
+    /// Choose whether and where Fornax data may leave this machine
+    /// (FORNX-464): profile (personal / corporate), consents, allowlist.
+    ///
+    /// Nothing is sent until a profile is chosen. `corporate` is local-only
+    /// and cannot be overridden. Reads `$FORNAX_HOME/fornax.db` directly.
+    Egress {
+        #[command(subcommand)]
+        action: egress_cmd::EgressAction,
     },
     /// Product feedback on a live finding/recommendation.
     ///
@@ -834,6 +844,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Timeline { finding, session } => handle_timeline_action(finding, session).await?,
         Commands::Corpus { action } => corpus_cmd::handle(action, &fornax_home()).await?,
         Commands::Adjudicate { action } => adjudicate_cmd::handle(action, &fornax_home()).await?,
+        Commands::Egress { action } => egress_cmd::handle(action, &fornax_home()).await?,
         Commands::Feedback { action } => feedback_cmd::handle(action, &fornax_home()).await?,
         Commands::Receipt { action } => receipt_cmd::handle(action, &fornax_home()).await?,
         Commands::Doctor => println!("{}", execution_identity_capture_report()),

@@ -399,6 +399,58 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// Write the derived `egress-projection.json` the separate `fornax-cloud`
+    /// uploader reads (contract v1). It is a view of the persisted state,
+    /// never a source of truth: the uploader fails closed unless it finds
+    /// `profile: personal` and a matching `uploader_spool_stream`
+    /// authorization. That purpose is not grantable in v0.0.9, so
+    /// `authorized` is always empty today and the uploader stays inert.
+    pub async fn write_egress_projection(&self, path: &std::path::Path) -> Result<()> {
+        use std::io::Write;
+        let state = self.egress_state().await?;
+        let authorized: Vec<serde_json::Value> = if state.profile == Profile::Personal {
+            state
+                .consents
+                .iter()
+                .filter(|c| {
+                    c.purpose == Purpose::UploaderSpoolStream
+                        && c.revoked_at.is_none()
+                        && c.profile_generation == state.generation
+                })
+                .map(|c| {
+                    serde_json::json!({
+                        "purpose": "uploader_spool_stream",
+                        "destination": c.destination,
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let doc = serde_json::json!({
+            "schema_version": 1,
+            "profile": state.profile.as_str(),
+            "generation": state.generation,
+            "authorized": authorized,
+        });
+        let tmp = path.with_extension("json.tmp");
+        {
+            let mut f = std::fs::File::create(&tmp).map_err(|e| invalid(e.to_string()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                f.set_permissions(std::fs::Permissions::from_mode(0o600))
+                    .map_err(|e| invalid(e.to_string()))?;
+            }
+            f.write_all(doc.to_string().as_bytes())
+                .map_err(|e| invalid(e.to_string()))?;
+            f.write_all(b"\n").map_err(|e| invalid(e.to_string()))?;
+            f.sync_all().map_err(|e| invalid(e.to_string()))?;
+        }
+        std::fs::rename(&tmp, path).map_err(|e| invalid(e.to_string()))?;
+        Ok(())
+    }
+
     async fn audit_egress(&self, action: AuditAction, target: String, source: &str) -> Result<()> {
         self.append_audit_event(
             &AuditEvent::new(
