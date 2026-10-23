@@ -301,11 +301,15 @@ fn startup_jitter_seconds() -> u64 {
         .unwrap_or(0)
 }
 
+/// No redirects: an allowlisted policy host must not be able to forward the
+/// device credential to a destination nobody authorized. No fallback to a
+/// default client (which would follow redirects) if the builder fails.
 fn build_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .expect("static reqwest client configuration is valid")
 }
 
 /// Step 1: resolve whether polling is enabled at all, reading the three env
@@ -462,6 +466,43 @@ async fn run_one_cycle(
     // Test-only panic injection -- see `TEST_PANIC_ENV`'s doc comment.
     if std::env::var(TEST_PANIC_ENV).as_deref() == Ok("1") {
         panic!("FORNX-311 test-injected panic (FORNAX_POLICY_POLL_TEST_PANIC=1)");
+    }
+
+    // FORNX-464: the persisted egress policy decides every cycle, so
+    // removing the allowlist entry stops the very next poll. A policy fetch
+    // carries no evidence but does present the device credential, so it
+    // needs an explicit allowlist entry in every profile. A denial (or an
+    // unreadable policy) opens no connection.
+    let no_classes = std::collections::BTreeSet::new();
+    match state
+        .store
+        .decide_egress(
+            fornax_types::egress::Purpose::PolicyFetch,
+            config.url.as_str(),
+            &no_classes,
+            false,
+        )
+        .await
+    {
+        Ok(permit)
+            if permit.authorizes(
+                fornax_types::egress::Purpose::PolicyFetch,
+                config.url.as_str(),
+            ) => {}
+        Ok(_) => {
+            return CycleOutcomeResult {
+                outcome: "egress_denied",
+                detail: "permit does not cover the poll URL".to_string(),
+                bundles_received: 0,
+            };
+        }
+        Err(denial) => {
+            return CycleOutcomeResult {
+                outcome: "egress_denied",
+                detail: denial.code().to_string(),
+                bundles_received: 0,
+            };
+        }
     }
 
     // Step 3: fetch.
@@ -664,6 +705,111 @@ fn upsert_refresh_unavailable_diagnostic(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::{counting_listener, test_state};
+    use fornax_types::egress::{Profile, Purpose};
+
+    fn config_for(addr: std::net::SocketAddr) -> PollConfig {
+        PollConfig {
+            url: reqwest::Url::parse(&format!("http://{addr}/policy")).unwrap(),
+            credential: Arc::new(DeviceCredential("test-credential".to_string())),
+            interval: Duration::from_secs(60),
+        }
+    }
+
+    fn hits(c: &std::sync::atomic::AtomicUsize) -> usize {
+        c.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// FORNX-464: a policy fetch needs an explicit allowlist entry in EVERY
+    /// profile; denial is proven by zero accepted connections.
+    #[tokio::test]
+    async fn policy_fetch_without_an_allowlist_entry_opens_no_connection_in_any_profile() {
+        let (addr, accepted) = counting_listener().await;
+        let state = test_state().await;
+        for profile in [Profile::Unconfigured, Profile::Personal, Profile::Corporate] {
+            state
+                .store
+                .set_egress_profile(profile, "test", true)
+                .await
+                .unwrap();
+            let out = run_one_cycle(state.clone(), config_for(addr), build_http_client()).await;
+            assert_eq!(out.outcome, "egress_denied", "{profile:?}");
+            assert_eq!(out.detail, "no_allowlist_entry", "{profile:?}");
+        }
+        assert_eq!(hits(&accepted), 0);
+    }
+
+    #[tokio::test]
+    async fn an_allowlisted_policy_fetch_connects_even_under_corporate_and_removal_stops_it() {
+        let (addr, accepted) = counting_listener().await;
+        let state = test_state().await;
+        state
+            .store
+            .set_egress_profile(Profile::Corporate, "test", false)
+            .await
+            .unwrap();
+        let entry = state
+            .store
+            .add_egress_allowlist(
+                Purpose::PolicyFetch,
+                &format!("http://{addr}/policy"),
+                "test",
+            )
+            .await
+            .unwrap();
+        let out = run_one_cycle(state.clone(), config_for(addr), build_http_client()).await;
+        assert_ne!(out.outcome, "egress_denied");
+        assert_eq!(hits(&accepted), 1);
+
+        state
+            .store
+            .remove_egress_allowlist(&entry, "test")
+            .await
+            .unwrap();
+        let out = run_one_cycle(state.clone(), config_for(addr), build_http_client()).await;
+        assert_eq!(out.outcome, "egress_denied");
+        assert_eq!(hits(&accepted), 1, "removal must stop the next poll");
+    }
+
+    #[tokio::test]
+    async fn a_policy_host_redirect_is_never_followed() {
+        let (target, target_hits) = counting_listener().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let location = format!("http://{target}/stolen");
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let location = location.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    let _ = socket
+                        .write_all(
+                            format!("HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                                .as_bytes(),
+                        )
+                        .await;
+                });
+            }
+        });
+        let state = test_state().await;
+        state
+            .store
+            .add_egress_allowlist(
+                Purpose::PolicyFetch,
+                &format!("http://{addr}/policy"),
+                "test",
+            )
+            .await
+            .unwrap();
+        let _ = run_one_cycle(state, config_for(addr), build_http_client()).await;
+        assert_eq!(
+            hits(&target_hits),
+            0,
+            "the redirect target must see zero connections"
+        );
+    }
 
     #[test]
     fn t01_backoff_multiplier_grows_then_caps_at_the_one_hour_ceiling() {
@@ -1031,6 +1177,27 @@ mod tests {
         TestFixture { state, dir }
     }
 
+    /// Existing scenario tests exercise the transport, not the egress gate:
+    /// allowlist the poll URL first (the gate itself is covered by the
+    /// `policy_fetch_*` tests above), then run one cycle.
+    async fn allow_poll_url(fixture: &TestFixture, config: &PollConfig) {
+        fixture
+            .state
+            .store
+            .add_egress_allowlist(
+                fornax_types::egress::Purpose::PolicyFetch,
+                config.url.as_str(),
+                "test",
+            )
+            .await
+            .expect("allowlist the test poll URL");
+    }
+
+    async fn run_allowlisted(fixture: &TestFixture, config: PollConfig) -> CycleOutcomeResult {
+        allow_poll_url(fixture, &config).await;
+        run_one_cycle(fixture.state.clone(), config, build_http_client()).await
+    }
+
     fn test_config(url: reqwest::Url, interval: Duration) -> PollConfig {
         PollConfig {
             url,
@@ -1070,8 +1237,7 @@ mod tests {
         let server = TestServer::start(move || response.clone()).await;
         let config = test_config(server.url(), Duration::from_secs(900));
 
-        let outcome1 =
-            run_one_cycle(fixture.state.clone(), config.clone(), build_http_client()).await;
+        let outcome1 = run_allowlisted(&fixture, config.clone()).await;
         assert_eq!(outcome1.outcome, "ok");
         assert_eq!(outcome1.bundles_received, 1);
 
@@ -1089,7 +1255,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let outcome2 = run_one_cycle(fixture.state.clone(), config, build_http_client()).await;
+        let outcome2 = run_allowlisted(&fixture, config).await;
         assert_eq!(outcome2.outcome, "ok");
         assert_eq!(outcome2.bundles_received, 1);
 
@@ -1204,7 +1370,7 @@ mod tests {
         let url = reqwest::Url::parse(&format!("http://127.0.0.1:{port}/poll")).unwrap();
         let config = test_config(url, Duration::from_secs(900));
 
-        let outcome = run_one_cycle(fixture.state.clone(), config, build_http_client()).await;
+        let outcome = run_allowlisted(&fixture, config).await;
         assert_eq!(outcome.outcome, "unreachable");
         assert!(!outcome.detail.contains(TEST_CREDENTIAL));
     }
@@ -1216,7 +1382,7 @@ mod tests {
         let server = TestServer::start(|| http_response(401, b"{}")).await;
         let config = test_config(server.url(), Duration::from_secs(900));
 
-        let outcome = run_one_cycle(fixture.state.clone(), config, build_http_client()).await;
+        let outcome = run_allowlisted(&fixture, config).await;
         assert_eq!(outcome.outcome, "auth_failed");
         assert!(!outcome.detail.contains(TEST_CREDENTIAL));
     }
@@ -1228,7 +1394,7 @@ mod tests {
         let server = TestServer::start(|| http_response(500, b"{}")).await;
         let config = test_config(server.url(), Duration::from_secs(900));
 
-        let outcome = run_one_cycle(fixture.state.clone(), config, build_http_client()).await;
+        let outcome = run_allowlisted(&fixture, config).await;
         assert_eq!(outcome.outcome, "http_error");
     }
 
@@ -1243,7 +1409,7 @@ mod tests {
         let server = TestServer::start(move || response.clone()).await;
         let config = test_config(server.url(), Duration::from_secs(900));
 
-        let outcome = run_one_cycle(fixture.state.clone(), config, build_http_client()).await;
+        let outcome = run_allowlisted(&fixture, config).await;
         assert_eq!(outcome.outcome, "too_large");
         assert_eq!(outcome.bundles_received, 0);
         let snapshot = fixture.state.policy.read().await;
@@ -1258,7 +1424,7 @@ mod tests {
         let server = TestServer::start(move || response.clone()).await;
         let config = test_config(server.url(), Duration::from_secs(900));
 
-        let outcome = run_one_cycle(fixture.state.clone(), config, build_http_client()).await;
+        let outcome = run_allowlisted(&fixture, config).await;
         assert_eq!(outcome.outcome, "malformed");
     }
 
@@ -1289,7 +1455,7 @@ mod tests {
         let server = TestServer::start(move || response.clone()).await;
         let config = test_config(server.url(), Duration::from_secs(900));
 
-        let outcome = run_one_cycle(fixture.state.clone(), config, build_http_client()).await;
+        let outcome = run_allowlisted(&fixture, config).await;
         assert_eq!(outcome.outcome, "ok");
 
         let snapshot = fixture.state.policy.read().await;
@@ -1333,7 +1499,7 @@ mod tests {
         );
         let server = TestServer::start(move || ok_response.clone()).await;
         let config = test_config(server.url(), Duration::from_secs(900));
-        let outcome = run_one_cycle(fixture.state.clone(), config, build_http_client()).await;
+        let outcome = run_allowlisted(&fixture, config).await;
         assert_eq!(outcome.outcome, "ok");
         let generation_after_seq2 = fixture
             .state
@@ -1364,7 +1530,7 @@ mod tests {
         );
         let server2 = TestServer::start(move || stale_response.clone()).await;
         let config2 = test_config(server2.url(), Duration::from_secs(900));
-        let outcome2 = run_one_cycle(fixture.state.clone(), config2, build_http_client()).await;
+        let outcome2 = run_allowlisted(&fixture, config2).await;
         assert_eq!(
             outcome2.outcome, "ok",
             "the HTTP transport itself succeeded"
@@ -1392,6 +1558,7 @@ mod tests {
         let json = json_response(200, &response);
         let server = TestServer::start(move || json.clone()).await;
         let config = test_config(server.url(), Duration::from_millis(20));
+        allow_poll_url(&fixture, &config).await;
 
         let panic_env = EnvVarGuard::set(TEST_PANIC_ENV, "1");
         let state_for_supervisor = fixture.state.clone();
@@ -1460,6 +1627,7 @@ mod tests {
         let server = TestServer::start(responder).await;
         let interval = Duration::from_millis(15);
         let config = test_config(server.url(), interval);
+        allow_poll_url(&fixture, &config).await;
 
         let state_for_supervisor = fixture.state.clone();
         let handle =
@@ -1532,6 +1700,7 @@ mod tests {
         let response = json_response(200, &empty_poll_response());
         let server = TestServer::start(move || response.clone()).await;
         let config = test_config(server.url(), Duration::from_secs(900));
+        allow_poll_url(&fixture, &config).await;
 
         let handle =
             tokio::spawn(async move { run_supervisor(fixture.state.clone(), config).await });
@@ -1587,7 +1756,7 @@ mod tests {
 
         for (expected_outcome, url) in scenarios {
             let config = test_config(url, Duration::from_secs(900));
-            let outcome = run_one_cycle(fixture.state.clone(), config, build_http_client()).await;
+            let outcome = run_allowlisted(&fixture, config).await;
             assert_eq!(outcome.outcome, expected_outcome);
             assert!(
                 !outcome.detail.contains(TEST_CREDENTIAL),

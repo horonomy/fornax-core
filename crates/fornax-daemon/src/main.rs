@@ -3327,12 +3327,42 @@ fn html_escape(s: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use fornax_types::{AgentEvent, Claim, EventKind, Provider};
     use uuid::Uuid;
 
-    async fn test_state() -> AppState {
+    /// A loopback "server" that only counts the connections it accepts.
+    pub(crate) async fn counting_listener() -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 500 x\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+        (addr, accepted)
+    }
+
+    pub(crate) async fn test_state() -> AppState {
         let db_path = std::env::temp_dir().join(format!("fornax-test-{}.db", Uuid::new_v4()));
         let store = fornax_store::Store::open(&db_path)
             .await
