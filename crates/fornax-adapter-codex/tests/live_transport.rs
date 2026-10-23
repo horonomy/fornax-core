@@ -735,3 +735,136 @@ fn lines_before_a_native_session_id_are_never_stored_under_the_rollout_path() {
     drop(daemon_guard);
     std::fs::remove_dir_all(&tmp).ok();
 }
+
+/// FORNX-462 review finding: a tailer that has not (yet) learned a native id
+/// must not hold a silent connection open, because the daemon then treats
+/// every session's evidence as possibly incomplete and downgrades their
+/// verdicts to `review`.
+#[test]
+fn a_tailer_without_a_native_id_does_not_downgrade_other_sessions() {
+    let tmp = tempdir("silent-tailer");
+    let fornax_home = tmp.clone();
+    let db_path = fornax_home.join("fornax.db");
+    let (daemon_guard, daemon_log_path) = spawn_daemon(&fornax_home);
+
+    // Tailer A: a rollout whose only line carries no session id.
+    let rollout_a = tmp.join("rollout-a.jsonl");
+    std::fs::write(
+        &rollout_a,
+        "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\"}}\n",
+    )
+    .expect("write rollout a");
+    let hook_a = Command::new(env!("CARGO_BIN_EXE_fornax-hook-codex"))
+        .arg("--file")
+        .arg(&rollout_a)
+        .env("FORNAX_HOME", &fornax_home)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn fornax-hook-codex A");
+    let _hook_a_guard = KillOnDrop(hook_a);
+    // Longer than the daemon's 1s drain budget for a silent connection.
+    std::thread::sleep(Duration::from_millis(2500));
+
+    // Session B, with a native id, while A is still running.
+    let b_id = "fx462-session-b";
+    let rollout_b = tmp.join("rollout-b.jsonl");
+    let mut lines = vec![session_meta_line(b_id)];
+    lines.extend(pytest_success_exec_pair("fx462-b-call"));
+    lines.push(task_complete_line("All tests passed."));
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    run_hook_codex_over_rollout(&fornax_home, &rollout_b, &lines, || {
+        rt.block_on(async {
+            let store = match fornax_store::Store::open(&db_path).await {
+                Ok(s) => s,
+                Err(_) => return false,
+            };
+            matches!(store.evidence_for_session(b_id).await, Ok(e) if !e.evidence.is_empty())
+        })
+    });
+    let finding = poll_until(
+        Duration::from_secs(8),
+        "waiting for session B's Finding",
+        || tail_log(&daemon_log_path),
+        || {
+            rt.block_on(async {
+                let store = fornax_store::Store::open(&db_path).await.ok()?;
+                store
+                    .findings_for_session(b_id)
+                    .await
+                    .ok()?
+                    .into_iter()
+                    .next()
+            })
+        },
+    );
+    assert_eq!(
+        finding.verdict, "verified",
+        "an unrelated tailer with no identity must not downgrade session B's verdict"
+    );
+    drop(daemon_guard);
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+/// FORNX-462 review finding: if the daemon socket is down when `session_meta`
+/// is read, the tailer must still learn the id from it, so that lines read
+/// once the daemon is back are forwarded under that native id.
+#[test]
+fn the_native_id_is_learned_even_when_the_daemon_was_down_at_session_meta() {
+    let tmp = tempdir("daemon-down-at-meta");
+    let fornax_home = tmp.clone();
+    let db_path = fornax_home.join("fornax.db");
+    let rollout_path = tmp.join("rollout.jsonl");
+    let native_id = "fx462-late-daemon-session";
+
+    // The rollout (with session_meta) exists and is read before any daemon runs.
+    let mut first = vec![session_meta_line(native_id)];
+    first.extend(pytest_success_exec_pair("fx462-before-daemon"));
+    let mut content = String::new();
+    for l in &first {
+        content.push_str(&l.to_string());
+        content.push('\n');
+    }
+    std::fs::write(&rollout_path, content).expect("write rollout");
+    let hook = Command::new(env!("CARGO_BIN_EXE_fornax-hook-codex"))
+        .arg("--file")
+        .arg(&rollout_path)
+        .env("FORNAX_HOME", &fornax_home)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn fornax-hook-codex");
+    let _hook_guard = KillOnDrop(hook);
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let (daemon_guard, daemon_log_path) = spawn_daemon(&fornax_home);
+
+    // New lines arrive once the daemon is up.
+    use std::io::Write;
+    let mut more = pytest_success_exec_pair("fx462-after-daemon");
+    more.push(task_complete_line("All tests passed."));
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&rollout_path)
+        .expect("open rollout for append");
+    for l in &more {
+        writeln!(f, "{l}").expect("append");
+    }
+    drop(f);
+
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    poll_until(
+        Duration::from_secs(8),
+        "waiting for evidence under the native id after the daemon came up",
+        || tail_log(&daemon_log_path),
+        || {
+            rt.block_on(async {
+                let store = fornax_store::Store::open(&db_path).await.ok()?;
+                let e = store.evidence_for_session(native_id).await.ok()?;
+                (!e.evidence.is_empty()).then_some(())
+            })
+        },
+    );
+    drop(daemon_guard);
+    std::fs::remove_dir_all(&tmp).ok();
+}
