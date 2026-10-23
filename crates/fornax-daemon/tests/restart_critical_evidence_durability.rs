@@ -26,6 +26,8 @@ use fornax_types::{
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use uuid::Uuid;
+mod common;
+use common::free_tcp_port;
 
 fn workspace_bin(name: &str) -> PathBuf {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -117,11 +119,6 @@ async fn start_daemon(home: &Path, port: u16) -> DaemonHandle {
     }
 
     handle
-}
-
-fn free_tcp_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().expect("local addr").port()
 }
 
 fn short_id() -> String {

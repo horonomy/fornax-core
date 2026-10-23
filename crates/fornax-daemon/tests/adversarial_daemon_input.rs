@@ -29,6 +29,8 @@ use std::time::Duration;
 
 use fornax_store::Store;
 use fornax_types::{EventKind, Evidence, EvidenceKind, Provider};
+mod common;
+use common::free_tcp_port;
 
 // ---------------------------------------------------------------------
 // Binary + environment plumbing
@@ -1330,11 +1332,6 @@ fn assert_no_unexpected_paths_created(daemon: &DaemonHandle) {
 /// immediately for the daemon to bind moments later. A tiny TOCTOU window
 /// exists (another process could grab the port in between) but is far safer
 /// than a fixed port that reliably collides with a leaked prior-run daemon.
-fn free_tcp_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().expect("local addr").port()
-}
-
 /// Short enough that `$FORNAX_HOME/fornax.sock` never risks `sockaddr_un`'s
 /// `SUN_LEN` cap — see the comment in `start_daemon`.
 fn short_id() -> String {

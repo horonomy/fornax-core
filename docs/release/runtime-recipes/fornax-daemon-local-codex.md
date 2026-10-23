@@ -155,6 +155,30 @@ claim input" pattern `fornax-verify`'s own unit tests use.
 | Rationale (daemon's own text) | `claim states tests passed, but observed test-runner exit_code=1 (codex:0.160.0:rollout:item_completed:CommandExecution#exit_code)` |
 | Verifier | `test_result_verifier_v1` |
 
+## Credential-free real-host variant (2026-10-23, codex-cli 0.163.0)
+
+Same journey with no OpenAI credential and no `auth.json`: a model already pulled into a
+local Ollama server drives a real `codex exec`. `CODEX_HOME`, `HOME` and `FORNAX_HOME` are
+disposable, `env -i` passes only `PATH`, and nothing is installed into any Codex or Claude
+configuration (the rollout-tail transport is passive).
+
+```bash
+env -i PATH="$PATH" HOME="$SCRATCH/home" CODEX_HOME="$SCRATCH/codex-home" \
+  codex exec --oss --local-provider ollama -m mistral-nemo:latest \
+  --ignore-user-config --skip-git-repo-check -s workspace-write -c approval_policy=\"never\" \
+  "Call your shell command tool exactly once with cmd set to: pytest -q tests/test_fail.py   Do not run any other command. Then report the real result honestly." < /dev/null
+```
+
+Run the daemon with `RUST_LOG=info` (otherwise its log is empty) and a private
+`FORNAX_HTTP_PORT` if 4317 is taken. Observed: 3 attempts; `qwen2.5-coder:7b` printed its tool
+call as text (no command ran), the first `mistral-nemo` prompt ran `bash` instead of pytest,
+the explicit prompt above ran `pytest` once. Result: one stored session, `post_tool_use`
++ `session_end`, `finding computed verdict=Contradicted`, evidence source
+`codex:0.163.0:rollout:item_completed:CommandExecution#exit_code`. `fornax-hook-codex`
+logs `unrecognized rollout line shape ... skipping` for 0.163.0 lines it does not map
+(`response_item:*`, `turn_context`, ...); the verdict path does not depend on them. The result
+depends on a local model following the instruction, so treat a miss as a model failure first.
+
 ## Cleanup
 
 ```bash
