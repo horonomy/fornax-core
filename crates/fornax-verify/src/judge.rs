@@ -508,21 +508,63 @@ impl SemanticJudgeConfig {
 pub struct LocalSelfHostedJudgeProvider {
     config: SemanticJudgeConfig,
     client: reqwest::blocking::Client,
+    /// FORNX-464: the egress decision for a NON-loopback endpoint. `None`
+    /// means no decision was made, which is a denial. Loopback endpoints need
+    /// none because they never leave the machine.
+    egress: Option<Result<fornax_types::egress::EgressPermit, fornax_types::egress::EgressDenial>>,
 }
 
 impl LocalSelfHostedJudgeProvider {
     pub fn new(config: SemanticJudgeConfig) -> Self {
+        // No redirects: a judge endpoint must not be able to forward claim
+        // text and evidence excerpts to a host nobody authorized. There is no
+        // fallback to a default client (which follows redirects); the static
+        // configuration below is always buildable.
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_millis(config.timeout_ms))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
-            // A client-builder failure here means a malformed timeout value
-            // or a genuinely broken TLS backend, not a runtime condition
-            // `judge()`'s callers can meaningfully recover from -- fall back
-            // to an un-timed-out default client rather than panicking; the
-            // per-request timeout is still enforced by `judge()`'s own
-            // wall-clock check below as a second line of defense.
-            .unwrap_or_default();
-        Self { config, client }
+            .expect("static reqwest client configuration is valid");
+        Self {
+            config,
+            client,
+            egress: None,
+        }
+    }
+
+    /// Attach the persisted egress decision for this endpoint (from
+    /// `Store::decide_egress(Purpose::SemanticJudge, ..)`). Required for any
+    /// non-loopback endpoint; ignored for loopback.
+    pub fn with_egress(
+        mut self,
+        decision: Result<fornax_types::egress::EgressPermit, fornax_types::egress::EgressDenial>,
+    ) -> Self {
+        self.egress = Some(decision);
+        self
+    }
+
+    /// Whether this call may leave the machine. `Err` carries a bounded
+    /// reason that is safe to surface; nothing has been sent.
+    fn egress_check(&self, input: &JudgeInput) -> Result<(), String> {
+        use fornax_types::egress::{Destination, Purpose};
+        let destination = Destination::parse(&self.config.endpoint)
+            .map_err(|d| format!("semantic judge endpoint refused: {d}"))?;
+        if fornax_types::egress::is_loopback_host(&destination.host) {
+            return Ok(());
+        }
+        if input.allow_raw_evidence {
+            return Err("raw evidence is never sent to a non-loopback semantic judge".to_string());
+        }
+        match &self.egress {
+            Some(Ok(permit))
+                if permit.authorizes(Purpose::SemanticJudge, &self.config.endpoint) =>
+            {
+                Ok(())
+            }
+            Some(Ok(_)) => Err("egress permit does not cover the judge endpoint".to_string()),
+            Some(Err(denial)) => Err(format!("egress denied: {denial}")),
+            None => Err("egress denied: no egress decision for a non-loopback judge".to_string()),
+        }
     }
 
     fn chat_completions_url(&self) -> String {
@@ -623,6 +665,15 @@ impl SemanticJudgeProvider for LocalSelfHostedJudgeProvider {
             // caller must handle specially, and never a fabricated verdict.
             return Ok(JudgeOutput::unavailable(
                 "semantic judge disabled via [semantic_judge].enabled = false",
+                &self.config.model,
+                &self.config.endpoint,
+                &called_at,
+            ));
+        }
+
+        if let Err(reason) = self.egress_check(input) {
+            return Ok(JudgeOutput::unavailable(
+                format!("{reason} -- treated as unavailable, nothing was sent"),
                 &self.config.model,
                 &self.config.endpoint,
                 &called_at,
@@ -896,6 +947,164 @@ mod judge_tests {
         let output = provider.judge(&input).unwrap();
         assert_eq!(output.verdict, JudgeVerdict::Unavailable);
         assert!(!output.rationale.is_empty());
+    }
+
+    /// A loopback "server" that only counts accepted connections.
+    fn counting_listener() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = stream
+                    .write_all(b"HTTP/1.1 500 x\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+            }
+        });
+        (format!("http://{addr}/v1"), hits)
+    }
+
+    /// FORNX-464: a non-loopback judge sends nothing without a permit, and
+    /// never sends raw evidence even with one. (192.0.2.1 is RFC 5737
+    /// TEST-NET-1: unroutable, so this also cannot reach anything.)
+    #[test]
+    fn a_non_loopback_judge_without_a_permit_is_unavailable_and_sends_nothing() {
+        let provider = LocalSelfHostedJudgeProvider::new(SemanticJudgeConfig {
+            enabled: true,
+            endpoint: "https://llm.corp.example.test/v1".into(),
+            model: "m".into(),
+            timeout_ms: 500,
+        });
+        let input = JudgeInput::new("claim", "subject");
+        let out = provider.judge(&input).unwrap();
+        assert_eq!(out.verdict, JudgeVerdict::Unavailable);
+        assert!(
+            out.rationale.contains("nothing was sent"),
+            "{}",
+            out.rationale
+        );
+
+        let denied = LocalSelfHostedJudgeProvider::new(SemanticJudgeConfig {
+            enabled: true,
+            endpoint: "https://llm.corp.example.test/v1".into(),
+            model: "m".into(),
+            timeout_ms: 500,
+        })
+        .with_egress(Err(fornax_types::egress::EgressDenial::CorporateLocalOnly));
+        let out = denied.judge(&input).unwrap();
+        assert_eq!(out.verdict, JudgeVerdict::Unavailable);
+        assert!(
+            out.rationale.contains("corporate_local_only"),
+            "{}",
+            out.rationale
+        );
+    }
+
+    #[test]
+    fn raw_evidence_is_never_sent_off_loopback_even_with_a_permit() {
+        use fornax_types::egress::{
+            decide, AllowlistEntry, Consent, EgressRequest, EgressState, Profile, Purpose,
+        };
+        use fornax_types::EgressContentClass;
+        let url = "https://llm.corp.example.test/v1";
+        let classes: std::collections::BTreeSet<_> = [
+            EgressContentClass::ClaimText,
+            EgressContentClass::RedactedEvidencePayload,
+        ]
+        .into();
+        let state = EgressState {
+            profile: Profile::Personal,
+            generation: 1,
+            consents: vec![Consent {
+                id: "c".into(),
+                purpose: Purpose::SemanticJudge,
+                destination: "https://llm.corp.example.test:443/v1".into(),
+                data_classes: ["claim_text", "redacted_evidence_payload"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                granted_at: "2026-01-01T00:00:00Z".into(),
+                expires_at: "2099-01-01T00:00:00Z".into(),
+                revoked_at: None,
+                profile_generation: 1,
+                authorization_ref: None,
+            }],
+            allowlist: vec![AllowlistEntry {
+                id: "a".into(),
+                purpose: Purpose::SemanticJudge,
+                destination: "https://llm.corp.example.test:443/v1".into(),
+                removed: false,
+            }],
+        };
+        let permit = decide(
+            &state,
+            &EgressRequest {
+                purpose: Purpose::SemanticJudge,
+                url,
+                classes: &classes,
+                legacy_cloud_sync_gate_open: false,
+                now: "2026-10-24T00:00:00Z",
+            },
+        )
+        .expect("a redacted-class judge call is permitted");
+        let provider = LocalSelfHostedJudgeProvider::new(SemanticJudgeConfig {
+            enabled: true,
+            endpoint: url.into(),
+            model: "m".into(),
+            timeout_ms: 500,
+        })
+        .with_egress(Ok(permit));
+        let raw = JudgeInput::new("claim", "subject").with_raw_evidence_allowed(true);
+        let out = provider.judge(&raw).unwrap();
+        assert_eq!(out.verdict, JudgeVerdict::Unavailable);
+        assert!(
+            out.rationale.contains("raw evidence is never sent"),
+            "{}",
+            out.rationale
+        );
+    }
+
+    /// A loopback judge needs no permit, but must still not follow a redirect
+    /// off the machine's intended endpoint.
+    #[test]
+    fn a_loopback_judge_needs_no_permit_and_never_follows_a_redirect() {
+        let (target_url, target_hits) = counting_listener();
+        let target = target_url.trim_end_matches("/v1").to_string();
+        let redirector = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = redirector.local_addr().unwrap();
+        let location = format!("{target}/stolen");
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for stream in redirector.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(
+                    format!("HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                        .as_bytes(),
+                );
+            }
+        });
+        let provider = LocalSelfHostedJudgeProvider::new(SemanticJudgeConfig {
+            enabled: true,
+            endpoint: format!("http://{addr}/v1"),
+            model: "m".into(),
+            timeout_ms: 2000,
+        });
+        let out = provider
+            .judge(&JudgeInput::new("claim", "subject"))
+            .unwrap();
+        assert_eq!(out.verdict, JudgeVerdict::Unavailable);
+        assert_eq!(
+            target_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the redirect target must see zero connections"
+        );
     }
 
     #[test]

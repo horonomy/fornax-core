@@ -2436,8 +2436,26 @@ async fn api_judge(
             let config = SemanticJudgeConfig::load_default();
             let objective = objective_supported_for_disagreement_check(fused.verdict);
 
+            // FORNX-464: a non-loopback endpoint needs the persisted egress
+            // decision (corporate: a recorded authorization with a reference);
+            // loopback needs none. Raw evidence is never sent off-loopback.
+            let judge_classes: std::collections::BTreeSet<_> = [
+                fornax_types::EgressContentClass::ClaimText,
+                fornax_types::EgressContentClass::RedactedEvidencePayload,
+            ]
+            .into();
+            let egress = state
+                .store
+                .decide_egress(
+                    fornax_types::egress::Purpose::SemanticJudge,
+                    &config.endpoint,
+                    &judge_classes,
+                    false,
+                )
+                .await;
+
             let judge_result = tokio::task::spawn_blocking(move || {
-                let provider = LocalSelfHostedJudgeProvider::new(config);
+                let provider = LocalSelfHostedJudgeProvider::new(config).with_egress(egress);
                 provider.judge(&input)
             })
             .await;
