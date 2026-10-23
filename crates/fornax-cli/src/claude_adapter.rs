@@ -934,4 +934,17 @@ mod tests {
         assert!(!state_path(&path).exists());
         cleanup(&path);
     }
+
+    #[test]
+    fn a_stale_hooks_flag_is_corrected_by_the_next_install_not_trusted() {
+        let path = tmp_settings_path("keep-stale-hooks-flag");
+        write_settings(&path, &serde_json::json!({ "hooks": {} }));
+        install_at(&path).expect("install");
+        // The user wipes the file; the recorded "hooks was an empty object" is now stale.
+        write_settings(&path, &serde_json::json!({ "model": "keep" }));
+        install_at(&path).expect("reinstall");
+        uninstall_at(&path).expect("uninstall");
+        assert_eq!(read_json(&path), serde_json::json!({ "model": "keep" }));
+        cleanup(&path);
+    }
 }
