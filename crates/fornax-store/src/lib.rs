@@ -331,7 +331,7 @@ impl Store {
     /// `retention::retention_class_for_table`'s doc comment for the same
     /// choice applied uniformly across all four insert paths.
     pub async fn insert_event(&self, e: &AgentEvent) -> Result<InsertOutcome> {
-        if e.session_id.is_empty() {
+        if e.session_id.trim().is_empty() {
             return Err(StoreError::MissingSessionIdentity {
                 kind: "agent_events",
             });
@@ -455,7 +455,7 @@ impl Store {
     where
         F: FnOnce(&AgentEvent) -> bool + Send,
     {
-        if c.session_id.is_empty() {
+        if c.session_id.trim().is_empty() {
             return Err(StoreError::MissingSessionIdentity { kind: "claims" });
         }
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -574,7 +574,7 @@ impl Store {
         ev: &Evidence,
         ingress_origin: Option<&'static str>,
     ) -> Result<InsertOutcome> {
-        if ev.session_id.is_empty() {
+        if ev.session_id.trim().is_empty() {
             return Err(StoreError::MissingSessionIdentity { kind: "evidence" });
         }
         let source = ev.source.as_ref().map(serde_json::to_string).transpose()?;
@@ -856,7 +856,7 @@ impl Store {
         session_id: &str,
         caps: &RuntimeCapabilities,
     ) -> Result<()> {
-        if session_id.is_empty() {
+        if session_id.trim().is_empty() {
             return Err(StoreError::MissingSessionIdentity {
                 kind: "runtime_capabilities",
             });
@@ -1444,6 +1444,28 @@ mod tests {
     /// accepted -- it cannot be scoped to any real session, and an
     /// adapter-side bug (or a UDS client bypassing an adapter entirely)
     /// must fail closed here rather than persist an unscoped row.
+    #[tokio::test]
+    async fn whitespace_only_session_id_is_rejected_like_an_empty_one() {
+        let path = tmp_db_path("event-whitespace-session-id");
+        let store = Store::open(&path).await.expect("open db");
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "  \t".into(),
+            provider: Provider::Codex,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("exec_command".into()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        assert!(matches!(
+            store.insert_event(&event).await,
+            Err(StoreError::MissingSessionIdentity { .. })
+        ));
+        std::fs::remove_file(&path).ok();
+    }
+
     #[tokio::test]
     async fn insert_event_with_blank_session_id_is_rejected_not_persisted() {
         let path = tmp_db_path("event-blank-session-id");
