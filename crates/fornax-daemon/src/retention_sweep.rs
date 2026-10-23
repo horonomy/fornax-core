@@ -200,6 +200,7 @@ async fn run_one_cycle(
         total.examined += report.examined;
         total.purged_evidence += report.purged_evidence;
         total.deleted_records += report.deleted_records;
+        total.purged_in_place += report.purged_in_place;
         total.unknown_table_skipped += report.unknown_table_skipped;
         let more_remaining = report.more_remaining;
         cursor = report.next_cursor;
@@ -213,6 +214,7 @@ async fn run_one_cycle(
             examined = total.examined,
             purged_evidence = total.purged_evidence,
             deleted_records = total.deleted_records,
+            purged_in_place = total.purged_in_place,
             unknown_table_skipped = total.unknown_table_skipped,
             "retention sweep cycle complete"
         );
