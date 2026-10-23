@@ -134,7 +134,11 @@ fn load_hooks_with_digest(
 /// files are 0600); and syncs the file and its directory.
 ///
 /// A symlinked `hooks.json` (e.g. dotfiles-managed) is resolved first so the
-/// link survives and its target is what gets replaced. The limits documented
+/// link survives and its target is what gets replaced. If `canonicalize`
+/// fails for any reason (dangling link, permissions, a loop) the original
+/// path is used and a link there is replaced instead; that never writes
+/// outside `path`. `config.toml` in the same directory does not resolve
+/// links, so the two Codex files differ here. The limits documented
 /// on `write_guarded` otherwise apply unchanged: the final-check-to-rename
 /// window, and no ACL/xattr/ownership carry-over.
 fn save_hooks(

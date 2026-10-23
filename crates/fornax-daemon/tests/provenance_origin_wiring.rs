@@ -25,6 +25,8 @@ use fornax_types::{AgentEvent, Claim, EventKind, Evidence, EvidenceKind, IngestM
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use uuid::Uuid;
+mod common;
+use common::free_tcp_port;
 
 fn workspace_bin(name: &str) -> PathBuf {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -95,7 +97,10 @@ async fn start_daemon() -> DaemonHandle {
 
     wait_for(Duration::from_secs(10), || {
         let alive = handle.is_alive();
-        let ready = alive && handle.home.join("fornax.sock").exists();
+        // The socket file appears at bind(), before listen(): only a successful
+        // connect proves the daemon is accepting.
+        let ready = alive
+            && std::os::unix::net::UnixStream::connect(handle.home.join("fornax.sock")).is_ok();
         if !alive {
             panic!(
                 "daemon exited during startup; log:\n{}",
@@ -124,11 +129,6 @@ where
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-}
-
-fn free_tcp_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().expect("local addr").port()
 }
 
 fn short_id() -> String {
