@@ -178,6 +178,7 @@ the explicit prompt above ran `pytest` once. Result: one stored session, `post_t
 logs `unrecognized rollout line shape ... skipping` for 0.163.0 lines it does not map
 (`response_item:*`, `turn_context`, ...); the verdict path does not depend on them. The result
 depends on a local model following the instruction, so treat a miss as a model failure first.
+Since FORNX-462 the tailer forwards nothing until the rollout's `session_meta` supplies a native session id (it no longer uses the file path), so a hand-built fixture must open with a `session_meta` line.
 
 ## Cleanup
 
