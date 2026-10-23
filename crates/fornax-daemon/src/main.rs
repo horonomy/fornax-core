@@ -2524,7 +2524,7 @@ async fn api_judge(
 /// `fornax_verify::voi::AcquisitionPolicy` gate both `/api/evidence-plan`
 /// (FORNX-345) and `/api/acquire-evidence` (FORNX-346) use -- never a
 /// fabricated `AUTO_SAFE`/`REQUIRE_APPROVAL`/`FORBIDDEN` model.
-fn build_acquisition_policy(state: &AppState) -> fornax_verify::voi::AcquisitionPolicy {
+async fn build_acquisition_policy(state: &AppState) -> fornax_verify::voi::AcquisitionPolicy {
     use fornax_types::experiment::{SideEffectAllowList, SideEffectClass};
     let granted_side_effects = SideEffectAllowList::new(
         [
@@ -2536,9 +2536,16 @@ fn build_acquisition_policy(state: &AppState) -> fornax_verify::voi::Acquisition
         .into_iter()
         .filter(|class| state.experiment_policy.permits(*class)),
     );
+    // FORNX-464: an acquisition that must send data out is only plannable
+    // under the personal profile AND the legacy kill switch. Unconfigured,
+    // corporate, or an unreadable egress policy all mean "no egress".
+    let personal = matches!(
+        state.store.egress_state().await,
+        Ok(s) if s.profile == fornax_types::egress::Profile::Personal
+    );
     fornax_verify::voi::AcquisitionPolicy {
         granted_side_effects,
-        egress_allowed: fornax_types::privacy::cloud_sync_allowed(),
+        egress_allowed: personal && fornax_types::privacy::cloud_sync_allowed(),
         disabled_sensors: (*state.sensor_disable).clone(),
     }
 }
@@ -2609,7 +2616,7 @@ async fn api_evidence_plan(
         })),
         FusionOutcome::Found(found) => {
             let recommendation = DefaultRiskPolicy.decide(&found.fused, risk);
-            let acquisition = build_acquisition_policy(&state);
+            let acquisition = build_acquisition_policy(&state).await;
             let input = PlanInput {
                 claim: &found.claim,
                 graph: &found.graph,
@@ -2710,7 +2717,7 @@ async fn api_acquire_evidence(
     };
     let fused_before = found.fused.clone();
 
-    let acquisition = build_acquisition_policy(&state);
+    let acquisition = build_acquisition_policy(&state).await;
     let plan_input = PlanInput {
         claim: &found.claim,
         graph: &found.graph,
