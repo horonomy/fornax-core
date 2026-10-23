@@ -91,6 +91,128 @@ fn group_has_fornax_command(group: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Pre-existing empty structures that `install` found in `settings.json` and
+/// that `uninstall` must therefore leave in place if removing the Fornax entry
+/// leaves them empty again. Install pushes into a user's empty `Stop: []` (or
+/// creates entries inside their `"hooks": {}`), after which nothing in the file
+/// can tell that empty array from one Fornax created -- so install remembers.
+///
+/// This is a keep-list, never a created-list: a missing, stale or corrupt
+/// record only means a structure is cleaned up as before, it can never cause a
+/// deletion. The record lives in `state_path` next to the settings file and
+/// exists only while there is something to remember.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct KeepEmpty {
+    hooks: bool,
+    events: std::collections::BTreeSet<String>,
+}
+
+impl KeepEmpty {
+    fn is_empty(&self) -> bool {
+        !self.hooks && self.events.is_empty()
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({ "hooks": self.hooks, "events": self.events })
+    }
+
+    /// Only the documented events are honoured, so a hand-edited record cannot
+    /// name anything else.
+    fn from_json(value: &serde_json::Value) -> Self {
+        Self {
+            hooks: value
+                .get("hooks")
+                .and_then(|h| h.as_bool())
+                .unwrap_or(false),
+            events: value
+                .get("events")
+                .and_then(|e| e.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.as_str())
+                .filter(|e| CLAUDE_HOOK_EVENTS.contains(e))
+                .map(str::to_string)
+                .collect(),
+        }
+    }
+}
+
+/// `<dir>/.<file name>.fornax-state` for the settings file at `settings_path`.
+fn state_path(settings_path: &std::path::Path) -> std::path::PathBuf {
+    let name = settings_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "settings.json".to_string());
+    settings_path.with_file_name(format!(".{name}.fornax-state"))
+}
+
+/// Reads the record; anything unreadable, oversized or malformed is "nothing
+/// to keep", so uninstall can never be blocked by it.
+fn load_keep(settings_path: &std::path::Path) -> KeepEmpty {
+    const MAX_RECORD_BYTES: u64 = 64 * 1024;
+    let path = state_path(settings_path);
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return KeepEmpty::default();
+    };
+    if meta.len() > MAX_RECORD_BYTES {
+        return KeepEmpty::default();
+    }
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .map(|v| KeepEmpty::from_json(&v))
+        .unwrap_or_default()
+}
+
+/// What `before` (the document as install found it) says to keep, merged into
+/// the `prior` record. Events that already carry a Fornax group were observed
+/// by an earlier install and are left as recorded; every other known event is
+/// re-observed, so a stale entry for an event the user has since changed is
+/// corrected rather than trusted.
+fn observe_keep(before: &serde_json::Value, prior: KeepEmpty) -> KeepEmpty {
+    let hooks_obj = before.get("hooks").and_then(|h| h.as_object());
+    let has_owned = |event: &str| {
+        hooks_obj
+            .and_then(|h| h.get(event))
+            .and_then(|e| e.as_array())
+            .is_some_and(|groups| groups.iter().any(group_has_fornax_command))
+    };
+    let mut keep = prior;
+    if !CLAUDE_HOOK_EVENTS.iter().any(|e| has_owned(e)) {
+        keep.hooks = hooks_obj.is_some_and(|h| h.is_empty());
+    }
+    for event in CLAUDE_HOOK_EVENTS {
+        if has_owned(event) {
+            continue;
+        }
+        let empty_array = hooks_obj
+            .and_then(|h| h.get(event))
+            .and_then(|e| e.as_array())
+            .is_some_and(|a| a.is_empty());
+        if empty_array {
+            keep.events.insert(event.to_string());
+        } else {
+            keep.events.remove(event);
+        }
+    }
+    keep
+}
+
+/// Writes the record, or removes it when there is nothing to remember.
+fn store_keep(settings_path: &std::path::Path, keep: &KeepEmpty) -> anyhow::Result<()> {
+    let path = state_path(settings_path);
+    if keep.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        };
+    }
+    let expected = crate::guarded_write::digest_of(&path)?;
+    let mut json = serde_json::to_string(&keep.to_json())?;
+    json.push('\n');
+    write_guarded(&path, &json, &expected)
+}
+
 /// Idempotently ensures each hook in `CLAUDE_HOOK_EVENTS` has one group
 /// running `fornax-hook-claude`, without touching any other group/event
 /// already present in `settings`.
@@ -136,7 +258,9 @@ fn install_claude_hooks(settings: &mut serde_json::Value) -> anyhow::Result<()> 
 /// up only what the removal of a Fornax entry itself emptied: a group, event
 /// or `hooks` object that was already empty before (or an event this build
 /// does not know) belongs to the user or another tool and is preserved.
-fn uninstall_claude_hooks(settings: &mut serde_json::Value) {
+/// Containers that were already empty when `install` ran are named in `keep`
+/// and stay, so install followed by uninstall restores what the user had.
+fn uninstall_claude_hooks(settings: &mut serde_json::Value, keep: &KeepEmpty) {
     let Some(hooks_obj) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
         return;
     };
@@ -158,13 +282,13 @@ fn uninstall_claude_hooks(settings: &mut serde_json::Value) {
             removed_here |= removed;
             !(removed && group_hooks.is_empty())
         });
-        if removed_here && entries.is_empty() {
+        if removed_here && entries.is_empty() && !keep.events.contains(event) {
             hooks_obj.remove(event);
         }
         removed_any |= removed_here;
     }
 
-    if removed_any && hooks_obj.is_empty() {
+    if removed_any && hooks_obj.is_empty() && !keep.hooks {
         settings
             .as_object_mut()
             .expect("checked object above")
@@ -231,11 +355,24 @@ fn install_at_with(
     }
     before_write();
     save_settings(path, &settings, &digest)?;
+    // After the settings write, so a refused write leaves no record; failing to
+    // write it is not an install failure -- uninstall then simply cleans up as
+    // it did before the record existed.
+    let recorded = store_keep(path, &observe_keep(&before, load_keep(path)));
+    let note = match recorded {
+        Ok(()) => String::new(),
+        Err(e) => format!(
+            " (could not record pre-existing empty hook structures, uninstall will not restore them: {e})"
+        ),
+    };
     Ok(AdapterActionResult {
         adapter: "claude-code".to_string(),
         action: "install".to_string(),
         changed: true,
-        message: format!("Installed Fornax Claude Code hooks in {}", path.display()),
+        message: format!(
+            "Installed Fornax Claude Code hooks in {}{note}",
+            path.display()
+        ),
         path: path.display().to_string(),
     })
 }
@@ -264,7 +401,8 @@ fn uninstall_at_with(
     }
     let (before, digest) = load_settings_with_digest(path)?;
     let mut settings = before.clone();
-    uninstall_claude_hooks(&mut settings);
+    let keep = load_keep(path);
+    uninstall_claude_hooks(&mut settings, &keep);
     if settings == before {
         return Ok(AdapterActionResult {
             adapter: "claude-code".to_string(),
@@ -276,6 +414,9 @@ fn uninstall_at_with(
     }
     before_write();
     save_settings(path, &settings, &digest)?;
+    // The hooks are gone, so the record has served its purpose; a leftover one
+    // is harmless (the next install re-observes) and not worth failing for.
+    let _ = store_keep(path, &KeepEmpty::default());
     Ok(AdapterActionResult {
         adapter: "claude-code".to_string(),
         action: "uninstall".to_string(),
@@ -555,5 +696,260 @@ mod tests {
         assert!(!result.changed);
         assert_eq!(std::fs::read(&path).unwrap(), before);
         std::fs::remove_file(&path).ok();
+    }
+
+    // FORNX-460: install -> uninstall restores pre-existing empty structures.
+
+    fn cleanup(path: &std::path::Path) {
+        std::fs::remove_file(path).ok();
+        std::fs::remove_file(state_path(path)).ok();
+    }
+
+    fn read_json(path: &std::path::Path) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    fn roundtrip_restores(name: &str, original: serde_json::Value) {
+        let path = tmp_settings_path(name);
+        write_settings(&path, &original);
+        install_at(&path).expect("install");
+        assert!(uninstall_at(&path).expect("uninstall").changed);
+        assert_eq!(read_json(&path), original, "{name}: structure not restored");
+        assert!(!state_path(&path).exists(), "{name}: record left behind");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn roundtrip_restores_a_preexisting_empty_known_event() {
+        roundtrip_restores(
+            "keep-empty-known",
+            serde_json::json!({ "hooks": { "Stop": [] }, "model": "keep" }),
+        );
+    }
+
+    #[test]
+    fn roundtrip_restores_a_preexisting_empty_hooks_object() {
+        roundtrip_restores(
+            "keep-empty-hooks",
+            serde_json::json!({ "hooks": {}, "model": "keep" }),
+        );
+    }
+
+    #[test]
+    fn roundtrip_restores_every_kind_of_preexisting_empty_together_with_foreign_data() {
+        roundtrip_restores(
+            "keep-everything",
+            serde_json::json!({
+                "model": "keep",
+                "hooks": {
+                    "Stop": [],
+                    "PreToolUse": [{ "hooks": [] }],
+                    "FutureEvent": [],
+                    "SessionStart": [{ "hooks": [{ "type": "command", "command": "other-tool" }] }]
+                }
+            }),
+        );
+    }
+
+    #[test]
+    fn roundtrip_on_a_file_with_nothing_empty_writes_no_record_and_restores_it() {
+        let path = tmp_settings_path("keep-nothing");
+        let original = serde_json::json!({ "model": "keep" });
+        write_settings(&path, &original);
+        install_at(&path).expect("install");
+        assert!(
+            !state_path(&path).exists(),
+            "nothing to remember, so no record"
+        );
+        uninstall_at(&path).expect("uninstall");
+        assert_eq!(read_json(&path), original);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn repeated_cycles_and_a_repeated_install_keep_restoring_the_original() {
+        let path = tmp_settings_path("keep-cycles");
+        let original = serde_json::json!({ "hooks": { "Stop": [] }, "model": "keep" });
+        write_settings(&path, &original);
+        for _ in 0..3 {
+            install_at(&path).expect("install");
+            let record = std::fs::read(state_path(&path)).expect("record while installed");
+            assert!(!install_at(&path).expect("repeat install").changed);
+            assert_eq!(std::fs::read(state_path(&path)).unwrap(), record);
+            uninstall_at(&path).expect("uninstall");
+            assert_eq!(read_json(&path), original);
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn missing_record_falls_back_to_cleaning_up_what_the_removal_emptied() {
+        let path = tmp_settings_path("keep-no-record");
+        write_settings(&path, &serde_json::json!({ "hooks": { "Stop": [] } }));
+        install_at(&path).expect("install");
+        std::fs::remove_file(state_path(&path)).unwrap();
+        uninstall_at(&path).expect("uninstall");
+        assert_eq!(read_json(&path), serde_json::json!({}));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn corrupt_oversized_or_foreign_record_never_blocks_uninstall_or_deletes_anything() {
+        for (name, record) in [
+            ("garbage", b"not json {{{".to_vec()),
+            ("wrong-shape", br#"["Stop"]"#.to_vec()),
+            ("oversized", vec![b' '; 70 * 1024]),
+            (
+                "unknown-events",
+                br#"{"hooks":false,"events":["Bogus","Stop"]}"#.to_vec(),
+            ),
+        ] {
+            let path = tmp_settings_path(&format!("keep-bad-{name}"));
+            let foreign = serde_json::json!({ "hooks": [{ "type": "command", "command": "x" }] });
+            write_settings(
+                &path,
+                &serde_json::json!({ "model": "keep", "hooks": { "PreToolUse": [{ "hooks": [{ "type": "command", "command": "x" }] }] } }),
+            );
+            install_at(&path).expect("install");
+            std::fs::write(state_path(&path), &record).unwrap();
+            assert!(uninstall_at(&path).expect("uninstall").changed, "{name}");
+            let after = read_json(&path);
+            assert_eq!(after["model"], "keep", "{name}");
+            assert_eq!(
+                after["hooks"]["PreToolUse"],
+                serde_json::json!([foreign]),
+                "{name}"
+            );
+            assert!(
+                after["hooks"].get("Stop").is_none() || name == "unknown-events",
+                "{name}"
+            );
+            cleanup(&path);
+        }
+    }
+
+    #[test]
+    fn a_record_naming_an_event_that_still_holds_foreign_data_deletes_nothing() {
+        let path = tmp_settings_path("keep-record-vs-foreign");
+        write_settings(&path, &serde_json::json!({ "hooks": { "Stop": [] } }));
+        install_at(&path).expect("install");
+        let mut settings = read_json(&path);
+        settings["hooks"]["Stop"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!(
+                { "hooks": [{ "type": "command", "command": "other-tool" }] }
+            ));
+        write_settings(&path, &settings);
+        uninstall_at(&path).expect("uninstall");
+        assert_eq!(
+            read_json(&path)["hooks"]["Stop"],
+            serde_json::json!([{ "hooks": [{ "type": "command", "command": "other-tool" }] }])
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn an_event_the_user_deleted_after_install_is_not_resurrected() {
+        let path = tmp_settings_path("keep-user-deleted");
+        write_settings(&path, &serde_json::json!({ "hooks": { "Stop": [] } }));
+        install_at(&path).expect("install");
+        let mut settings = read_json(&path);
+        settings["hooks"].as_object_mut().unwrap().remove("Stop");
+        write_settings(&path, &settings);
+        uninstall_at(&path).expect("uninstall");
+        assert_eq!(read_json(&path), serde_json::json!({}));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_stale_record_is_corrected_by_the_next_install_not_trusted() {
+        let path = tmp_settings_path("keep-stale");
+        write_settings(&path, &serde_json::json!({ "hooks": { "Stop": [] } }));
+        install_at(&path).expect("install");
+        // The user wipes the file entirely; the old record (Stop) is now stale.
+        write_settings(&path, &serde_json::json!({}));
+        install_at(&path).expect("reinstall");
+        uninstall_at(&path).expect("uninstall");
+        assert_eq!(
+            read_json(&path),
+            serde_json::json!({}),
+            "Stop was not pre-existing the second time"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_stale_record_does_not_touch_a_file_with_no_owned_entry() {
+        let path = tmp_settings_path("keep-stale-noop");
+        let bytes = write_settings(
+            &path,
+            &serde_json::json!({ "hooks": { "FutureEvent": [] } }),
+        );
+        std::fs::write(state_path(&path), br#"{"hooks":true,"events":["Stop"]}"#).unwrap();
+        let result = uninstall_at(&path).expect("uninstall");
+        assert!(!result.changed);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(
+            state_path(&path).exists(),
+            "a no-op uninstall touches nothing"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn partial_install_from_an_older_build_keeps_newly_observed_empties_only() {
+        let path = tmp_settings_path("keep-partial");
+        // An earlier build installed Stop only (no record); PreToolUse is the user's empty array.
+        write_settings(
+            &path,
+            &serde_json::json!({ "hooks": { "Stop": [fornax_group()], "PreToolUse": [] } }),
+        );
+        install_at(&path).expect("install");
+        uninstall_at(&path).expect("uninstall");
+        assert_eq!(
+            read_json(&path),
+            serde_json::json!({ "hooks": { "PreToolUse": [] } })
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn plan_and_a_no_op_install_write_no_record() {
+        let path = tmp_settings_path("keep-plan");
+        write_settings(&path, &serde_json::json!({ "hooks": { "Stop": [] } }));
+        plan_install_at(&path).expect("plan");
+        assert!(!state_path(&path).exists());
+        install_at(&path).expect("install");
+        std::fs::remove_file(state_path(&path)).unwrap();
+        assert!(!install_at(&path).expect("no-op install").changed);
+        assert!(!state_path(&path).exists());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_refused_install_write_leaves_no_record() {
+        let path = tmp_settings_path("keep-refused");
+        write_settings(&path, &serde_json::json!({ "hooks": { "Stop": [] } }));
+        let racing = path.clone();
+        let err = install_at_with(&path, move || {
+            std::fs::write(&racing, b"{\"edited\":true}").unwrap();
+        });
+        assert!(err.is_err());
+        assert!(!state_path(&path).exists());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_stale_hooks_flag_is_corrected_by_the_next_install_not_trusted() {
+        let path = tmp_settings_path("keep-stale-hooks-flag");
+        write_settings(&path, &serde_json::json!({ "hooks": {} }));
+        install_at(&path).expect("install");
+        // The user wipes the file; the recorded "hooks was an empty object" is now stale.
+        write_settings(&path, &serde_json::json!({ "model": "keep" }));
+        install_at(&path).expect("reinstall");
+        uninstall_at(&path).expect("uninstall");
+        assert_eq!(read_json(&path), serde_json::json!({ "model": "keep" }));
+        cleanup(&path);
     }
 }
