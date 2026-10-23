@@ -1414,4 +1414,65 @@ mod tests {
         assert!(!dump.contains("first_seen_at"), "{dump}");
         std::fs::remove_file(&path).ok();
     }
+
+    /// End to end for the core requirement: with a live consent, staging
+    /// before the retention sweep means the sweep can delete the source rows
+    /// and the data is still uploadable. Without staging first it would not be.
+    #[tokio::test]
+    async fn the_retention_sweep_cannot_outrun_an_export_once_staging_ran_first() {
+        let (store, path) = open().await;
+        let consent = consenting(&store).await;
+        // Back-date the consent and profile history so a 40-day-old record is
+        // eligible (granted 60 days ago, personal since then).
+        let sixty = (Utc::now() - Duration::days(60)).to_rfc3339();
+        sqlx::query("UPDATE egress_consents SET granted_at = ?1")
+            .bind(&sixty)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE egress_profile_log SET changed_at = ?1")
+            .bind(&sixty)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let old = (Utc::now() - Duration::days(40)).to_rfc3339();
+        record(&store, "s-old", &old).await;
+        sqlx::query("UPDATE dataset_lineage_tags SET recorded_at = ?1")
+            .bind(&old)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        // The daemon stages ahead of every sweep.
+        assert_eq!(store.stage_upload_records().await.unwrap().staged, 5);
+        let report = store
+            .sweep_expired_records(Utc::now(), None, 1000)
+            .await
+            .unwrap();
+        assert!(
+            report.purged_evidence + report.deleted_records > 0,
+            "the sweep must actually remove source data for this to prove anything: {report:?}"
+        );
+        let purged: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM evidence WHERE evidence_purged = 1")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        let events_left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert!(purged > 0 || events_left == 0, "raw data was purged");
+
+        // The export is intact and sealable after the purge.
+        let window = store.pending_upload_windows().await.unwrap().remove(0);
+        let batch = store
+            .seal_upload_batch(&window, &consent, DEST)
+            .await
+            .unwrap()
+            .expect("staged data survives the sweep");
+        assert_eq!(batch.member_count, 5);
+        assert!(!batch.members_json.contains(CANARY));
+        std::fs::remove_file(&path).ok();
+    }
 }
