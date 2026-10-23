@@ -302,23 +302,31 @@ fn run_hook_codex_over_rollout(
     let _ = child.wait();
 }
 
+fn session_meta_line(session_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "timestamp": "2026-10-23T00:00:00.000Z",
+        "type": "session_meta",
+        "payload": {"id": session_id, "session_id": session_id}
+    })
+}
+
 fn run_case(label: &str, passed: bool, assistant_text: &str) -> (String, fornax_store::FindingRow) {
     let tmp = tempdir(label);
     let fornax_home = tmp.clone();
     let db_path = fornax_home.join("fornax.db");
     let rollout_path = tmp.join("rollout.jsonl");
-    // `fornax-hook-codex` uses the rollout file's own path as the session
-    // hint when no `session_meta` line supplies a real session id -- this
-    // test supplies none, so the file path itself is the session id,
-    // deterministic and unique per test run via `tempdir`'s pid+label.
-    let session_id = rollout_path.to_string_lossy().to_string();
+    // Real rollouts open with a `session_meta` line carrying the provider's
+    // native session id, and `fornax-hook-codex` forwards nothing until it
+    // has seen one (FORNX-462), so the fixture opens the same way.
+    let session_id = format!("fx462-{label}-session");
     let (daemon_guard, daemon_log_path) = spawn_daemon(&fornax_home);
 
-    let mut lines = if passed {
+    let mut lines = vec![session_meta_line(&session_id)];
+    lines.extend(if passed {
         pytest_success_exec_pair("fx433-call-pos")
     } else {
         fixture_native_events("custom_tool_call_exec_pair_failure.json")
-    };
+    });
     lines.push(task_complete_line(assistant_text));
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -587,4 +595,143 @@ fn real_codex_shell_command_failure_contradicts_a_false_success_claim_end_to_end
          stopped parsing the literal exit code, got verdict={} evidence_ids={}",
         finding.verdict, finding.evidence_ids
     );
+}
+
+/// FORNX-462: the rollout path is never an identity. Lines the tailer reads
+/// before the stream has supplied a native session id are not stored under
+/// the file path (or anywhere); once a `session_meta` line arrives later in
+/// the same stream, subsequent lines are stored under that native id. The
+/// control half proves the hook was alive and forwarding throughout, so the
+/// negative half cannot pass vacuously.
+#[test]
+fn lines_before_a_native_session_id_are_never_stored_under_the_rollout_path() {
+    use std::io::Write;
+
+    let tmp = tempdir("no-native-id");
+    let fornax_home = tmp.clone();
+    let db_path = fornax_home.join("fornax.db");
+    let rollout_path = tmp.join("rollout.jsonl");
+    let path_id = rollout_path.to_string_lossy().to_string();
+    let native_id = "fx462-native-session";
+    let (daemon_guard, daemon_log_path) = spawn_daemon(&fornax_home);
+
+    let encode = |lines: &[serde_json::Value]| {
+        let mut s = String::new();
+        for l in lines {
+            s.push_str(&l.to_string());
+            s.push('\n');
+        }
+        s
+    };
+
+    // 1. A complete exec pair + claim, but no session_meta yet.
+    let mut unidentified = pytest_success_exec_pair("fx462-pre-id-call");
+    unidentified.push(task_complete_line("All tests passed."));
+    std::fs::write(&rollout_path, encode(&unidentified)).expect("write rollout");
+
+    let hook = Command::new(env!("CARGO_BIN_EXE_fornax-hook-codex"))
+        .arg("--file")
+        .arg(&rollout_path)
+        .env("FORNAX_HOME", &fornax_home)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn fornax-hook-codex");
+    let _hook_guard = KillOnDrop(hook);
+
+    // Several 500ms poll cycles: ample time for the hook to have read and
+    // (wrongly) forwarded the unidentified lines if it were going to.
+    std::thread::sleep(Duration::from_millis(3000));
+
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let stored_under = |id: &str| -> (usize, usize, usize) {
+        rt.block_on(async {
+            let store = fornax_store::Store::open(&db_path)
+                .await
+                .expect("open store");
+            (
+                store
+                    .events_for_session(id)
+                    .await
+                    .map(|e| e.len())
+                    .unwrap_or(0),
+                store
+                    .evidence_for_session(id)
+                    .await
+                    .map(|e| e.evidence.len())
+                    .unwrap_or(0),
+                store
+                    .findings_for_session(id)
+                    .await
+                    .map(|f| f.len())
+                    .unwrap_or(0),
+            )
+        })
+    };
+    assert_eq!(
+        stored_under(&path_id),
+        (0, 0, 0),
+        "nothing may be stored under the rollout path as a session id"
+    );
+    let all_findings = rt.block_on(async {
+        fornax_store::Store::open(&db_path)
+            .await
+            .expect("open store")
+            .recent_findings(10)
+            .await
+            .expect("recent findings")
+    });
+    assert!(
+        all_findings.is_empty(),
+        "no finding may exist before an identity is known"
+    );
+
+    // 2. Control: the same live stream now learns its native id.
+    let mut identified = vec![session_meta_line(native_id)];
+    identified.extend(pytest_success_exec_pair("fx462-post-id-call"));
+    identified.push(task_complete_line("All tests passed."));
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&rollout_path)
+        .expect("open rollout for append");
+    f.write_all(encode(&identified).as_bytes())
+        .expect("append rollout");
+    drop(f);
+
+    let finding = poll_until(
+        Duration::from_secs(8),
+        "waiting for a Finding under the native session id",
+        || tail_log(&daemon_log_path),
+        || {
+            rt.block_on(async {
+                let store = fornax_store::Store::open(&db_path).await.ok()?;
+                store
+                    .findings_for_session(native_id)
+                    .await
+                    .ok()?
+                    .into_iter()
+                    .next()
+            })
+        },
+    );
+    // The tailer is still connected, so the daemon conservatively reports
+    // `review` instead of a definite verdict (HORO-1712); this test is about
+    // identity, not the verdict.
+    assert!(
+        matches!(finding.verdict.as_str(), "verified" | "review"),
+        "unexpected verdict {}",
+        finding.verdict
+    );
+    assert!(
+        stored_under(native_id).0 > 0,
+        "events after the native id are stored under it"
+    );
+    assert_eq!(
+        stored_under(&path_id),
+        (0, 0, 0),
+        "still nothing under the rollout path once the native id is known"
+    );
+
+    drop(daemon_guard);
+    std::fs::remove_dir_all(&tmp).ok();
 }

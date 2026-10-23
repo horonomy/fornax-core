@@ -76,6 +76,7 @@ async fn main() -> anyhow::Result<()> {
     let mut adapter = CodexAdapter::new();
     let mut stream: Option<UnixStream> = None;
     let mut caps_sent = false;
+    let mut warned_no_session_id = false;
     let mut offset: u64 = 0;
 
     loop {
@@ -96,8 +97,22 @@ async fn main() -> anyhow::Result<()> {
 
                 let Some(s) = stream.as_mut() else { continue };
 
-                let session_hint = file.display().to_string();
-                let outcome = adapter.normalize(&session_hint, &entry);
+                // FORNX-462: never invent an identity. The rollout path is not
+                // a provider-native session id (it embeds the OS username and
+                // would split the session from the hook path's UUID), so pass
+                // no hint and forward nothing until the stream's own
+                // `session_meta` has supplied one. The adapter still observes
+                // every line, so format latching and call correlation are kept.
+                let outcome = adapter.normalize("", &entry);
+                let Some(sid) = adapter.known_session_id().map(str::to_string) else {
+                    if !warned_no_session_id {
+                        eprintln!(
+                            "fornax-hook-codex: no native session id seen yet; not forwarding until the rollout's session_meta supplies one"
+                        );
+                        warned_no_session_id = true;
+                    }
+                    continue;
+                };
 
                 if !caps_sent {
                     // Sent once per connection (contrast
@@ -105,10 +120,6 @@ async fn main() -> anyhow::Result<()> {
                     // because it has no long-lived process to gate on —
                     // both are conforming, see `AgentAdapter::probe`'s doc
                     // on repeated-announcement idempotency).
-                    let sid = adapter
-                        .known_session_id()
-                        .unwrap_or(&session_hint)
-                        .to_string();
                     let caps = stamped_capabilities(&adapter, &sid);
                     send(s, &IngestMessage::Capabilities(caps)).await;
                     caps_sent = true;
