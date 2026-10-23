@@ -35,3 +35,14 @@ CREATE TABLE egress_allowlist (
     added_at     TEXT NOT NULL,
     removed_at   TEXT
 );
+
+-- Append-only history of profile changes. A record is only ever eligible for
+-- upload if the profile in force when it was captured was 'personal'; a record
+-- captured while 'corporate' (or before any profile was chosen) stays
+-- ineligible even if the install later switches to personal.
+CREATE TABLE egress_profile_log (
+    seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+    changed_at  TEXT NOT NULL,
+    profile     TEXT NOT NULL CHECK (profile IN ('unconfigured', 'personal', 'corporate')),
+    generation  INTEGER NOT NULL
+);

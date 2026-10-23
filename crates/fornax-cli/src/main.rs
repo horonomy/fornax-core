@@ -381,8 +381,8 @@ enum Commands {
         #[command(subcommand)]
         action: adjudicate_cmd::AdjudicateAction,
     },
-    /// Choose whether and where Fornax data may leave this machine
-    /// (FORNX-464): profile (personal / corporate), consents, allowlist.
+    /// Choose whether and where Fornax data may leave this machine:
+    /// profile (personal / corporate), consents, allowlist.
     ///
     /// Nothing is sent until a profile is chosen. `corporate` is local-only
     /// and cannot be overridden. Reads `$FORNAX_HOME/fornax.db` directly.

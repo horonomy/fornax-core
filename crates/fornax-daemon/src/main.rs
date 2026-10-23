@@ -3352,7 +3352,7 @@ fn html_escape(s: &str) -> String {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
     use fornax_types::{AgentEvent, Claim, EventKind, Provider};
     use uuid::Uuid;

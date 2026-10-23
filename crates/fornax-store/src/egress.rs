@@ -192,6 +192,14 @@ impl Store {
         .bind(source)
         .execute(&mut *tx)
         .await?;
+        sqlx::query(
+            "INSERT INTO egress_profile_log (changed_at, profile, generation) VALUES (?1, ?2, ?3)",
+        )
+        .bind(&now)
+        .bind(profile.as_str())
+        .bind(generation)
+        .execute(&mut *tx)
+        .await?;
         let revoked = if profile == Profile::Corporate {
             sqlx::query(
                 "UPDATE egress_consents SET revoked_at = ?1, revoked_reason = 'entered corporate profile'
