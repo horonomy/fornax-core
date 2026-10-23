@@ -13,6 +13,10 @@ CREATE TABLE upload_outbox (
     member_json  TEXT NOT NULL,                      -- canonical JSON of the metadata member
     member_sha256 TEXT NOT NULL,
     staged_at    TEXT NOT NULL,
+    -- The consent that authorized staging this row. A row is only ever sealed
+    -- under that same live consent; when it ends, pending rows expire and
+    -- sealed batches are retired, never re-targeted at a later consent.
+    consent_id   TEXT NOT NULL,
     state        TEXT NOT NULL DEFAULT 'pending'
         CHECK (state IN ('pending', 'inflight', 'acknowledged', 'poison', 'expired')),
     batch_id     TEXT,

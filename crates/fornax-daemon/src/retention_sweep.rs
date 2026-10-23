@@ -164,6 +164,26 @@ async fn run_one_cycle(
     mut cursor: Option<String>,
     config: SweepConfig,
 ) -> Option<String> {
+    // FORNX-464: with a live upload consent, snapshot every eligible record
+    // into the metadata-only outbox BEFORE the sweep deletes or purges
+    // anything, so the 30-day raw retention cannot outrun a monthly export.
+    // If staging fails the sweep is skipped this cycle (retention is
+    // best-effort; losing an export is not), and the cursor is unchanged.
+    match state.store.stage_upload_records().await {
+        Ok(staged) if staged.staged > 0 || staged.expired_at_bound > 0 => {
+            tracing::info!(
+                staged = staged.staged,
+                expired_at_bound = staged.expired_at_bound,
+                "upload outbox staged ahead of the retention sweep"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "upload staging failed; skipping this retention sweep so nothing is purged before it is exported");
+            return cursor;
+        }
+    }
+
     let mut total = SweepReport::default();
     for _ in 0..MAX_BATCHES_PER_CYCLE {
         let report = match state

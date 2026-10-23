@@ -198,6 +198,7 @@ struct ClaimSrc {
     source_event_id: String,
     subject: String,
     claimed_at: String,
+    parent_event_at: String,
 }
 
 #[derive(sqlx::FromRow)]
@@ -208,6 +209,7 @@ struct EvidenceSrc {
     kind: String,
     observed_at: String,
     provenance: String,
+    parent_event_at: String,
 }
 
 #[derive(sqlx::FromRow)]
@@ -218,6 +220,8 @@ struct FindingSrc {
     verdict: String,
     verifier_name: String,
     computed_at: String,
+    claim_at: String,
+    parent_event_at: String,
 }
 
 #[derive(sqlx::FromRow)]
@@ -277,7 +281,15 @@ impl Store {
     /// retention sweep and before sealing. Also enforces the outbox bound.
     pub async fn stage_upload_records(&self) -> Result<StageReport> {
         let mut report = StageReport::default();
-        let Some(consent) = self.live_upload_consent().await? else {
+        let live = self.live_upload_consent().await?;
+        // Whatever consent staged a row must still be the live one: when it
+        // ends (revoked, expired, profile changed, replaced), its pending
+        // rows are expired with a recorded gap and its sealed batches are
+        // retired -- never re-targeted at a later consent or destination.
+        report.expired_at_bound += self
+            .retire_unauthorized_upload_work(live.as_ref().map(|c| c.id.as_str()))
+            .await?;
+        let Some(consent) = live else {
             return Ok(report);
         };
         let Some(eligible_since) = parse_ts(&consent.granted_at) else {
@@ -321,8 +333,16 @@ impl Store {
             if let Some(t) = &e.tool_name {
                 m.insert("tool_name".into(), json!(safe_label(t)));
             }
-            report.staged +=
-                insert_member(&mut tx, "events", &e.id, &window, &m, &staged_at).await?;
+            report.staged += insert_member(
+                &mut tx,
+                "events",
+                &e.id,
+                &window,
+                &m,
+                &staged_at,
+                &consent.id,
+            )
+            .await?;
             staged_sessions.push(e.session_id);
         }
 
@@ -331,12 +351,13 @@ impl Store {
         staged_sessions.sort();
         staged_sessions.dedup();
         for session_id in staged_sessions {
+            // The session's TRUE earliest event (no consent-time filter): a
+            // session that began before consent, or under another profile,
+            // is never announced as a session member.
             let first: Option<(String, String)> = sqlx::query_as(
-                "SELECT MIN(observed_at), provider FROM agent_events
-                 WHERE session_id = ?1 AND substr(observed_at, 1, 19) >= substr(?2, 1, 19)",
+                "SELECT MIN(observed_at), provider FROM agent_events WHERE session_id = ?1",
             )
             .bind(&session_id)
-            .bind(&since)
             .fetch_optional(&mut *tx)
             .await?;
             let Some((first_seen, provider)) = first else {
@@ -349,13 +370,23 @@ impl Store {
             m.insert("session_id".into(), json!(session_id));
             m.insert("provider".into(), json!(safe_label(&provider)));
             m.insert("first_seen_at".into(), json!(first_seen));
-            report.staged +=
-                insert_member(&mut tx, "sessions", &session_id, &window, &m, &staged_at).await?;
+            report.staged += insert_member(
+                &mut tx,
+                "sessions",
+                &session_id,
+                &window,
+                &m,
+                &staged_at,
+                &consent.id,
+            )
+            .await?;
         }
 
         let claims: Vec<ClaimSrc> = sqlx::query_as(
-            "SELECT c.id, c.session_id, c.source_event_id, c.subject, c.claimed_at
+            "SELECT c.id, c.session_id, c.source_event_id, c.subject, c.claimed_at,
+                    pe.observed_at AS parent_event_at
              FROM claims c
+             JOIN agent_events pe ON pe.id = c.source_event_id
              LEFT JOIN upload_outbox o ON o.kind = 'claims' AND o.object_id = c.id
              WHERE o.object_id IS NULL AND substr(c.claimed_at, 1, 19) >= substr(?1, 1, 19)
              ORDER BY c.claimed_at ASC LIMIT ?2",
@@ -365,22 +396,36 @@ impl Store {
         .fetch_all(&mut *tx)
         .await?;
         for c in claims {
+            // Both the claim and the event it was made about must be eligible.
             let Some((_, window)) = eligible(&c.claimed_at) else {
                 continue;
             };
+            if eligible(&c.parent_event_at).is_none() {
+                continue;
+            }
             let mut m = Map::new();
             m.insert("id".into(), json!(c.id));
             m.insert("session_id".into(), json!(c.session_id));
             m.insert("source_event_id".into(), json!(c.source_event_id));
             m.insert("subject".into(), json!(safe_label(&c.subject)));
             m.insert("claimed_at".into(), json!(c.claimed_at));
-            report.staged +=
-                insert_member(&mut tx, "claims", &c.id, &window, &m, &staged_at).await?;
+            report.staged += insert_member(
+                &mut tx,
+                "claims",
+                &c.id,
+                &window,
+                &m,
+                &staged_at,
+                &consent.id,
+            )
+            .await?;
         }
 
         let evidence: Vec<EvidenceSrc> = sqlx::query_as(
-            "SELECT v.id, v.session_id, v.source_event_id, v.kind, v.observed_at, v.provenance
+            "SELECT v.id, v.session_id, v.source_event_id, v.kind, v.observed_at, v.provenance,
+                    pe.observed_at AS parent_event_at
              FROM evidence v
+             JOIN agent_events pe ON pe.id = v.source_event_id
              LEFT JOIN upload_outbox o ON o.kind = 'evidence' AND o.object_id = v.id
              WHERE o.object_id IS NULL AND substr(v.observed_at, 1, 19) >= substr(?1, 1, 19)
              ORDER BY v.observed_at ASC LIMIT ?2",
@@ -393,6 +438,9 @@ impl Store {
             let Some((_, window)) = eligible(&v.observed_at) else {
                 continue;
             };
+            if eligible(&v.parent_event_at).is_none() {
+                continue;
+            }
             let mut m = Map::new();
             m.insert("id".into(), json!(v.id));
             m.insert("session_id".into(), json!(v.session_id));
@@ -400,13 +448,24 @@ impl Store {
             m.insert("kind".into(), json!(safe_label(&v.kind)));
             m.insert("observed_at".into(), json!(v.observed_at));
             m.insert("provenance".into(), json!(safe_label(&v.provenance)));
-            report.staged +=
-                insert_member(&mut tx, "evidence", &v.id, &window, &m, &staged_at).await?;
+            report.staged += insert_member(
+                &mut tx,
+                "evidence",
+                &v.id,
+                &window,
+                &m,
+                &staged_at,
+                &consent.id,
+            )
+            .await?;
         }
 
         let findings: Vec<FindingSrc> = sqlx::query_as(
-            "SELECT f.id, f.claim_id, c.session_id, f.verdict, f.verifier_name, f.computed_at
-             FROM findings f JOIN claims c ON c.id = f.claim_id
+            "SELECT f.id, f.claim_id, c.session_id, f.verdict, f.verifier_name, f.computed_at,
+                    c.claimed_at AS claim_at, pe.observed_at AS parent_event_at
+             FROM findings f
+             JOIN claims c ON c.id = f.claim_id
+             JOIN agent_events pe ON pe.id = c.source_event_id
              LEFT JOIN upload_outbox o ON o.kind = 'findings' AND o.object_id = f.id
              WHERE o.object_id IS NULL AND substr(f.computed_at, 1, 19) >= substr(?1, 1, 19)
              ORDER BY f.computed_at ASC LIMIT ?2",
@@ -416,9 +475,14 @@ impl Store {
         .fetch_all(&mut *tx)
         .await?;
         for f in findings {
+            // A finding is only uploadable if the claim it judges, and the
+            // event that claim was made about, were themselves eligible.
             let Some((_, window)) = eligible(&f.computed_at) else {
                 continue;
             };
+            if eligible(&f.claim_at).is_none() || eligible(&f.parent_event_at).is_none() {
+                continue;
+            }
             let mut m = Map::new();
             m.insert("id".into(), json!(f.id));
             m.insert("claim_id".into(), json!(f.claim_id));
@@ -426,8 +490,16 @@ impl Store {
             m.insert("verdict".into(), json!(safe_label(&f.verdict)));
             m.insert("verifier_name".into(), json!(safe_label(&f.verifier_name)));
             m.insert("computed_at".into(), json!(f.computed_at));
-            report.staged +=
-                insert_member(&mut tx, "findings", &f.id, &window, &m, &staged_at).await?;
+            report.staged += insert_member(
+                &mut tx,
+                "findings",
+                &f.id,
+                &window,
+                &m,
+                &staged_at,
+                &consent.id,
+            )
+            .await?;
         }
         tx.commit().await?;
 
@@ -517,6 +589,55 @@ impl Store {
         Ok(total_dropped)
     }
 
+    /// Expire pending rows and retire sealed batches whose consent is not the
+    /// live one (`live_consent_id`, `None` = no live consent). Counts and
+    /// audits what it drops. Returns the number of pending rows expired.
+    pub async fn retire_unauthorized_upload_work(
+        &self,
+        live_consent_id: Option<&str>,
+    ) -> Result<usize> {
+        let live = live_consent_id.unwrap_or("");
+        let stale: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT window_id, COUNT(*) FROM upload_outbox
+             WHERE state = 'pending' AND consent_id <> ?1 GROUP BY window_id",
+        )
+        .bind(live)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut expired = 0usize;
+        for (window, n) in stale {
+            sqlx::query("UPDATE upload_outbox SET state = 'expired' WHERE state = 'pending' AND window_id = ?1 AND consent_id <> ?2")
+                .bind(&window)
+                .bind(live)
+                .execute(&self.pool)
+                .await?;
+            sqlx::query("INSERT INTO upload_gaps (window_id, reason, dropped_count, recorded_at) VALUES (?1, 'consent_ended', ?2, ?3)")
+                .bind(&window)
+                .bind(n)
+                .bind(Utc::now().to_rfc3339())
+                .execute(&self.pool)
+                .await?;
+            self.audit_upload(
+                AuditAction::UploadGapRecorded,
+                format!("gap:{window}:consent_ended:{n}"),
+                AuditOutcome::Denied,
+            )
+            .await?;
+            expired += n as usize;
+        }
+        let retired: Vec<(String,)> = sqlx::query_as(
+            "SELECT batch_id FROM upload_batches WHERE state = 'sealed' AND consent_id <> ?1",
+        )
+        .bind(live)
+        .fetch_all(&self.pool)
+        .await?;
+        for (batch_id,) in retired {
+            self.poison_upload_batch(&batch_id, "consent ended before the batch was acknowledged")
+                .await?;
+        }
+        Ok(expired)
+    }
+
     /// Windows that still have pending rows, oldest first.
     pub async fn pending_upload_windows(&self) -> Result<Vec<String>> {
         let rows: Vec<(String,)> = sqlx::query_as(
@@ -559,11 +680,12 @@ impl Store {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let rows: Vec<(String, String, String)> = sqlx::query_as(
             "SELECT kind, object_id, member_json FROM upload_outbox
-             WHERE state = 'pending' AND window_id = ?1
+             WHERE state = 'pending' AND window_id = ?1 AND consent_id = ?3
              ORDER BY kind ASC, object_id ASC LIMIT ?2",
         )
         .bind(window_id)
         .bind(MAX_BATCH_MEMBERS)
+        .bind(consent_id)
         .fetch_all(&mut *tx)
         .await?;
         if rows.is_empty() {
@@ -736,11 +858,13 @@ async fn insert_member(
     window: &str,
     member: &Map<String, Value>,
     staged_at: &str,
+    consent_id: &str,
 ) -> Result<usize> {
     let json = canonical_json(&Value::Object(member.clone()));
     let n = sqlx::query(
-        "INSERT OR IGNORE INTO upload_outbox (kind, object_id, window_id, member_json, member_sha256, staged_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT OR IGNORE INTO upload_outbox
+           (kind, object_id, window_id, member_json, member_sha256, staged_at, consent_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
     )
     .bind(kind)
     .bind(object_id)
@@ -748,6 +872,7 @@ async fn insert_member(
     .bind(&json)
     .bind(sha256_hex(json.as_bytes()))
     .bind(staged_at)
+    .bind(consent_id)
     .execute(tx)
     .await?
     .rows_affected();
@@ -1005,7 +1130,7 @@ mod tests {
     #[tokio::test]
     async fn staged_members_survive_the_source_rows_being_purged() {
         let (store, path) = open().await;
-        consenting(&store).await;
+        let consent = consenting(&store).await;
         let (_, _, evidence_id, _) = record(&store, "s-1", &at(5)).await;
         store.stage_upload_records().await.unwrap();
 
@@ -1021,7 +1146,7 @@ mod tests {
 
         let window = store.pending_upload_windows().await.unwrap().remove(0);
         let batch = store
-            .seal_upload_batch(&window, "c", DEST)
+            .seal_upload_batch(&window, &consent, DEST)
             .await
             .unwrap()
             .expect("something to seal");
@@ -1172,6 +1297,121 @@ mod tests {
             .unwrap()
             .iter()
             .any(|g| g.1 == "age_cap"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A row staged under one consent is never sealed under another.
+    #[tokio::test]
+    async fn work_staged_under_an_ended_consent_is_not_retargeted_at_a_later_one() {
+        let (store, path) = open().await;
+        let first = consenting(&store).await;
+        record(&store, "s-a", &at(5)).await;
+        store.stage_upload_records().await.unwrap();
+        let window = store.pending_upload_windows().await.unwrap().remove(0);
+        // One batch sealed (in flight) and more rows still pending.
+        let sealed = store
+            .seal_upload_batch(&window, &first, DEST)
+            .await
+            .unwrap()
+            .unwrap();
+        record(&store, "s-b", &at(6)).await;
+        store.stage_upload_records().await.unwrap();
+        assert!(!store.pending_upload_windows().await.unwrap().is_empty());
+
+        // The consent ends; a different consent (new destination) is granted.
+        store.revoke_egress_consent(&first, "t", "t").await.unwrap();
+        let other = "https://other.example.test/v1/metadata-batches";
+        store
+            .add_egress_allowlist(Purpose::EvidenceBatchUpload, other, "t")
+            .await
+            .unwrap();
+        let second = store
+            .grant_egress_consent(
+                Purpose::EvidenceBatchUpload,
+                other,
+                &classes(),
+                30,
+                None,
+                "t",
+            )
+            .await
+            .unwrap();
+        // Same profile generation, so the second consent is live.
+        store.stage_upload_records().await.unwrap();
+
+        // The first consent's pending rows expired (with a gap) and its sealed
+        // batch was retired: nothing of it can be sealed or resent to `other`.
+        assert!(store.pending_upload_windows().await.unwrap().is_empty());
+        assert!(store
+            .seal_upload_batch(&window, &second, other)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store.unfinished_upload_batches().await.unwrap().is_empty());
+        let gaps = store.upload_gaps().await.unwrap();
+        assert!(gaps.iter().any(|g| g.1 == "consent_ended"), "{gaps:?}");
+        let _ = sealed;
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A finding computed after consent about a claim made before it is not
+    /// uploadable, and neither is a session that began before consent.
+    #[tokio::test]
+    async fn a_parent_captured_before_consent_makes_its_children_ineligible() {
+        let (store, path) = open().await;
+        let (event_id, claim_id, evidence_id, _) = {
+            // Everything below is captured BEFORE the consent.
+            record(&store, "s-pre", &at(-3600)).await
+        };
+        let consent = consenting(&store).await;
+        let _ = consent;
+        // New evidence and a new finding AFTER consent, about the OLD event/claim.
+        let late_evidence = Evidence {
+            id: Uuid::new_v4(),
+            session_id: "s-pre".into(),
+            source_event_id: event_id,
+            kind: EvidenceKind::ExitCode,
+            observed_at: at(5),
+            payload: json!({}),
+            provenance: "claude_code:PostToolUse:Bash#tool_response".into(),
+            source: None,
+            extension: None,
+            evidence_purged: false,
+        };
+        store.insert_evidence(&late_evidence).await.unwrap();
+        let late_finding = Finding {
+            id: Uuid::new_v4(),
+            claim_id,
+            verdict: Verdict::Verified,
+            evidence_ids: vec![evidence_id],
+            verifier_name: "v".into(),
+            rationale: "r".into(),
+            computed_at: at(5),
+        };
+        store.insert_finding(&late_finding).await.unwrap();
+        // A new post-consent event in the same pre-consent session.
+        let new_event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "s-pre".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: at(6),
+            tool_name: Some("Bash".into()),
+            tool_input: None,
+            tool_response: None,
+            raw: json!({}),
+        };
+        store.insert_event(&new_event).await.unwrap();
+
+        store.stage_upload_records().await.unwrap();
+        let dump = outbox_dump(&store).await;
+        // Only the genuinely new event is staged: not the late evidence or
+        // finding (their parents predate consent) and no session member (the
+        // session began before consent).
+        assert!(dump.contains(&new_event.id.to_string()), "{dump}");
+        assert!(!dump.contains(&late_evidence.id.to_string()), "{dump}");
+        assert!(!dump.contains(&late_finding.id.to_string()), "{dump}");
+        assert!(!dump.contains("first_seen_at"), "{dump}");
         std::fs::remove_file(&path).ok();
     }
 }
