@@ -348,8 +348,9 @@ impl AgentAdapter for CodexAdapter {
 
     /// Prefers the session id discovered from the rollout file's own
     /// `session_meta` line (see `Self::session_id`) once known; falls back
-    /// to `session_hint` (e.g. the file path, used by `main.rs` before any
-    /// `session_meta` line has been seen) otherwise.
+    /// to `session_hint` otherwise. `fornax-hook-codex` passes an empty hint
+    /// and forwards nothing until an id is known (FORNX-462): a blank or
+    /// whitespace `session_id` is never accepted as one.
     fn normalize(
         &mut self,
         session_hint: &str,
@@ -359,6 +360,7 @@ impl AgentAdapter for CodexAdapter {
             if let Some(sid) = native
                 .pointer("/payload/session_id")
                 .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
             {
                 self.session_id = Some(sid.to_string());
             }
@@ -1682,6 +1684,25 @@ mod tests {
         });
         let msgs = normalize(&mut adapter, &output).into_messages();
         assert_eq!(msgs.len(), 1);
+    }
+
+    #[test]
+    fn a_blank_session_id_is_never_latched_and_a_later_real_one_is() {
+        let mut adapter = CodexAdapter::new();
+        for blank in ["", "   "] {
+            let meta =
+                serde_json::json!({"type": "session_meta", "payload": {"session_id": blank}});
+            let _ = adapter.normalize("", &meta);
+            assert_eq!(
+                adapter.known_session_id(),
+                None,
+                "blank id {blank:?} latched"
+            );
+        }
+        let meta =
+            serde_json::json!({"type": "session_meta", "payload": {"session_id": "real-sess"}});
+        let _ = adapter.normalize("", &meta);
+        assert_eq!(adapter.known_session_id(), Some("real-sess"));
     }
 
     #[test]

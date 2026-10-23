@@ -76,13 +76,10 @@ async fn main() -> anyhow::Result<()> {
     let mut adapter = CodexAdapter::new();
     let mut stream: Option<UnixStream> = None;
     let mut caps_sent = false;
+    let mut warned_no_session_id = false;
     let mut offset: u64 = 0;
 
     loop {
-        if stream.is_none() {
-            stream = UnixStream::connect(sock_path()).await.ok();
-        }
-
         let content = tokio::fs::read_to_string(&file).await.unwrap_or_default();
         if (content.len() as u64) > offset {
             let new_part = &content[offset as usize..];
@@ -94,10 +91,34 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 };
 
-                let Some(s) = stream.as_mut() else { continue };
+                // FORNX-462: never invent an identity. The rollout path is not
+                // a provider-native session id (it embeds the OS username and
+                // would split the session from the hook path's UUID), so pass
+                // no hint and forward nothing until the stream's own
+                // `session_meta` has supplied one. The adapter observes every
+                // line whether or not the daemon is reachable, so the id is
+                // learned even if the socket is down when `session_meta` is
+                // read, and format latching and call correlation are kept.
+                let outcome = adapter.normalize("", &entry);
+                let Some(sid) = adapter.known_session_id().map(str::to_string) else {
+                    if !warned_no_session_id {
+                        eprintln!(
+                            "fornax-hook-codex: no native session id seen yet; not forwarding until the rollout's session_meta supplies one"
+                        );
+                        warned_no_session_id = true;
+                    }
+                    continue;
+                };
 
-                let session_hint = file.display().to_string();
-                let outcome = adapter.normalize(&session_hint, &entry);
+                // Connect only once an identity exists: a connection that
+                // never sends anything makes the daemon treat every session's
+                // evidence as possibly incomplete and downgrade their verdicts
+                // (HORO-1712 handoff tracking).
+                if stream.is_none() {
+                    stream = UnixStream::connect(sock_path()).await.ok();
+                    caps_sent = false;
+                }
+                let Some(s) = stream.as_mut() else { continue };
 
                 if !caps_sent {
                     // Sent once per connection (contrast
@@ -105,10 +126,6 @@ async fn main() -> anyhow::Result<()> {
                     // because it has no long-lived process to gate on —
                     // both are conforming, see `AgentAdapter::probe`'s doc
                     // on repeated-announcement idempotency).
-                    let sid = adapter
-                        .known_session_id()
-                        .unwrap_or(&session_hint)
-                        .to_string();
                     let caps = stamped_capabilities(&adapter, &sid);
                     send(s, &IngestMessage::Capabilities(caps)).await;
                     caps_sent = true;
