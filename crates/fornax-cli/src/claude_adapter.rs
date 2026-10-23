@@ -128,35 +128,38 @@ fn install_claude_hooks(settings: &mut serde_json::Value) -> anyhow::Result<()> 
 
 /// Removes only Fornax hook entries from `settings`, leaving every other
 /// hook group, hook event, and top-level setting exactly as it was. Cleans
-/// up groups/events left empty by the removal, but never removes a group
-/// that still carries another tool's hook entry.
+/// up only what the removal of a Fornax entry itself emptied: a group, event
+/// or `hooks` object that was already empty before (or an event this build
+/// does not know) belongs to the user or another tool and is preserved.
 fn uninstall_claude_hooks(settings: &mut serde_json::Value) {
     let Some(hooks_obj) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
         return;
     };
 
+    let mut removed_any = false;
     for event in CLAUDE_HOOK_EVENTS {
         let Some(entries) = hooks_obj.get_mut(event).and_then(|e| e.as_array_mut()) else {
             continue;
         };
-        for group in entries.iter_mut() {
-            if let Some(group_hooks) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
-                group_hooks.retain(|h| {
-                    h.get("command").and_then(|c| c.as_str()) != Some(FORNAX_HOOK_COMMAND)
-                });
-            }
-        }
-        entries.retain(|group| {
-            group
-                .get("hooks")
-                .and_then(|h| h.as_array())
-                .map(|a| !a.is_empty())
-                .unwrap_or(true)
+        let mut removed_here = false;
+        entries.retain_mut(|group| {
+            let Some(group_hooks) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
+                return true;
+            };
+            let before = group_hooks.len();
+            group_hooks
+                .retain(|h| h.get("command").and_then(|c| c.as_str()) != Some(FORNAX_HOOK_COMMAND));
+            let removed = group_hooks.len() < before;
+            removed_here |= removed;
+            !(removed && group_hooks.is_empty())
         });
+        if removed_here && entries.is_empty() {
+            hooks_obj.remove(event);
+        }
+        removed_any |= removed_here;
     }
 
-    hooks_obj.retain(|_, v| v.as_array().map(|a| !a.is_empty()).unwrap_or(true));
-    if hooks_obj.is_empty() {
+    if removed_any && hooks_obj.is_empty() {
         settings
             .as_object_mut()
             .expect("checked object above")
@@ -386,5 +389,105 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
         assert!(load_settings(&path).unwrap()["hooks"]["Stop"].is_array());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // FW-EMPTY-01: uninstall must only remove what an owned Fornax entry's
+    // removal empties. Pre-existing empty events/groups belong to the user
+    // or to other tools (including events a newer Claude Code adds).
+    fn fornax_group() -> serde_json::Value {
+        serde_json::json!({ "hooks": [{ "type": "command", "command": FORNAX_HOOK_COMMAND }] })
+    }
+
+    fn write_settings(path: &std::path::Path, value: &serde_json::Value) -> Vec<u8> {
+        let bytes = serde_json::to_vec_pretty(value).unwrap();
+        std::fs::write(path, &bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn uninstall_without_an_owned_entry_leaves_unowned_empties_byte_identical() {
+        let path = tmp_settings_path("fw-empty-none-owned");
+        let before = write_settings(
+            &path,
+            &serde_json::json!({
+                "hooks": { "FutureEvent": [], "PreToolUse": [], "Stop": [{ "hooks": [] }] },
+                "model": "keep"
+            }),
+        );
+        let result = uninstall_at(&path).expect("uninstall");
+        assert!(!result.changed, "nothing owned, so nothing to change");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn uninstall_without_an_owned_entry_keeps_an_empty_hooks_object() {
+        let path = tmp_settings_path("fw-empty-hooks-object");
+        let before = write_settings(&path, &serde_json::json!({ "hooks": {}, "model": "keep" }));
+        let result = uninstall_at(&path).expect("uninstall");
+        assert!(!result.changed);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn uninstall_removes_only_the_owned_entry_and_keeps_foreign_and_empty_data() {
+        let path = tmp_settings_path("fw-empty-mixed");
+        let foreign = serde_json::json!({ "matcher": "Bash", "hooks": [{ "type": "command", "command": "other-tool" }] });
+        write_settings(
+            &path,
+            &serde_json::json!({
+                "hooks": {
+                    "FutureEvent": [],
+                    "PreToolUse": [{ "hooks": [] }, fornax_group()],
+                    "PostToolUse": [foreign.clone(), fornax_group()],
+                    "Stop": [fornax_group()]
+                },
+                "model": "keep"
+            }),
+        );
+        let result = uninstall_at(&path).expect("uninstall");
+        assert!(result.changed);
+        let after = load_settings(&path).unwrap();
+        assert_eq!(
+            after,
+            serde_json::json!({
+                "hooks": {
+                    "FutureEvent": [],
+                    "PreToolUse": [{ "hooks": [] }],
+                    "PostToolUse": [foreign]
+                },
+                "model": "keep"
+            })
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn uninstall_after_install_still_cleans_up_what_the_owned_removal_emptied() {
+        let path = tmp_settings_path("fw-empty-roundtrip");
+        write_settings(&path, &serde_json::json!({ "model": "keep" }));
+        install_at(&path).expect("install");
+        uninstall_at(&path).expect("uninstall");
+        assert_eq!(
+            load_settings(&path).unwrap(),
+            serde_json::json!({ "model": "keep" })
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn uninstall_keeps_unowned_empties_when_the_owned_removal_empties_hooks_otherwise() {
+        let path = tmp_settings_path("fw-empty-hooks-key");
+        write_settings(
+            &path,
+            &serde_json::json!({ "hooks": { "Stop": [fornax_group()] }, "model": "keep" }),
+        );
+        uninstall_at(&path).expect("uninstall");
+        assert_eq!(
+            load_settings(&path).unwrap(),
+            serde_json::json!({ "model": "keep" })
+        );
+        std::fs::remove_file(&path).ok();
     }
 }
