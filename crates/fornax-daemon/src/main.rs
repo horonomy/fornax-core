@@ -1496,6 +1496,19 @@ async fn api_status(
     Query(q): Query<StatusQuery>,
 ) -> Json<serde_json::Value> {
     match q.session {
+        // A legacy placeholder ("unknown", a rollout path) is not a session
+        // identity: never answer it as a session reading (FORNX-465).
+        Some(session_id)
+            if fornax_store::session_attribution(&session_id)
+                == fornax_store::ATTRIBUTION_LEGACY_UNATTRIBUTED =>
+        {
+            Json(serde_json::json!({
+                "latest": null,
+                "session_scoped": false,
+                "scope": "host",
+                "unattributed_session": true,
+            }))
+        }
         Some(session_id) => match state.store.latest_finding_for_session(&session_id).await {
             Ok(row) => Json(serde_json::json!({
                 "latest": row.as_ref().map(finding_json),
@@ -3329,7 +3342,8 @@ async fn dashboard(State(state): State<AppState>) -> axum::response::Html<String
          <style>body{font-family:monospace;margin:2rem;background:#0b0e14;color:#d6dee8}\
          table{border-collapse:collapse;width:100%}td,th{padding:.4rem .6rem;border-bottom:1px solid #2a3140;text-align:left}\
          .verified{color:#4caf50}.contradicted{color:#e5534b}.unverified{color:#c9a227}.review{color:#4a9dd6}.unavailable{color:#7d8798}\
-         </style></head><body><h2>🛡 Fornax — recent findings</h2><table>\
+         </style></head><body><h2>🛡 Fornax — recent findings</h2>\
+         <p>Host-wide: the newest findings across every session on this machine.</p><table>\
          <tr><th>Verdict</th><th>Claim</th><th>Verifier</th><th>Rationale</th><th>When</th></tr>",
     );
     for r in rows {
@@ -4111,6 +4125,26 @@ mod tests {
             unknown_session.0["latest"].is_null(),
             "a known-good session query for a session with no findings must not fall back to any other session's finding"
         );
+
+        // FORNX-465: a legacy placeholder is never answered as a session reading,
+        // even when rows are filed under it.
+        record_finding(
+            &state,
+            "unknown",
+            fornax_types::Verdict::Contradicted,
+            "2026-01-01T00:00:09Z",
+        )
+        .await;
+        let legacy = api_status(
+            State(state.clone()),
+            Query(StatusQuery {
+                session: Some("unknown".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(legacy.0["session_scoped"], false);
+        assert_eq!(legacy.0["scope"], "host");
+        assert!(legacy.0["latest"].is_null());
     }
 
     /// FORNX-85: `/api/capabilities?session=<id>` must surface the exact

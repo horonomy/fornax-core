@@ -935,13 +935,12 @@ impl Store {
         let rows = sqlx::query_as::<_, FindingRow>(
             "SELECT f.id, f.claim_id, f.verdict, f.evidence_ids, f.verifier_name, f.rationale, f.computed_at,
                     c.text as claim_text, c.session_id as session_id,
-                    (SELECT CASE WHEN json_valid(e.raw) AND json_type(e.raw, '$.agent_id') = 'text'
-                                 THEN json_extract(e.raw, '$.agent_id') END
-                       FROM agent_events e WHERE e.id = c.source_event_id) as agent_id,
-                    (SELECT CASE WHEN json_valid(e.raw) AND json_type(e.raw, '$.agent_type') = 'text'
-                                 THEN json_extract(e.raw, '$.agent_type') END
-                       FROM agent_events e WHERE e.id = c.source_event_id) as agent_type
+                    CASE WHEN json_valid(e.raw) THEN CASE WHEN json_type(e.raw, '$.agent_id') = 'text'
+                         THEN json_extract(e.raw, '$.agent_id') END END as agent_id,
+                    CASE WHEN json_valid(e.raw) THEN CASE WHEN json_type(e.raw, '$.agent_type') = 'text'
+                         THEN json_extract(e.raw, '$.agent_type') END END as agent_type
              FROM findings f JOIN claims c ON c.id = f.claim_id
+             LEFT JOIN agent_events e ON e.id = c.source_event_id
              ORDER BY f.computed_at DESC LIMIT ?1",
         )
         .bind(limit)
@@ -956,13 +955,12 @@ impl Store {
         let row = sqlx::query_as::<_, FindingRow>(
             "SELECT f.id, f.claim_id, f.verdict, f.evidence_ids, f.verifier_name, f.rationale, f.computed_at,
                     c.text as claim_text, c.session_id as session_id,
-                    (SELECT CASE WHEN json_valid(e.raw) AND json_type(e.raw, '$.agent_id') = 'text'
-                                 THEN json_extract(e.raw, '$.agent_id') END
-                       FROM agent_events e WHERE e.id = c.source_event_id) as agent_id,
-                    (SELECT CASE WHEN json_valid(e.raw) AND json_type(e.raw, '$.agent_type') = 'text'
-                                 THEN json_extract(e.raw, '$.agent_type') END
-                       FROM agent_events e WHERE e.id = c.source_event_id) as agent_type
+                    CASE WHEN json_valid(e.raw) THEN CASE WHEN json_type(e.raw, '$.agent_id') = 'text'
+                         THEN json_extract(e.raw, '$.agent_id') END END as agent_id,
+                    CASE WHEN json_valid(e.raw) THEN CASE WHEN json_type(e.raw, '$.agent_type') = 'text'
+                         THEN json_extract(e.raw, '$.agent_type') END END as agent_type
              FROM findings f JOIN claims c ON c.id = f.claim_id
+             LEFT JOIN agent_events e ON e.id = c.source_event_id
              WHERE f.id = ?1",
         )
         .bind(id)
@@ -1008,13 +1006,12 @@ impl Store {
         let row = sqlx::query_as::<_, FindingRow>(
             "SELECT f.id, f.claim_id, f.verdict, f.evidence_ids, f.verifier_name, f.rationale, f.computed_at,
                     c.text as claim_text, c.session_id as session_id,
-                    (SELECT CASE WHEN json_valid(e.raw) AND json_type(e.raw, '$.agent_id') = 'text'
-                                 THEN json_extract(e.raw, '$.agent_id') END
-                       FROM agent_events e WHERE e.id = c.source_event_id) as agent_id,
-                    (SELECT CASE WHEN json_valid(e.raw) AND json_type(e.raw, '$.agent_type') = 'text'
-                                 THEN json_extract(e.raw, '$.agent_type') END
-                       FROM agent_events e WHERE e.id = c.source_event_id) as agent_type
+                    CASE WHEN json_valid(e.raw) THEN CASE WHEN json_type(e.raw, '$.agent_id') = 'text'
+                         THEN json_extract(e.raw, '$.agent_id') END END as agent_id,
+                    CASE WHEN json_valid(e.raw) THEN CASE WHEN json_type(e.raw, '$.agent_type') = 'text'
+                         THEN json_extract(e.raw, '$.agent_type') END END as agent_type
              FROM findings f JOIN claims c ON c.id = f.claim_id
+             LEFT JOIN agent_events e ON e.id = c.source_event_id
              WHERE c.session_id = ?1
              ORDER BY f.computed_at DESC LIMIT 1",
         )
@@ -1031,13 +1028,12 @@ impl Store {
         let rows = sqlx::query_as::<_, FindingRow>(
             "SELECT f.id, f.claim_id, f.verdict, f.evidence_ids, f.verifier_name, f.rationale, f.computed_at,
                     c.text as claim_text, c.session_id as session_id,
-                    (SELECT CASE WHEN json_valid(e.raw) AND json_type(e.raw, '$.agent_id') = 'text'
-                                 THEN json_extract(e.raw, '$.agent_id') END
-                       FROM agent_events e WHERE e.id = c.source_event_id) as agent_id,
-                    (SELECT CASE WHEN json_valid(e.raw) AND json_type(e.raw, '$.agent_type') = 'text'
-                                 THEN json_extract(e.raw, '$.agent_type') END
-                       FROM agent_events e WHERE e.id = c.source_event_id) as agent_type
+                    CASE WHEN json_valid(e.raw) THEN CASE WHEN json_type(e.raw, '$.agent_id') = 'text'
+                         THEN json_extract(e.raw, '$.agent_id') END END as agent_id,
+                    CASE WHEN json_valid(e.raw) THEN CASE WHEN json_type(e.raw, '$.agent_type') = 'text'
+                         THEN json_extract(e.raw, '$.agent_type') END END as agent_type
              FROM findings f JOIN claims c ON c.id = f.claim_id
+             LEFT JOIN agent_events e ON e.id = c.source_event_id
              WHERE c.session_id = ?1
              ORDER BY f.computed_at DESC",
         )
@@ -1077,7 +1073,7 @@ pub const ATTRIBUTION_NATIVE: &str = "native";
 pub const ATTRIBUTION_LEGACY_UNATTRIBUTED: &str = "legacy_unattributed";
 
 pub fn session_attribution(session_id: &str) -> &'static str {
-    if session_id == "unknown" || session_id.starts_with('/') {
+    if session_id == "unknown" || session_id.contains('/') || session_id.contains('\\') {
         ATTRIBUTION_LEGACY_UNATTRIBUTED
     } else {
         ATTRIBUTION_NATIVE
@@ -3210,6 +3206,22 @@ mod tests {
             .unwrap();
         assert!(row.agent_id.is_none() && row.agent_type.is_none());
 
+        // Malformed raw JSON must not break the query either.
+        insert_session_finding_with_raw(
+            &store,
+            "sess-malformed",
+            Verdict::Verified,
+            "2026-01-01T00:00:00Z",
+            serde_json::Value::String("{not json".into()),
+        )
+        .await;
+        let row = store
+            .latest_finding_for_session("sess-malformed")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.agent_id.is_none());
+
         // A non-string agent_id is not an identity and must not break the query.
         insert_session_finding_with_raw(
             &store,
@@ -3244,6 +3256,10 @@ mod tests {
             ATTRIBUTION_NATIVE
         );
         assert_eq!(session_attribution("sess-1"), ATTRIBUTION_NATIVE);
+        assert_eq!(
+            session_attribution("rollout\\2026\\a.jsonl"),
+            ATTRIBUTION_LEGACY_UNATTRIBUTED
+        );
     }
 
     #[tokio::test]
