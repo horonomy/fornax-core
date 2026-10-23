@@ -22,10 +22,12 @@
 //! Requires `node` on PATH (present on GitHub's `ubuntu-latest` runners
 //! without any extra setup step).
 
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+#[path = "../../fornax-daemon/tests/common/mod.rs"]
+mod common;
+use common::free_tcp_port;
 
 /// Walk up from the test binary's own path to find `target/<profile>/`,
 /// then resolve a sibling workspace binary by name. `env!("CARGO_BIN_EXE_*")`
@@ -54,14 +56,6 @@ fn sibling_workspace_bin(name: &str) -> PathBuf {
             panic!("walked past filesystem root looking for `{name}`");
         }
     }
-}
-
-fn free_tcp_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("local_addr")
-        .port()
 }
 
 fn plugin_path() -> PathBuf {

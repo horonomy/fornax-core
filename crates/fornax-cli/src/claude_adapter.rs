@@ -61,8 +61,13 @@ fn load_settings_with_digest(
 }
 
 /// Replaces `path` with `settings` through `write_guarded`: refuses if the
-/// file changed since `expected` was taken, never writes through a planted
-/// temp path, keeps the file's permissions, and fsyncs (FORNX-420).
+/// file changed since `expected` was taken, stages in an exclusive unique
+/// sibling, keeps the rwx bits, and fsyncs (FORNX-420).
+///
+/// Limits (see `write_guarded`): a symlinked `settings.json` is replaced by a
+/// regular file rather than written through, because resolving it could land
+/// the write outside `~/.claude`; ownership, ACLs and xattrs are not carried
+/// over.
 fn save_settings(
     path: &std::path::Path,
     settings: &serde_json::Value,

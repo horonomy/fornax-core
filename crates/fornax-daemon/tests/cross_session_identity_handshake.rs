@@ -34,6 +34,8 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
+mod common;
+use common::free_tcp_port;
 
 fn workspace_bin(name: &str) -> PathBuf {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -152,11 +154,6 @@ fn fornax_status_output(home: &Path, port: u16) -> String {
         .output()
         .expect("run fornax status");
     String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
-fn free_tcp_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().expect("local addr").port()
 }
 
 fn short_id() -> String {
