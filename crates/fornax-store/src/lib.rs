@@ -3,6 +3,7 @@
 //! verifiers (FORNX-49) from this store alone, with no network/adapter
 //! dependency.
 
+use fornax_types::execution_identity;
 use fornax_types::{
     AgentEvent, Claim, DatasetLineageTag, Evidence, EvidenceGraph, EvidenceLink, Finding,
     LegacyCapabilitiesWire, MissingEvidence, RuntimeCapabilities, TenantRef,
@@ -408,6 +409,11 @@ impl Store {
                 }),
             };
         }
+
+        // FORNX-466: provider-native agent/turn attribution, read once here
+        // from the untouched provider payload through the shared contract
+        // normalizer, in the event's own transaction.
+        insert_event_attribution(&mut *tx, e, &provider_tag).await?;
 
         let lineage_tag = DatasetLineageTag::new(
             retention::retention_class_for_table("agent_events"),
@@ -929,18 +935,27 @@ impl Store {
         rows.into_iter().map(TryInto::try_into).collect()
     }
 
+    /// Attribution persisted for one event, or `None` when it has none.
+    /// Claims and evidence resolve theirs through their `source_event_id`.
+    pub async fn attribution_for_event(&self, event_id: &str) -> Result<Option<EventAttribution>> {
+        let row = sqlx::query_as::<_, EventAttribution>(
+            "SELECT agent_id, agent_type, turn_id, lineage_status FROM event_attribution WHERE event_id = ?1",
+        )
+        .bind(event_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
     /// Most recent findings across all sessions, for the localhost dashboard
     /// (FORNX-32) and detail command (FORNX-31).
     pub async fn recent_findings(&self, limit: i64) -> Result<Vec<FindingRow>> {
         let rows = sqlx::query_as::<_, FindingRow>(
             "SELECT f.id, f.claim_id, f.verdict, f.evidence_ids, f.verifier_name, f.rationale, f.computed_at,
                     c.text as claim_text, c.session_id as session_id,
-                    CASE WHEN json_valid(e.raw) THEN CASE WHEN json_type(e.raw, '$.agent_id') = 'text'
-                         THEN json_extract(e.raw, '$.agent_id') END END as agent_id,
-                    CASE WHEN json_valid(e.raw) THEN CASE WHEN json_type(e.raw, '$.agent_type') = 'text'
-                         THEN json_extract(e.raw, '$.agent_type') END END as agent_type
+                    ea.agent_id as agent_id, ea.agent_type as agent_type, ea.turn_id as turn_id
              FROM findings f JOIN claims c ON c.id = f.claim_id
-             LEFT JOIN agent_events e ON e.id = c.source_event_id
+             LEFT JOIN event_attribution ea ON ea.event_id = c.source_event_id
              ORDER BY f.computed_at DESC LIMIT ?1",
         )
         .bind(limit)
@@ -955,12 +970,9 @@ impl Store {
         let row = sqlx::query_as::<_, FindingRow>(
             "SELECT f.id, f.claim_id, f.verdict, f.evidence_ids, f.verifier_name, f.rationale, f.computed_at,
                     c.text as claim_text, c.session_id as session_id,
-                    CASE WHEN json_valid(e.raw) THEN CASE WHEN json_type(e.raw, '$.agent_id') = 'text'
-                         THEN json_extract(e.raw, '$.agent_id') END END as agent_id,
-                    CASE WHEN json_valid(e.raw) THEN CASE WHEN json_type(e.raw, '$.agent_type') = 'text'
-                         THEN json_extract(e.raw, '$.agent_type') END END as agent_type
+                    ea.agent_id as agent_id, ea.agent_type as agent_type, ea.turn_id as turn_id
              FROM findings f JOIN claims c ON c.id = f.claim_id
-             LEFT JOIN agent_events e ON e.id = c.source_event_id
+             LEFT JOIN event_attribution ea ON ea.event_id = c.source_event_id
              WHERE f.id = ?1",
         )
         .bind(id)
@@ -1006,12 +1018,9 @@ impl Store {
         let row = sqlx::query_as::<_, FindingRow>(
             "SELECT f.id, f.claim_id, f.verdict, f.evidence_ids, f.verifier_name, f.rationale, f.computed_at,
                     c.text as claim_text, c.session_id as session_id,
-                    CASE WHEN json_valid(e.raw) THEN CASE WHEN json_type(e.raw, '$.agent_id') = 'text'
-                         THEN json_extract(e.raw, '$.agent_id') END END as agent_id,
-                    CASE WHEN json_valid(e.raw) THEN CASE WHEN json_type(e.raw, '$.agent_type') = 'text'
-                         THEN json_extract(e.raw, '$.agent_type') END END as agent_type
+                    ea.agent_id as agent_id, ea.agent_type as agent_type, ea.turn_id as turn_id
              FROM findings f JOIN claims c ON c.id = f.claim_id
-             LEFT JOIN agent_events e ON e.id = c.source_event_id
+             LEFT JOIN event_attribution ea ON ea.event_id = c.source_event_id
              WHERE c.session_id = ?1
              ORDER BY f.computed_at DESC LIMIT 1",
         )
@@ -1028,12 +1037,9 @@ impl Store {
         let rows = sqlx::query_as::<_, FindingRow>(
             "SELECT f.id, f.claim_id, f.verdict, f.evidence_ids, f.verifier_name, f.rationale, f.computed_at,
                     c.text as claim_text, c.session_id as session_id,
-                    CASE WHEN json_valid(e.raw) THEN CASE WHEN json_type(e.raw, '$.agent_id') = 'text'
-                         THEN json_extract(e.raw, '$.agent_id') END END as agent_id,
-                    CASE WHEN json_valid(e.raw) THEN CASE WHEN json_type(e.raw, '$.agent_type') = 'text'
-                         THEN json_extract(e.raw, '$.agent_type') END END as agent_type
+                    ea.agent_id as agent_id, ea.agent_type as agent_type, ea.turn_id as turn_id
              FROM findings f JOIN claims c ON c.id = f.claim_id
-             LEFT JOIN agent_events e ON e.id = c.source_event_id
+             LEFT JOIN event_attribution ea ON ea.event_id = c.source_event_id
              WHERE c.session_id = ?1
              ORDER BY f.computed_at DESC",
         )
@@ -1057,6 +1063,17 @@ pub struct SessionSummary {
     pub claim_count: i64,
     pub finding_count: i64,
     pub last_activity: String,
+}
+
+/// Provider-native agent/turn attribution persisted for one event
+/// (FORNX-466). Absent (`None` from [`Store::attribution_for_event`]) means
+/// the payload carried none or the event predates attribution.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow, serde::Serialize)]
+pub struct EventAttribution {
+    pub agent_id: Option<String>,
+    pub agent_type: Option<String>,
+    pub turn_id: Option<String>,
+    pub lineage_status: String,
 }
 
 /// Whether a stored `session_id` is a provider-native identity or a legacy
@@ -1313,12 +1330,40 @@ pub struct FindingRow {
     pub computed_at: String,
     pub claim_text: String,
     pub session_id: String,
-    /// Provider-native subagent identity (`agent_id`/`agent_type`) read from
-    /// the source event's raw hook payload, when the provider supplied one.
-    /// `None` means the payload carried none -- NOT that this was the root
-    /// agent. Never derived, never defaulted (FORNX-465).
+    /// Provider-native agent/turn attribution persisted for the claim's
+    /// source event (`event_attribution`, FORNX-466). `None` means the
+    /// payload carried none, or the row predates attribution -- NOT that this
+    /// was the root agent. Never derived, never defaulted, never backfilled.
     pub agent_id: Option<String>,
     pub agent_type: Option<String>,
+    pub turn_id: Option<String>,
+}
+
+/// Persist the provider-native agent/turn attribution for `e`, if its payload
+/// carried any (FORNX-466). No row is written for an event that carried none:
+/// absence means unattributed, never "root agent". Providers without a
+/// contract mapping (opencode) are never read, so nothing is invented.
+async fn insert_event_attribution(
+    tx: &mut sqlx::SqliteConnection,
+    e: &AgentEvent,
+    provider_tag: &str,
+) -> Result<()> {
+    let native = execution_identity::native_identity(provider_tag, &e.raw);
+    let agent_type = execution_identity::native_agent_type(provider_tag, &e.raw);
+    if native.agent_id.is_none() && native.turn_id.is_none() && agent_type.is_none() {
+        return Ok(());
+    }
+    sqlx::query(
+        "INSERT OR IGNORE INTO event_attribution (event_id, agent_id, agent_type, turn_id, lineage_status)
+         VALUES (?1, ?2, ?3, ?4, 'unknown')",
+    )
+    .bind(e.id.to_string())
+    .bind(native.agent_id)
+    .bind(agent_type)
+    .bind(native.turn_id)
+    .execute(tx)
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3237,6 +3282,245 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(row.agent_id.is_none());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    fn event_with_raw(session: &str, provider: Provider, raw: serde_json::Value) -> AgentEvent {
+        AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: session.into(),
+            provider,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("Bash".into()),
+            tool_input: None,
+            tool_response: None,
+            raw,
+        }
+    }
+
+    /// FORNX-466 AC1: attribution is read from the provider payload through
+    /// the shared normalizer, stored per event, and only when present.
+    #[tokio::test]
+    async fn event_attribution_is_stored_only_for_authentic_native_fields() {
+        let path = tmp_db_path("event-attribution");
+        let store = Store::open(&path).await.expect("open db");
+
+        let sub = event_with_raw(
+            "s-1",
+            Provider::ClaudeCode,
+            serde_json::json!({"session_id": "s-1", "agent_id": "a-9", "agent_type": "general-purpose", "prompt_id": "p-1"}),
+        );
+        let main = event_with_raw(
+            "s-1",
+            Provider::ClaudeCode,
+            serde_json::json!({"session_id": "s-1"}),
+        );
+        let codex = event_with_raw(
+            "c-1",
+            Provider::Codex,
+            serde_json::json!({"session_id": "c-1", "turn_id": "t-7"}),
+        );
+        // Claude sends no turn_id; one in the payload must not be adopted.
+        let claude_turn = event_with_raw(
+            "s-2",
+            Provider::ClaudeCode,
+            serde_json::json!({"session_id": "s-2", "turn_id": "t-1"}),
+        );
+        // opencode has no contract mapping: never read, never invented.
+        let opencode = event_with_raw(
+            "o-1",
+            Provider::OpenCode,
+            serde_json::json!({"agent_id": "x", "turn_id": "y"}),
+        );
+        for e in [&sub, &main, &codex, &claude_turn, &opencode] {
+            store.insert_event(e).await.unwrap();
+        }
+
+        let got = store
+            .attribution_for_event(&sub.id.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.agent_id.as_deref(), Some("a-9"));
+        assert_eq!(got.agent_type.as_deref(), Some("general-purpose"));
+        assert_eq!(got.turn_id, None);
+        assert_eq!(got.lineage_status, "unknown");
+
+        assert!(store
+            .attribution_for_event(&main.id.to_string())
+            .await
+            .unwrap()
+            .is_none());
+        let c = store
+            .attribution_for_event(&codex.id.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((c.agent_id, c.turn_id.as_deref()), (None, Some("t-7")));
+        assert!(store
+            .attribution_for_event(&claude_turn.id.to_string())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .attribution_for_event(&opencode.id.to_string())
+            .await
+            .unwrap()
+            .is_none());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn deleting_an_event_removes_its_attribution() {
+        let path = tmp_db_path("event-attribution-cascade");
+        let store = Store::open(&path).await.expect("open db");
+        let e = event_with_raw(
+            "s-1",
+            Provider::ClaudeCode,
+            serde_json::json!({"session_id": "s-1", "agent_id": "a-1"}),
+        );
+        store.insert_event(&e).await.unwrap();
+        sqlx::query("DELETE FROM agent_events WHERE id = ?1")
+            .bind(e.id.to_string())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM event_attribution")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// FORNX-466 AC4 + AC2: two concurrent sessions and one subagent with
+    /// intentionally different results. Session A never shows B's finding;
+    /// the subagent's evidence is attributable to (session, agent); the
+    /// per-session evidence pool is unchanged (pinned, disclosed in doctor).
+    #[tokio::test]
+    async fn two_sessions_and_a_subagent_stay_isolated_and_attributable() {
+        let path = tmp_db_path("two-sessions-one-subagent");
+        let store = Store::open(&path).await.expect("open db");
+
+        let a_main = event_with_raw(
+            "sess-a",
+            Provider::ClaudeCode,
+            serde_json::json!({"session_id": "sess-a"}),
+        );
+        let a_sub = event_with_raw(
+            "sess-a",
+            Provider::ClaudeCode,
+            serde_json::json!({"session_id": "sess-a", "agent_id": "agent-7", "agent_type": "Explore"}),
+        );
+        let b_main = event_with_raw(
+            "sess-b",
+            Provider::ClaudeCode,
+            serde_json::json!({"session_id": "sess-b"}),
+        );
+        for e in [&a_main, &a_sub, &b_main] {
+            store.insert_event(e).await.unwrap();
+        }
+
+        let mk_evidence = |session: &str, event: &AgentEvent, exit: i64| Evidence {
+            id: Uuid::new_v4(),
+            session_id: session.into(),
+            source_event_id: event.id,
+            kind: EvidenceKind::ExitCode,
+            observed_at: "2026-01-01T00:00:01Z".into(),
+            payload: serde_json::json!({"exit_code": exit}),
+            provenance: "test".into(),
+            source: None,
+            extension: None,
+            evidence_purged: false,
+        };
+        let sub_ev = mk_evidence("sess-a", &a_sub, 0);
+        let main_ev = mk_evidence("sess-a", &a_main, 1);
+        let b_ev = mk_evidence("sess-b", &b_main, 0);
+        for ev in [&sub_ev, &main_ev, &b_ev] {
+            store.insert_evidence(ev).await.unwrap();
+        }
+
+        // The subagent's evidence resolves to (sess-a, agent-7) through its source event.
+        let attr = store
+            .attribution_for_event(&sub_ev.source_event_id.to_string())
+            .await
+            .unwrap()
+            .expect("subagent evidence is attributable");
+        assert_eq!(attr.agent_id.as_deref(), Some("agent-7"));
+        assert_eq!(sub_ev.session_id, "sess-a");
+        // Main-session evidence is unattributed, not "root".
+        assert!(store
+            .attribution_for_event(&main_ev.source_event_id.to_string())
+            .await
+            .unwrap()
+            .is_none());
+
+        // Pooling decision (FORNX-466 AC2), pinned: evidence is pooled per
+        // session, so sess-a's pool holds BOTH its main and subagent
+        // evidence -- and none of sess-b's.
+        let pool = store.evidence_for_session("sess-a").await.unwrap().evidence;
+        let ids: Vec<_> = pool.iter().map(|e| e.id).collect();
+        assert!(ids.contains(&sub_ev.id) && ids.contains(&main_ev.id));
+        assert!(!ids.contains(&b_ev.id));
+
+        // Findings: sess-a's newest is its own, sess-b's newer one never shows.
+        let mk_finding = |event: &AgentEvent, session: &str, verdict: Verdict, at: &str| {
+            (
+                Claim {
+                    id: Uuid::new_v4(),
+                    session_id: session.into(),
+                    source_event_id: event.id,
+                    text: "claim".into(),
+                    subject: "test_result".into(),
+                    claimed_at: at.into(),
+                },
+                verdict,
+                at.to_string(),
+            )
+        };
+        let cases = [
+            mk_finding(&a_sub, "sess-a", Verdict::Verified, "2026-01-01T00:00:02Z"),
+            mk_finding(
+                &b_main,
+                "sess-b",
+                Verdict::Contradicted,
+                "2026-01-01T00:00:03Z",
+            ),
+        ];
+        for (claim, verdict, at) in &cases {
+            store.insert_claim(claim).await.unwrap();
+            store
+                .insert_finding(&Finding {
+                    id: Uuid::new_v4(),
+                    claim_id: claim.id,
+                    verdict: *verdict,
+                    evidence_ids: vec![],
+                    verifier_name: "test".into(),
+                    rationale: "r".into(),
+                    computed_at: at.clone(),
+                })
+                .await
+                .unwrap();
+        }
+        let a = store
+            .latest_finding_for_session("sess-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.verdict, "verified");
+        assert_eq!(a.session_id, "sess-a");
+        assert_eq!(a.agent_id.as_deref(), Some("agent-7"));
+        assert_eq!(a.agent_type.as_deref(), Some("Explore"));
+        let b = store
+            .latest_finding_for_session("sess-b")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(b.verdict, "contradicted");
+        assert!(b.agent_id.is_none());
 
         std::fs::remove_file(&path).ok();
     }
