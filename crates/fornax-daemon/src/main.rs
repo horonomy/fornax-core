@@ -4114,7 +4114,7 @@ mod tests {
         );
 
         let unknown_session = api_status(
-            State(state),
+            State(state.clone()),
             Query(StatusQuery {
                 session: Some("sess-never-seen".to_string()),
             }),
