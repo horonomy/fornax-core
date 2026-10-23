@@ -490,4 +490,65 @@ mod tests {
         );
         std::fs::remove_file(&path).ok();
     }
+
+    #[test]
+    fn uninstall_keeps_the_hooks_object_when_only_an_unowned_empty_event_remains() {
+        let path = tmp_settings_path("fw-empty-hooks-key-kept");
+        write_settings(
+            &path,
+            &serde_json::json!({
+                "hooks": { "FutureEvent": [], "Stop": [fornax_group()] },
+                "model": "keep"
+            }),
+        );
+        uninstall_at(&path).expect("uninstall");
+        assert_eq!(
+            load_settings(&path).unwrap(),
+            serde_json::json!({ "hooks": { "FutureEvent": [] }, "model": "keep" })
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn uninstall_removes_every_owned_command_but_keeps_a_foreign_hook_in_the_same_group() {
+        let path = tmp_settings_path("fw-empty-shared-group");
+        let foreign = serde_json::json!({ "type": "command", "command": "other-tool" });
+        let owned = serde_json::json!({ "type": "command", "command": FORNAX_HOOK_COMMAND });
+        write_settings(
+            &path,
+            &serde_json::json!({
+                "hooks": {
+                    "Stop": [
+                        { "matcher": "x", "hooks": [owned.clone(), foreign.clone(), owned.clone()] },
+                        fornax_group()
+                    ]
+                }
+            }),
+        );
+        uninstall_at(&path).expect("uninstall");
+        assert_eq!(
+            load_settings(&path).unwrap(),
+            serde_json::json!({ "hooks": { "Stop": [{ "matcher": "x", "hooks": [foreign] }] } })
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn uninstall_leaves_odd_shapes_untouched() {
+        let path = tmp_settings_path("fw-empty-odd-shapes");
+        let before = write_settings(
+            &path,
+            &serde_json::json!({
+                "hooks": {
+                    "PreToolUse": null,
+                    "PostToolUse": "not-an-array",
+                    "Stop": [null, 7, { "matcher": "only" }, { "hooks": "nope" }]
+                }
+            }),
+        );
+        let result = uninstall_at(&path).expect("uninstall");
+        assert!(!result.changed);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_file(&path).ok();
+    }
 }
