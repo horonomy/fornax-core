@@ -228,6 +228,16 @@ async fn run(
 
     'outer: loop {
         let batch = if let Some(b) = work.pop() {
+            // A batch sealed for another destination (an older consent that
+            // is still live) is never sent to this consent's URL: it stays
+            // sealed until that consent ends or the operator reverts.
+            if b.destination != consent.destination {
+                println!(
+                    "skipping batch {}: sealed for a different destination than the live consent",
+                    b.batch_id
+                );
+                continue;
+            }
             b
         } else {
             let mut next = None;

@@ -299,13 +299,13 @@ impl Store {
         let Some(consent) = live else {
             return Ok(report);
         };
-        // A renewal that keeps the same destination and does not narrow the
-        // data classes continues the earlier authorization: its pending rows
+        // A renewal that keeps the same destination and has exactly the
+        // same data classes continues the earlier authorization: its pending rows
         // move to the renewed consent and its start date still counts.
         let mut eligible_since_raw = consent.granted_at.clone();
         for older in live_all.iter().skip(1) {
             if older.destination == consent.destination
-                && older.data_classes.is_subset(&consent.data_classes)
+                && older.data_classes == consent.data_classes
             {
                 sqlx::query(
                     "UPDATE upload_outbox SET consent_id = ?1 WHERE state = 'pending' AND consent_id = ?2",
@@ -1454,6 +1454,34 @@ mod tests {
             .expect("both sessions' rows seal under the renewed consent");
         assert!(sealed.member_count >= 2, "{sealed:?}");
         let _ = first;
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A renewal with different data classes is a different authorization: it
+    /// takes over nothing the earlier consent staged and is not back-dated.
+    #[tokio::test]
+    async fn a_renewal_with_different_classes_does_not_take_over_earlier_work() {
+        let (store, path) = open().await;
+        let first = consenting(&store).await;
+        record(&store, "s-a", &at(5)).await;
+        store.stage_upload_records().await.unwrap();
+        let narrower: std::collections::BTreeSet<_> = classes().into_iter().take(1).collect();
+        let second = store
+            .grant_egress_consent(Purpose::EvidenceBatchUpload, DEST, &narrower, 30, None, "t")
+            .await
+            .unwrap();
+        store.stage_upload_records().await.unwrap();
+        let window = store.pending_upload_windows().await.unwrap().remove(0);
+        assert!(store
+            .seal_upload_batch(&window, &second, DEST)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .seal_upload_batch(&window, &first, DEST)
+            .await
+            .unwrap()
+            .is_some());
         std::fs::remove_file(&path).ok();
     }
 
