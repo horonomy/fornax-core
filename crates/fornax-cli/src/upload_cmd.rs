@@ -1,7 +1,7 @@
 //! `fornax upload` (FORNX-464): the personal monthly metadata batch upload.
 //!
-//! Operator-invoked (no scheduler in this release): run it monthly, from cron
-//! or launchd, for the previous closed month. It sends metadata only -- ids,
+//! Operator-invoked here; the daemon also runs the same sender automatically
+//! for each closed month while a live consent exists. It sends metadata only -- ids,
 //! kinds, providers, timestamps, verdict enums, bounded labels -- from an
 //! outbox staged ahead of the retention sweep, under a live personal-profile
 //! consent, to the consented destination, and only while
@@ -13,12 +13,7 @@
 //! a retry after a crash or a lost response is byte-identical and carries the
 //! same `Idempotency-Key`, which the receiver dedups on.
 
-use std::time::Duration;
-
 use clap::Subcommand;
-use fornax_store::upload::{current_window, SealedBatch, CANONICALIZATION};
-use fornax_types::egress::Purpose;
-use fornax_types::EgressContentClass;
 
 #[derive(Subcommand)]
 pub enum UploadAction {
@@ -40,18 +35,6 @@ pub enum UploadAction {
         #[arg(long, default_value_t = 8)]
         max_batches: usize,
     },
-}
-
-const MAX_ATTEMPTS_PER_RUN: u32 = 4;
-const DEVICE_ID_ENV: &str = "FORNX_DEVICE_ID";
-const CREDENTIAL_FILE_ENV: &str = "FORNAX_DEVICE_CREDENTIAL_FILE";
-const BACKOFF_ENV: &str = "FORNAX_UPLOAD_BACKOFF_MS";
-
-enum Sent {
-    Acknowledged,
-    Poisoned,
-    /// Retries for this run are exhausted; the batch stays sealed.
-    Pending,
 }
 
 pub async fn handle(action: UploadAction, fornax_home: &std::path::Path) -> anyhow::Result<()> {
@@ -96,7 +79,7 @@ async fn status(store: &fornax_store::Store) -> anyhow::Result<()> {
             println!("  {window} {reason} dropped={n} recorded={at}");
         }
     }
-    println!("schedule: none -- run `fornax upload run` monthly (cron/launchd); there is no built-in scheduler in this release");
+    println!("schedule: automatic monthly upload by the daemon while a live consent exists; `fornax upload run` sends on demand");
     Ok(())
 }
 
@@ -113,291 +96,28 @@ async fn preview(store: &fornax_store::Store, window: Option<&str>) -> anyhow::R
     Ok(())
 }
 
-fn read_credential(home: &std::path::Path) -> anyhow::Result<String> {
-    let path = std::env::var(CREDENTIAL_FILE_ENV)
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| home.join("device-credential"));
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&path)
-            .map_err(|e| anyhow::anyhow!("device credential {}: {e}", path.display()))?
-            .permissions()
-            .mode();
-        if mode & 0o077 != 0 {
-            anyhow::bail!(
-                "device credential {} is group/world-readable (mode {:o}); chmod 600 it",
-                path.display(),
-                mode & 0o777
-            );
-        }
-    }
-    let raw = std::fs::read_to_string(&path)
-        .map_err(|e| anyhow::anyhow!("device credential {}: {e}", path.display()))?;
-    let value = raw.lines().next().unwrap_or("").trim().to_string();
-    if value.is_empty() {
-        anyhow::bail!("device credential {} is empty", path.display());
-    }
-    Ok(value)
-}
-
-async fn device_id(store: &fornax_store::Store) -> anyhow::Result<String> {
-    if let Ok(id) = std::env::var(DEVICE_ID_ENV) {
-        if !id.trim().is_empty() {
-            return Ok(id.trim().to_string());
-        }
-    }
-    if let Some(anchor) = store.first_audit_checkpoint_receipt().await? {
-        return Ok(anchor.device_id);
-    }
-    anyhow::bail!("device id unknown: set {DEVICE_ID_ENV} (the id this device registered with)")
-}
-
-fn backoff(attempt: u32) -> Duration {
-    let base: u64 = std::env::var(BACKOFF_ENV)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1000);
-    Duration::from_millis(base.saturating_mul(1u64 << attempt.min(6)).min(30_000))
-}
-
-fn retry_after(resp: &reqwest::Response) -> Option<Duration> {
-    resp.headers()
-        .get(reqwest::header::RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .parse::<u64>()
-        .ok()
-        .map(|s| Duration::from_secs(s.min(30)))
-}
-
 async fn run(
     store: &fornax_store::Store,
     home: &std::path::Path,
     window: Option<String>,
     max_batches: usize,
 ) -> anyhow::Result<()> {
-    let Some(consent) = store.live_upload_consent().await? else {
-        anyhow::bail!(
-            "no live consent for evidence_batch_upload under the personal profile: nothing is staged or sent \
-             (see `fornax egress status`)"
-        );
-    };
-    let staged = store.stage_upload_records().await?;
+    let report = fornax_upload::run_upload(store, home, window, max_batches).await?;
     println!(
         "staged {} new metadata member(s); {} expired at the outbox bound or with an ended consent",
-        staged.staged, staged.expired_at_bound
+        report.staged, report.expired_at_bound
     );
-
-    let url = reqwest::Url::parse(&consent.destination)?;
-    let classes: std::collections::BTreeSet<EgressContentClass> = [
-        EgressContentClass::EvidenceMetadata,
-        EgressContentClass::FindingVerdicts,
-    ]
-    .into_iter()
-    .collect();
-    let device = device_id(store).await?;
-    let credential = read_credential(home)?;
-    // No redirects: the consented destination must not be able to forward the
-    // batch (and the device credential) elsewhere.
-    let http = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("static reqwest client configuration is valid");
-
-    let mut work: Vec<SealedBatch> = store.unfinished_upload_batches().await?;
-    let mut sent = 0usize;
-    let mut poisoned = 0usize;
-    let mut pending = 0usize;
-    let mut budget = max_batches;
-
-    let windows: Vec<String> = match window {
-        Some(w) => vec![w],
-        None => {
-            let open = current_window(chrono::Utc::now());
-            store
-                .pending_upload_windows()
-                .await?
-                .into_iter()
-                .filter(|w| *w < open)
-                .collect()
-        }
-    };
-
-    'outer: loop {
-        let batch = if let Some(b) = work.pop() {
-            // A batch sealed for another destination (an older consent that
-            // is still live) is never sent to this consent's URL: it stays
-            // sealed until that consent ends or the operator reverts.
-            if b.destination != consent.destination {
-                println!(
-                    "skipping batch {}: sealed for a different destination than the live consent",
-                    b.batch_id
-                );
-                continue;
-            }
-            b
-        } else {
-            let mut next = None;
-            for w in &windows {
-                if let Some(b) = store
-                    .seal_upload_batch(w, &consent.id, &consent.destination)
-                    .await?
-                {
-                    next = Some(b);
-                    break;
-                }
-            }
-            match next {
-                Some(b) => b,
-                None => break 'outer,
-            }
-        };
-        if budget == 0 {
-            // Sealed but not sent: it stays sealed for the next run.
-            pending += 1;
-            break;
-        }
-        budget -= 1;
-        match send_batch(store, &http, &url, &classes, &device, &credential, &batch).await? {
-            Sent::Acknowledged => sent += 1,
-            // One permanent rejection stops the run: a systematic fault must
-            // not walk through every remaining batch.
-            Sent::Poisoned => {
-                poisoned += 1;
-                break;
-            }
-            Sent::Pending => {
-                pending += 1;
-                break;
-            }
-        }
+    for batch in &report.skipped {
+        println!(
+            "skipping batch {batch}: sealed for a different destination than the live consent"
+        );
     }
-
-    println!("uploaded {sent} batch(es); {poisoned} rejected permanently; {pending} still pending");
-    if pending > 0 {
-        anyhow::bail!("upload incomplete: {pending} sealed batch(es) remain; re-run to resume (same bytes, same idempotency key)");
+    println!(
+        "uploaded {} batch(es); {} rejected permanently; {} still pending",
+        report.sent, report.poisoned, report.pending
+    );
+    if report.pending > 0 {
+        anyhow::bail!("upload incomplete: {} sealed batch(es) remain; re-run to resume (same bytes, same idempotency key)", report.pending);
     }
     Ok(())
-}
-
-async fn send_batch(
-    store: &fornax_store::Store,
-    http: &reqwest::Client,
-    url: &reqwest::Url,
-    classes: &std::collections::BTreeSet<EgressContentClass>,
-    device: &str,
-    credential: &str,
-    batch: &SealedBatch,
-) -> anyhow::Result<Sent> {
-    let members: serde_json::Value = serde_json::from_str(&batch.members_json)?;
-    let body = serde_json::json!({
-        "schema_version": 1,
-        "canonicalization": CANONICALIZATION,
-        "device_id": device,
-        "batch_id": batch.batch_id,
-        "window_id": batch.window_id,
-        "manifest_sha256": batch.manifest_sha256,
-        "members": members,
-    });
-
-    for attempt in 0..MAX_ATTEMPTS_PER_RUN {
-        // Re-ask the persisted decision on EVERY attempt: a revoked consent,
-        // an allowlist removal or a switch to corporate stops the next send.
-        let permit = store
-            .decide_egress(
-                Purpose::EvidenceBatchUpload,
-                url.as_str(),
-                classes,
-                fornax_types::privacy::cloud_sync_allowed(),
-            )
-            .await
-            .map_err(|d| anyhow::anyhow!("egress denied ({d}); nothing was sent"))?;
-        anyhow::ensure!(
-            permit.authorizes(Purpose::EvidenceBatchUpload, url.as_str()),
-            "egress permit does not cover the upload URL"
-        );
-
-        let response = http
-            .post(url.clone())
-            .bearer_auth(credential)
-            .header("Idempotency-Key", &batch.manifest_sha256)
-            .json(&body)
-            .send()
-            .await;
-        let (outcome, wait): (Result<(), String>, Option<Duration>) = match response {
-            Ok(resp) => {
-                let status = resp.status();
-                let wait = retry_after(&resp);
-                if status.is_success() {
-                    store.record_upload_attempt(&batch.batch_id, None).await?;
-                    store.acknowledge_upload_batch(&batch.batch_id).await?;
-                    return Ok(Sent::Acknowledged);
-                }
-                if status.as_u16() == 409 {
-                    // The receiver already holds this exact manifest
-                    // (idempotent duplicate): that is an acknowledgement.
-                    store.record_upload_attempt(&batch.batch_id, None).await?;
-                    store.acknowledge_upload_batch(&batch.batch_id).await?;
-                    return Ok(Sent::Acknowledged);
-                }
-                // Redirects are never followed, and a wrong path or an oversized
-                // request is an operator/configuration fault that would hit every
-                // batch alike: keep the data sealed and stop, never poison it.
-                if status.is_redirection() || matches!(status.as_u16(), 404 | 405 | 413) {
-                    let reason = if status.is_redirection() {
-                        "redirect refused".to_string()
-                    } else {
-                        format!("http {}", status.as_u16())
-                    };
-                    store
-                        .record_upload_attempt(&batch.batch_id, Some(&reason))
-                        .await?;
-                    anyhow::bail!(
-                        "the receiver answered {reason}; check the allowlisted destination and receiver, then re-run (the batch stays sealed)"
-                    );
-                }
-                if status.as_u16() == 401 || status.as_u16() == 403 {
-                    // An operator-fixable credential problem: never poison
-                    // data over it. Stop and keep the batch sealed.
-                    store
-                        .record_upload_attempt(&batch.batch_id, Some("credential rejected"))
-                        .await?;
-                    anyhow::bail!(
-                        "the receiver rejected the device credential (HTTP {}); fix it and re-run",
-                        status.as_u16()
-                    );
-                }
-                if status.as_u16() == 408 || status.as_u16() == 429 || status.is_server_error() {
-                    (Err(format!("http {}", status.as_u16())), wait)
-                } else {
-                    let reason = format!("http {}", status.as_u16());
-                    store
-                        .record_upload_attempt(&batch.batch_id, Some(&reason))
-                        .await?;
-                    store.poison_upload_batch(&batch.batch_id, &reason).await?;
-                    return Ok(Sent::Poisoned);
-                }
-            }
-            Err(e) => (
-                Err(if e.is_timeout() {
-                    "timeout".into()
-                } else {
-                    "transport error".into()
-                }),
-                None,
-            ),
-        };
-        if let Err(reason) = outcome {
-            store
-                .record_upload_attempt(&batch.batch_id, Some(&reason))
-                .await?;
-            if attempt + 1 < MAX_ATTEMPTS_PER_RUN {
-                tokio::time::sleep(wait.unwrap_or_else(|| backoff(attempt))).await;
-            }
-        }
-    }
-    Ok(Sent::Pending)
 }

@@ -17,6 +17,7 @@ fornax-corpus = { path = "../fornax-corpus" }
 fornax-bench = { path = "../fornax-bench" }
 fornax-experiment-runner = { path = "../fornax-experiment-runner" }
 fornax-receipt = { path = "../fornax-receipt" }
+fornax-upload = { path = "../fornax-upload" }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true

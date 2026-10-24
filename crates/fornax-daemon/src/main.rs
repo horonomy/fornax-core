@@ -39,6 +39,7 @@ use tokio::time::timeout;
 mod audit_checkpoint_submit;
 mod policy_poll;
 mod retention_sweep;
+mod upload_schedule;
 
 fn fornax_home() -> PathBuf {
     std::env::var("FORNAX_HOME")
@@ -463,6 +464,10 @@ async fn main() -> anyhow::Result<()> {
     // for why it deliberately does not hold `AppState::processing`.
     let retention_sweep_task = retention_sweep::spawn(state.clone(), db_path.clone());
 
+    // FORNX-464: automatic monthly metadata upload. Inert (a no-op tick)
+    // unless a live personal-profile consent exists; see `upload_schedule`.
+    let upload_schedule_task = upload_schedule::spawn(state.clone(), home.clone());
+
     let app = Router::new()
         .route("/api/status", get(api_status))
         .route("/api/findings/recent", get(api_findings_recent))
@@ -503,6 +508,7 @@ async fn main() -> anyhow::Result<()> {
     poll_task.abort();
     checkpoint_task.abort();
     retention_sweep_task.abort();
+    upload_schedule_task.abort();
     let _ = std::fs::remove_file(&sock_path);
     let _ = std::fs::remove_file(&pid_path);
     tracing::info!("fornaxd stopped");

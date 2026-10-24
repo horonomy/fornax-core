@@ -10,6 +10,7 @@ fornax-store = { path = "../fornax-store" }
 fornax-verify = { path = "../fornax-verify" }
 fornax-experiment-runner = { path = "../fornax-experiment-runner" }
 fornax-acquire = { path = "../fornax-acquire" }
+fornax-upload = { path = "../fornax-upload" }
 # The adapter owns interpretation of its retained completion shape; the store
 # supplies transactional source validation without knowing provider formats.
 fornax-adapter-codex = { path = "../fornax-adapter-codex" }

@@ -1,0 +1,18 @@
+[package]
+name = "fornax-upload"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fornax-types = { path = "../fornax-types" }
+fornax-store = { path = "../fornax-store" }
+anyhow.workspace = true
+chrono.workspace = true
+reqwest = { workspace = true, features = ["json", "rustls"] }
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+sqlx.workspace = true
+uuid.workspace = true
