@@ -1539,10 +1539,24 @@ async fn api_status(
 
 async fn api_findings_recent(State(state): State<AppState>) -> Json<serde_json::Value> {
     match state.store.recent_findings(50).await {
-        Ok(rows) => Json(serde_json::json!({
-            "findings": rows.iter().map(finding_json).collect::<Vec<_>>(),
-            "scope": "host",
-        })),
+        Ok(rows) => {
+            // Only needed to explain an empty list; a failed count must not
+            // hide findings that exist.
+            let observed = if rows.is_empty() {
+                state.store.observed_counts().await.ok()
+            } else {
+                None
+            };
+            Json(serde_json::json!({
+                "findings": rows.iter().map(finding_json).collect::<Vec<_>>(),
+                "scope": "host",
+                "observed": observed.map(|(events, sessions, claims)| serde_json::json!({
+                    "events": events,
+                    "sessions": sessions,
+                    "claims": claims,
+                })),
+            }))
+        }
         Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
     }
 }
@@ -4057,6 +4071,40 @@ mod tests {
     /// finding from another session, which is exactly the cross-session
     /// leak the CLI's `scope: "session"` claim depends on this endpoint
     /// never committing.
+    #[tokio::test]
+    async fn api_findings_recent_explains_an_empty_list_with_observed_counts() {
+        let state = test_state().await;
+        let observed = |v: &Json<serde_json::Value>| v.0["observed"].clone();
+
+        let empty = api_findings_recent(State(state.clone())).await;
+        assert_eq!(
+            observed(&empty),
+            serde_json::json!({"events": 0, "sessions": 0, "claims": 0})
+        );
+
+        state
+            .store
+            .insert_event(&AgentEvent {
+                id: Uuid::new_v4(),
+                session_id: "s1".to_string(),
+                provider: Provider::Codex,
+                kind: EventKind::PostToolUse,
+                observed_at: "2026-10-24T00:00:00Z".to_string(),
+                tool_name: Some("exec_command".to_string()),
+                tool_input: None,
+                tool_response: None,
+                raw: serde_json::json!({}),
+            })
+            .await
+            .expect("insert event");
+        let after_event = api_findings_recent(State(state)).await;
+        assert_eq!(
+            observed(&after_event),
+            serde_json::json!({"events": 1, "sessions": 1, "claims": 0})
+        );
+        assert_eq!(after_event.0["findings"], serde_json::json!([]));
+    }
+
     #[tokio::test]
     async fn api_status_with_session_confirms_scoping_and_isolates_sessions() {
         let state = test_state().await;

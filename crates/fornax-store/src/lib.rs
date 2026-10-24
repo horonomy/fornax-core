@@ -1024,6 +1024,21 @@ impl Store {
         Ok(rows)
     }
 
+    /// What this daemon has captured so far, as `(events, sessions, claims)`.
+    /// Lets `fornax detail` tell "nothing has reported in" apart from
+    /// "events arrived but no claim has been checked" when there are no
+    /// findings yet.
+    pub async fn observed_counts(&self) -> Result<(i64, i64, i64)> {
+        let (events, sessions): (i64, i64) =
+            sqlx::query_as("SELECT COUNT(*), COUNT(DISTINCT session_id) FROM agent_events")
+                .fetch_one(&self.pool)
+                .await?;
+        let (claims,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM claims")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok((events, sessions, claims))
+    }
+
     /// One finding row by id, joined with its claim (FORNX-18: the
     /// dashboard's finding-detail page). `None` if no such finding exists.
     pub async fn finding_by_id(&self, id: &str) -> Result<Option<FindingRow>> {

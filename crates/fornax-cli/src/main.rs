@@ -2134,6 +2134,26 @@ fn verdict_icon(verdict: &str) -> &'static str {
     }
 }
 
+/// Why there is nothing to show yet, and the next step. "No findings" reads
+/// the same whether no agent ever reported in or events arrived but no claim
+/// was checked, and the two need different actions.
+fn no_findings_explanation(observed: Option<&serde_json::Value>) -> String {
+    let count = |key: &str| observed.and_then(|o| o.get(key)).and_then(|n| n.as_i64());
+    match (count("events"), count("sessions"), count("claims")) {
+        (Some(0), _, _) => "No findings recorded yet. No agent session has reported to this daemon. \
+            Install an adapter (`fornax adapter list`, `fornax install <adapter>`), trust its hooks \
+            inside the agent (Codex: `/hooks`), then start a session."
+            .to_string(),
+        (Some(events), Some(sessions), Some(0)) => format!(
+            "No findings recorded yet. {events} event(s) from {sessions} session(s) were captured, \
+             but no agent claim has been checked, so there is nothing to verify. Findings need an agent \
+             claim that tests passed: Codex claims are read by the rollout tailer (`fornax-hook-codex`, see the \
+             Codex integration doc), Claude Code claims by its Stop hook."
+        ),
+        _ => "No findings recorded yet.".to_string(),
+    }
+}
+
 fn print_detail(v: &serde_json::Value) {
     let empty = vec![];
     let findings = v
@@ -2141,7 +2161,7 @@ fn print_detail(v: &serde_json::Value) {
         .and_then(|f| f.as_array())
         .unwrap_or(&empty);
     if findings.is_empty() {
-        println!("No findings recorded yet.");
+        println!("{}", no_findings_explanation(v.get("observed")));
         return;
     }
     println!("Host-wide: recent findings across all sessions on this machine.\n");
@@ -3207,6 +3227,18 @@ fn render_calibration(v: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_findings_explanation_separates_silence_from_unchecked_claims() {
+        let none = serde_json::json!({"events": 0, "sessions": 0, "claims": 0});
+        assert!(no_findings_explanation(Some(&none)).contains("No agent session has reported"));
+        let some = serde_json::json!({"events": 3, "sessions": 1, "claims": 0});
+        let text = no_findings_explanation(Some(&some));
+        assert!(text.contains("3 event(s) from 1 session(s)"), "{text}");
+        assert!(text.contains("no agent claim has been checked"), "{text}");
+        assert!(text.contains("claim that tests passed"), "{text}");
+        assert_eq!(no_findings_explanation(None), "No findings recorded yet.");
+    }
 
     #[test]
     fn render_status_line_shows_no_findings_message_when_null() {
