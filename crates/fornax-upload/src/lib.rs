@@ -152,7 +152,11 @@ pub async fn run_upload(
     max_batches: usize,
 ) -> anyhow::Result<RunReport> {
     let Some(_lock) = UploadLock::acquire(home)? else {
-        anyhow::bail!("another upload run is in progress (home/upload.lock); nothing was sent");
+        anyhow::bail!(
+            "another upload run is in progress ({}); nothing was sent. If no upload is actually running \
+             (for example after a crash), the lock expires 30 minutes after it was taken, or delete it",
+            home.join("upload.lock").display()
+        );
     };
     let Some(consent) = store.live_upload_consent().await? else {
         anyhow::bail!(
