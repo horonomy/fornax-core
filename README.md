@@ -61,7 +61,7 @@ echo '{"hook_event_name":"Stop","session_id":"'"$SESSION"'","transcript_path":"/
   | ./target/debug/fornax-hook-claude
 
 # 3. Check the verdict — CONTRADICTED, with the rationale spelling out why.
-./target/debug/fornax status   # compact one-liner: 🛡 ✕ CONTRADICTED
+./target/debug/fornax status   # compact one-liner: 🛡 ✕ CONTRADICTED (host-wide)
 ./target/debug/fornax detail   # full claim/evidence/rationale/verifier detail
 ```
 

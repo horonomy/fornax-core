@@ -477,7 +477,7 @@ fn session_id_from_event_payload(payload: &serde_json::Value) -> Option<String> 
     payload
         .pointer("/properties/sessionID")
         .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.trim().is_empty())
         .map(String::from)
 }
 
@@ -509,7 +509,7 @@ fn translate(
             let Some(session_id) = payload
                 .pointer("/input/sessionID")
                 .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
+                .filter(|s| !s.trim().is_empty())
                 .map(String::from)
             else {
                 return NormalizationOutcome::Ignored {
@@ -721,6 +721,20 @@ mod tests {
             "hook": "tool.execute.before",
             "payload": {
                 "input": {"tool": "bash", "callID": "call_1", "args": {"command": "ls"}}
+            }
+        });
+        match normalize(&native) {
+            NormalizationOutcome::Ignored { .. } => {}
+            other => panic!("expected Ignored, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn whitespace_only_session_id_is_ignored_like_a_missing_one() {
+        let native = serde_json::json!({
+            "hook": "tool.execute.before",
+            "payload": {
+                "input": {"sessionID": "   ", "tool": "bash", "callID": "call_1", "args": {"command": "ls"}}
             }
         });
         match normalize(&native) {

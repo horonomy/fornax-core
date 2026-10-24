@@ -331,7 +331,7 @@ impl Store {
     /// `retention::retention_class_for_table`'s doc comment for the same
     /// choice applied uniformly across all four insert paths.
     pub async fn insert_event(&self, e: &AgentEvent) -> Result<InsertOutcome> {
-        if e.session_id.is_empty() {
+        if e.session_id.trim().is_empty() {
             return Err(StoreError::MissingSessionIdentity {
                 kind: "agent_events",
             });
@@ -455,7 +455,7 @@ impl Store {
     where
         F: FnOnce(&AgentEvent) -> bool + Send,
     {
-        if c.session_id.is_empty() {
+        if c.session_id.trim().is_empty() {
             return Err(StoreError::MissingSessionIdentity { kind: "claims" });
         }
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -574,7 +574,7 @@ impl Store {
         ev: &Evidence,
         ingress_origin: Option<&'static str>,
     ) -> Result<InsertOutcome> {
-        if ev.session_id.is_empty() {
+        if ev.session_id.trim().is_empty() {
             return Err(StoreError::MissingSessionIdentity { kind: "evidence" });
         }
         let source = ev.source.as_ref().map(serde_json::to_string).transpose()?;
@@ -856,7 +856,7 @@ impl Store {
         session_id: &str,
         caps: &RuntimeCapabilities,
     ) -> Result<()> {
-        if session_id.is_empty() {
+        if session_id.trim().is_empty() {
             return Err(StoreError::MissingSessionIdentity {
                 kind: "runtime_capabilities",
             });
@@ -934,8 +934,13 @@ impl Store {
     pub async fn recent_findings(&self, limit: i64) -> Result<Vec<FindingRow>> {
         let rows = sqlx::query_as::<_, FindingRow>(
             "SELECT f.id, f.claim_id, f.verdict, f.evidence_ids, f.verifier_name, f.rationale, f.computed_at,
-                    c.text as claim_text, c.session_id as session_id
+                    c.text as claim_text, c.session_id as session_id,
+                    CASE WHEN json_valid(e.raw) THEN CASE WHEN json_type(e.raw, '$.agent_id') = 'text'
+                         THEN json_extract(e.raw, '$.agent_id') END END as agent_id,
+                    CASE WHEN json_valid(e.raw) THEN CASE WHEN json_type(e.raw, '$.agent_type') = 'text'
+                         THEN json_extract(e.raw, '$.agent_type') END END as agent_type
              FROM findings f JOIN claims c ON c.id = f.claim_id
+             LEFT JOIN agent_events e ON e.id = c.source_event_id
              ORDER BY f.computed_at DESC LIMIT ?1",
         )
         .bind(limit)
@@ -949,8 +954,13 @@ impl Store {
     pub async fn finding_by_id(&self, id: &str) -> Result<Option<FindingRow>> {
         let row = sqlx::query_as::<_, FindingRow>(
             "SELECT f.id, f.claim_id, f.verdict, f.evidence_ids, f.verifier_name, f.rationale, f.computed_at,
-                    c.text as claim_text, c.session_id as session_id
+                    c.text as claim_text, c.session_id as session_id,
+                    CASE WHEN json_valid(e.raw) THEN CASE WHEN json_type(e.raw, '$.agent_id') = 'text'
+                         THEN json_extract(e.raw, '$.agent_id') END END as agent_id,
+                    CASE WHEN json_valid(e.raw) THEN CASE WHEN json_type(e.raw, '$.agent_type') = 'text'
+                         THEN json_extract(e.raw, '$.agent_type') END END as agent_type
              FROM findings f JOIN claims c ON c.id = f.claim_id
+             LEFT JOIN agent_events e ON e.id = c.source_event_id
              WHERE f.id = ?1",
         )
         .bind(id)
@@ -995,8 +1005,13 @@ impl Store {
     pub async fn latest_finding_for_session(&self, session_id: &str) -> Result<Option<FindingRow>> {
         let row = sqlx::query_as::<_, FindingRow>(
             "SELECT f.id, f.claim_id, f.verdict, f.evidence_ids, f.verifier_name, f.rationale, f.computed_at,
-                    c.text as claim_text, c.session_id as session_id
+                    c.text as claim_text, c.session_id as session_id,
+                    CASE WHEN json_valid(e.raw) THEN CASE WHEN json_type(e.raw, '$.agent_id') = 'text'
+                         THEN json_extract(e.raw, '$.agent_id') END END as agent_id,
+                    CASE WHEN json_valid(e.raw) THEN CASE WHEN json_type(e.raw, '$.agent_type') = 'text'
+                         THEN json_extract(e.raw, '$.agent_type') END END as agent_type
              FROM findings f JOIN claims c ON c.id = f.claim_id
+             LEFT JOIN agent_events e ON e.id = c.source_event_id
              WHERE c.session_id = ?1
              ORDER BY f.computed_at DESC LIMIT 1",
         )
@@ -1012,8 +1027,13 @@ impl Store {
     pub async fn findings_for_session(&self, session_id: &str) -> Result<Vec<FindingRow>> {
         let rows = sqlx::query_as::<_, FindingRow>(
             "SELECT f.id, f.claim_id, f.verdict, f.evidence_ids, f.verifier_name, f.rationale, f.computed_at,
-                    c.text as claim_text, c.session_id as session_id
+                    c.text as claim_text, c.session_id as session_id,
+                    CASE WHEN json_valid(e.raw) THEN CASE WHEN json_type(e.raw, '$.agent_id') = 'text'
+                         THEN json_extract(e.raw, '$.agent_id') END END as agent_id,
+                    CASE WHEN json_valid(e.raw) THEN CASE WHEN json_type(e.raw, '$.agent_type') = 'text'
+                         THEN json_extract(e.raw, '$.agent_type') END END as agent_type
              FROM findings f JOIN claims c ON c.id = f.claim_id
+             LEFT JOIN agent_events e ON e.id = c.source_event_id
              WHERE c.session_id = ?1
              ORDER BY f.computed_at DESC",
         )
@@ -1037,6 +1057,27 @@ pub struct SessionSummary {
     pub claim_count: i64,
     pub finding_count: i64,
     pub last_activity: String,
+}
+
+/// Whether a stored `session_id` is a provider-native identity or a legacy
+/// placeholder that was never one (FORNX-465).
+///
+/// Before FORNX-433 the adapters filed identity-less payloads under the
+/// literal `"unknown"`, and before FORNX-462 the Codex tailer keyed a session
+/// by its rollout file path. Neither is a native session identity, yet both
+/// read back as real sessions. Stored rows are never rewritten (a record's
+/// scope is fixed when it is recorded); this only classifies on read so
+/// callers can say "unattributed" instead of presenting them as a session.
+/// Native ids stay opaque: only the two known legacy shapes are flagged.
+pub const ATTRIBUTION_NATIVE: &str = "native";
+pub const ATTRIBUTION_LEGACY_UNATTRIBUTED: &str = "legacy_unattributed";
+
+pub fn session_attribution(session_id: &str) -> &'static str {
+    if session_id == "unknown" || session_id.contains('/') || session_id.contains('\\') {
+        ATTRIBUTION_LEGACY_UNATTRIBUTED
+    } else {
+        ATTRIBUTION_NATIVE
+    }
 }
 
 /// Result of `Store::evidence_for_session`: the rows that deserialized
@@ -1272,6 +1313,12 @@ pub struct FindingRow {
     pub computed_at: String,
     pub claim_text: String,
     pub session_id: String,
+    /// Provider-native subagent identity (`agent_id`/`agent_type`) read from
+    /// the source event's raw hook payload, when the provider supplied one.
+    /// `None` means the payload carried none -- NOT that this was the root
+    /// agent. Never derived, never defaulted (FORNX-465).
+    pub agent_id: Option<String>,
+    pub agent_type: Option<String>,
 }
 
 #[cfg(test)]
@@ -1444,6 +1491,28 @@ mod tests {
     /// accepted -- it cannot be scoped to any real session, and an
     /// adapter-side bug (or a UDS client bypassing an adapter entirely)
     /// must fail closed here rather than persist an unscoped row.
+    #[tokio::test]
+    async fn whitespace_only_session_id_is_rejected_like_an_empty_one() {
+        let path = tmp_db_path("event-whitespace-session-id");
+        let store = Store::open(&path).await.expect("open db");
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "  \t".into(),
+            provider: Provider::Codex,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("exec_command".into()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        assert!(matches!(
+            store.insert_event(&event).await,
+            Err(StoreError::MissingSessionIdentity { .. })
+        ));
+        std::fs::remove_file(&path).ok();
+    }
+
     #[tokio::test]
     async fn insert_event_with_blank_session_id_is_rejected_not_persisted() {
         let path = tmp_db_path("event-blank-session-id");
@@ -3020,6 +3089,23 @@ mod tests {
         verdict: Verdict,
         computed_at: &str,
     ) {
+        insert_session_finding_with_raw(
+            store,
+            session_id,
+            verdict,
+            computed_at,
+            serde_json::json!({}),
+        )
+        .await;
+    }
+
+    async fn insert_session_finding_with_raw(
+        store: &Store,
+        session_id: &str,
+        verdict: Verdict,
+        computed_at: &str,
+        raw: serde_json::Value,
+    ) {
         let event = AgentEvent {
             id: Uuid::new_v4(),
             session_id: session_id.into(),
@@ -3029,7 +3115,7 @@ mod tests {
             tool_name: Some("exec_command".into()),
             tool_input: None,
             tool_response: None,
-            raw: serde_json::json!({}),
+            raw,
         };
         store.insert_event(&event).await.expect("insert event");
         let claim = Claim {
@@ -3082,6 +3168,98 @@ mod tests {
         assert_eq!(latest.session_id, "sess-a");
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn finding_carries_the_native_subagent_identity_only_when_the_payload_has_one() {
+        let path = tmp_db_path("finding-agent-attribution");
+        let store = Store::open(&path).await.expect("open db");
+
+        insert_session_finding_with_raw(
+            &store,
+            "sess-agent",
+            Verdict::Verified,
+            "2026-01-01T00:00:01Z",
+            serde_json::json!({"agent_id": "agent-7", "agent_type": "Explore"}),
+        )
+        .await;
+        let row = store
+            .latest_finding_for_session("sess-agent")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.agent_id.as_deref(), Some("agent-7"));
+        assert_eq!(row.agent_type.as_deref(), Some("Explore"));
+
+        // No agent field: None, never a defaulted "root".
+        insert_session_finding(
+            &store,
+            "sess-root",
+            Verdict::Verified,
+            "2026-01-01T00:00:02Z",
+        )
+        .await;
+        let row = store
+            .latest_finding_for_session("sess-root")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.agent_id.is_none() && row.agent_type.is_none());
+
+        // Malformed raw JSON must not break the query either.
+        insert_session_finding_with_raw(
+            &store,
+            "sess-malformed",
+            Verdict::Verified,
+            "2026-01-01T00:00:00Z",
+            serde_json::Value::String("{not json".into()),
+        )
+        .await;
+        let row = store
+            .latest_finding_for_session("sess-malformed")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.agent_id.is_none());
+
+        // A non-string agent_id is not an identity and must not break the query.
+        insert_session_finding_with_raw(
+            &store,
+            "sess-odd",
+            Verdict::Verified,
+            "2026-01-01T00:00:03Z",
+            serde_json::json!({"agent_id": 42}),
+        )
+        .await;
+        let row = store
+            .latest_finding_for_session("sess-odd")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.agent_id.is_none());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn legacy_placeholder_session_ids_are_flagged_unattributed_on_read() {
+        assert_eq!(
+            session_attribution("unknown"),
+            ATTRIBUTION_LEGACY_UNATTRIBUTED
+        );
+        assert_eq!(
+            session_attribution("/Users/x/.codex/sessions/2026/10/rollout-1.jsonl"),
+            ATTRIBUTION_LEGACY_UNATTRIBUTED
+        );
+        assert_eq!(
+            session_attribution("01a133e8-c9c5-7f70-88f1-9cad93738293"),
+            ATTRIBUTION_NATIVE
+        );
+        assert_eq!(session_attribution("sess-1"), ATTRIBUTION_NATIVE);
+        assert_eq!(
+            session_attribution("rollout\\2026\\a.jsonl"),
+            ATTRIBUTION_LEGACY_UNATTRIBUTED
+        );
     }
 
     #[tokio::test]

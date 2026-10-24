@@ -865,17 +865,21 @@ async fn main() -> anyhow::Result<()> {
 /// `host_id` column on any of the three row types), mirroring every other
 /// product's "host" in this contract.
 fn execution_identity_capture_report() -> String {
-    "session: captured (AgentEvent/Claim/Evidence all carry a real session_id, \
-     populated from the native hook session; fornax statusline's latest_finding \
-     segment declares scope:\"session\" once the host confirms it, HORO-1601/1602) \
-     -- agent/turn/task: not captured (no field exists on any persisted row; \
-     CanonicalHostEvent/HostEventIdentity model agent_id/turn_id but that type is \
-     a bounded validation library fornax-daemon never constructs or persists, \
-     HORO-1712) -- host: implicit (one daemon/$FORNAX_HOME per machine; no host_id \
-     column on any row) -- not a defect: partial adoption of the execution-identity \
-     contract is expected (horonomy/.github governance/product/\
-     execution-identity-contract.md#partial-adoption-is-expected-not-a-defect); \
-     remaining dimensions tracked under HORO-1603/HORO-1712"
+    "session: captured (AgentEvent/Claim/Evidence carry the provider-native session_id; \
+     rows written before FORNX-433 (Claude/Codex hooks) or FORNX-462 (Codex tailer) may be \
+     filed under the literal \"unknown\" or a rollout file path -- those are flagged \
+     legacy_unattributed on read and never rewritten; fornax statusline's latest_finding \
+     segment declares scope:\"session\" once the host confirms it) \
+     -- agent: partial (agent_id/agent_type are shown on a finding only when the source \
+     hook payload carried them, read from the stored payload; their absence does NOT mean \
+     the root agent; Claude and Codex hooks expose them, opencode does not) \
+     -- turn/task: not captured (no field on any persisted row) \
+     -- lineage: not captured (no provider hook exposes a parent link) \
+     -- host: implicit (one daemon/$FORNAX_HOME per machine; no host_id column on any row) \
+     -- fornax status and fornax detail are host-wide (newest findings across all sessions) \
+     and say so -- not a defect: partial adoption of the execution-identity contract is \
+     expected (horonomy/.github governance/product/\
+     execution-identity-contract.md#partial-adoption-is-expected-not-a-defect)"
         .to_string()
 }
 
@@ -2079,7 +2083,16 @@ fn render_status_line(v: &serde_json::Value) -> String {
         .and_then(|s| s.as_str())
         .unwrap_or("unknown");
     let icon = verdict_icon(verdict);
-    format!("{icon} {}", verdict.to_uppercase())
+    // `/api/status` without `?session=` is the newest finding across every
+    // session on this machine; say so rather than let it read as "this
+    // session's" (FORNX-465). Only a daemon-confirmed session-scoped answer
+    // is left unlabelled.
+    let scope = if v.get("session_scoped").and_then(|b| b.as_bool()) == Some(true) {
+        ""
+    } else {
+        " (host-wide)"
+    };
+    format!("{icon} {}{scope}", verdict.to_uppercase())
 }
 
 fn verdict_icon(verdict: &str) -> &'static str {
@@ -2103,6 +2116,7 @@ fn print_detail(v: &serde_json::Value) {
         println!("No findings recorded yet.");
         return;
     }
+    println!("Host-wide: recent findings across all sessions on this machine.\n");
     for f in findings {
         let verdict = f.get("verdict").and_then(|s| s.as_str()).unwrap_or("?");
         let claim = f.get("claim_text").and_then(|s| s.as_str()).unwrap_or("");
@@ -2112,7 +2126,17 @@ fn print_detail(v: &serde_json::Value) {
             .and_then(|s| s.as_str())
             .unwrap_or("");
         let when = f.get("computed_at").and_then(|s| s.as_str()).unwrap_or("");
+        let session = f.get("session_id").and_then(|s| s.as_str()).unwrap_or("?");
+        let session_note = match f.get("attribution").and_then(|s| s.as_str()) {
+            Some("legacy_unattributed") => " (legacy: not a native session identity)",
+            _ => "",
+        };
         println!("{} {}", verdict_icon(verdict), verdict.to_uppercase());
+        println!("  session:   {session}{session_note}");
+        if let Some(agent) = f.get("agent_id").and_then(|s| s.as_str()) {
+            let kind = f.get("agent_type").and_then(|s| s.as_str()).unwrap_or("?");
+            println!("  agent:     {agent} ({kind})");
+        }
         println!("  claim:     {claim}");
         println!("  rationale: {rationale}");
         println!("  verifier:  {verifier}");
@@ -3165,13 +3189,21 @@ mod tests {
     #[test]
     fn render_status_line_shows_contradicted_icon_and_verdict() {
         let v = serde_json::json!({"latest": {"verdict": "contradicted"}});
-        assert_eq!(render_status_line(&v), "🛡 ✕ CONTRADICTED");
+        assert_eq!(render_status_line(&v), "🛡 ✕ CONTRADICTED (host-wide)");
+    }
+
+    #[test]
+    fn render_status_line_is_unlabelled_only_when_the_daemon_confirmed_session_scope() {
+        let v = serde_json::json!({
+            "latest": {"verdict": "verified"}, "session_scoped": true, "scope": "session"
+        });
+        assert_eq!(render_status_line(&v), "🛡 ✓ VERIFIED");
     }
 
     #[test]
     fn render_status_line_shows_verified_icon() {
         let v = serde_json::json!({"latest": {"verdict": "verified"}});
-        assert_eq!(render_status_line(&v), "🛡 ✓ VERIFIED");
+        assert_eq!(render_status_line(&v), "🛡 ✓ VERIFIED (host-wide)");
     }
 
     #[test]
@@ -4815,7 +4847,11 @@ mod tests {
         fn reports_session_captured_and_others_truthfully_absent() {
             let report = execution_identity_capture_report();
             assert!(report.contains("session: captured"));
-            assert!(report.contains("agent/turn/task: not captured"));
+            assert!(report.contains("turn/task: not captured"));
+            assert!(report.contains("lineage: not captured"));
+            assert!(report.contains("agent: partial"));
+            assert!(report.contains("legacy_unattributed"));
+            assert!(report.contains("host-wide"));
             assert!(report.contains("host: implicit"));
             assert!(report.contains("#partial-adoption-is-expected-not-a-defect"));
             // Never claim a dimension is captured when it isn't -- the exact
