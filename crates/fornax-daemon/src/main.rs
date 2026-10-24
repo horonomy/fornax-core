@@ -1478,18 +1478,54 @@ struct StatusQuery {
     session: Option<String>,
 }
 
+/// A finding row as JSON, plus whether its session is a native identity or a
+/// legacy placeholder (FORNX-465) -- never rewritten in storage.
+fn finding_json(row: &fornax_store::FindingRow) -> serde_json::Value {
+    let mut v = serde_json::to_value(row).unwrap_or(serde_json::Value::Null);
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            "attribution".into(),
+            fornax_store::session_attribution(&row.session_id).into(),
+        );
+    }
+    v
+}
+
 async fn api_status(
     State(state): State<AppState>,
     Query(q): Query<StatusQuery>,
 ) -> Json<serde_json::Value> {
     match q.session {
+        // A legacy placeholder ("unknown", a rollout path) is not a session
+        // identity: never answer it as a session reading (FORNX-465).
+        Some(session_id)
+            if fornax_store::session_attribution(&session_id)
+                == fornax_store::ATTRIBUTION_LEGACY_UNATTRIBUTED =>
+        {
+            Json(serde_json::json!({
+                "latest": null,
+                "session_scoped": false,
+                "scope": "host",
+                "unattributed_session": true,
+            }))
+        }
         Some(session_id) => match state.store.latest_finding_for_session(&session_id).await {
-            Ok(row) => Json(serde_json::json!({ "latest": row, "session_scoped": true })),
+            Ok(row) => Json(serde_json::json!({
+                "latest": row.as_ref().map(finding_json),
+                "session_scoped": true,
+                "scope": "session",
+            })),
             Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
         },
+        // No session asked for: the newest finding across every session on
+        // this machine. `scope: "host"` says so, so no consumer presents it
+        // as the current session's finding (FORNX-465).
         None => match state.store.recent_findings(1).await {
-            Ok(rows) if !rows.is_empty() => Json(serde_json::json!({ "latest": rows[0] })),
-            Ok(_) => Json(serde_json::json!({ "latest": null })),
+            Ok(rows) if !rows.is_empty() => Json(serde_json::json!({
+                "latest": finding_json(&rows[0]),
+                "scope": "host",
+            })),
+            Ok(_) => Json(serde_json::json!({ "latest": null, "scope": "host" })),
             Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
         },
     }
@@ -1497,7 +1533,10 @@ async fn api_status(
 
 async fn api_findings_recent(State(state): State<AppState>) -> Json<serde_json::Value> {
     match state.store.recent_findings(50).await {
-        Ok(rows) => Json(serde_json::json!({ "findings": rows })),
+        Ok(rows) => Json(serde_json::json!({
+            "findings": rows.iter().map(finding_json).collect::<Vec<_>>(),
+            "scope": "host",
+        })),
         Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
     }
 }
@@ -3303,7 +3342,8 @@ async fn dashboard(State(state): State<AppState>) -> axum::response::Html<String
          <style>body{font-family:monospace;margin:2rem;background:#0b0e14;color:#d6dee8}\
          table{border-collapse:collapse;width:100%}td,th{padding:.4rem .6rem;border-bottom:1px solid #2a3140;text-align:left}\
          .verified{color:#4caf50}.contradicted{color:#e5534b}.unverified{color:#c9a227}.review{color:#4a9dd6}.unavailable{color:#7d8798}\
-         </style></head><body><h2>🛡 Fornax — recent findings</h2><table>\
+         </style></head><body><h2>🛡 Fornax — recent findings</h2>\
+         <p>Host-wide: the newest findings across every session on this machine.</p><table>\
          <tr><th>Verdict</th><th>Claim</th><th>Verifier</th><th>Rationale</th><th>When</th></tr>",
     );
     for r in rows {
@@ -4062,6 +4102,11 @@ mod tests {
             cross_session.0.get("session_scoped").is_none(),
             "no `session` query param -> no session_scoped confirmation at all"
         );
+        // FORNX-465: the unscoped answer must declare itself host-wide so no
+        // consumer can present it as the current session's finding.
+        assert_eq!(cross_session.0["scope"], "host");
+        assert_eq!(scoped.0["scope"], "session");
+        assert_eq!(scoped.0["latest"]["attribution"], "native");
         assert_eq!(
             cross_session.0["latest"]["verdict"].as_str(),
             Some("verified"),
@@ -4069,7 +4114,7 @@ mod tests {
         );
 
         let unknown_session = api_status(
-            State(state),
+            State(state.clone()),
             Query(StatusQuery {
                 session: Some("sess-never-seen".to_string()),
             }),
@@ -4080,6 +4125,26 @@ mod tests {
             unknown_session.0["latest"].is_null(),
             "a known-good session query for a session with no findings must not fall back to any other session's finding"
         );
+
+        // FORNX-465: a legacy placeholder is never answered as a session reading,
+        // even when rows are filed under it.
+        record_finding(
+            &state,
+            "unknown",
+            fornax_types::Verdict::Contradicted,
+            "2026-01-01T00:00:09Z",
+        )
+        .await;
+        let legacy = api_status(
+            State(state.clone()),
+            Query(StatusQuery {
+                session: Some("unknown".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(legacy.0["session_scoped"], false);
+        assert_eq!(legacy.0["scope"], "host");
+        assert!(legacy.0["latest"].is_null());
     }
 
     /// FORNX-85: `/api/capabilities?session=<id>` must surface the exact
