@@ -12,8 +12,11 @@ use uuid::Uuid;
 
 const CANARY: &str = "SECRET-CANARY-5be1";
 
-fn fornax_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_fornax")
+/// The `fornax` under test. `FORNAX_E2E_FORNAX_BIN` points the real-receiver
+/// test at a specific (e.g. release-candidate) executable instead of the one
+/// cargo just built.
+fn fornax_bin() -> String {
+    std::env::var("FORNAX_E2E_FORNAX_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_fornax").into())
 }
 
 struct Req {
@@ -479,21 +482,142 @@ async fn a_wrong_path_or_oversized_reply_keeps_the_batch_sealed() {
     }
 }
 
+/// A recording TCP proxy in front of the real receiver. It forwards each request
+/// unchanged, remembers the raw request bytes and the receiver's status line,
+/// and can drop the first response after the receiver has already answered --
+/// the lost-acknowledgement case, where the receiver stored the batch but the
+/// sender never learned it.
+type Exchange = (Vec<u8>, String);
+
+struct LossyProxy {
+    addr: SocketAddr,
+    seen: Arc<Mutex<Vec<Exchange>>>,
+}
+
+fn read_http(stream: &mut std::net::TcpStream) -> Vec<u8> {
+    // A stalled peer must fail the test, never hang it.
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(15)));
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let (mut head_end, mut want) = (None, 0usize);
+    loop {
+        let n = stream.read(&mut chunk).unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if head_end.is_none() {
+            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                head_end = Some(i + 4);
+                let head = String::from_utf8_lossy(&buf[..i]).to_lowercase();
+                want = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+            }
+        }
+        if let Some(h) = head_end {
+            if buf.len() >= h + want {
+                break;
+            }
+        }
+    }
+    buf
+}
+
+impl LossyProxy {
+    fn start(upstream: SocketAddr, drop_first_response: bool) -> LossyProxy {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: Arc<Mutex<Vec<Exchange>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            let mut dropped = !drop_first_response;
+            for client in listener.incoming() {
+                let mut client = client.unwrap();
+                let request = read_http(&mut client);
+                if request.is_empty() {
+                    continue;
+                }
+                let mut up = std::net::TcpStream::connect(upstream).unwrap();
+                up.write_all(&request).unwrap();
+                let response = read_http(&mut up);
+                let status = String::from_utf8_lossy(&response)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                log.lock().unwrap().push((request, status));
+                if !dropped {
+                    dropped = true;
+                    drop(client); // the receiver answered; the sender never hears it
+                    continue;
+                }
+                let _ = client.write_all(&response);
+            }
+        });
+        LossyProxy { addr, seen }
+    }
+
+    fn snapshot(&self) -> Vec<Exchange> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+fn raw_exchange(addr: SocketAddr, request: &[u8]) -> (String, String) {
+    let mut s = std::net::TcpStream::connect(addr).unwrap();
+    s.write_all(request).unwrap();
+    let response = String::from_utf8_lossy(&read_http(&mut s)).to_string();
+    let status = response.lines().next().unwrap_or("").to_string();
+    (status, response)
+}
+
+fn header_value(raw: &[u8], name: &str) -> Option<String> {
+    let text = String::from_utf8_lossy(raw);
+    let head = text.split("\r\n\r\n").next()?;
+    head.lines().find_map(|l| {
+        let (k, v) = l.split_once(':')?;
+        k.eq_ignore_ascii_case(name).then(|| v.trim().to_string())
+    })
+}
+
+fn body_of(raw: &[u8]) -> &[u8] {
+    let i = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    &raw[i..]
+}
+
 /// Core -> Cloud contract, against the REAL `fornax-cloud` receiver rather
-/// than a mock. Ignored by default; run it with a cloud backend listening and
-/// `FORNAX_E2E_CLOUD_URL` (the `/v1/metadata-batches` URL),
+/// than a mock, including receiver-side deduplication after a LOST
+/// acknowledgement. Ignored by default; run it with a cloud backend listening
+/// and `FORNAX_E2E_CLOUD_URL` (the `/v1/metadata-batches` URL),
 /// `FORNAX_E2E_CLOUD_CRED_FILE` (a device credential file, copied unread) and
-/// `FORNAX_E2E_DEVICE_ID` set. The receiver's strict schema and canonical hash
-/// check are what make a pass meaningful.
+/// `FORNAX_E2E_DEVICE_ID` set. Optionally `FORNAX_E2E_OTHER_CRED_FILE` (a
+/// second device in the same organisation) adds the wrong-device control.
+///
+/// The sender goes through a proxy that lets the first request reach the
+/// receiver and then drops the response. The sender must retry the identical
+/// bytes and idempotency key; the receiver must answer the retry as a duplicate
+/// (HTTP 200) rather than store a second archive. The test then replays the
+/// recorded request again directly. Afterwards the row count is checked with
+/// `psql` against the receiver's database by the caller (exactly one row).
 #[tokio::test]
 #[ignore = "needs a running fornax-cloud backend; see the doc comment"]
-async fn the_real_cloud_receiver_accepts_the_batch_once_and_dedups_the_resend() {
+async fn the_real_cloud_receiver_dedups_an_identical_resend_after_a_lost_acknowledgement() {
     let (Ok(url), Ok(cred)) = (
         std::env::var("FORNAX_E2E_CLOUD_URL"),
         std::env::var("FORNAX_E2E_CLOUD_CRED_FILE"),
     ) else {
         panic!("FORNAX_E2E_CLOUD_URL and FORNAX_E2E_CLOUD_CRED_FILE are required");
     };
+    let parsed = reqwest_url_parts(&url);
+    let upstream: SocketAddr = parsed
+        .0
+        .parse()
+        .expect("receiver must be a loopback ip:port");
+    let proxy = LossyProxy::start(upstream, true);
+    let proxy_url = format!("http://{}{}", proxy.addr, parsed.1);
+
     let env = Env::new();
     std::fs::copy(&cred, env.home.join("device-credential")).unwrap();
     #[cfg(unix)]
@@ -505,15 +629,77 @@ async fn the_real_cloud_receiver_accepts_the_batch_once_and_dedups_the_resend() 
         )
         .unwrap();
     }
-    env.authorize(&url);
+    env.authorize(&proxy_url);
     env.seed().await;
 
     let out = env.ok(&["upload", "run", "--window", &window_now()]);
     assert!(out.contains("uploaded 1 batch(es)"), "{out}");
     assert!(out.contains("0 rejected permanently"), "{out}");
-    let again = env.ok(&["upload", "run", "--window", &window_now()]);
-    assert!(again.contains("uploaded 0 batch(es)"), "{again}");
+
+    // First attempt reached the receiver (stored, 202) but its answer was
+    // lost; the retry carried the identical bytes and key and was answered as
+    // a duplicate by the RECEIVER.
+    let seen = proxy.snapshot();
+    assert_eq!(seen.len(), 2, "exactly one attempt and one retry: {seen:?}");
+    assert!(seen[0].1.contains("202"), "first stored it: {}", seen[0].1);
+    assert!(
+        seen[1].1.contains("200"),
+        "retry is a duplicate: {}",
+        seen[1].1
+    );
+    assert_eq!(seen[0].0, seen[1].0, "retry must be byte-identical");
+    let key = header_value(&seen[0].0, "idempotency-key").expect("Idempotency-Key");
+    let body: serde_json::Value = serde_json::from_slice(body_of(&seen[0].0)).unwrap();
+    assert_eq!(body["manifest_sha256"], key.as_str());
+
+    // Replay the identical request straight at the receiver: still a duplicate.
+    let (status, response) = raw_exchange(upstream, &seen[0].0);
+    assert!(status.contains("200"), "{status}");
+    assert!(response.contains("\"duplicate\""), "{response}");
+
+    // Control: the same bytes under another device's credential are refused.
+    let other_cred = std::env::var("FORNAX_E2E_OTHER_CRED_FILE");
+    if other_cred.is_err() {
+        eprintln!("SKIPPED wrong-device control: FORNAX_E2E_OTHER_CRED_FILE is not set");
+    }
+    if let Ok(other) = other_cred {
+        let token = std::fs::read_to_string(other).unwrap().trim().to_string();
+        let text = String::from_utf8_lossy(&seen[0].0).to_string();
+        let swapped: String = text
+            .lines()
+            .map(|l| {
+                if l.to_lowercase().starts_with("authorization:") {
+                    format!("authorization: Bearer {token}")
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        let (head, _) = swapped.split_once("\r\n\r\n").unwrap_or((&swapped, ""));
+        let forged = [head.as_bytes(), b"\r\n\r\n", body_of(&seen[0].0)].concat();
+        let (status, _) = raw_exchange(upstream, &forged);
+        assert!(
+            status.contains("403"),
+            "wrong device must be refused: {status}"
+        );
+    }
+
+    // The sender's own bookkeeping agrees and a further run sends nothing.
     let status = env.ok(&["upload", "status"]);
     assert!(status.contains("acknowledged"), "{status}");
+    let before = proxy.snapshot().len();
+    let again = env.ok(&["upload", "run", "--window", &window_now()]);
+    assert!(again.contains("uploaded 0 batch(es)"), "{again}");
+    assert_eq!(proxy.snapshot().len(), before);
     std::fs::remove_dir_all(&env.home).ok();
+}
+
+/// `("127.0.0.1:18765", "/v1/metadata-batches")` from a loopback http URL.
+fn reqwest_url_parts(url: &str) -> (String, String) {
+    let rest = url.strip_prefix("http://").expect("loopback http url");
+    match rest.split_once('/') {
+        Some((host, path)) => (host.to_string(), format!("/{path}")),
+        None => (rest.to_string(), String::new()),
+    }
 }
