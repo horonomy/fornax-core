@@ -495,6 +495,8 @@ struct LossyProxy {
 }
 
 fn read_http(stream: &mut std::net::TcpStream) -> Vec<u8> {
+    // A stalled peer must fail the test, never hang it.
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(15)));
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
     let (mut head_end, mut want) = (None, 0usize);
@@ -656,7 +658,11 @@ async fn the_real_cloud_receiver_dedups_an_identical_resend_after_a_lost_acknowl
     assert!(response.contains("\"duplicate\""), "{response}");
 
     // Control: the same bytes under another device's credential are refused.
-    if let Ok(other) = std::env::var("FORNAX_E2E_OTHER_CRED_FILE") {
+    let other_cred = std::env::var("FORNAX_E2E_OTHER_CRED_FILE");
+    if other_cred.is_err() {
+        eprintln!("SKIPPED wrong-device control: FORNAX_E2E_OTHER_CRED_FILE is not set");
+    }
+    if let Ok(other) = other_cred {
         let token = std::fs::read_to_string(other).unwrap().trim().to_string();
         let text = String::from_utf8_lossy(&seen[0].0).to_string();
         let swapped: String = text
