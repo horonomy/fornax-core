@@ -413,7 +413,7 @@ impl Store {
         // FORNX-466: provider-native agent/turn attribution, read once here
         // from the untouched provider payload through the shared contract
         // normalizer, in the event's own transaction.
-        insert_event_attribution(&mut *tx, e, &provider_tag).await?;
+        insert_event_attribution(&mut tx, e, &provider_tag).await?;
 
         let lineage_tag = DatasetLineageTag::new(
             retention::retention_class_for_table("agent_events"),
@@ -532,6 +532,46 @@ impl Store {
                 id: c.id.to_string(),
             })
         }
+    }
+
+    /// Persist an event bound from a validated canonical host observation
+    /// together with the attribution its typed identity carried (FORNX-466
+    /// AC3). `bind_host_event` yields an `AgentEvent` with a null `raw`, so the
+    /// payload-based attribution in [`Store::insert_event`] has nothing to
+    /// read; the canonical identity is the source here. Nothing is derived or
+    /// defaulted: an absent agent/turn stays absent, and blank values are
+    /// treated as absent. `agent_type` is not part of the canonical identity
+    /// and is left unset.
+    pub async fn insert_bound_host_event(
+        &self,
+        e: &AgentEvent,
+        identity: &fornax_types::host_event::HostEventIdentity,
+    ) -> Result<InsertOutcome> {
+        use fornax_types::host_event::HostLineageStatus;
+        let outcome = self.insert_event(e).await?;
+        fn clean(v: &Option<String>) -> Option<&str> {
+            v.as_deref().map(str::trim).filter(|v| !v.is_empty())
+        }
+        let (agent_id, turn_id) = (clean(&identity.agent_id), clean(&identity.turn_id));
+        if agent_id.is_none() && turn_id.is_none() {
+            return Ok(outcome);
+        }
+        let lineage = match identity.lineage_status {
+            HostLineageStatus::Root => "root",
+            HostLineageStatus::Child => "child",
+            HostLineageStatus::Unknown => "unknown",
+        };
+        sqlx::query(
+            "INSERT OR IGNORE INTO event_attribution (event_id, agent_id, agent_type, turn_id, lineage_status)
+             VALUES (?1, ?2, NULL, ?3, ?4)",
+        )
+        .bind(e.id.to_string())
+        .bind(agent_id)
+        .bind(turn_id)
+        .bind(lineage)
+        .execute(&self.pool)
+        .await?;
+        Ok(outcome)
     }
 
     /// See [`Store::insert_event`]'s doc comment — same atomic
@@ -1374,6 +1414,72 @@ mod tests {
 
     fn tmp_db_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("fornax-store-test-{name}-{}.db", Uuid::new_v4()))
+    }
+
+    /// FORNX-466 AC3: a bound host observation keeps the agent/turn/lineage
+    /// its validated canonical identity carried, and invents nothing.
+    #[tokio::test]
+    async fn bound_host_event_persists_canonical_identity_and_invents_nothing() {
+        use fornax_types::host_event::{HostEventIdentity, HostLineageStatus};
+        let path = tmp_db_path("bound-host");
+        let store = Store::open(&path).await.expect("open");
+        let identity = |agent: Option<&str>, turn: Option<&str>, l| HostEventIdentity {
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            host_id: "h".into(),
+            tool_provider: "claude_code".into(),
+            lineage_status: l,
+            tool_instance_id: None,
+            provider_session_id: Some("s-1".into()),
+            agent_id: agent.map(Into::into),
+            turn_id: turn.map(Into::into),
+            parent_agent_id: None,
+            session_lineage_id: None,
+            event_id: None,
+            repo_id: None,
+            worktree_id: None,
+        };
+        let event = |_n: u8| AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "s-1".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("Bash".into()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::Value::Null,
+        };
+        let sub = event(1);
+        store
+            .insert_bound_host_event(
+                &sub,
+                &identity(Some("agent-7"), Some("t-1"), HostLineageStatus::Child),
+            )
+            .await
+            .unwrap();
+        let got = store
+            .attribution_for_event(&sub.id.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.agent_id.as_deref(), Some("agent-7"));
+        assert_eq!(got.turn_id.as_deref(), Some("t-1"));
+        assert_eq!(got.lineage_status, "child");
+
+        let root = event(2);
+        store
+            .insert_bound_host_event(&root, &identity(Some("  "), None, HostLineageStatus::Root))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .attribution_for_event(&root.id.to_string())
+                .await
+                .unwrap()
+                .is_none(),
+            "blank identity must stay unattributed, never invent a root agent"
+        );
+        std::fs::remove_file(&path).ok();
     }
 
     #[tokio::test]
