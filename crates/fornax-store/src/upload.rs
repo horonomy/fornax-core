@@ -638,6 +638,40 @@ impl Store {
         Ok(expired)
     }
 
+    /// Batch counts by state, for `fornax upload status`.
+    pub async fn upload_batch_counts(&self) -> Result<Vec<(String, i64)>> {
+        Ok(sqlx::query_as(
+            "SELECT state, COUNT(*) FROM upload_batches GROUP BY state ORDER BY state ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// A few pending members per kind (optionally one window), exactly as they
+    /// would be uploaded -- so the operator can inspect what would leave the
+    /// machine before it does. Metadata only by construction.
+    pub async fn preview_pending_members(
+        &self,
+        window_id: Option<&str>,
+        per_kind: i64,
+    ) -> Result<Vec<(String, String)>> {
+        let mut out = Vec::new();
+        for kind in KINDS {
+            let rows: Vec<(String,)> = sqlx::query_as(
+                "SELECT member_json FROM upload_outbox
+                 WHERE state = 'pending' AND kind = ?1 AND (?2 IS NULL OR window_id = ?2)
+                 ORDER BY object_id ASC LIMIT ?3",
+            )
+            .bind(kind)
+            .bind(window_id)
+            .bind(per_kind)
+            .fetch_all(&self.pool)
+            .await?;
+            out.extend(rows.into_iter().map(|r| (kind.to_string(), r.0)));
+        }
+        Ok(out)
+    }
+
     /// Windows that still have pending rows, oldest first.
     pub async fn pending_upload_windows(&self) -> Result<Vec<String>> {
         let rows: Vec<(String,)> = sqlx::query_as(
