@@ -870,11 +870,17 @@ fn execution_identity_capture_report() -> String {
      filed under the literal \"unknown\" or a rollout file path -- those are flagged \
      legacy_unattributed on read and never rewritten; fornax statusline's latest_finding \
      segment declares scope:\"session\" once the host confirms it) \
-     -- agent: partial (agent_id/agent_type are shown on a finding only when the source \
-     hook payload carried them, read from the stored payload; their absence does NOT mean \
-     the root agent; Claude and Codex hooks expose them, opencode does not) \
-     -- turn/task: not captured (no field on any persisted row) \
-     -- lineage: not captured (no provider hook exposes a parent link) \
+     -- agent: captured per event for Claude Code subagents (agent_id/agent_type) and Codex \
+     hooks (agent_id), read from the provider payload into event_attribution; claims, \
+     evidence and findings are attributed through their source event; no attribution row \
+     means unattributed, NOT the root agent, and rows recorded before attribution existed \
+     are never backfilled; opencode has no contract mapping and is never read \
+     -- turn: captured for Codex hooks only (Claude Code sends no turn_id) -- task: not \
+     captured -- lineage: always unknown (no provider hook exposes a parent link) \
+     -- evidence pooling is per SESSION by design: a subagent shares its parent's \
+     session_id, so its evidence can verify the parent's claims and the reverse; \
+     attribution tells you which agent produced a record, it does not partition \
+     verification \
      -- host: implicit (one daemon/$FORNAX_HOME per machine; no host_id column on any row) \
      -- fornax status and fornax detail are host-wide (newest findings across all sessions) \
      and say so -- not a defect: partial adoption of the execution-identity contract is \
@@ -4847,17 +4853,18 @@ mod tests {
         fn reports_session_captured_and_others_truthfully_absent() {
             let report = execution_identity_capture_report();
             assert!(report.contains("session: captured"));
-            assert!(report.contains("turn/task: not captured"));
-            assert!(report.contains("lineage: not captured"));
-            assert!(report.contains("agent: partial"));
+            assert!(report.contains("task: not captured"));
+            assert!(report.contains("lineage: always unknown"));
+            assert!(report.contains("agent: captured per event"));
+            assert!(report.contains("evidence pooling is per SESSION"));
             assert!(report.contains("legacy_unattributed"));
             assert!(report.contains("host-wide"));
             assert!(report.contains("host: implicit"));
             assert!(report.contains("#partial-adoption-is-expected-not-a-defect"));
             // Never claim a dimension is captured when it isn't -- the exact
             // fabricated-precision failure this check exists to avoid.
-            assert!(!report.contains("agent: captured"));
-            assert!(!report.contains("turn: captured"));
+            // Turn is captured for Codex only -- never claimed for every provider.
+            assert!(report.contains("turn: captured for Codex hooks only"));
             assert!(!report.contains("task: captured"));
         }
 
