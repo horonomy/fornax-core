@@ -28,8 +28,20 @@ struct Mock {
     seen: Arc<Mutex<Vec<Req>>>,
 }
 
+/// Called with the 1-based request number after a request is recorded and
+/// before the reply is written.
+type Hook = Arc<dyn Fn(usize) + Send + Sync>;
+
 impl Mock {
     fn start(script: Vec<(u16, Vec<(&'static str, String)>)>) -> Mock {
+        Mock::start_with(script, None, std::time::Duration::ZERO)
+    }
+
+    fn start_with(
+        script: Vec<(u16, Vec<(&'static str, String)>)>,
+        hook: Option<Hook>,
+        delay: std::time::Duration,
+    ) -> Mock {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -73,7 +85,15 @@ impl Mock {
                     .map(|(k, v)| (k.trim().to_lowercase(), v.trim().to_string()))
                     .collect();
                 let body = String::from_utf8_lossy(&buf[head_end..]).to_string();
-                recorded.lock().unwrap().push(Req { headers, body });
+                let n = {
+                    let mut g = recorded.lock().unwrap();
+                    g.push(Req { headers, body });
+                    g.len()
+                };
+                if let Some(hook) = &hook {
+                    hook(n);
+                }
+                std::thread::sleep(delay);
 
                 let (status, extra) = {
                     let mut g = script.lock().unwrap();
@@ -232,6 +252,93 @@ impl Env {
             })
             .await
             .unwrap();
+    }
+}
+
+impl Env {
+    /// `authorize` that also returns the consent id.
+    fn authorize_with_id(&self, url: &str) -> String {
+        self.ok(&["egress", "profile-set", "personal"]);
+        self.allow_and_consent(url)
+    }
+
+    /// Allowlist `url` and grant a consent for it; returns the consent id.
+    fn allow_and_consent(&self, url: &str) -> String {
+        self.ok(&[
+            "egress",
+            "allow-add",
+            "--purpose",
+            "evidence_batch_upload",
+            url,
+        ]);
+        let out = self.ok(&[
+            "egress",
+            "consent-grant",
+            "--purpose",
+            "evidence_batch_upload",
+            "--destination",
+            url,
+            "--classes",
+            "evidence_metadata,finding_verdicts",
+        ]);
+        out.split_whitespace()
+            .nth(4)
+            .expect("consent id in grant output")
+            .to_string()
+    }
+
+    /// One content-bearing event observed `days_ago` days ago.
+    async fn seed_old_event(&self, days_ago: i64) {
+        use fornax_types::{AgentEvent, EventKind, Provider};
+        let store = fornax_store::Store::open(self.home.join("fornax.db"))
+            .await
+            .unwrap();
+        store
+            .insert_event(&AgentEvent {
+                id: Uuid::new_v4(),
+                session_id: format!("s-old-{days_ago}"),
+                provider: Provider::ClaudeCode,
+                kind: EventKind::PostToolUse,
+                observed_at: (chrono::Utc::now() - chrono::Duration::days(days_ago)).to_rfc3339(),
+                tool_name: Some("Bash".into()),
+                tool_input: Some(serde_json::json!({"command": CANARY})),
+                tool_response: None,
+                raw: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Backdate every consent and profile change so old events are eligible.
+    async fn backdate_consent(&self, days: i64) {
+        let when = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+        let pool = sqlx::SqlitePool::connect(&format!(
+            "sqlite://{}",
+            self.home.join("fornax.db").display()
+        ))
+        .await
+        .unwrap();
+        for sql in [
+            "UPDATE egress_consents SET granted_at = ?1",
+            "UPDATE egress_profile_log SET changed_at = ?1",
+        ] {
+            sqlx::query(sql).bind(&when).execute(&pool).await.unwrap();
+        }
+        pool.close().await;
+    }
+
+    /// Spawn `fornax upload run` without waiting for it.
+    fn spawn_upload_run(&self) -> std::process::Child {
+        Command::new(fornax_bin())
+            .args(["upload", "run", "--window", &window_now()])
+            .env("FORNAX_HOME", &self.home)
+            .env("FORNAX_CLOUD_SYNC_ENABLED", "1")
+            .env("FORNX_DEVICE_ID", "device-test")
+            .env("FORNAX_UPLOAD_BACKOFF_MS", "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn fornax")
     }
 }
 
@@ -515,5 +622,157 @@ async fn the_real_cloud_receiver_accepts_the_batch_once_and_dedups_the_resend() 
     assert!(again.contains("uploaded 0 batch(es)"), "{again}");
     let status = env.ok(&["upload", "status"]);
     assert!(status.contains("acknowledged"), "{status}");
+    std::fs::remove_dir_all(&env.home).ok();
+}
+
+fn wait_for(mock: &Mock, n: usize) {
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while mock.count() < n {
+        assert!(
+            std::time::Instant::now() < end,
+            "mock never saw request {n}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Two closed months -> two batches. The receiver revokes the consent (via
+/// the real `fornax egress consent-revoke`) as it receives the first request;
+/// the second batch must never be sent.
+#[tokio::test]
+async fn revoking_consent_mid_run_stops_the_second_batch() {
+    let env = Env::new();
+    let home = env.home.clone();
+    let consent_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let id_for_hook = consent_id.clone();
+    let hook: Hook = Arc::new(move |n| {
+        if n == 1 {
+            let id = id_for_hook.lock().unwrap().clone().expect("consent id set");
+            let out = Command::new(fornax_bin())
+                .args(["egress", "consent-revoke", &id])
+                .env("FORNAX_HOME", &home)
+                .output()
+                .expect("run consent-revoke");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    });
+    let mock = Mock::start_with(vec![(202, vec![])], Some(hook), std::time::Duration::ZERO);
+    let id = env.authorize_with_id(&mock.url());
+    *consent_id.lock().unwrap() = Some(id);
+    env.seed_old_event(70).await;
+    env.seed_old_event(35).await;
+    env.backdate_consent(100).await;
+
+    let _ = env.run(&["upload", "run"]);
+    // The first request arriving is the positive control: the receiver and
+    // the revoke hook are live, so the missing second request is meaningful.
+    assert_eq!(mock.count(), 1, "the second batch must never be sent");
+
+    let status = env.ok(&["upload", "status"]);
+    assert!(
+        status.contains("acknowledged: 1") && status.contains("sealed: 1"),
+        "one batch acknowledged, the other still sealed (not sent): {status}"
+    );
+
+    // The consent is gone: a later run refuses and still sends nothing.
+    let err = env.fails(&["upload", "run"]);
+    assert!(err.contains("no live consent"), "{err}");
+    assert_eq!(mock.count(), 1);
+    std::fs::remove_dir_all(&env.home).ok();
+}
+
+/// A batch sealed for destination A (receiver down) is never re-aimed at the
+/// destination of a later, also-allowlisted consent B.
+#[tokio::test]
+async fn a_batch_sealed_for_one_url_is_never_sent_to_a_renewed_consents_url() {
+    let a = Mock::start(vec![(503, vec![])]);
+    let b = Mock::start(vec![(202, vec![])]);
+    let env = Env::new();
+    env.authorize(&a.url());
+    env.seed_old_event(40).await;
+    env.backdate_consent(100).await;
+
+    let err = env.fails(&["upload", "run"]);
+    assert!(err.contains("upload incomplete"), "{err}");
+    let a_attempts = a.count();
+    assert_eq!(a_attempts, 4, "A was tried (positive control)");
+    assert!(env.ok(&["upload", "status"]).contains("sealed: 1"));
+
+    // Renew to B while A's batch is sealed.
+    env.allow_and_consent(&b.url());
+    let _ = env.run(&["upload", "run"]);
+    assert_eq!(b.count(), 0, "B must never receive A's sealed batch");
+    assert_eq!(a.count(), a_attempts, "A is no longer the live URL");
+    let status = env.ok(&["upload", "status"]);
+    assert!(
+        status.contains("sealed: 1") && !status.contains("acknowledged"),
+        "{status}"
+    );
+    std::fs::remove_dir_all(&env.home).ok();
+}
+
+/// A second `fornax upload run` while the first is mid-request is refused and
+/// sends nothing; the lock is released afterwards.
+#[tokio::test]
+async fn a_concurrent_upload_run_is_refused_and_the_receiver_sees_one_request() {
+    let mock = Mock::start_with(vec![(202, vec![])], None, std::time::Duration::from_secs(3));
+    let env = Env::new();
+    env.authorize(&mock.url());
+    env.seed().await;
+
+    let a = env.spawn_upload_run();
+    wait_for(&mock, 1); // A holds the lock and is waiting on the reply.
+    assert!(env.home.join("upload.lock").exists(), "lock held by A");
+
+    let err = env.fails(&["upload", "run", "--window", &window_now()]);
+    assert!(err.contains("another upload run is in progress"), "{err}");
+    assert!(env.home.join("upload.lock").exists(), "B must not steal it");
+
+    let a_out = a.wait_with_output().unwrap();
+    assert!(
+        a_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&a_out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&a_out.stdout).contains("uploaded 1 batch(es)"));
+    assert_eq!(mock.count(), 1, "exactly one request in total");
+    assert!(
+        !env.home.join("upload.lock").exists(),
+        "the lock is removed after A finishes"
+    );
+    std::fs::remove_dir_all(&env.home).ok();
+}
+
+#[tokio::test]
+async fn a_fresh_lock_blocks_and_a_stale_lock_is_taken_over() {
+    let mock = Mock::start(vec![(202, vec![])]);
+    let env = Env::new();
+    env.authorize(&mock.url());
+    env.seed().await;
+    let lock = env.home.join("upload.lock");
+
+    // Control: a fresh lock blocks the run and is left in place.
+    std::fs::write(&lock, "999999").unwrap();
+    let err = env.fails(&["upload", "run", "--window", &window_now()]);
+    assert!(err.contains("another upload run is in progress"), "{err}");
+    assert_eq!(mock.count(), 0);
+    assert!(lock.exists());
+
+    // Stale (mtime 31 minutes ago): taken over, the run sends, lock removed.
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 60);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&lock)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    let out = env.ok(&["upload", "run", "--window", &window_now()]);
+    assert!(out.contains("uploaded 1 batch(es)"), "{out}");
+    assert_eq!(mock.count(), 1);
+    assert!(!lock.exists(), "the taken-over lock is released");
     std::fs::remove_dir_all(&env.home).ok();
 }

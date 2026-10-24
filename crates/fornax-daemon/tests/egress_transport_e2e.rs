@@ -110,7 +110,8 @@ impl Counter {
     fn probe(&self) {
         let addr = self.base.trim_start_matches("http://");
         let mut s = TcpStream::connect(addr).expect("listener accepts");
-        s.write_all(b"GET /probe HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        s.write_all(b"GET /probe HTTP/1.1\r\nHost: x\r\n\r\n")
+            .unwrap();
         let mut sink = Vec::new();
         s.set_read_timeout(Some(Duration::from_secs(2))).ok();
         let _ = s.read_to_end(&mut sink);
@@ -178,7 +179,10 @@ fn base_env(cmd: &mut Command, home: &Path, paths: &Paths) {
         .env("FORNAX_UPLOAD_BACKOFF_MS", "1")
         .env("FORNAX_AUDIT_CHECKPOINT_URL", paths.checkpoint_url())
         .env("FORNAX_POLICY_POLL_URL", paths.poll_url())
-        .env("FORNAX_DEVICE_CREDENTIAL_FILE", home.join("device-credential"))
+        .env(
+            "FORNAX_DEVICE_CREDENTIAL_FILE",
+            home.join("device-credential"),
+        )
         .env("FORNAX_AUDIT_CHECKPOINT_INTERVAL_SECONDS", "60")
         .env("FORNAX_POLICY_POLL_INTERVAL_SECONDS", "60")
         .env("FORNAX_UPLOAD_SCHEDULE_INTERVAL_SECONDS", "60");
@@ -191,7 +195,10 @@ struct Scenario {
 
 impl Scenario {
     fn new() -> Scenario {
-        let home = std::env::temp_dir().join(format!("fnx-egt-{}", &Uuid::new_v4().simple().to_string()[..8]));
+        let home = std::env::temp_dir().join(format!(
+            "fnx-egt-{}",
+            &Uuid::new_v4().simple().to_string()[..8]
+        ));
         std::fs::create_dir_all(&home).unwrap();
         let cred = home.join("device-credential");
         std::fs::write(&cred, "fnxd_v1_test-credential\n").unwrap();
@@ -226,8 +233,16 @@ impl Scenario {
     fn personal_authorized(&self, with_policy_allowlist: bool) {
         self.cli_ok(&["egress", "profile-set", "personal"]);
         let mut grants = vec![
-            ("evidence_batch_upload", self.paths.upload_url(), "evidence_metadata,finding_verdicts"),
-            ("audit_checkpoint", self.paths.checkpoint_url(), "evidence_metadata"),
+            (
+                "evidence_batch_upload",
+                self.paths.upload_url(),
+                "evidence_metadata,finding_verdicts",
+            ),
+            (
+                "audit_checkpoint",
+                self.paths.checkpoint_url(),
+                "evidence_metadata",
+            ),
         ];
         if with_policy_allowlist {
             self.cli_ok(&[
@@ -382,7 +397,11 @@ async fn corporate_opens_no_connection_on_any_path_and_the_personal_control_does
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
-        assert_eq!(s.paths.total(), 0, "corporate `upload run` opened a connection");
+        assert_eq!(
+            s.paths.total(),
+            0,
+            "corporate `upload run` opened a connection"
+        );
     }
 
     let mut daemons = [
@@ -421,7 +440,9 @@ async fn corporate_opens_no_connection_on_any_path_and_the_personal_control_does
     assert!(control["upload"][0].starts_with("POST /v1/metadata-batches"));
     assert!(control["checkpoint"][0].starts_with("POST /v1/audit-checkpoints"));
     assert!(control["poll"][0].starts_with("GET /v1/policy"));
-    assert!(daemons[0].log().contains("monthly upload schedule task enabled"));
+    assert!(daemons[0]
+        .log()
+        .contains("monthly upload schedule task enabled"));
 
     // The corporate daemons ran the same tasks for the same time.
     for (i, s) in [&fresh, &switched].into_iter().enumerate() {
