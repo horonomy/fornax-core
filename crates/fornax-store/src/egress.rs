@@ -416,7 +416,7 @@ impl Store {
     pub async fn write_egress_projection(&self, path: &std::path::Path) -> Result<()> {
         use std::io::Write;
         let state = self.egress_state().await?;
-        let authorized: Vec<serde_json::Value> = if state.profile == Profile::Personal {
+        let authorized: Vec<String> = if state.profile == Profile::Personal {
             state
                 .consents
                 .iter()
@@ -425,22 +425,38 @@ impl Store {
                         && c.revoked_at.is_none()
                         && c.profile_generation == state.generation
                 })
-                .map(|c| {
-                    serde_json::json!({
-                        "purpose": "uploader_spool_stream",
-                        "destination": c.destination,
-                    })
-                })
+                .map(|c| c.destination.clone())
                 .collect()
         } else {
             Vec::new()
         };
-        let doc = serde_json::json!({
-            "schema_version": 1,
-            "profile": state.profile.as_str(),
-            "generation": state.generation,
-            "authorized": authorized,
-        });
+        // Field order is the contract's byte order (the cloud uploader's
+        // golden fixtures are byte-identical to this output).
+        #[derive(serde::Serialize)]
+        struct Authorized<'a> {
+            purpose: &'static str,
+            destination: &'a str,
+        }
+        #[derive(serde::Serialize)]
+        struct Projection<'a> {
+            schema_version: u32,
+            profile: &'static str,
+            generation: i64,
+            authorized: Vec<Authorized<'a>>,
+        }
+        let doc = Projection {
+            schema_version: 1,
+            profile: state.profile.as_str(),
+            generation: state.generation,
+            authorized: authorized
+                .iter()
+                .map(|d| Authorized {
+                    purpose: "uploader_spool_stream",
+                    destination: d,
+                })
+                .collect(),
+        };
+        let body = serde_json::to_string(&doc).map_err(|e| invalid(e.to_string()))?;
         let tmp = path.with_extension("json.tmp");
         {
             let mut f = std::fs::File::create(&tmp).map_err(|e| invalid(e.to_string()))?;
@@ -450,7 +466,7 @@ impl Store {
                 f.set_permissions(std::fs::Permissions::from_mode(0o600))
                     .map_err(|e| invalid(e.to_string()))?;
             }
-            f.write_all(doc.to_string().as_bytes())
+            f.write_all(body.as_bytes())
                 .map_err(|e| invalid(e.to_string()))?;
             f.write_all(b"\n").map_err(|e| invalid(e.to_string()))?;
             f.sync_all().map_err(|e| invalid(e.to_string()))?;
@@ -489,6 +505,61 @@ mod tests {
     async fn open() -> (Store, std::path::PathBuf) {
         let path = std::env::temp_dir().join(format!("fornax-egress-{}.db", Uuid::new_v4()));
         (Store::open(&path).await.expect("open db"), path)
+    }
+
+    fn golden(name: &str) -> Vec<u8> {
+        std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/egress-projection")
+                .join(name),
+        )
+        .unwrap()
+    }
+
+    /// Core's projection writer is byte-identical to the cloud uploader's
+    /// golden fixtures, so the two repositories cannot drift apart silently.
+    #[tokio::test]
+    async fn the_projection_is_byte_identical_to_the_cloud_golden_fixtures() {
+        let (store, path) = open().await;
+        let out = std::env::temp_dir().join(format!("fornax-proj-{}.json", Uuid::new_v4()));
+
+        store.write_egress_projection(&out).await.unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), golden("unconfigured.json"));
+
+        // generation 3 = personal, corporate, personal again.
+        store
+            .set_egress_profile(Profile::Personal, "t", false)
+            .await
+            .unwrap();
+        store
+            .set_egress_profile(Profile::Corporate, "t", false)
+            .await
+            .unwrap();
+        store
+            .set_egress_profile(Profile::Personal, "t", true)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO egress_consents (id, purpose, destination, data_classes, granted_at, expires_at, profile_generation)
+             VALUES ('c1', 'uploader_spool_stream', 'https://ingest.example.test', '[]', '2026-01-01T00:00:00Z', '2099-01-01T00:00:00Z', 3)",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        store.write_egress_projection(&out).await.unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), golden("personal.json"));
+
+        // Corporate never authorizes anything, whatever consents exist.
+        store
+            .set_egress_profile(Profile::Corporate, "t", false)
+            .await
+            .unwrap();
+        store.write_egress_projection(&out).await.unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+        assert_eq!(doc["profile"], "corporate");
+        assert_eq!(doc["authorized"], serde_json::json!([]));
+        std::fs::remove_file(&out).ok();
+        std::fs::remove_file(&path).ok();
     }
 
     fn meta() -> BTreeSet<EgressContentClass> {
