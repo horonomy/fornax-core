@@ -163,9 +163,6 @@ impl Paths {
     fn poll_url(&self) -> String {
         self.poll.url("/v1/policy")
     }
-    fn total(&self) -> usize {
-        self.upload.hits().len() + self.checkpoint.hits().len() + self.poll.hits().len()
-    }
 }
 
 /// Env shared by the CLI and the daemon: isolated HOME, every transport
@@ -388,8 +385,19 @@ async fn corporate_opens_no_connection_on_any_path_and_the_personal_control_does
     switched.make_upload_due().await;
     switched.cli_ok(&["egress", "profile-set", "corporate"]);
 
+    // Personal with consents AND a policy_fetch allowlist entry, then
+    // corporate: only the evidence-free policy poll may still connect.
+    let with_policy = Scenario::new();
+    with_policy.personal_authorized(true);
+    with_policy.make_upload_due().await;
+    with_policy.cli_ok(&["egress", "profile-set", "corporate"]);
+
+    // Connections on the evidence-carrying paths only.
+    let evidence_hits =
+        |s: &Scenario| s.paths.upload.hits().len() + s.paths.checkpoint.hits().len();
+
     // `fornax upload run` on both corporate installs: refused, no connection.
-    for s in [&fresh, &switched] {
+    for s in [&fresh, &switched, &with_policy] {
         let out = s.cli(&["upload", "run"]);
         assert!(!out.status.success(), "corporate `upload run` must fail");
         assert!(
@@ -398,7 +406,7 @@ async fn corporate_opens_no_connection_on_any_path_and_the_personal_control_does
             String::from_utf8_lossy(&out.stderr)
         );
         assert_eq!(
-            s.paths.total(),
+            evidence_hits(s),
             0,
             "corporate `upload run` opened a connection"
         );
@@ -408,6 +416,7 @@ async fn corporate_opens_no_connection_on_any_path_and_the_personal_control_does
         personal.start_daemon(),
         fresh.start_daemon(),
         switched.start_daemon(),
+        with_policy.start_daemon(),
     ];
 
     // Give the personal control time to exercise every path, then hold the
@@ -416,6 +425,7 @@ async fn corporate_opens_no_connection_on_any_path_and_the_personal_control_does
         !personal.paths.upload.hits().is_empty()
             && !personal.paths.checkpoint.hits().is_empty()
             && !personal.paths.poll.hits().is_empty()
+            && !with_policy.paths.poll.hits().is_empty()
     })
     .await;
     // A little extra so a late corporate attempt on any path would show up.
@@ -469,14 +479,28 @@ async fn corporate_opens_no_connection_on_any_path_and_the_personal_control_does
         );
     }
 
+    // Corporate WITH a policy_fetch allowlist entry: the evidence-free poll
+    // connects (positive control that the poll wiring is live in corporate),
+    // while upload and checkpoint stay at zero.
+    let d = &daemons[3];
+    assert!(d.log().contains("monthly upload schedule task enabled"));
+    let poll_hits = with_policy.paths.poll.hits();
+    assert!(
+        !poll_hits.is_empty() && poll_hits[0].starts_with("GET /v1/policy"),
+        "corporate + policy_fetch allowlist: the poll should connect; log:\n{}",
+        d.log()
+    );
+    assert_eq!(with_policy.paths.upload.hits(), Vec::<String>::new());
+    assert_eq!(with_policy.paths.checkpoint.hits(), Vec::<String>::new());
+
     // And `fornax upload run` after the daemon ran, still nothing.
-    for s in [&fresh, &switched] {
+    for s in [&fresh, &switched, &with_policy] {
         assert!(!s.cli(&["upload", "run"]).status.success());
-        assert_eq!(s.paths.total(), 0);
+        assert_eq!(evidence_hits(s), 0);
     }
 
     drop(daemons);
-    for s in [&personal, &fresh, &switched] {
+    for s in [&personal, &fresh, &switched, &with_policy] {
         std::fs::remove_dir_all(&s.home).ok();
     }
 }
