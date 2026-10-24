@@ -125,7 +125,10 @@ impl Env {
             .args(args)
             .env("FORNAX_HOME", &self.home)
             .env("FORNAX_CLOUD_SYNC_ENABLED", "1")
-            .env("FORNX_DEVICE_ID", "device-test")
+            .env(
+                "FORNX_DEVICE_ID",
+                std::env::var("FORNAX_E2E_DEVICE_ID").unwrap_or_else(|_| "device-test".into()),
+            )
             .env("FORNAX_UPLOAD_BACKOFF_MS", "1")
             .output()
             .expect("run fornax")
@@ -474,4 +477,43 @@ async fn a_wrong_path_or_oversized_reply_keeps_the_batch_sealed() {
         );
         std::fs::remove_dir_all(&env.home).ok();
     }
+}
+
+/// Core -> Cloud contract, against the REAL `fornax-cloud` receiver rather
+/// than a mock. Ignored by default; run it with a cloud backend listening and
+/// `FORNAX_E2E_CLOUD_URL` (the `/v1/metadata-batches` URL),
+/// `FORNAX_E2E_CLOUD_CRED_FILE` (a device credential file, copied unread) and
+/// `FORNAX_E2E_DEVICE_ID` set. The receiver's strict schema and canonical hash
+/// check are what make a pass meaningful.
+#[tokio::test]
+#[ignore = "needs a running fornax-cloud backend; see the doc comment"]
+async fn the_real_cloud_receiver_accepts_the_batch_once_and_dedups_the_resend() {
+    let (Ok(url), Ok(cred)) = (
+        std::env::var("FORNAX_E2E_CLOUD_URL"),
+        std::env::var("FORNAX_E2E_CLOUD_CRED_FILE"),
+    ) else {
+        panic!("FORNAX_E2E_CLOUD_URL and FORNAX_E2E_CLOUD_CRED_FILE are required");
+    };
+    let env = Env::new();
+    std::fs::copy(&cred, env.home.join("device-credential")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            env.home.join("device-credential"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+    env.authorize(&url);
+    env.seed().await;
+
+    let out = env.ok(&["upload", "run", "--window", &window_now()]);
+    assert!(out.contains("uploaded 1 batch(es)"), "{out}");
+    assert!(out.contains("0 rejected permanently"), "{out}");
+    let again = env.ok(&["upload", "run", "--window", &window_now()]);
+    assert!(again.contains("uploaded 0 batch(es)"), "{again}");
+    let status = env.ok(&["upload", "status"]);
+    assert!(status.contains("acknowledged"), "{status}");
+    std::fs::remove_dir_all(&env.home).ok();
 }
