@@ -2475,8 +2475,26 @@ async fn api_judge(
             let config = SemanticJudgeConfig::load_default();
             let objective = objective_supported_for_disagreement_check(fused.verdict);
 
+            // FORNX-464: a non-loopback endpoint needs the persisted egress
+            // decision (corporate: a recorded authorization with a reference);
+            // loopback needs none. Raw evidence is never sent off-loopback.
+            let judge_classes: std::collections::BTreeSet<_> = [
+                fornax_types::EgressContentClass::ClaimText,
+                fornax_types::EgressContentClass::RedactedEvidencePayload,
+            ]
+            .into();
+            let egress = state
+                .store
+                .decide_egress(
+                    fornax_types::egress::Purpose::SemanticJudge,
+                    &config.endpoint,
+                    &judge_classes,
+                    false,
+                )
+                .await;
+
             let judge_result = tokio::task::spawn_blocking(move || {
-                let provider = LocalSelfHostedJudgeProvider::new(config);
+                let provider = LocalSelfHostedJudgeProvider::new(config).with_egress(egress);
                 provider.judge(&input)
             })
             .await;
@@ -2545,7 +2563,7 @@ async fn api_judge(
 /// `fornax_verify::voi::AcquisitionPolicy` gate both `/api/evidence-plan`
 /// (FORNX-345) and `/api/acquire-evidence` (FORNX-346) use -- never a
 /// fabricated `AUTO_SAFE`/`REQUIRE_APPROVAL`/`FORBIDDEN` model.
-fn build_acquisition_policy(state: &AppState) -> fornax_verify::voi::AcquisitionPolicy {
+async fn build_acquisition_policy(state: &AppState) -> fornax_verify::voi::AcquisitionPolicy {
     use fornax_types::experiment::{SideEffectAllowList, SideEffectClass};
     let granted_side_effects = SideEffectAllowList::new(
         [
@@ -2557,9 +2575,16 @@ fn build_acquisition_policy(state: &AppState) -> fornax_verify::voi::Acquisition
         .into_iter()
         .filter(|class| state.experiment_policy.permits(*class)),
     );
+    // FORNX-464: an acquisition that must send data out is only plannable
+    // under the personal profile AND the legacy kill switch. Unconfigured,
+    // corporate, or an unreadable egress policy all mean "no egress".
+    let personal = matches!(
+        state.store.egress_state().await,
+        Ok(s) if s.profile == fornax_types::egress::Profile::Personal
+    );
     fornax_verify::voi::AcquisitionPolicy {
         granted_side_effects,
-        egress_allowed: fornax_types::privacy::cloud_sync_allowed(),
+        egress_allowed: personal && fornax_types::privacy::cloud_sync_allowed(),
         disabled_sensors: (*state.sensor_disable).clone(),
     }
 }
@@ -2630,7 +2655,7 @@ async fn api_evidence_plan(
         })),
         FusionOutcome::Found(found) => {
             let recommendation = DefaultRiskPolicy.decide(&found.fused, risk);
-            let acquisition = build_acquisition_policy(&state);
+            let acquisition = build_acquisition_policy(&state).await;
             let input = PlanInput {
                 claim: &found.claim,
                 graph: &found.graph,
@@ -2731,7 +2756,7 @@ async fn api_acquire_evidence(
     };
     let fused_before = found.fused.clone();
 
-    let acquisition = build_acquisition_policy(&state);
+    let acquisition = build_acquisition_policy(&state).await;
     let plan_input = PlanInput {
         claim: &found.claim,
         graph: &found.graph,
@@ -3372,7 +3397,37 @@ mod tests {
     use fornax_types::{AgentEvent, Claim, EventKind, Provider};
     use uuid::Uuid;
 
-    async fn test_state() -> AppState {
+    /// A loopback "server" that only counts the connections it accepts.
+    pub(crate) async fn counting_listener() -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 500 x\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+        (addr, accepted)
+    }
+
+    pub(crate) async fn test_state() -> AppState {
         let db_path = std::env::temp_dir().join(format!("fornax-test-{}.db", Uuid::new_v4()));
         let store = fornax_store::Store::open(&db_path)
             .await

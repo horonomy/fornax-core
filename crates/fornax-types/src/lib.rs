@@ -18,6 +18,7 @@ pub mod audit_checkpoint;
 pub mod calibration;
 pub mod capabilities;
 pub mod causal;
+pub mod egress;
 pub mod epistemic_contract;
 pub mod execution_identity;
 pub mod experiment;

@@ -22,6 +22,7 @@ pub mod audit_ledger;
 pub mod calibration;
 pub mod compliance_report;
 pub mod corpus;
+pub mod egress;
 pub mod evidence_consumption;
 pub mod feedback;
 pub mod policy_cache;
@@ -50,6 +51,10 @@ pub(crate) static CORPUS_MINING_GATE_TEST_LOCK: std::sync::Mutex<()> = std::sync
 pub enum StoreError {
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
+    /// FORNX-464: an egress state change was refused, or persisted egress
+    /// state could not be understood (callers deny).
+    #[error("egress policy: {0}")]
+    InvalidEgress(String),
     #[error("serialization error: {0}")]
     Json(#[from] serde_json::Error),
     /// FORNX-119: a persisted policy-cache row failed to reconstruct into

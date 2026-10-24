@@ -111,6 +111,11 @@ pub enum AuditTarget {
     GoldLabel {
         target_id: String,
     },
+    /// FORNX-464: the egress profile, a consent, or an allowlist entry
+    /// (`target_id` names which, never its content).
+    EgressPolicy {
+        target_id: String,
+    },
     #[serde(other)]
     Unrecognized,
 }
@@ -140,6 +145,17 @@ pub enum AuditAction {
     /// dataset's provenance chain is independently verifiable, not just
     /// asserted by the `gold_labels` table's own `revision_digest`.
     GoldLabelFrozen,
+    /// FORNX-464: the egress profile (personal / corporate / unconfigured)
+    /// was set or changed.
+    EgressProfileChanged,
+    /// FORNX-464: a consent to send one purpose's data to one destination
+    /// was recorded.
+    EgressConsentGranted,
+    /// FORNX-464: a consent was revoked (explicitly, or all of them on
+    /// entering the corporate profile).
+    EgressConsentRevoked,
+    /// FORNX-464: a destination was added to or removed from the allowlist.
+    EgressAllowlistChanged,
     /// Forward-compatibility catch-all. Preserves and round-trips the
     /// original wire string verbatim — see the module docs' "Two enum
     /// shapes" section.
