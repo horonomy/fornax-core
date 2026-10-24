@@ -127,6 +127,10 @@ pub enum StoreError {
     /// `process_line` quarantines it, same as `ClaimIdCollision`.
     #[error("{kind} row has a blank session_id -- refusing to persist, this cannot be scoped to any real session")]
     MissingSessionIdentity { kind: &'static str },
+    /// FORNX-466 AC3: a canonical host identity that does not describe the
+    /// event it was supplied with (different session or provider).
+    #[error("host identity does not match the event: {field}")]
+    HostIdentityMismatch { field: &'static str },
 }
 
 /// Outcome of an idempotent insert (`Store::insert_event`/
@@ -548,6 +552,16 @@ impl Store {
         identity: &fornax_types::host_event::HostEventIdentity,
     ) -> Result<InsertOutcome> {
         use fornax_types::host_event::HostLineageStatus;
+        if identity.provider_session_id.as_deref() != Some(e.session_id.as_str()) {
+            return Err(StoreError::HostIdentityMismatch {
+                field: "provider_session_id",
+            });
+        }
+        if identity.tool_provider != tag(&e.provider)? {
+            return Err(StoreError::HostIdentityMismatch {
+                field: "tool_provider",
+            });
+        }
         let outcome = self.insert_event(e).await?;
         fn clean(v: &Option<String>) -> Option<&str> {
             v.as_deref().map(str::trim).filter(|v| !v.is_empty())
@@ -1465,6 +1479,21 @@ mod tests {
         assert_eq!(got.agent_id.as_deref(), Some("agent-7"));
         assert_eq!(got.turn_id.as_deref(), Some("t-1"));
         assert_eq!(got.lineage_status, "child");
+
+        let mismatched = event(3);
+        let mut other_session = identity(Some("agent-9"), None, HostLineageStatus::Child);
+        other_session.provider_session_id = Some("someone-else".into());
+        assert!(matches!(
+            store
+                .insert_bound_host_event(&mismatched, &other_session)
+                .await,
+            Err(StoreError::HostIdentityMismatch { .. })
+        ));
+        assert!(store
+            .attribution_for_event(&mismatched.id.to_string())
+            .await
+            .unwrap()
+            .is_none());
 
         let root = event(2);
         store
