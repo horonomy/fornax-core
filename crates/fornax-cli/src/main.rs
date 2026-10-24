@@ -22,6 +22,7 @@ mod guarded_write;
 mod receipt_cmd;
 mod statusline;
 mod timeline;
+mod upload_cmd;
 
 use adapter_registry::AdapterArg;
 
@@ -389,6 +390,15 @@ enum Commands {
     Egress {
         #[command(subcommand)]
         action: egress_cmd::EgressAction,
+    },
+    /// The personal monthly metadata batch upload: status, preview, run.
+    ///
+    /// Operator-invoked (no scheduler in this release). Metadata only, to the
+    /// consented destination, under a live personal-profile consent. Reads
+    /// `$FORNAX_HOME/fornax.db` directly.
+    Upload {
+        #[command(subcommand)]
+        action: upload_cmd::UploadAction,
     },
     /// Product feedback on a live finding/recommendation.
     ///
@@ -845,6 +855,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Corpus { action } => corpus_cmd::handle(action, &fornax_home()).await?,
         Commands::Adjudicate { action } => adjudicate_cmd::handle(action, &fornax_home()).await?,
         Commands::Egress { action } => egress_cmd::handle(action, &fornax_home()).await?,
+        Commands::Upload { action } => upload_cmd::handle(action, &fornax_home()).await?,
         Commands::Feedback { action } => feedback_cmd::handle(action, &fornax_home()).await?,
         Commands::Receipt { action } => receipt_cmd::handle(action, &fornax_home()).await?,
         Commands::Doctor => println!("{}", execution_identity_capture_report()),

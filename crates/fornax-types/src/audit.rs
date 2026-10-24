@@ -156,6 +156,14 @@ pub enum AuditAction {
     EgressConsentRevoked,
     /// FORNX-464: a destination was added to or removed from the allowlist.
     EgressAllowlistChanged,
+    /// FORNX-464: a batch of metadata records was sealed for upload.
+    UploadBatchSealed,
+    /// FORNX-464: the receiver acknowledged a sealed batch.
+    UploadBatchAcknowledged,
+    /// FORNX-464: a sealed batch was permanently rejected by the receiver.
+    UploadBatchPoisoned,
+    /// FORNX-464: records were dropped from the upload outbox at its bound.
+    UploadGapRecorded,
     /// Forward-compatibility catch-all. Preserves and round-trips the
     /// original wire string verbatim — see the module docs' "Two enum
     /// shapes" section.

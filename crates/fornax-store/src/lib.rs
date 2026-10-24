@@ -28,6 +28,7 @@ pub mod feedback;
 pub mod policy_cache;
 pub mod quarantine;
 pub mod retention;
+pub mod upload;
 
 pub use audit_checkpoint::{
     evaluate_checkpoint_consistency, AuditCheckpointReceipt, CheckpointConsistencyVerdict,
