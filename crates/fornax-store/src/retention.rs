@@ -211,6 +211,17 @@ pub fn longitudinal_persistence_allowed(class: &RetentionClass) -> bool {
     }
 }
 
+/// Replaces an event's `raw` when its content is purged in place (the column
+/// is NOT NULL). Valid JSON, so every reader that parses `raw` still can.
+const RAW_PURGED_MARKER: &str = r#"{"raw_content_expired":true}"#;
+/// Replaces a claim's `text` when its content is purged in place.
+const CLAIM_TEXT_PURGED_MARKER: &str = "[claim text expired]";
+
+/// SQLite `SQLITE_CONSTRAINT_FOREIGNKEY` (extended code 787).
+fn is_foreign_key_violation(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("787"))
+}
+
 /// The egress gate a future replay/research export path must consult before
 /// sending any data off this machine (FORNX-106 AC5). See this module's docs
 /// — no export path exists yet to call this, but the gate is ready and
@@ -691,18 +702,50 @@ impl Store {
                     purged_evidence_ids.push(record.record_id.clone());
                 }
                 "agent_events" => {
-                    sqlx::query("DELETE FROM agent_events WHERE id = ?1")
+                    // FORNX-467: a surviving claim/evidence row may still
+                    // reference this event (a finding outlives its claim by
+                    // 335 days; soft-purged evidence is kept), so a plain
+                    // DELETE would fail the foreign key and wedge the whole
+                    // sweep. Delete when unreferenced, otherwise purge the
+                    // raw content in place and keep the stub.
+                    match sqlx::query("DELETE FROM agent_events WHERE id = ?1")
                         .bind(&record.record_id)
                         .execute(&mut *tx)
-                        .await?;
-                    report.deleted_records += 1;
+                        .await
+                    {
+                        Ok(_) => report.deleted_records += 1,
+                        Err(e) if is_foreign_key_violation(&e) => {
+                            sqlx::query(
+                                "UPDATE agent_events
+                                 SET tool_input = NULL, tool_response = NULL, raw = ?2
+                                 WHERE id = ?1",
+                            )
+                            .bind(&record.record_id)
+                            .bind(RAW_PURGED_MARKER)
+                            .execute(&mut *tx)
+                            .await?;
+                            report.purged_in_place += 1;
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
                 }
                 "claims" => {
-                    sqlx::query("DELETE FROM claims WHERE id = ?1")
+                    match sqlx::query("DELETE FROM claims WHERE id = ?1")
                         .bind(&record.record_id)
                         .execute(&mut *tx)
-                        .await?;
-                    report.deleted_records += 1;
+                        .await
+                    {
+                        Ok(_) => report.deleted_records += 1,
+                        Err(e) if is_foreign_key_violation(&e) => {
+                            sqlx::query("UPDATE claims SET text = ?2 WHERE id = ?1")
+                                .bind(&record.record_id)
+                                .bind(CLAIM_TEXT_PURGED_MARKER)
+                                .execute(&mut *tx)
+                                .await?;
+                            report.purged_in_place += 1;
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
                 }
                 "findings" => {
                     sqlx::query("DELETE FROM findings WHERE id = ?1")
@@ -910,6 +953,11 @@ pub struct SweepReport {
     pub purged_evidence: usize,
     /// `"agent_events"`/`"claims"`/`"findings"` rows hard-deleted.
     pub deleted_records: usize,
+    /// `"agent_events"`/`"claims"` rows that a surviving record still
+    /// references (a longer-lived finding, or soft-purged evidence), so they
+    /// could not be hard-deleted: their raw content was purged in place and
+    /// the identity/timestamp stub kept (FORNX-467).
+    pub purged_in_place: usize,
     /// Expired rows whose `record_table` was not one this store knows how
     /// to act on — their lineage tag was still removed, but the
     /// (unrecognized) underlying record, if any, was left untouched.
@@ -1986,6 +2034,148 @@ mod tests {
             );
         }
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// FORNX-467: the production shape -- an event, the claim made about it,
+    /// evidence from it, and a finding -- all older than the raw window. The
+    /// sweep used to fail on the foreign keys and purge nothing.
+    #[tokio::test]
+    async fn sweep_purges_linked_raw_data_without_breaking_referential_integrity() {
+        use fornax_types::{
+            AgentEvent, Claim, EventKind, Evidence, EvidenceKind, Finding, Provider, Verdict,
+        };
+        const CANARY: &str = "RAW-CANARY-91c2";
+        let path =
+            std::env::temp_dir().join(format!("fornax-retention-fk-{}.db", uuid::Uuid::new_v4()));
+        let store = Store::open(&path).await.expect("open db");
+        let now = Utc::now();
+        let old = (now - chrono::Duration::days(40)).to_rfc3339();
+
+        let event = AgentEvent {
+            id: uuid::Uuid::new_v4(),
+            session_id: "s-1".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: old.clone(),
+            tool_name: Some("Bash".into()),
+            tool_input: Some(serde_json::json!({"command": CANARY})),
+            tool_response: Some(serde_json::json!({"stdout": CANARY})),
+            raw: serde_json::json!({"cwd": CANARY}),
+        };
+        store.insert_event(&event).await.unwrap();
+        let claim = Claim {
+            id: uuid::Uuid::new_v4(),
+            session_id: "s-1".into(),
+            source_event_id: event.id,
+            text: format!("tests pass {CANARY}"),
+            subject: "test_result".into(),
+            claimed_at: old.clone(),
+        };
+        store.insert_claim(&claim).await.unwrap();
+        let evidence = Evidence {
+            id: uuid::Uuid::new_v4(),
+            session_id: "s-1".into(),
+            source_event_id: event.id,
+            kind: EvidenceKind::ExitCode,
+            observed_at: old.clone(),
+            payload: serde_json::json!({"command": CANARY}),
+            provenance: "test".into(),
+            source: None,
+            extension: None,
+            evidence_purged: false,
+        };
+        store.insert_evidence(&evidence).await.unwrap();
+        let finding = Finding {
+            id: uuid::Uuid::new_v4(),
+            claim_id: claim.id,
+            verdict: Verdict::Verified,
+            evidence_ids: vec![evidence.id],
+            verifier_name: "v".into(),
+            rationale: "kept".into(),
+            computed_at: old.clone(),
+        };
+        store.insert_finding(&finding).await.unwrap();
+        // An event nothing references: still hard-deleted.
+        let lone = AgentEvent {
+            id: uuid::Uuid::new_v4(),
+            session_id: "s-2".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: old.clone(),
+            tool_name: None,
+            tool_input: Some(serde_json::json!({"command": CANARY})),
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        store.insert_event(&lone).await.unwrap();
+        sqlx::query("UPDATE dataset_lineage_tags SET recorded_at = ?1")
+            .bind(&old)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        let report = store
+            .sweep_expired_records(now, None, 1000)
+            .await
+            .expect("the sweep must not fail on linked data");
+        assert_eq!(report.purged_evidence, 1, "{report:?}");
+        assert_eq!(
+            report.purged_in_place, 2,
+            "event + claim are still referenced: {report:?}"
+        );
+        assert_eq!(
+            report.deleted_records, 1,
+            "only the unreferenced event is deleted: {report:?}"
+        );
+
+        // Raw content is gone everywhere.
+        let dump: String = sqlx::query_scalar(
+            "SELECT group_concat(COALESCE(tool_input,'') || COALESCE(tool_response,'') || raw, '|') FROM agent_events",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        let claims: String = sqlx::query_scalar("SELECT group_concat(text, '|') FROM claims")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        let payloads: String =
+            sqlx::query_scalar("SELECT group_concat(payload, '|') FROM evidence")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        for (what, text) in [
+            ("events", &dump),
+            ("claims", &claims),
+            ("evidence", &payloads),
+        ] {
+            assert!(
+                !text.contains(CANARY),
+                "{what} still holds raw content: {text}"
+            );
+        }
+        // The finding, verdict and rationale survive, and integrity holds.
+        let (verdict, rationale): (String, String) =
+            sqlx::query_as("SELECT verdict, rationale FROM findings")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!((verdict.as_str(), rationale.as_str()), ("verified", "kept"));
+        let violations: Vec<(String, i64, String, i64)> =
+            sqlx::query_as("PRAGMA foreign_key_check")
+                .fetch_all(&store.pool)
+                .await
+                .unwrap();
+        assert!(violations.is_empty(), "{violations:?}");
+
+        // A second sweep is a clean no-op.
+        let again = store.sweep_expired_records(now, None, 1000).await.unwrap();
+        assert_eq!(
+            again.purged_in_place + again.deleted_records + again.purged_evidence,
+            0,
+            "{again:?}"
+        );
         std::fs::remove_file(&path).ok();
     }
 }
