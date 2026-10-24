@@ -233,6 +233,7 @@ fn corporate_status_names_the_authorized_judge_exception_and_is_not_org_enforced
         ],
     );
     let status = ok(&home, &["egress", "status"]);
+    assert!(status.contains("allowlisted policy fetch"), "{status}");
     assert!(status.contains("semantic-judge gateway"), "{status}");
     assert!(status.contains("recorded corporate processing"), "{status}");
     assert!(

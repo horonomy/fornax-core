@@ -9,9 +9,10 @@
 //! re-reads the persisted state on every outbound attempt, so a change here
 //! takes effect on the next request.
 //!
-//! This release has no scheduled or monthly upload: nothing here sends data,
-//! it only records what a future sender may do. `fornax export-spool`
-//! remains a manual, per-session export.
+//! Nothing here sends data: it records the profile, allowlist and consents
+//! that the daemon's scheduled monthly upload (and `fornax upload run`) consult
+//! before every request. `fornax export-spool` remains a manual, per-session
+//! export.
 
 use std::collections::BTreeSet;
 
