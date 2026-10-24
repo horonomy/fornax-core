@@ -1421,6 +1421,21 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// Canonical bytes for non-ASCII, astral, control and separator
+    /// characters match Python's `json.dumps(sort_keys=True, separators=
+    /// (",", ":"), ensure_ascii=False)` byte for byte. The receiver's test
+    /// (`test_metadata_batches.py`) pins the same input to the same sha256.
+    #[test]
+    fn canonical_bytes_match_the_receivers_python_for_non_ascii_input() {
+        let raw = r#"[{"z":"\u00e9\u65e5\u672c\u8a9e","id":"\ud83d\ude00 astral","a":"quote\" back\\ slash","ctl":"\u0001\u001f\t\n\r\b\f","del":"\u007f","sep":"\u2028\u2029","k\u00e9y":null,"n":[1,-2,0],"\u00e9":"\u00e9"}]"#;
+        let value: Value = serde_json::from_str(raw).unwrap();
+        let canon = canonical_json(&value);
+        assert_eq!(
+            sha256_hex(canon.as_bytes()),
+            "ba92b426a67174c156e915e055260a88ae9ec9f7770c7bbd4591c584df2d1a14"
+        );
+    }
+
     /// Renewing a consent (same destination) while the first is still valid
     /// must not strand or lose the work staged under the first.
     #[tokio::test]
