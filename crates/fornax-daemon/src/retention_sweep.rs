@@ -179,8 +179,15 @@ async fn run_one_cycle(
         }
         Ok(_) => {}
         Err(e) => {
-            tracing::warn!(error = %e, "upload staging failed; skipping this retention sweep so nothing is purged before it is exported");
-            return cursor;
+            // Retention is a privacy control and must not stall behind an
+            // unreadable egress state: only a live consent makes a failed
+            // staging worth skipping the sweep for.
+            let consent_live = matches!(state.store.live_upload_consent().await, Ok(Some(_)));
+            if consent_live {
+                tracing::warn!(error = %e, "upload staging failed; skipping this retention sweep so nothing is purged before it is exported");
+                return cursor;
+            }
+            tracing::warn!(error = %e, "upload staging failed with no live consent; retention sweep continues");
         }
     }
 

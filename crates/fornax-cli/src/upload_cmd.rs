@@ -253,7 +253,12 @@ async fn run(
         budget -= 1;
         match send_batch(store, &http, &url, &classes, &device, &credential, &batch).await? {
             Sent::Acknowledged => sent += 1,
-            Sent::Poisoned => poisoned += 1,
+            // One permanent rejection stops the run: a systematic fault must
+            // not walk through every remaining batch.
+            Sent::Poisoned => {
+                poisoned += 1;
+                break;
+            }
             Sent::Pending => {
                 pending += 1;
                 break;
@@ -321,14 +326,28 @@ async fn send_batch(
                     store.acknowledge_upload_batch(&batch.batch_id).await?;
                     return Ok(Sent::Acknowledged);
                 }
-                if status.is_redirection() {
+                if status.as_u16() == 409 {
+                    // The receiver already holds this exact manifest
+                    // (idempotent duplicate): that is an acknowledgement.
+                    store.record_upload_attempt(&batch.batch_id, None).await?;
+                    store.acknowledge_upload_batch(&batch.batch_id).await?;
+                    return Ok(Sent::Acknowledged);
+                }
+                // Redirects are never followed, and a wrong path or an oversized
+                // request is an operator/configuration fault that would hit every
+                // batch alike: keep the data sealed and stop, never poison it.
+                if status.is_redirection() || matches!(status.as_u16(), 404 | 405 | 413) {
+                    let reason = if status.is_redirection() {
+                        "redirect refused".to_string()
+                    } else {
+                        format!("http {}", status.as_u16())
+                    };
                     store
-                        .record_upload_attempt(&batch.batch_id, Some("redirect refused"))
+                        .record_upload_attempt(&batch.batch_id, Some(&reason))
                         .await?;
-                    store
-                        .poison_upload_batch(&batch.batch_id, "redirect refused")
-                        .await?;
-                    return Ok(Sent::Poisoned);
+                    anyhow::bail!(
+                        "the receiver answered {reason}; check the allowlisted destination and receiver, then re-run (the batch stays sealed)"
+                    );
                 }
                 if status.as_u16() == 401 || status.as_u16() == 403 {
                     // An operator-fixable credential problem: never poison

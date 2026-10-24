@@ -235,9 +235,16 @@ impl Store {
     /// personal profile, purpose `evidence_batch_upload`, not revoked, current
     /// profile generation, unexpired.
     pub async fn live_upload_consent(&self) -> Result<Option<Consent>> {
+        Ok(self.live_upload_consents().await?.into_iter().next())
+    }
+
+    /// Every consent that currently authorizes the batch upload, newest first.
+    /// Renewing a consent must not strand work staged under the one it
+    /// replaces while that one is still valid.
+    async fn live_upload_consents(&self) -> Result<Vec<Consent>> {
         let state = self.egress_state().await?;
         if state.profile != Profile::Personal {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         let now = Utc::now();
         let mut live: Vec<&Consent> = state
@@ -248,7 +255,7 @@ impl Store {
             .filter(|c| parse_ts(&c.expires_at).is_some_and(|e| now < e))
             .collect();
         live.sort_by(|a, b| b.granted_at.cmp(&a.granted_at));
-        Ok(live.first().map(|c| (*c).clone()))
+        Ok(live.into_iter().cloned().collect())
     }
 
     /// The profile in force at `ts`, from the append-only history. No history
@@ -281,18 +288,38 @@ impl Store {
     /// retention sweep and before sealing. Also enforces the outbox bound.
     pub async fn stage_upload_records(&self) -> Result<StageReport> {
         let mut report = StageReport::default();
-        let live = self.live_upload_consent().await?;
-        // Whatever consent staged a row must still be the live one: when it
-        // ends (revoked, expired, profile changed, replaced), its pending
-        // rows are expired with a recorded gap and its sealed batches are
-        // retired -- never re-targeted at a later consent or destination.
-        report.expired_at_bound += self
-            .retire_unauthorized_upload_work(live.as_ref().map(|c| c.id.as_str()))
-            .await?;
+        let live_all = self.live_upload_consents().await?;
+        let live = live_all.first().cloned();
+        // Whatever consent staged a row must still be live: when it ends
+        // (revoked, expired, profile changed), its pending rows are expired
+        // with a recorded gap and its sealed batches are retired. A renewal
+        // that leaves the earlier consent valid strands nothing.
+        let live_ids: Vec<&str> = live_all.iter().map(|c| c.id.as_str()).collect();
+        report.expired_at_bound += self.retire_unauthorized_upload_work(&live_ids).await?;
         let Some(consent) = live else {
             return Ok(report);
         };
-        let Some(eligible_since) = parse_ts(&consent.granted_at) else {
+        // A renewal that keeps the same destination and does not narrow the
+        // data classes continues the earlier authorization: its pending rows
+        // move to the renewed consent and its start date still counts.
+        let mut eligible_since_raw = consent.granted_at.clone();
+        for older in live_all.iter().skip(1) {
+            if older.destination == consent.destination
+                && older.data_classes.is_subset(&consent.data_classes)
+            {
+                sqlx::query(
+                    "UPDATE upload_outbox SET consent_id = ?1 WHERE state = 'pending' AND consent_id = ?2",
+                )
+                .bind(&consent.id)
+                .bind(&older.id)
+                .execute(&self.pool)
+                .await?;
+                if older.granted_at < eligible_since_raw {
+                    eligible_since_raw = older.granted_at.clone();
+                }
+            }
+        }
+        let Some(eligible_since) = parse_ts(&eligible_since_raw) else {
             return Ok(report);
         };
         let history = self.profile_history().await?;
@@ -552,7 +579,7 @@ impl Store {
             }
             for (kind, id) in victims {
                 sqlx::query(
-                    "UPDATE upload_outbox SET state = 'expired' WHERE kind = ?1 AND object_id = ?2",
+                    "UPDATE upload_outbox SET state = 'expired' WHERE kind = ?1 AND object_id = ?2 AND state = 'pending'",
                 )
                 .bind(kind)
                 .bind(id)
@@ -594,21 +621,23 @@ impl Store {
     /// audits what it drops. Returns the number of pending rows expired.
     pub async fn retire_unauthorized_upload_work(
         &self,
-        live_consent_id: Option<&str>,
+        live_consent_ids: &[&str],
     ) -> Result<usize> {
-        let live = live_consent_id.unwrap_or("");
-        let stale: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT window_id, COUNT(*) FROM upload_outbox
-             WHERE state = 'pending' AND consent_id <> ?1 GROUP BY window_id",
+        let is_live = |id: &str| live_consent_ids.contains(&id);
+        let stale: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT window_id, consent_id, COUNT(*) FROM upload_outbox
+             WHERE state = 'pending' GROUP BY window_id, consent_id",
         )
-        .bind(live)
         .fetch_all(&self.pool)
         .await?;
         let mut expired = 0usize;
-        for (window, n) in stale {
-            sqlx::query("UPDATE upload_outbox SET state = 'expired' WHERE state = 'pending' AND window_id = ?1 AND consent_id <> ?2")
+        for (window, consent_id, n) in stale {
+            if is_live(&consent_id) {
+                continue;
+            }
+            sqlx::query("UPDATE upload_outbox SET state = 'expired' WHERE state = 'pending' AND window_id = ?1 AND consent_id = ?2")
                 .bind(&window)
-                .bind(live)
+                .bind(&consent_id)
                 .execute(&self.pool)
                 .await?;
             sqlx::query("INSERT INTO upload_gaps (window_id, reason, dropped_count, recorded_at) VALUES (?1, 'consent_ended', ?2, ?3)")
@@ -625,15 +654,19 @@ impl Store {
             .await?;
             expired += n as usize;
         }
-        let retired: Vec<(String,)> = sqlx::query_as(
-            "SELECT batch_id FROM upload_batches WHERE state = 'sealed' AND consent_id <> ?1",
+        let sealed: Vec<(String, String)> = sqlx::query_as(
+            "SELECT batch_id, consent_id FROM upload_batches WHERE state = 'sealed'",
         )
-        .bind(live)
         .fetch_all(&self.pool)
         .await?;
-        for (batch_id,) in retired {
-            self.poison_upload_batch(&batch_id, "consent ended before the batch was acknowledged")
+        for (batch_id, consent_id) in sealed {
+            if !is_live(&consent_id) {
+                self.poison_upload_batch(
+                    &batch_id,
+                    "consent ended before the batch was acknowledged",
+                )
                 .await?;
+            }
         }
         Ok(expired)
     }
@@ -1385,6 +1418,42 @@ mod tests {
         let gaps = store.upload_gaps().await.unwrap();
         assert!(gaps.iter().any(|g| g.1 == "consent_ended"), "{gaps:?}");
         let _ = sealed;
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Renewing a consent (same destination) while the first is still valid
+    /// must not strand or lose the work staged under the first.
+    #[tokio::test]
+    async fn renewing_a_consent_keeps_pending_work_and_its_start_date() {
+        let (store, path) = open().await;
+        let first = consenting(&store).await;
+        record(&store, "s-a", &at(5)).await;
+        store.stage_upload_records().await.unwrap();
+        let second = store
+            .grant_egress_consent(
+                Purpose::EvidenceBatchUpload,
+                DEST,
+                &classes(),
+                30,
+                None,
+                "t",
+            )
+            .await
+            .unwrap();
+        // Captured after the first consent, not yet staged when it is renewed.
+        record(&store, "s-b", &at(6)).await;
+        store.stage_upload_records().await.unwrap();
+
+        let gaps = store.upload_gaps().await.unwrap();
+        assert!(gaps.iter().all(|g| g.1 != "consent_ended"), "{gaps:?}");
+        let window = store.pending_upload_windows().await.unwrap().remove(0);
+        let sealed = store
+            .seal_upload_batch(&window, &second, DEST)
+            .await
+            .unwrap()
+            .expect("both sessions' rows seal under the renewed consent");
+        assert!(sealed.member_count >= 2, "{sealed:?}");
+        let _ = first;
         std::fs::remove_file(&path).ok();
     }
 

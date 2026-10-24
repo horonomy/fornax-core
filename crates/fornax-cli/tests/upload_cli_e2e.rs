@@ -394,8 +394,14 @@ async fn a_redirect_is_refused_and_its_target_sees_nothing() {
     let env = Env::new();
     env.authorize(&mock.url());
     env.seed().await;
-    env.ok(&["upload", "run", "--window", &window_now()]);
+    let err = env.fails(&["upload", "run", "--window", &window_now()]);
+    assert!(err.contains("redirect refused"), "{err}");
     assert_eq!(mock.count(), 1);
+    let status = env.ok(&["upload", "status"]);
+    assert!(
+        status.contains("sealed: 1") && !status.contains("poison"),
+        "a redirect must not poison data: {status}"
+    );
     assert_eq!(
         target.count(),
         0,
@@ -450,5 +456,35 @@ async fn preview_is_local_shows_exact_metadata_and_sends_nothing() {
     assert!(out.contains("exactly as they would be uploaded"), "{out}");
     assert!(!out.contains(CANARY), "{out}");
     assert_eq!(mock.count(), 0);
+    std::fs::remove_dir_all(&env.home).ok();
+}
+
+#[tokio::test]
+async fn a_wrong_path_or_oversized_reply_keeps_the_batch_sealed() {
+    for code in [404u16, 405, 413] {
+        let mock = Mock::start(vec![(code, vec![])]);
+        let env = Env::new();
+        env.authorize(&mock.url());
+        env.seed().await;
+        env.fails(&["upload", "run", "--window", &window_now()]);
+        let status = env.ok(&["upload", "status"]);
+        assert!(
+            status.contains("sealed: 1") && !status.contains("poison"),
+            "HTTP {code} must not poison data: {status}"
+        );
+        std::fs::remove_dir_all(&env.home).ok();
+    }
+}
+
+#[tokio::test]
+async fn a_duplicate_manifest_conflict_counts_as_acknowledged() {
+    let mock = Mock::start(vec![(409, vec![])]);
+    let env = Env::new();
+    env.authorize(&mock.url());
+    env.seed().await;
+    let out = env.ok(&["upload", "run", "--window", &window_now()]);
+    assert!(out.contains("uploaded 1 batch(es)"), "{out}");
+    let status = env.ok(&["upload", "status"]);
+    assert!(status.contains("acknowledged"), "{status}");
     std::fs::remove_dir_all(&env.home).ok();
 }
