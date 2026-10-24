@@ -2146,8 +2146,8 @@ fn no_findings_explanation(observed: Option<&serde_json::Value>) -> String {
             .to_string(),
         (Some(events), Some(sessions), Some(0)) => format!(
             "No findings recorded yet. {events} event(s) from {sessions} session(s) were captured, \
-             but no agent claim has been checked, so there is nothing to verify. Findings need a \
-             claim: Codex claims are read by the rollout tailer (`fornax-hook-codex`, see the \
+             but no agent claim has been checked, so there is nothing to verify. Findings need an agent \
+             claim that tests passed: Codex claims are read by the rollout tailer (`fornax-hook-codex`, see the \
              Codex integration doc), Claude Code claims by its Stop hook."
         ),
         _ => "No findings recorded yet.".to_string(),
@@ -3236,6 +3236,7 @@ mod tests {
         let text = no_findings_explanation(Some(&some));
         assert!(text.contains("3 event(s) from 1 session(s)"), "{text}");
         assert!(text.contains("no agent claim has been checked"), "{text}");
+        assert!(text.contains("claim that tests passed"), "{text}");
         assert_eq!(no_findings_explanation(None), "No findings recorded yet.");
     }
 
