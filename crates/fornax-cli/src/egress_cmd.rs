@@ -192,8 +192,10 @@ async fn print_status(store: &fornax_store::Store) -> anyhow::Result<()> {
             "  no profile chosen: NOTHING leaves this machine (policy fetch only if allowlisted)"
         ),
         Profile::Corporate => println!(
-            "  corporate is local-only: no evidence, checkpoint or work data is uploaded, whatever \
-             else is configured"
+            "  corporate is local-only: no evidence or checkpoint is uploaded and the monthly upload never \
+             runs, whatever else is configured. Only an allowlisted policy fetch (no local data) \
+             and an allowlisted semantic-judge gateway with a recorded corporate processing \
+             authorization may make requests. A local setting, not organization-enforced policy"
         ),
         Profile::Personal => println!(
             "  personal: metadata only, only to an allowlisted destination, only under a live consent, \
@@ -233,8 +235,8 @@ async fn print_status(store: &fornax_store::Store) -> anyhow::Result<()> {
         println!("  (none)");
     }
     println!(
-        "scheduled/monthly upload: not available in this release (nothing here sends data; \
-         `fornax export-spool` is a manual, per-session export)"
+        "scheduled/monthly upload: the daemon sends each closed month automatically under a live \
+         personal consent (see `fornax upload status`); never under corporate or unconfigured"
     );
     Ok(())
 }

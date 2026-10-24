@@ -45,13 +45,17 @@ fn projection(home: &std::path::Path) -> serde_json::Value {
 }
 
 #[test]
-fn a_fresh_install_says_nothing_leaves_and_no_monthly_upload_exists() {
+fn a_fresh_install_says_nothing_leaves_and_the_monthly_upload_is_described_as_scheduled() {
     let home = temp_home();
     let status = ok(&home, &["egress", "status"]);
     assert!(status.contains("profile: unconfigured"), "{status}");
     assert!(status.contains("NOTHING leaves this machine"), "{status}");
     assert!(
-        status.contains("scheduled/monthly upload: not available in this release"),
+        status.contains("scheduled/monthly upload: the daemon sends each closed month"),
+        "{status}"
+    );
+    assert!(
+        !status.contains("not available in this release"),
         "{status}"
     );
     std::fs::remove_dir_all(&home).ok();
@@ -167,6 +171,7 @@ fn corporate_revokes_consents_refuses_new_ones_and_needs_confirmation_to_leave()
     ok(&home, &["egress", "profile-set", "corporate"]);
     let status = ok(&home, &["egress", "status"]);
     assert!(status.contains("corporate is local-only"), "{status}");
+    assert!(status.contains("monthly upload never"), "{status}");
     assert!(status.contains("-- revoked"), "{status}");
     assert_eq!(projection(&home)["profile"], "corporate");
 
@@ -194,6 +199,49 @@ fn corporate_revokes_consents_refuses_new_ones_and_needs_confirmation_to_leave()
             "personal",
             "--confirm-leave-corporate",
         ],
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn corporate_status_names_the_authorized_judge_exception_and_is_not_org_enforced() {
+    let home = temp_home();
+    ok(&home, &["egress", "profile-set", "corporate"]);
+    ok(
+        &home,
+        &[
+            "egress",
+            "allow-add",
+            "--purpose",
+            "semantic_judge",
+            "https://judge.invalid/v1",
+        ],
+    );
+    ok(
+        &home,
+        &[
+            "egress",
+            "consent-grant",
+            "--purpose",
+            "semantic_judge",
+            "--destination",
+            "https://judge.invalid/v1",
+            "--classes",
+            "claim_text,redacted_evidence_payload",
+            "--authorization-ref",
+            "TEST-DISPOSABLE-NO-NETWORK",
+        ],
+    );
+    let status = ok(&home, &["egress", "status"]);
+    assert!(status.contains("semantic-judge gateway"), "{status}");
+    assert!(status.contains("recorded corporate processing"), "{status}");
+    assert!(
+        status.contains("not organization-enforced policy"),
+        "{status}"
+    );
+    assert!(
+        !status.contains("no evidence, checkpoint or work data"),
+        "{status}"
     );
     std::fs::remove_dir_all(&home).ok();
 }
