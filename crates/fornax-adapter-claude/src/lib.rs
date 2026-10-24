@@ -1229,7 +1229,7 @@ fn translate(
     let session_id = match raw
         .get("session_id")
         .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.trim().is_empty())
     {
         Some(s) => s.to_string(),
         None => {
@@ -1498,6 +1498,24 @@ mod tests {
         match normalize(&raw) {
             NormalizationOutcome::Ignored { .. } => {}
             other => panic!("expected Ignored, got {other:?}"),
+        }
+    }
+
+    /// Execution-identity contract: a whitespace-only native id is absent.
+    #[test]
+    fn whitespace_only_session_id_is_ignored_not_accepted() {
+        for blank in [" ", "\t", "  \n"] {
+            let raw = serde_json::json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": blank,
+                "tool_name": "Bash",
+                "tool_input": {"command": "pytest"},
+                "tool_response": {"exit_code": 0}
+            });
+            assert!(
+                matches!(normalize(&raw), NormalizationOutcome::Ignored { .. }),
+                "{blank:?} must be treated as no identity"
+            );
         }
     }
 

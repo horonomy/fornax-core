@@ -74,7 +74,7 @@ pub fn bind_host_event(
         .identity()
         .provider_session_id
         .as_ref()
-        .filter(|session_id| !session_id.is_empty())
+        .filter(|session_id| !session_id.trim().is_empty())
     else {
         return gap(HostBindingGapReason::SessionIdentityUnavailable, provenance);
     };

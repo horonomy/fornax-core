@@ -20,6 +20,7 @@ pub mod capabilities;
 pub mod causal;
 pub mod egress;
 pub mod epistemic_contract;
+pub mod execution_identity;
 pub mod experiment;
 pub mod extension;
 pub mod graph;
