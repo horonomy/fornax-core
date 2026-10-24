@@ -84,6 +84,51 @@ fn retry_after(resp: &reqwest::Response) -> Option<Duration> {
         .map(|s| Duration::from_secs(s.min(30)))
 }
 
+/// Only one upload run may be sealing and sending at a time (the daemon's
+/// schedule and an operator's `fornax upload run` share this).
+struct UploadLock(std::path::PathBuf);
+
+/// A lock older than this is from a crashed run and is taken over.
+const LOCK_STALE_AFTER: Duration = Duration::from_secs(30 * 60);
+
+impl UploadLock {
+    fn acquire(home: &std::path::Path) -> anyhow::Result<Option<Self>> {
+        use std::io::Write;
+        let path = home.join("upload.lock");
+        for _ in 0..2 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut f) => {
+                    let _ = writeln!(f, "{}", std::process::id());
+                    return Ok(Some(Self(path)));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let age = std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok());
+                    if age.is_some_and(|a| a > LOCK_STALE_AFTER) {
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    return Ok(None);
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(None)
+    }
+}
+
+impl Drop for UploadLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// What one upload run did. The caller decides how to report it.
 #[derive(Debug, Default)]
 pub struct RunReport {
@@ -106,6 +151,9 @@ pub async fn run_upload(
     window: Option<String>,
     max_batches: usize,
 ) -> anyhow::Result<RunReport> {
+    let Some(_lock) = UploadLock::acquire(home)? else {
+        anyhow::bail!("another upload run is in progress (home/upload.lock); nothing was sent");
+    };
     let Some(consent) = store.live_upload_consent().await? else {
         anyhow::bail!(
             "no live consent for evidence_batch_upload under the personal profile: nothing is staged or sent \
@@ -212,6 +260,11 @@ pub async fn run_upload(
 /// Why a scheduled tick did or did not send.
 #[derive(Debug)]
 pub enum TickOutcome {
+    /// The `FORNAX_CLOUD_SYNC_ENABLED` kill switch is off: nothing is staged,
+    /// sealed or sent.
+    Disabled,
+    /// Another upload run holds the lock; this tick does nothing.
+    Busy,
     /// No live personal-profile consent: nothing is staged or sent.
     NoConsent,
     /// Consent is live but no closed month or unfinished batch is due.
@@ -233,6 +286,9 @@ pub async fn scheduled_tick(
     store: &fornax_store::Store,
     home: &std::path::Path,
 ) -> anyhow::Result<TickOutcome> {
+    if !fornax_types::privacy::cloud_sync_allowed() {
+        return Ok(TickOutcome::Disabled);
+    }
     if store.live_upload_consent().await?.is_none() {
         return Ok(TickOutcome::NoConsent);
     }
@@ -263,7 +319,17 @@ pub async fn scheduled_tick(
     if let Err(e) = read_credential(home) {
         return Ok(TickOutcome::NotConfigured(e.to_string()));
     }
-    Ok(TickOutcome::Ran(run_upload(store, home, None, 8).await?))
+    // `run_upload` takes the lock itself; losing the race is not an error.
+    match run_upload(store, home, None, 8).await {
+        Ok(report) => Ok(TickOutcome::Ran(report)),
+        Err(e)
+            if e.to_string()
+                .starts_with("another upload run is in progress") =>
+        {
+            Ok(TickOutcome::Busy)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 async fn send_batch(
@@ -319,17 +385,11 @@ async fn send_batch(
                     store.acknowledge_upload_batch(&batch.batch_id).await?;
                     return Ok(Sent::Acknowledged);
                 }
-                if status.as_u16() == 409 {
-                    // The receiver already holds this exact manifest
-                    // (idempotent duplicate): that is an acknowledgement.
-                    store.record_upload_attempt(&batch.batch_id, None).await?;
-                    store.acknowledge_upload_batch(&batch.batch_id).await?;
-                    return Ok(Sent::Acknowledged);
-                }
-                // Redirects are never followed, and a wrong path or an oversized
-                // request is an operator/configuration fault that would hit every
+                // Redirects are never followed, a wrong path or an oversized request is
+                // an operator/configuration fault, and a 409 means the receiver holds
+                // a DIFFERENT manifest under this batch id (never an acknowledgement) that would hit every
                 // batch alike: keep the data sealed and stop, never poison it.
-                if status.is_redirection() || matches!(status.as_u16(), 404 | 405 | 413) {
+                if status.is_redirection() || matches!(status.as_u16(), 404 | 405 | 409 | 413) {
                     let reason = if status.is_redirection() {
                         "redirect refused".to_string()
                     } else {

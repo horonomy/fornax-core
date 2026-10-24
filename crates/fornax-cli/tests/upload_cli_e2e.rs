@@ -461,7 +461,7 @@ async fn preview_is_local_shows_exact_metadata_and_sends_nothing() {
 
 #[tokio::test]
 async fn a_wrong_path_or_oversized_reply_keeps_the_batch_sealed() {
-    for code in [404u16, 405, 413] {
+    for code in [404u16, 405, 409, 413] {
         let mock = Mock::start(vec![(code, vec![])]);
         let env = Env::new();
         env.authorize(&mock.url());
@@ -474,17 +474,4 @@ async fn a_wrong_path_or_oversized_reply_keeps_the_batch_sealed() {
         );
         std::fs::remove_dir_all(&env.home).ok();
     }
-}
-
-#[tokio::test]
-async fn a_duplicate_manifest_conflict_counts_as_acknowledged() {
-    let mock = Mock::start(vec![(409, vec![])]);
-    let env = Env::new();
-    env.authorize(&mock.url());
-    env.seed().await;
-    let out = env.ok(&["upload", "run", "--window", &window_now()]);
-    assert!(out.contains("uploaded 1 batch(es)"), "{out}");
-    let status = env.ok(&["upload", "status"]);
-    assert!(status.contains("acknowledged"), "{status}");
-    std::fs::remove_dir_all(&env.home).ok();
 }

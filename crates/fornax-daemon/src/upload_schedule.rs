@@ -48,7 +48,12 @@ async fn supervisor_loop(state: AppState, home: PathBuf) {
         let outcome =
             tokio::spawn(async move { fornax_upload::scheduled_tick(&store, &home).await }).await;
         match outcome {
-            Ok(Ok(TickOutcome::NoConsent)) | Ok(Ok(TickOutcome::NothingDue)) => {}
+            Ok(Ok(
+                TickOutcome::NoConsent
+                | TickOutcome::NothingDue
+                | TickOutcome::Disabled
+                | TickOutcome::Busy,
+            )) => {}
             Ok(Ok(TickOutcome::NotConfigured(why))) => {
                 tracing::warn!(reason = %why, "monthly upload is due but the device is not provisioned; nothing sent");
             }

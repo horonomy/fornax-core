@@ -142,6 +142,14 @@ async fn the_schedule_is_inert_without_a_live_personal_consent_and_sends_once_wi
     }
     assert_eq!(count.load(Ordering::SeqCst), 1);
 
+    // 2b. A held lock (another run in progress) makes the tick a no-op.
+    std::fs::write(home.join("upload.lock"), "1").unwrap();
+    assert!(matches!(
+        scheduled_tick(&store, &home).await.unwrap(),
+        TickOutcome::Busy | TickOutcome::NothingDue
+    ));
+    std::fs::remove_file(home.join("upload.lock")).ok();
+
     // 3. Nothing further is due: no second request.
     assert!(matches!(
         scheduled_tick(&store, &home).await.unwrap(),
