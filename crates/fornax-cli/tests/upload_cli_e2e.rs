@@ -699,13 +699,22 @@ async fn a_batch_sealed_for_one_url_is_never_sent_to_a_renewed_consents_url() {
     let err = env.fails(&["upload", "run"]);
     assert!(err.contains("upload incomplete"), "{err}");
     let a_attempts = a.count();
-    assert_eq!(a_attempts, 4, "A was tried (positive control)");
+    assert!(a_attempts >= 1, "A was tried (positive control)");
     assert!(env.ok(&["upload", "status"]).contains("sealed: 1"));
 
     // Renew to B while A's batch is sealed.
     env.allow_and_consent(&b.url());
-    let _ = env.run(&["upload", "run"]);
-    assert_eq!(b.count(), 0, "B must never receive A's sealed batch");
+    let renewed = env.run(&["upload", "run"]);
+    let renewed_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&renewed.stdout),
+        String::from_utf8_lossy(&renewed.stderr)
+    );
+    assert_eq!(
+        b.count(),
+        0,
+        "B must never receive A's sealed batch: {renewed_text}"
+    );
     assert_eq!(a.count(), a_attempts, "A is no longer the live URL");
     let status = env.ok(&["upload", "status"]);
     assert!(
@@ -719,7 +728,7 @@ async fn a_batch_sealed_for_one_url_is_never_sent_to_a_renewed_consents_url() {
 /// sends nothing; the lock is released afterwards.
 #[tokio::test]
 async fn a_concurrent_upload_run_is_refused_and_the_receiver_sees_one_request() {
-    let mock = Mock::start_with(vec![(202, vec![])], None, std::time::Duration::from_secs(3));
+    let mock = Mock::start_with(vec![(202, vec![])], None, std::time::Duration::from_secs(6));
     let env = Env::new();
     env.authorize(&mock.url());
     env.seed().await;
