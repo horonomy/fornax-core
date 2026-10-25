@@ -20,6 +20,7 @@ mod evidence_plan_cmd;
 mod experiment_ux;
 mod feedback_cmd;
 mod guarded_write;
+mod launchd_plist;
 mod receipt_cmd;
 mod statusline;
 mod timeline;

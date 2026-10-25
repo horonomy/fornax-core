@@ -169,6 +169,11 @@ impl AdapterPlugin for CodexAdapter {
             r.message,
             crate::codex_watch_marker::DISCLOSURE
         );
+        r.message.push_str(" | ");
+        r.message.push_str(&crate::launchd_plist::install_message(
+            &crate::dirs_home(),
+            &crate::fornax_home(),
+        ));
         Ok(r)
     }
 
@@ -184,6 +189,9 @@ impl AdapterPlugin for CodexAdapter {
         if removed {
             r.message = format!("{} | capture: daemon Codex capture turned off", r.message);
         }
+        r.message.push_str(" | ");
+        r.message
+            .push_str(&crate::launchd_plist::uninstall_message(&crate::dirs_home()));
         Ok(r)
     }
 }

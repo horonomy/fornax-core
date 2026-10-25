@@ -65,6 +65,12 @@ fn plan_reports_capture_before_install_and_install_discloses_what_is_read() {
         "{text}"
     );
     assert!(text.contains("secret-pattern redaction only"), "{text}");
+    assert!(text.contains("daemon autostart"), "{text}");
+    // Only a plain file under the isolated HOME; nothing is ever loaded.
+    assert!(
+        !text.contains("launchctl bootstrap") || s.home.join("Library/LaunchAgents").is_dir(),
+        "{text}"
+    );
 
     let marker: serde_json::Value = serde_json::from_slice(&fs::read(s.marker()).unwrap()).unwrap();
     assert_eq!(
