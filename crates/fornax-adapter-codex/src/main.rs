@@ -10,12 +10,16 @@
 //! Usage: `fornax-hook-codex [--file <rollout.jsonl>]` (defaults to the most
 //! recently modified rollout file), runs until interrupted, tailing new lines.
 
+use fornax_adapter_codex::rollout_tail::{read_new_lines, Start, TailCursor};
 use fornax_adapter_codex::{stamped_capabilities, CodexAdapter};
 use fornax_types::{AgentAdapter, IngestMessage, NormalizationOutcome};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
+
+/// Longest rollout line the tailer will buffer; a longer one is skipped.
+const MAX_LINE_BYTES: u64 = 8 * 1024 * 1024;
 
 fn sock_path() -> PathBuf {
     let home = std::env::var("FORNAX_HOME")
@@ -27,7 +31,11 @@ fn sock_path() -> PathBuf {
 }
 
 fn default_rollout_file() -> Option<PathBuf> {
-    let sessions_dir = PathBuf::from(std::env::var("HOME").ok()?).join(".codex/sessions");
+    let codex_home = match std::env::var("CODEX_HOME") {
+        Ok(h) if !h.is_empty() => PathBuf::from(h),
+        _ => PathBuf::from(std::env::var("HOME").ok()?).join(".codex"),
+    };
+    let sessions_dir = codex_home.join("sessions");
     let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
     for entry in walk_jsonl(&sessions_dir) {
         if let Ok(meta) = std::fs::metadata(&entry) {
@@ -77,17 +85,17 @@ async fn main() -> anyhow::Result<()> {
     let mut stream: Option<UnixStream> = None;
     let mut caps_sent = false;
     let mut warned_no_session_id = false;
-    let mut offset: u64 = 0;
+    let mut cursor: Option<TailCursor> = None;
 
     loop {
-        let content = tokio::fs::read_to_string(&file).await.unwrap_or_default();
-        if (content.len() as u64) > offset {
-            let new_part = &content[offset as usize..];
-            for line in new_part.lines() {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+        // FORNX-468: bounded, newline-delimited reads. A half-written last
+        // line is left for the next tick instead of being skipped forever, a
+        // shrunk/replaced file restarts at 0, and one invalid-UTF-8 line no
+        // longer hides the whole file.
+        if let Ok(read) = read_new_lines(&file, cursor.as_ref(), Start::Beginning, MAX_LINE_BYTES) {
+            cursor = Some(read.cursor);
+            for line in read.lines {
+                let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) else {
                     continue;
                 };
 
@@ -145,7 +153,6 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
-            offset = content.len() as u64;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
