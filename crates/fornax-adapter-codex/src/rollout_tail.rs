@@ -50,26 +50,7 @@ pub fn read_new_lines(
     let (dev, ino) = identity(&meta);
     let len = meta.len();
 
-    let mut cur = match cursor {
-        Some(c) if c.dev == dev && c.ino == ino && c.offset <= len => c.clone(),
-        // First sight, replaced file or truncation.
-        Some(_) => TailCursor {
-            dev,
-            ino,
-            ..Default::default()
-        },
-        None => TailCursor {
-            dev,
-            ino,
-            offset: match start {
-                Start::Beginning => 0,
-                Start::End => len,
-            },
-            skipping: false,
-        },
-    };
-    cur.dev = dev;
-    cur.ino = ino;
+    let mut cur = resolve(cursor, start, dev, ino, len);
 
     let mut out = TailRead {
         cursor: cur.clone(),
@@ -119,6 +100,81 @@ pub fn read_new_lines(
     }
     out.cursor = cur;
     Ok(out)
+}
+
+/// Complete lines of `path[..upto]`, and the offset just after the last
+/// newline among them (a half-written trailing line is not consumed). `None`
+/// when the prefix is larger than `cap`: the caller replays less instead of
+/// buffering an unbounded history.
+pub fn read_prefix(
+    path: &Path,
+    upto: u64,
+    cap: u64,
+) -> std::io::Result<Option<(Vec<String>, u64)>> {
+    if upto > cap {
+        return Ok(None);
+    }
+    let mut buf = Vec::with_capacity(upto as usize);
+    std::fs::File::open(path)?
+        .take(upto)
+        .read_to_end(&mut buf)?;
+    let end = buf.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+    let lines = buf[..end]
+        .split(|b| *b == b'\n')
+        .filter_map(|l| std::str::from_utf8(l).ok())
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    Ok(Some((lines, end as u64)))
+}
+
+/// Applies the identity/truncation rules: a usable `cursor` is kept; anything
+/// else (first sight, replaced file, shrunk file) starts per `start`, except
+/// that a file known to have changed identity restarts at 0.
+fn resolve(cursor: Option<&TailCursor>, start: Start, dev: u64, ino: u64, len: u64) -> TailCursor {
+    match cursor {
+        Some(c) if c.dev == dev && c.ino == ino && c.offset <= len => c.clone(),
+        Some(_) => TailCursor {
+            dev,
+            ino,
+            ..Default::default()
+        },
+        None => TailCursor {
+            dev,
+            ino,
+            offset: match start {
+                Start::Beginning => 0,
+                Start::End => len,
+            },
+            skipping: false,
+        },
+    }
+}
+
+/// Where reading would resume for `path`, without consuming anything.
+pub fn resume_cursor(
+    path: &Path,
+    cursor: Option<&TailCursor>,
+    start: Start,
+) -> std::io::Result<TailCursor> {
+    let meta = std::fs::metadata(path)?;
+    let (dev, ino) = identity(&meta);
+    Ok(resolve(cursor, start, dev, ino, meta.len()))
+}
+
+/// Offset just after the last newline in `path[..upto]`, searching at most
+/// the final 8 MiB (0 if there is none in that window).
+pub fn last_newline_before(path: &Path, upto: u64) -> std::io::Result<u64> {
+    const WINDOW: u64 = 8 * 1024 * 1024;
+    let from = upto.saturating_sub(WINDOW);
+    let mut f = std::fs::File::open(path)?;
+    f.seek(SeekFrom::Start(from))?;
+    let mut buf = Vec::new();
+    f.take(upto - from).read_to_end(&mut buf)?;
+    Ok(buf
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map_or(0, |i| from + i as u64 + 1))
 }
 
 /// Where a never-seen file starts when no cursor exists.
@@ -250,6 +306,18 @@ mod tests {
         append(&f, b"{\"new\":1}\n");
         let r2 = read_new_lines(&f, Some(&r1.cursor), Start::End, CAP).unwrap();
         assert_eq!(r2.lines, vec!["{\"new\":1}"]);
+    }
+
+    #[test]
+    fn read_prefix_returns_complete_lines_and_their_end_offset() {
+        let d = Dir::new("prefix");
+        let f = d.0.join("rollout-a.jsonl");
+        append(&f, b"{\"a\":1}\n{\"b\":2}\n{\"c\":");
+        let len = std::fs::metadata(&f).unwrap().len();
+        let (lines, end) = read_prefix(&f, len, CAP).unwrap().unwrap();
+        assert_eq!(lines, vec!["{\"a\":1}", "{\"b\":2}"]);
+        assert_eq!(end, 16);
+        assert!(read_prefix(&f, len, 4).unwrap().is_none());
     }
 
     #[test]

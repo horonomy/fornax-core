@@ -37,6 +37,7 @@ use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
 use tokio::time::timeout;
 
 mod audit_checkpoint_submit;
+mod codex_watch;
 mod policy_poll;
 mod retention_sweep;
 mod upload_schedule;
@@ -468,6 +469,10 @@ async fn main() -> anyhow::Result<()> {
     // unless a live personal-profile consent exists; see `upload_schedule`.
     let upload_schedule_task = upload_schedule::spawn(state.clone(), home.clone());
 
+    // FORNX-468: opt-in Codex rollout capture. Inert unless
+    // `$FORNAX_HOME/codex-watch.json` exists; see `codex_watch`.
+    let codex_watch_task = codex_watch::spawn(state.clone(), home.clone());
+
     let app = Router::new()
         .route("/api/status", get(api_status))
         .route("/api/findings/recent", get(api_findings_recent))
@@ -509,6 +514,7 @@ async fn main() -> anyhow::Result<()> {
     checkpoint_task.abort();
     retention_sweep_task.abort();
     upload_schedule_task.abort();
+    codex_watch_task.abort();
     let _ = std::fs::remove_file(&sock_path);
     let _ = std::fs::remove_file(&pid_path);
     tracing::info!("fornaxd stopped");
