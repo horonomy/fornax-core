@@ -133,26 +133,52 @@ impl AdapterPlugin for CodexAdapter {
     }
 
     fn plan(&self) -> anyhow::Result<AdapterActionResult> {
-        crate::codex_adapter::plan_install_all(
+        let mut r = crate::codex_adapter::plan_install_all(
             &self.target_path(),
             &crate::codex_adapter::default_notify_script(),
             &crate::codex_hooks::default_path(),
-        )
+        )?;
+        let installed = crate::codex_watch_marker::is_installed(&crate::fornax_home());
+        r.changed |= !installed;
+        r.message = format!(
+            "{} | capture: {}",
+            r.message,
+            if installed {
+                "daemon Codex capture already enabled"
+            } else {
+                "would enable daemon Codex capture (reads all Codex sessions on this machine)"
+            }
+        );
+        Ok(r)
     }
 
     fn install(&self) -> anyhow::Result<AdapterActionResult> {
-        crate::codex_adapter::install_all(
+        let mut r = crate::codex_adapter::install_all(
             &self.target_path(),
             &crate::codex_adapter::default_notify_script(),
             &crate::codex_hooks::default_path(),
-        )
+        )?;
+        let wrote = crate::codex_watch_marker::install(&crate::fornax_home(), &self.target_path())?;
+        r.changed |= wrote;
+        r.message = format!(
+            "{} | capture: {}",
+            r.message,
+            crate::codex_watch_marker::DISCLOSURE
+        );
+        Ok(r)
     }
 
     fn uninstall(&self) -> anyhow::Result<AdapterActionResult> {
-        crate::codex_adapter::uninstall_all(
+        let mut r = crate::codex_adapter::uninstall_all(
             &self.target_path(),
             &crate::codex_hooks::default_path(),
-        )
+        )?;
+        let removed = crate::codex_watch_marker::uninstall(&crate::fornax_home())?;
+        r.changed |= removed;
+        if removed {
+            r.message = format!("{} | capture: daemon Codex capture turned off", r.message);
+        }
+        Ok(r)
     }
 }
 

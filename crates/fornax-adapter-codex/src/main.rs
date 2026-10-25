@@ -7,7 +7,7 @@
 //! binary is transport plumbing only — no translation logic lives here
 //! (D5, ADR 0001).
 //!
-//! Usage: `fornax-hook-codex [--file <rollout.jsonl>]` (defaults to the most
+//! Usage: `fornax-hook-codex [--file <rollout.jsonl>] [--force]` (defaults to the most
 //! recently modified rollout file), runs until interrupted, tailing new lines.
 
 use fornax_adapter_codex::rollout_tail::{read_new_lines, Start, TailCursor};
@@ -68,6 +68,20 @@ fn walk_jsonl(dir: &Path) -> Vec<PathBuf> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+
+    // FORNX-468: when the daemon captures Codex rollouts itself (opt-in marker
+    // written by `fornax install codex`), a second reader would store every
+    // line twice and, because it holds a long-lived connection, downgrade that
+    // session's verdicts to Review.
+    if sock_path().with_file_name("codex-watch.json").exists()
+        && !args.iter().any(|a| a == "--force")
+    {
+        eprintln!(
+            "fornax-hook-codex: the daemon already captures Codex sessions (codex-watch.json exists); \
+             not starting a second reader. Pass --force to run anyway."
+        );
+        return Ok(());
+    }
     let file = args
         .iter()
         .position(|a| a == "--file")
