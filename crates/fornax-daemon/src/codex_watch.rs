@@ -164,6 +164,7 @@ async fn watch_loop(state: AppState, home: PathBuf) {
                 }
             }
             first_scan = false;
+            idle.retain(|p, _| p.exists());
             // A cursor for a file that is gone (rotated, deleted) is dead weight.
             let before = cursors.len();
             cursors.retain(|p, _| Path::new(p).exists());
@@ -205,7 +206,12 @@ async fn watch_loop(state: AppState, home: PathBuf) {
             .collect();
         for p in dropped {
             if let Some(t) = tracked.remove(&p) {
-                idle.insert(p, t.cursor.offset);
+                // Keyed by file length (not cursor offset, which trails a
+                // half-written last line) so the re-add check can match.
+                let len = std::fs::metadata(&p)
+                    .map(|m| m.len())
+                    .unwrap_or(t.cursor.offset);
+                idle.insert(p, len);
             }
         }
         if changed {
@@ -243,7 +249,16 @@ fn start_tracking(
                 }
                 // Too large to replay: still resume on a line boundary.
                 if saved.is_none() {
-                    cursor.offset = last_newline_before(path, upto).ok()?;
+                    match last_newline_before(path, upto).ok()? {
+                        // No line break in the window (one giant line): stay
+                        // at the end and discard the rest of that line,
+                        // rather than rewinding to 0 and backfilling.
+                        0 => {
+                            cursor.offset = upto;
+                            cursor.skipping = true;
+                        }
+                        nl => cursor.offset = nl,
+                    }
                 }
                 tracing::warn!(file = %path.display(), "codex rollout prefix too large to replay; only its session_meta line was");
             }

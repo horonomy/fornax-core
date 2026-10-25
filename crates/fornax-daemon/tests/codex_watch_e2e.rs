@@ -235,6 +235,47 @@ async fn codex_watch_does_not_backfill_history_but_follows_the_session_on() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn codex_watch_history_ending_in_an_unterminated_giant_line_is_not_backfilled() {
+    let env = Env::new("giantline");
+    env.opt_in();
+    let mut history = vec![session_meta("cw-giant")];
+    history.extend(passing_pair("old", ""));
+    history.push(task_complete("All tests passed."));
+    let path = env.rollout("giantline");
+    append_lines(&path, &history);
+    // A line still being written: no newline anywhere in the last 8 MiB.
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(&vec![b'x'; 9 * 1024 * 1024]).unwrap();
+    }
+
+    let _d = env.start_daemon();
+    settle().await;
+    assert!(
+        findings(&env, "cw-giant").await.is_empty(),
+        "history before the giant line must not be backfilled"
+    );
+
+    // The giant line finishes, then the session goes on.
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(b"\n").unwrap();
+    }
+    let mut next = passing_pair("new", "");
+    next.push(task_complete("All tests passed."));
+    append_lines(&path, &next);
+    let f = wait_for_finding(&env, "cw-giant", 1).await;
+    settle().await;
+    assert_eq!(f.len(), 1, "exactly the new turn's claim");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn codex_watch_restart_resumes_from_cursor_without_duplicates() {
     let env = Env::new("restart");
     env.opt_in();
