@@ -141,18 +141,31 @@ impl AdapterPlugin for CodexAdapter {
     }
 
     fn install(&self) -> anyhow::Result<AdapterActionResult> {
-        crate::codex_adapter::install_all(
+        let mut result = crate::codex_adapter::install_all(
             &self.target_path(),
             &crate::codex_adapter::default_notify_script(),
             &crate::codex_hooks::default_path(),
-        )
+        )?;
+        result.message.push_str(" | ");
+        result
+            .message
+            .push_str(&crate::launchd_plist::install_message(
+                &crate::dirs_home(),
+                &crate::fornax_home(),
+            ));
+        Ok(result)
     }
 
     fn uninstall(&self) -> anyhow::Result<AdapterActionResult> {
-        crate::codex_adapter::uninstall_all(
+        let mut result = crate::codex_adapter::uninstall_all(
             &self.target_path(),
             &crate::codex_hooks::default_path(),
-        )
+        )?;
+        result.message.push_str(" | ");
+        result
+            .message
+            .push_str(&crate::launchd_plist::uninstall_message(&crate::dirs_home()));
+        Ok(result)
     }
 }
 
