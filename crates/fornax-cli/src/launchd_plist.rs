@@ -8,6 +8,9 @@
 use std::path::{Path, PathBuf};
 
 pub const LABEL: &str = "com.horonomy.fornax-daemon";
+/// Written into every plist Fornax creates; install and uninstall only touch a
+/// file that carries it, so a hand-written plist under the same label is safe.
+const OWNER_MARK: &str = "<!-- managed by fornax: `fornax uninstall codex` removes this file -->";
 
 pub fn plist_path(user_home: &Path) -> PathBuf {
     user_home
@@ -34,12 +37,14 @@ fn render(daemon_bin: &Path, fornax_home: &Path) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+{OWNER_MARK}
 <plist version="1.0">
 <dict>
   <key>Label</key><string>{LABEL}</string>
   <key>ProgramArguments</key><array><string>{bin}</string></array>
   <key>EnvironmentVariables</key><dict><key>FORNAX_HOME</key><string>{home}</string></dict>
   <key>RunAtLoad</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>StandardOutPath</key><string>{log}</string>
   <key>StandardErrorPath</key><string>{log}</string>
@@ -57,7 +62,16 @@ pub fn install(user_home: &Path, fornax_home: &Path, daemon_bin: &Path) -> anyho
         "fornax-daemon not found at {}",
         daemon_bin.display()
     );
+    for p in [user_home, fornax_home, daemon_bin] {
+        let ok = p.is_absolute() && p.to_str().is_some_and(|t| !t.chars().any(char::is_control));
+        anyhow::ensure!(
+            ok,
+            "{} is not an absolute, plain-text path; not writing a login item",
+            p.display()
+        );
+    }
     let path = plist_path(user_home);
+    ensure_ours(&path)?;
     let dir = path.parent().expect("plist path has a parent");
     std::fs::create_dir_all(dir)?;
     std::fs::create_dir_all(fornax_home.join("logs"))?;
@@ -67,8 +81,20 @@ pub fn install(user_home: &Path, fornax_home: &Path, daemon_bin: &Path) -> anyho
     Ok(path)
 }
 
+/// Refuses to touch an existing file that Fornax did not write.
+fn ensure_ours(path: &Path) -> anyhow::Result<()> {
+    match std::fs::read_to_string(path) {
+        Ok(body) if !body.contains(OWNER_MARK) => anyhow::bail!(
+            "{} exists and was not written by Fornax; leaving it alone",
+            path.display()
+        ),
+        _ => Ok(()),
+    }
+}
+
 /// Removes the plist; true if one was there.
 pub fn uninstall(user_home: &Path) -> anyhow::Result<bool> {
+    ensure_ours(&plist_path(user_home))?;
     match std::fs::remove_file(plist_path(user_home)) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -152,6 +178,33 @@ mod tests {
         let d = scratch("missing");
         let err = install(&d, &d.join("fh"), &d.join("fornax-daemon")).unwrap_err();
         assert!(err.to_string().contains("not found"));
+        assert!(!plist_path(&d).exists());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_foreign_plist_with_the_same_label_is_never_overwritten_or_removed() {
+        let d = scratch("foreign");
+        let daemon = d.join("fornax-daemon");
+        std::fs::write(&daemon, "").unwrap();
+        let path = plist_path(&d);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "<plist>hand written</plist>").unwrap();
+        assert!(install(&d, &d.join("fh"), &daemon).is_err());
+        assert!(uninstall(&d).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "<plist>hand written</plist>"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn control_characters_in_a_path_are_refused() {
+        let d = scratch("ctrl");
+        let daemon = d.join("fornax-daemon");
+        std::fs::write(&daemon, "").unwrap();
+        assert!(install(&d, &d.join("fh\nx"), &daemon).is_err());
         assert!(!plist_path(&d).exists());
         std::fs::remove_dir_all(&d).ok();
     }
