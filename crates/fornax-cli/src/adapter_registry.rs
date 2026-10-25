@@ -141,6 +141,10 @@ impl AdapterPlugin for CodexAdapter {
     }
 
     fn install(&self) -> anyhow::Result<AdapterActionResult> {
+        crate::codex_adapter::write_notify_script(
+            &crate::codex_adapter::default_notify_script(),
+            &std::env::current_exe()?.canonicalize()?,
+        )?;
         crate::codex_adapter::install_all(
             &self.target_path(),
             &crate::codex_adapter::default_notify_script(),
