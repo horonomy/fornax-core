@@ -345,7 +345,8 @@ fn install_at_with(
     );
     if !on_path {
         message.push_str(&format!(
-            " Warning: `{HOOK_BIN}` was not found on PATH — hook invocations will fail until it is."
+            " Note: `{HOOK_BIN}` is not on PATH. Findings do not need it; only if you trust these hooks \
+             in `/hooks`, put it on PATH (next to `fornax`) or those hook calls will fail."
         ));
     }
     Ok(mk("install", path, true, message))
