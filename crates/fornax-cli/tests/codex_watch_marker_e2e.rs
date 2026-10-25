@@ -89,3 +89,16 @@ fn uninstall_turns_capture_off() {
     assert!(!s.marker().exists(), "marker must be removed");
     assert!(stdout(&out).contains("daemon Codex capture turned off"));
 }
+
+#[test]
+fn uninstall_turns_capture_off_even_when_the_codex_config_cannot_be_edited() {
+    let s = Scratch::new();
+    assert!(s.run(&["install", "codex"]).status.success());
+    // The user's config became unparsable after install.
+    fs::write(s.home.join(".codex").join("config.toml"), "not = [valid").unwrap();
+    let _ = s.run(&["uninstall", "codex"]);
+    assert!(
+        !s.marker().exists(),
+        "a failed config edit must not leave capture on"
+    );
+}

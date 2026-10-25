@@ -169,11 +169,13 @@ impl AdapterPlugin for CodexAdapter {
     }
 
     fn uninstall(&self) -> anyhow::Result<AdapterActionResult> {
+        // Capture goes off first: a failed edit of the Codex config must not
+        // leave the daemon still reading every Codex session.
+        let removed = crate::codex_watch_marker::uninstall(&crate::fornax_home())?;
         let mut r = crate::codex_adapter::uninstall_all(
             &self.target_path(),
             &crate::codex_hooks::default_path(),
         )?;
-        let removed = crate::codex_watch_marker::uninstall(&crate::fornax_home())?;
         r.changed |= removed;
         if removed {
             r.message = format!("{} | capture: daemon Codex capture turned off", r.message);
