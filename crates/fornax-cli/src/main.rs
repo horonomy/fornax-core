@@ -15,6 +15,7 @@ mod codex_adapter;
 mod codex_hooks;
 mod codex_watch_marker;
 mod corpus_cmd;
+mod doctor_cmd;
 mod egress_cmd;
 mod evidence_plan_cmd;
 mod experiment_ux;
@@ -421,10 +422,11 @@ enum Commands {
         #[command(subcommand)]
         action: receipt_cmd::ReceiptAction,
     },
-    /// Report which execution-identity dimensions this build's own write
-    /// path actually populates.
+    /// Check that Fornax can work on this machine (daemon running, Codex
+    /// wired, capture on), each with its next step, then report which
+    /// execution-identity dimensions this build's own write path populates.
     ///
-    /// Static and side-effect-free -- never a database read, never a daemon
+    /// The identity part is static and side-effect-free -- never a database read, never a daemon
     /// round trip, just a true statement about the current binary. Mirrors
     /// Circinus's `circinus doctor`'s `execution_identity_capture` check and
     /// Libra Governor's `libra-governor doctor` equivalent in intent, not in
@@ -860,7 +862,11 @@ async fn main() -> anyhow::Result<()> {
         Commands::Upload { action } => upload_cmd::handle(action, &fornax_home()).await?,
         Commands::Feedback { action } => feedback_cmd::handle(action, &fornax_home()).await?,
         Commands::Receipt { action } => receipt_cmd::handle(action, &fornax_home()).await?,
-        Commands::Doctor => println!("{}", execution_identity_capture_report()),
+        Commands::Doctor => println!(
+            "{}\nExecution-identity capture (what a finding can be attributed to):\n{}",
+            doctor_cmd::report(&fornax_home()),
+            execution_identity_capture_report()
+        ),
     }
     Ok(())
 }
