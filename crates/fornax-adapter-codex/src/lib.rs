@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 pub mod hook;
+pub mod rollout_tail;
 pub use hook::CodexHookAdapter;
 
 /// This adapter implementation's own version — independent of the Codex CLI
