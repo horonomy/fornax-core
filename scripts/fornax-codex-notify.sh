@@ -36,9 +36,16 @@
 # turn.
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-FORNAX_BIN="$REPO_ROOT/target/debug/fornax"
+# `fornax install codex` copies this script to $FORNAX_HOME/bin and replaces the
+# placeholder below with the absolute path of the fornax binary that installed
+# it, so it keeps working wherever the checkout or build directory is. Run
+# straight from a source checkout (placeholder untouched) it falls back to the
+# debug build next to the script.
+FORNAX_BIN="${FORNAX_BIN:-__FORNAX_BIN__}"
+if [ "$FORNAX_BIN" = "__FORNAX_""BIN__" ]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  FORNAX_BIN="$(cd "$SCRIPT_DIR/.." && pwd)/target/debug/fornax"
+fi
 FORNAX_HOME="${FORNAX_HOME:-$HOME/.fornax}"
 STATE_FILE="$FORNAX_HOME/last-status"
 

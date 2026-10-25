@@ -133,39 +133,66 @@ impl AdapterPlugin for CodexAdapter {
     }
 
     fn plan(&self) -> anyhow::Result<AdapterActionResult> {
-        crate::codex_adapter::plan_install_all(
+        let mut r = crate::codex_adapter::plan_install_all(
             &self.target_path(),
             &crate::codex_adapter::default_notify_script(),
             &crate::codex_hooks::default_path(),
-        )
+        )?;
+        let installed = crate::codex_watch_marker::is_installed(&crate::fornax_home());
+        r.changed |= !installed;
+        r.message = format!(
+            "{} | capture: {}",
+            r.message,
+            if installed {
+                "daemon Codex capture already enabled"
+            } else {
+                "would enable daemon Codex capture (reads all Codex sessions on this machine)"
+            }
+        );
+        Ok(r)
     }
 
     fn install(&self) -> anyhow::Result<AdapterActionResult> {
-        let mut result = crate::codex_adapter::install_all(
+        crate::codex_adapter::write_notify_script(
+            &crate::codex_adapter::default_notify_script(),
+            &std::env::current_exe()?.canonicalize()?,
+        )?;
+        let mut r = crate::codex_adapter::install_all(
             &self.target_path(),
             &crate::codex_adapter::default_notify_script(),
             &crate::codex_hooks::default_path(),
         )?;
-        result.message.push_str(" | ");
-        result
-            .message
-            .push_str(&crate::launchd_plist::install_message(
-                &crate::dirs_home(),
-                &crate::fornax_home(),
-            ));
-        Ok(result)
+        let wrote = crate::codex_watch_marker::install(&crate::fornax_home(), &self.target_path())?;
+        r.changed |= wrote;
+        r.message = format!(
+            "{} | capture: {}",
+            r.message,
+            crate::codex_watch_marker::DISCLOSURE
+        );
+        r.message.push_str(" | ");
+        r.message.push_str(&crate::launchd_plist::install_message(
+            &crate::dirs_home(),
+            &crate::fornax_home(),
+        ));
+        Ok(r)
     }
 
     fn uninstall(&self) -> anyhow::Result<AdapterActionResult> {
-        let mut result = crate::codex_adapter::uninstall_all(
+        // Capture goes off first: a failed edit of the Codex config must not
+        // leave the daemon still reading every Codex session.
+        let removed = crate::codex_watch_marker::uninstall(&crate::fornax_home())?;
+        let mut r = crate::codex_adapter::uninstall_all(
             &self.target_path(),
             &crate::codex_hooks::default_path(),
         )?;
-        result.message.push_str(" | ");
-        result
-            .message
+        r.changed |= removed;
+        if removed {
+            r.message = format!("{} | capture: daemon Codex capture turned off", r.message);
+        }
+        r.message.push_str(" | ");
+        r.message
             .push_str(&crate::launchd_plist::uninstall_message(&crate::dirs_home()));
-        Ok(result)
+        Ok(r)
     }
 }
 

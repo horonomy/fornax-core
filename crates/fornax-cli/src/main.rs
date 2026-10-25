@@ -13,6 +13,7 @@ mod adjudicate_cmd;
 mod claude_adapter;
 mod codex_adapter;
 mod codex_hooks;
+mod codex_watch_marker;
 mod corpus_cmd;
 mod egress_cmd;
 mod evidence_plan_cmd;
