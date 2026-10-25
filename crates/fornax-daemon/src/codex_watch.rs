@@ -15,10 +15,12 @@
 //! through [`crate::process_line`], so ingest-boundary redaction and
 //! quarantine apply exactly as for any other adapter.
 //!
-//! Only new activity is ingested: a rollout first seen when the task starts
-//! (no saved cursor) begins at its current end; one that appears later is read
-//! from the start. Before forwarding from a mid-file position the prefix is
-//! replayed through the adapter with its output discarded, which restores the
+//! Only new activity is ingested, decided per file: a rollout created after
+//! the watcher began is read from its start; one that already existed (a
+//! `codex resume` of an old session, a file outside the 32-file window at
+//! startup, anything written while capture was off) starts at its current end.
+//! Before forwarding from a mid-file position the prefix is replayed through
+//! the adapter with its output discarded, which restores the
 //! native session id (FORNX-462: never invent one), format latch and pending
 //! call pairing. One task handles files and lines strictly in order, so a
 //! claim's own exit-code evidence is always stored before the claim is
@@ -29,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use fornax_adapter_codex::rollout_tail::{
-    discover, read_new_lines, read_prefix, resume_cursor, Start, TailCursor,
+    discover, last_newline_before, read_new_lines, read_prefix, resume_cursor, Start, TailCursor,
 };
 use fornax_adapter_codex::{stamped_capabilities, CodexAdapter};
 use fornax_types::{AgentAdapter, IngestMessage, NormalizationOutcome};
@@ -47,7 +49,7 @@ const MAX_FILES: usize = 32;
 const MAX_LINE_BYTES: u64 = 8 * 1024 * 1024;
 /// Largest prefix replayed to recover adapter state; beyond it only the first
 /// line (`session_meta`) is replayed.
-const WARM_REPLAY_CAP: u64 = 64 * 1024 * 1024;
+const WARM_REPLAY_CAP: u64 = 8 * 1024 * 1024;
 
 #[derive(serde::Deserialize)]
 struct Marker {
@@ -69,8 +71,14 @@ pub(crate) fn spawn(state: AppState, home: PathBuf) -> tokio::task::JoinHandle<(
 
 fn read_marker(home: &Path) -> Option<Marker> {
     let raw = std::fs::read_to_string(home.join(MARKER_FILE)).ok()?;
-    match serde_json::from_str(&raw) {
-        Ok(m) => Some(m),
+    match serde_json::from_str::<Marker>(&raw) {
+        Ok(m) if m.sessions_dir.is_absolute() => Some(m),
+        Ok(_) => {
+            tracing::warn!(
+                "codex-watch.json sessions_dir must be absolute; codex capture stays off"
+            );
+            None
+        }
         Err(e) => {
             tracing::warn!(error = %e, "codex-watch.json is unreadable; codex capture stays off");
             None
@@ -100,7 +108,14 @@ fn save_cursors(home: &Path, cursors: &BTreeMap<String, TailCursor>) {
 
 async fn watch_loop(state: AppState, home: PathBuf) {
     let mut tracked: BTreeMap<PathBuf, Tracked> = BTreeMap::new();
+    // Files dropped for idleness, with the length they had; re-tracked only
+    // once they grow, so an idle session is not replayed every 30 minutes.
+    let mut idle: BTreeMap<PathBuf, u64> = BTreeMap::new();
     let mut cursors = load_cursors(&home);
+    // What counts as history is decided per file: a rollout created before
+    // this point (and not yet followed) starts at its end. Reset whenever
+    // capture is switched off, so nothing written while it was off is read.
+    let mut watching_since = SystemTime::now();
     let mut first_scan = true;
     let mut last_scan: Option<Instant> = None;
     let mut warned_missing_dir = false;
@@ -110,7 +125,14 @@ async fn watch_loop(state: AppState, home: PathBuf) {
         if last_scan.is_none_or(|t| t.elapsed() >= SCAN_EVERY) {
             last_scan = Some(Instant::now());
             let Some(marker) = read_marker(&home) else {
-                tracked.clear();
+                if !tracked.is_empty() || !cursors.is_empty() {
+                    tracked.clear();
+                    idle.clear();
+                    cursors.clear();
+                    let _ = std::fs::remove_file(home.join(CURSOR_FILE));
+                }
+                watching_since = SystemTime::now();
+                first_scan = true;
                 continue;
             };
             if !marker.sessions_dir.is_dir() {
@@ -118,8 +140,6 @@ async fn watch_loop(state: AppState, home: PathBuf) {
                     tracing::warn!(dir = %marker.sessions_dir.display(), "codex sessions directory not found; retrying");
                     warned_missing_dir = true;
                 }
-                // Whatever appears under a directory that did not exist yet is
-                // new activity, not history.
                 first_scan = false;
                 continue;
             }
@@ -133,12 +153,23 @@ async fn watch_loop(state: AppState, home: PathBuf) {
                 if tracked.contains_key(&path) {
                     continue;
                 }
+                let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                if idle.get(&path) == Some(&len) {
+                    continue;
+                }
+                idle.remove(&path);
                 let saved = cursors.get(path.to_string_lossy().as_ref()).cloned();
-                if let Some(t) = start_tracking(&path, saved, first_scan) {
+                if let Some(t) = start_tracking(&path, saved, watching_since, first_scan) {
                     tracked.insert(path, t);
                 }
             }
             first_scan = false;
+            // A cursor for a file that is gone (rotated, deleted) is dead weight.
+            let before = cursors.len();
+            cursors.retain(|p, _| Path::new(p).exists());
+            if cursors.len() != before {
+                save_cursors(&home, &cursors);
+            }
         }
 
         let mut changed = false;
@@ -147,6 +178,14 @@ async fn watch_loop(state: AppState, home: PathBuf) {
             else {
                 continue;
             };
+            // Truncated or replaced: the file restarts at 0, so what the
+            // adapter learned about the old one (session id, open calls) is stale.
+            let restarted = read.cursor.ino != t.cursor.ino
+                || read.cursor.dev != t.cursor.dev
+                || read.cursor.offset < t.cursor.offset;
+            if restarted {
+                t.reset();
+            }
             if read.cursor != t.cursor {
                 changed = true;
             }
@@ -159,32 +198,52 @@ async fn watch_loop(state: AppState, home: PathBuf) {
             t.cursor = read.cursor;
             cursors.insert(path.to_string_lossy().into_owned(), t.cursor.clone());
         }
-        tracked.retain(|_, t| t.last_activity.elapsed() < IDLE_AFTER);
+        let dropped: Vec<PathBuf> = tracked
+            .iter()
+            .filter(|(_, t)| t.last_activity.elapsed() >= IDLE_AFTER)
+            .map(|(p, _)| p.clone())
+            .collect();
+        for p in dropped {
+            if let Some(t) = tracked.remove(&p) {
+                idle.insert(p, t.cursor.offset);
+            }
+        }
         if changed {
             save_cursors(&home, &cursors);
         }
     }
 }
 
-/// Builds the per-file state, positioned at `saved` or (first sight) at the
-/// end of the file on the daemon's first scan / the start of a file that
-/// appeared later, with adapter state recovered from the prefix.
-fn start_tracking(path: &Path, saved: Option<TailCursor>, first_scan: bool) -> Option<Tracked> {
+/// Builds the per-file state, positioned at `saved`, or for a file seen for
+/// the first time at its start (created since `watching_since`) or its end
+/// (history), with adapter state recovered from the prefix.
+fn start_tracking(
+    path: &Path,
+    saved: Option<TailCursor>,
+    watching_since: SystemTime,
+    first_scan: bool,
+) -> Option<Tracked> {
     let len = std::fs::metadata(path).ok()?.len();
+    let start = start_for(&saved, path, watching_since, first_scan);
     // Identity/truncation rules applied without consuming anything.
-    let mut cursor = resume_cursor(path, saved.as_ref(), start_for(&saved, first_scan)).ok()?;
+    let mut cursor = resume_cursor(path, saved.as_ref(), start).ok()?;
     let mut adapter = CodexAdapter::new();
     if cursor.offset > 0 {
         let upto = cursor.offset.min(len);
         match read_prefix(path, upto, WARM_REPLAY_CAP) {
             Ok(Some((lines, consumed))) => {
                 replay_silently(&mut adapter, &lines);
-                // A half-written line at the resume point belongs to history.
+                // Resume at the last complete line: a half-written one is
+                // read once it is finished.
                 cursor.offset = consumed;
             }
             Ok(None) => {
                 if let Ok(head) = read_new_lines(path, None, Start::Beginning, MAX_LINE_BYTES) {
                     replay_silently(&mut adapter, &head.lines[..head.lines.len().min(1)]);
+                }
+                // Too large to replay: still resume on a line boundary.
+                if saved.is_none() {
+                    cursor.offset = last_newline_before(path, upto).ok()?;
                 }
                 tracing::warn!(file = %path.display(), "codex rollout prefix too large to replay; only its session_meta line was");
             }
@@ -201,11 +260,35 @@ fn start_tracking(path: &Path, saved: Option<TailCursor>, first_scan: bool) -> O
     })
 }
 
-fn start_for(saved: &Option<TailCursor>, first_scan: bool) -> Start {
-    if saved.is_none() && first_scan {
-        Start::End
-    } else {
+/// A file with a saved cursor resumes from it. Otherwise it is new activity
+/// only if the file was created after the watcher began (falling back to "not
+/// on the first scan" where the platform has no creation time).
+fn start_for(
+    saved: &Option<TailCursor>,
+    path: &Path,
+    watching_since: SystemTime,
+    first_scan: bool,
+) -> Start {
+    if saved.is_some() {
+        return Start::Beginning;
+    }
+    let created_after = std::fs::metadata(path)
+        .and_then(|m| m.created())
+        .map(|c| c >= watching_since)
+        .unwrap_or(!first_scan);
+    if created_after {
         Start::Beginning
+    } else {
+        Start::End
+    }
+}
+
+impl Tracked {
+    fn reset(&mut self) {
+        self.adapter = CodexAdapter::new();
+        self.session_hint = None;
+        self.caps_sent = false;
+        self.warned_no_session = false;
     }
 }
 

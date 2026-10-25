@@ -70,9 +70,6 @@ impl Env {
         let d = Daemon(child);
         let sock = self.home.join("fornax.sock");
         wait_for("daemon socket", Duration::from_secs(15), || sock.exists());
-        // The first scan decides what counts as history; let it happen before
-        // a test writes the activity it expects to be followed.
-        std::thread::sleep(Duration::from_millis(1500));
         d
     }
 
@@ -301,4 +298,56 @@ async fn codex_watch_missing_sessions_dir_is_retried_not_fatal() {
     lines.push(task_complete("All tests passed."));
     append_lines(&late.join("rollout-late.jsonl"), &lines);
     wait_for_finding(&env, "cw-late", 1).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn codex_watch_reinstall_does_not_backfill_what_happened_while_off() {
+    let env = Env::new("reinstall");
+    env.opt_in();
+    let _d = env.start_daemon();
+    let rollout = env.rollout("reinstall");
+    let mut turn1 = vec![session_meta("cw-reinstall")];
+    turn1.extend(passing_pair("t1", ""));
+    turn1.push(task_complete("All tests passed."));
+    append_lines(&rollout, &turn1);
+    wait_for_finding(&env, "cw-reinstall", 1).await;
+
+    // Capture off (uninstall), a turn happens, capture on again.
+    std::fs::remove_file(env.home.join("codex-watch.json")).unwrap();
+    settle().await;
+    let mut turn2 = passing_pair("t2", "");
+    turn2.push(task_complete("All tests passed."));
+    append_lines(&rollout, &turn2);
+    env.opt_in();
+    settle().await;
+    assert_eq!(
+        findings(&env, "cw-reinstall").await.len(),
+        1,
+        "the turn written while capture was off must not be ingested"
+    );
+
+    let mut turn3 = passing_pair("t3", "");
+    turn3.push(task_complete("All tests passed."));
+    append_lines(&rollout, &turn3);
+    wait_for_finding(&env, "cw-reinstall", 2).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn codex_watch_ignores_a_relative_sessions_dir() {
+    let env = Env::new("relative");
+    std::fs::write(
+        env.home.join("codex-watch.json"),
+        json!({"sessions_dir": "codex/sessions"}).to_string(),
+    )
+    .unwrap();
+    let _d = env.start_daemon();
+    let mut lines = vec![session_meta("cw-relative")];
+    lines.extend(passing_pair("c1", ""));
+    lines.push(task_complete("All tests passed."));
+    append_lines(&env.rollout("relative"), &lines);
+    settle().await;
+    assert_eq!(
+        env.store().await.observed_counts().await.unwrap(),
+        (0, 0, 0)
+    );
 }
