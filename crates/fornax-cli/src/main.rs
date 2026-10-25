@@ -2155,8 +2155,8 @@ fn no_findings_explanation(observed: Option<&serde_json::Value>) -> String {
         (Some(events), Some(sessions), Some(0)) => format!(
             "No findings recorded yet. {events} event(s) from {sessions} session(s) were captured, \
              but no agent claim has been checked, so there is nothing to verify. Findings need an agent \
-             claim that tests passed: Codex claims are read by the rollout tailer (`fornax-hook-codex`, see the \
-             Codex integration doc), Claude Code claims by its Stop hook."
+             claim that tests passed: Codex claims are read from the rollout by the daemon's Codex capture \
+             (`fornax doctor` shows whether it is on), Claude Code claims by its Stop hook."
         ),
         _ => "No findings recorded yet.".to_string(),
     }
