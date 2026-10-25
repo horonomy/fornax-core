@@ -16,13 +16,48 @@ pub fn default_path() -> std::path::PathBuf {
     crate::dirs_home().join(".codex").join("config.toml")
 }
 
-/// Absolute path to `scripts/fornax-codex-notify.sh`, resolved relative to
-/// this crate's location in the workspace at compile time — matches the
-/// documented from-source workflow (`cargo build --workspace` from the
-/// repo root; see `docs/dogfooding-codex-notify.md`).
+const NOTIFY_SCRIPT_TEMPLATE: &str = include_str!("../../../scripts/fornax-codex-notify.sh");
+const NOTIFY_BIN_PLACEHOLDER: &str = "__FORNAX_BIN__";
+
+/// Where `install` puts the notify script: under the Fornax home, so the path
+/// written into `~/.codex/config.toml` does not depend on where this binary
+/// was built or checked out (FORNX-469).
 pub fn default_notify_script() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../scripts/fornax-codex-notify.sh")
+    crate::fornax_home()
+        .join("bin")
+        .join(CODEX_NOTIFY_SCRIPT_MARKER)
+}
+
+/// Writes the embedded notify script to `script_path` (0755, atomic) with the
+/// absolute path of this `fornax` binary baked in. Refuses a binary path that
+/// could break out of the shell string it is placed in.
+pub fn write_notify_script(
+    script_path: &std::path::Path,
+    fornax_bin: &std::path::Path,
+) -> anyhow::Result<()> {
+    let bin = fornax_bin.to_string_lossy();
+    anyhow::ensure!(
+        fornax_bin.is_absolute() && !bin.contains(['"', '$', '`', '\\', '\n']),
+        "cannot bake {} into the notify script (not absolute, or contains shell metacharacters)",
+        fornax_bin.display()
+    );
+    let body = NOTIFY_SCRIPT_TEMPLATE.replacen(NOTIFY_BIN_PLACEHOLDER, &bin, 1);
+    if std::fs::read_to_string(script_path).ok().as_deref() == Some(body.as_str()) {
+        return Ok(());
+    }
+    let dir = script_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("notify script path has no parent"))?;
+    std::fs::create_dir_all(dir)?;
+    let tmp = dir.join(format!(".{CODEX_NOTIFY_SCRIPT_MARKER}.tmp"));
+    std::fs::write(&tmp, body)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+    }
+    std::fs::rename(&tmp, script_path)?;
+    Ok(())
 }
 
 /// Parses `path` as a format-preserving TOML document (comments and table
@@ -129,6 +164,14 @@ fn compute_install_plan(
             .and_then(|v| v.as_str());
         if existing_first == Some(script_str.as_str()) {
             return Ok(InstallPlan::AlreadyInstalled);
+        }
+        if notify_is_fornax(existing) {
+            // A Fornax-owned entry left by an older install (a checkout that
+            // moved or was deleted) is ours to repoint, not a foreign command.
+            let mut arr = toml_edit::Array::new();
+            arr.push(script_str);
+            doc["notify"] = toml_edit::Item::Value(toml_edit::Value::Array(arr));
+            return Ok(InstallPlan::WouldInstall(Box::new(doc), digest));
         }
         anyhow::bail!(
             "existing \"notify\" in {} is already wired to {:?} — refusing to overwrite it \
@@ -360,6 +403,60 @@ mod tests {
             "fornax-cli-test-codex-{name}-{}.toml",
             uuid::Uuid::new_v4()
         ))
+    }
+
+    #[test]
+    fn written_script_bakes_the_binary_path_and_is_executable() {
+        let dir = std::env::temp_dir().join(format!("fnx-notify-{}", std::process::id()));
+        let script = dir.join("bin").join(CODEX_NOTIFY_SCRIPT_MARKER);
+        write_notify_script(&script, std::path::Path::new("/opt/fornax/bin/fornax")).unwrap();
+        let body = std::fs::read_to_string(&script).unwrap();
+        assert!(body.contains("${FORNAX_BIN:-/opt/fornax/bin/fornax}"));
+        assert!(!body.contains("${FORNAX_BIN:-__FORNAX_BIN__}"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&script).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn script_refuses_a_binary_path_that_could_inject_shell() {
+        let dir = std::env::temp_dir().join(format!("fnx-notify-bad-{}", std::process::id()));
+        let script = dir.join(CODEX_NOTIFY_SCRIPT_MARKER);
+        for bad in ["/tmp/a\"b", "/tmp/$(x)", "/tmp/`x`", "relative/fornax"] {
+            assert!(write_notify_script(&script, std::path::Path::new(bad)).is_err());
+        }
+        assert!(!script.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reinstall_repoints_a_stale_fornax_notify_path() {
+        let path = tmp_config_path("stale-notify");
+        std::fs::write(
+            &path,
+            "notify = [\"/gone/checkout/scripts/fornax-codex-notify.sh\"]\n",
+        )
+        .unwrap();
+        let result = install_at(&path, &fake_script()).expect("install");
+        assert!(result.changed);
+        let doc = load_codex_config(&path).unwrap();
+        assert_eq!(
+            doc["notify"][0].as_str(),
+            Some(fake_script().to_str().unwrap())
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn foreign_notify_is_still_refused() {
+        let path = tmp_config_path("foreign-notify");
+        std::fs::write(&path, "notify = [\"/usr/bin/other-tool\"]\n").unwrap();
+        assert!(install_at(&path, &fake_script()).is_err());
+        std::fs::remove_file(&path).ok();
     }
 
     fn fake_script() -> std::path::PathBuf {
