@@ -108,3 +108,22 @@ fn uninstall_turns_capture_off_even_when_the_codex_config_cannot_be_edited() {
         "a failed config edit must not leave capture on"
     );
 }
+
+#[test]
+fn doctor_tells_a_new_user_what_is_missing_then_what_is_ready() {
+    let s = Scratch::new();
+    let before = stdout(&s.run(&["doctor"]));
+    assert!(before.contains("Fornax checklist"), "{before}");
+    assert!(before.contains("[!!] codex wiring"), "{before}");
+    assert!(before.contains("[!!] codex capture"), "{before}");
+    assert!(before.contains("fornax install codex"), "{before}");
+    // The execution-identity disclosure is still there.
+    assert!(before.contains("session: captured"), "{before}");
+
+    assert!(s.run(&["install", "codex"]).status.success());
+    let after = stdout(&s.run(&["doctor"]));
+    assert!(after.contains("[ok] codex wiring"), "{after}");
+    assert!(after.contains("[ok] codex capture"), "{after}");
+    // No daemon runs in this test, and doctor must say so.
+    assert!(after.contains("[!!] daemon"), "{after}");
+}
