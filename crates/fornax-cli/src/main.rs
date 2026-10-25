@@ -2162,6 +2162,18 @@ fn no_findings_explanation(observed: Option<&serde_json::Value>) -> String {
     }
 }
 
+/// A claim is the agent's whole final message, often several lines with a
+/// code block; `detail` shows one readable line of it.
+fn one_line_claim(claim: &str) -> String {
+    const MAX: usize = 240;
+    let flat = claim.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= MAX {
+        return flat;
+    }
+    let cut: String = flat.chars().take(MAX).collect();
+    format!("{cut}…")
+}
+
 fn print_detail(v: &serde_json::Value) {
     let empty = vec![];
     let findings = v
@@ -2193,7 +2205,7 @@ fn print_detail(v: &serde_json::Value) {
             let kind = f.get("agent_type").and_then(|s| s.as_str()).unwrap_or("?");
             println!("  agent:     {agent} ({kind})");
         }
-        println!("  claim:     {claim}");
+        println!("  claim:     {}", one_line_claim(claim));
         println!("  rationale: {rationale}");
         println!("  verifier:  {verifier}");
         println!("  when:      {when}");
@@ -4905,6 +4917,22 @@ mod tests {
                 "fornax --version must derive from Cargo package metadata, not a \
                  separately hand-maintained constant"
             );
+        }
+    }
+
+    mod claim_display {
+        use super::*;
+
+        #[test]
+        fn a_multiline_claim_becomes_one_bounded_line() {
+            let c = "Done.\n\n```\n1 passed in 0.00s\n```\nAll good.";
+            assert_eq!(
+                one_line_claim(c),
+                "Done. ``` 1 passed in 0.00s ``` All good."
+            );
+            let long = "x ".repeat(400);
+            let out = one_line_claim(&long);
+            assert!(out.chars().count() <= 241 && out.ends_with('…'));
         }
     }
 
