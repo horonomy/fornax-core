@@ -338,9 +338,9 @@ fn install_at_with(
         .unwrap_or(false);
     let mut message = format!(
         "Installed Fornax Codex hooks in {} (PreToolUse, PostToolUse, SessionStart). \
-         Codex will skip them until you trust them via `/hooks`. \
-         These hooks capture tool evidence only; to get findings, also run `fornax-hook-codex` \
-         (it reads the agent's claims from the Codex rollout).",
+         Codex skips them until you trust them via `/hooks`; they are optional extra tool \
+         evidence. Claims are read from the Codex rollout by the daemon's Codex capture, which \
+         `fornax install codex` turns on (check with `fornax doctor`).",
         path.display()
     );
     if !on_path {

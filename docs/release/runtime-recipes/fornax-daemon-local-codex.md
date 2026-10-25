@@ -23,6 +23,13 @@ transports for the same provider — see
 module docs for why they coexist rather than one replacing the other. This
 recipe covers only the rollout-tail path, which is the one `GJ-0003` names.
 
+> Since FORNX-468 a user does not start `fornax-hook-codex` by hand: `fornax
+> install codex` turns on the daemon's own Codex capture (marker
+> `$FORNAX_HOME/codex-watch.json`), which follows rollouts in-process and needs
+> no `/hooks` trust. The standalone tailer below is the engineering path for this
+> recipe and refuses to start while that marker exists (use `--force` to run it
+> anyway).
+
 | Field | Value |
 |---|---|
 | Working directory | repo root |
