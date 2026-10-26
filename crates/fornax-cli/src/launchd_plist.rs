@@ -81,15 +81,31 @@ pub fn install(user_home: &Path, fornax_home: &Path, daemon_bin: &Path) -> anyho
     Ok(path)
 }
 
-/// Refuses to touch an existing file that Fornax did not write.
+/// Only a path that is genuinely absent, or a regular file we can read and that
+/// carries our ownership mark, may be written or removed. Anything else
+/// (foreign, binary, invalid UTF-8, unreadable, a directory or symlink) is
+/// unverified and is left alone.
 fn ensure_ours(path: &Path) -> anyhow::Result<()> {
-    match std::fs::read_to_string(path) {
-        Ok(body) if !body.contains(OWNER_MARK) => anyhow::bail!(
-            "{} exists and was not written by Fornax; leaving it alone",
+    let leave = |why: &str| {
+        anyhow::anyhow!(
+            "{} {why}; leaving it alone",
             path.display()
-        ),
-        _ => Ok(()),
+        )
+    };
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(leave(&format!("cannot be inspected ({e})"))),
+        Ok(m) if !m.is_file() => return Err(leave("is not a regular file")),
+        Ok(_) => {}
     }
+    let bytes = std::fs::read(path).map_err(|e| leave(&format!("cannot be read ({e})")))?;
+    let body = std::str::from_utf8(&bytes).map_err(|_| leave("is not valid UTF-8 text"))?;
+    anyhow::ensure!(
+        body.contains(OWNER_MARK),
+        "{} exists and was not written by Fornax; leaving it alone",
+        path.display()
+    );
+    Ok(())
 }
 
 /// Removes the plist; true if one was there.
