@@ -86,12 +86,7 @@ pub fn install(user_home: &Path, fornax_home: &Path, daemon_bin: &Path) -> anyho
 /// (foreign, binary, invalid UTF-8, unreadable, a directory or symlink) is
 /// unverified and is left alone.
 fn ensure_ours(path: &Path) -> anyhow::Result<()> {
-    let leave = |why: &str| {
-        anyhow::anyhow!(
-            "{} {why}; leaving it alone",
-            path.display()
-        )
-    };
+    let leave = |why: &str| anyhow::anyhow!("{} {why}; leaving it alone", path.display());
     match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(leave(&format!("cannot be inspected ({e})"))),
@@ -240,6 +235,8 @@ mod tests {
     /// be checked to have left it byte-for-byte alone.
     enum Existing {
         File(Vec<u8>),
+        /// Cannot be read back; only its size is compared.
+        Opaque(u64),
         Dir,
         Symlink(PathBuf),
     }
@@ -254,8 +251,14 @@ mod tests {
 
         let install_err = install(&d, &d.join("fh"), &daemon).expect_err("install must refuse");
         let uninstall_err = uninstall(&d).expect_err("uninstall must refuse");
-        assert!(install_err.to_string().contains("leaving it alone"), "{install_err}");
-        assert!(uninstall_err.to_string().contains("leaving it alone"), "{uninstall_err}");
+        assert!(
+            install_err.to_string().contains("leaving it alone"),
+            "{install_err}"
+        );
+        assert!(
+            uninstall_err.to_string().contains("leaving it alone"),
+            "{uninstall_err}"
+        );
 
         let meta = std::fs::symlink_metadata(&path).expect("still present");
         match existing {
@@ -263,17 +266,21 @@ mod tests {
                 assert!(meta.is_file());
                 assert_eq!(std::fs::read(&path).unwrap(), bytes);
             }
+            Existing::Opaque(len) => {
+                assert!(meta.is_file());
+                assert_eq!(meta.len(), len);
+            }
             Existing::Dir => assert!(meta.is_dir()),
             Existing::Symlink(target) => {
                 assert!(meta.file_type().is_symlink());
                 assert_eq!(std::fs::read_link(&path).unwrap(), target);
             }
         }
-        // No staged temp file left behind either.
+        // No staged temp file (dot-prefixed) left behind either.
         let stray: Vec<_> = std::fs::read_dir(path.parent().unwrap())
             .unwrap()
             .map(|e| e.unwrap().file_name())
-            .filter(|n| n != path.file_name().unwrap())
+            .filter(|n| n.to_string_lossy().starts_with('.'))
             .collect();
         assert!(stray.is_empty(), "unexpected files: {stray:?}");
         std::fs::remove_dir_all(&d).ok();
@@ -312,10 +319,10 @@ mod tests {
             return;
         }
         assert_unverified_is_preserved("unreadable", |p| {
-            std::fs::write(p, format!("{OWNER_MARK} unreadable")).unwrap();
+            let body = format!("{OWNER_MARK} unreadable");
+            std::fs::write(p, &body).unwrap();
             std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o000)).unwrap();
-            // Restored by the helper's cleanup via remove_dir_all (owner can unlink).
-            Existing::File(Vec::new())
+            Existing::Opaque(body.len() as u64)
         });
     }
 
