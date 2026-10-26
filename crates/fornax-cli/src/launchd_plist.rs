@@ -76,9 +76,53 @@ pub fn install(user_home: &Path, fornax_home: &Path, daemon_bin: &Path) -> anyho
     std::fs::create_dir_all(dir)?;
     std::fs::create_dir_all(fornax_home.join("logs"))?;
     let tmp = dir.join(format!(".{LABEL}.plist.tmp"));
-    std::fs::write(&tmp, render(daemon_bin, fornax_home))?;
-    std::fs::rename(&tmp, &path)?;
+    stage(&tmp, &render(daemon_bin, fornax_home))?;
+    // A verified-ours plist is replaced atomically. An absent one is published
+    // with a hard link, which fails rather than clobbers if something appears
+    // at the path between the check above and now.
+    let published = if std::fs::symlink_metadata(&path).is_ok() {
+        std::fs::rename(&tmp, &path)
+    } else {
+        std::fs::hard_link(&tmp, &path).and_then(|()| std::fs::remove_file(&tmp))
+    };
+    if let Err(e) = published {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(path)
+}
+
+/// Writes the staging file with `create_new`, so a pre-planted symlink or file
+/// is never followed or truncated. A leftover regular file from an interrupted
+/// install is replaced; anything else at the staging path is left alone.
+fn stage(tmp: &Path, body: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let open = || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .open(tmp)
+    };
+    let mut file = match open() {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let stale = std::fs::symlink_metadata(tmp)?;
+            anyhow::ensure!(
+                stale.is_file(),
+                "{} exists and is not a regular file; leaving it alone",
+                tmp.display()
+            );
+            std::fs::remove_file(tmp)?;
+            open()?
+        }
+        other => other?,
+    };
+    if let Err(e) = file.write_all(body.as_bytes()) {
+        let _ = std::fs::remove_file(tmp);
+        return Err(e.into());
+    }
+    Ok(())
 }
 
 /// Only a path that is genuinely absent, or a regular file we can read and that
@@ -95,8 +139,10 @@ fn ensure_ours(path: &Path) -> anyhow::Result<()> {
     }
     let bytes = std::fs::read(path).map_err(|e| leave(&format!("cannot be read ({e})")))?;
     let body = std::str::from_utf8(&bytes).map_err(|_| leave("is not valid UTF-8 text"))?;
+    // The mark sits on the third line of every plist we render; a mark quoted
+    // elsewhere in a foreign file does not make it ours.
     anyhow::ensure!(
-        body.contains(OWNER_MARK),
+        body.lines().nth(2) == Some(OWNER_MARK),
         "{} exists and was not written by Fornax; leaving it alone",
         path.display()
     );
@@ -109,7 +155,10 @@ pub fn uninstall(user_home: &Path) -> anyhow::Result<bool> {
     match std::fs::remove_file(plist_path(user_home)) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e.into()),
+        Err(e) => Err(anyhow::anyhow!(
+            "{} cannot be removed ({e}); leaving it alone",
+            plist_path(user_home).display()
+        )),
     }
 }
 
@@ -360,6 +409,62 @@ mod tests {
         assert!(std::fs::read_to_string(&path).unwrap().contains(OWNER_MARK));
         install(&d, &d.join("fh2"), &daemon).expect("our own plist may be rewritten");
         assert!(uninstall(&d).unwrap());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_foreign_plist_that_merely_quotes_the_mark_is_not_ours() {
+        assert_unverified_is_preserved("quoted-mark", |p| {
+            let body = format!("<plist><!-- see {OWNER_MARK} --></plist>\n").into_bytes();
+            std::fs::write(p, &body).unwrap();
+            Existing::File(body)
+        });
+    }
+
+    #[test]
+    fn a_symlink_to_a_file_carrying_the_mark_is_not_ours() {
+        assert_unverified_is_preserved("symlink-marked", |p| {
+            let target = p.parent().unwrap().join("elsewhere.txt");
+            std::fs::write(&target, render(Path::new("/x"), Path::new("/y"))).unwrap();
+            std::os::unix::fs::symlink(&target, p).unwrap();
+            Existing::Symlink(target)
+        });
+    }
+
+    #[test]
+    fn a_planted_staging_symlink_is_never_followed_or_truncated() {
+        let d = scratch("tmp-symlink");
+        let daemon = d.join("fornax-daemon");
+        std::fs::write(&daemon, "").unwrap();
+        let path = plist_path(&d);
+        let dir = path.parent().unwrap();
+        std::fs::create_dir_all(dir).unwrap();
+        let victim = d.join("victim.txt");
+        std::fs::write(&victim, "precious").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.join(format!(".{LABEL}.plist.tmp"))).unwrap();
+
+        let err =
+            install(&d, &d.join("fh"), &daemon).expect_err("must refuse a symlinked staging path");
+        assert!(err.to_string().contains("leaving it alone"), "{err}");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
+        assert!(!path.exists(), "no plist published");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_stale_regular_staging_file_is_replaced_and_no_staging_file_is_left() {
+        let d = scratch("tmp-stale");
+        let daemon = d.join("fornax-daemon");
+        std::fs::write(&daemon, "").unwrap();
+        let path = plist_path(&d);
+        let dir = path.parent().unwrap();
+        std::fs::create_dir_all(dir).unwrap();
+        let tmp = dir.join(format!(".{LABEL}.plist.tmp"));
+        std::fs::write(&tmp, "half-written").unwrap();
+
+        install(&d, &d.join("fh"), &daemon).expect("stale staging file is ours to replace");
+        assert!(!tmp.exists());
+        assert!(std::fs::read_to_string(&path).unwrap().contains(LABEL));
         std::fs::remove_dir_all(&d).ok();
     }
 }
