@@ -219,4 +219,124 @@ mod tests {
         assert!(!uninstall(&d).unwrap());
         std::fs::remove_dir_all(&d).ok();
     }
+
+    /// What sits at the plist path before install/uninstall, so a refusal can
+    /// be checked to have left it byte-for-byte alone.
+    enum Existing {
+        File(Vec<u8>),
+        Dir,
+        Symlink(PathBuf),
+    }
+
+    fn assert_unverified_is_preserved(name: &str, make: impl FnOnce(&Path) -> Existing) {
+        let d = scratch(name);
+        let daemon = d.join("fornax-daemon");
+        std::fs::write(&daemon, "").unwrap();
+        let path = plist_path(&d);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let existing = make(&path);
+
+        let install_err = install(&d, &d.join("fh"), &daemon).expect_err("install must refuse");
+        let uninstall_err = uninstall(&d).expect_err("uninstall must refuse");
+        assert!(install_err.to_string().contains("leaving it alone"), "{install_err}");
+        assert!(uninstall_err.to_string().contains("leaving it alone"), "{uninstall_err}");
+
+        let meta = std::fs::symlink_metadata(&path).expect("still present");
+        match existing {
+            Existing::File(bytes) => {
+                assert!(meta.is_file());
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            }
+            Existing::Dir => assert!(meta.is_dir()),
+            Existing::Symlink(target) => {
+                assert!(meta.file_type().is_symlink());
+                assert_eq!(std::fs::read_link(&path).unwrap(), target);
+            }
+        }
+        // No staged temp file left behind either.
+        let stray: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n != path.file_name().unwrap())
+            .collect();
+        assert!(stray.is_empty(), "unexpected files: {stray:?}");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_foreign_binary_plist_is_never_overwritten_or_removed() {
+        assert_unverified_is_preserved("bplist", |p| {
+            let bytes = b"bplist00\xd1\x01\x02\x5fcom.example.other\xff\xfe\x08".to_vec();
+            std::fs::write(p, &bytes).unwrap();
+            Existing::File(bytes)
+        });
+    }
+
+    #[test]
+    fn a_plist_with_invalid_utf8_is_never_overwritten_or_removed() {
+        // Carries the ownership text but is not valid UTF-8: not verifiably ours.
+        assert_unverified_is_preserved("badutf8", |p| {
+            let mut bytes = OWNER_MARK.as_bytes().to_vec();
+            bytes.extend_from_slice(b"\xff\xfe\xc3\x28");
+            std::fs::write(p, &bytes).unwrap();
+            Existing::File(bytes)
+        });
+    }
+
+    #[test]
+    fn an_unreadable_plist_is_never_overwritten_or_removed() {
+        use std::os::unix::fs::PermissionsExt;
+        let probe = scratch("unreadable-probe");
+        let f = probe.join("f");
+        std::fs::write(&f, "x").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let can_still_read = std::fs::read(&f).is_ok(); // running as root
+        std::fs::remove_dir_all(&probe).ok();
+        if can_still_read {
+            return;
+        }
+        assert_unverified_is_preserved("unreadable", |p| {
+            std::fs::write(p, format!("{OWNER_MARK} unreadable")).unwrap();
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // Restored by the helper's cleanup via remove_dir_all (owner can unlink).
+            Existing::File(Vec::new())
+        });
+    }
+
+    #[test]
+    fn a_directory_at_the_plist_path_is_never_replaced_or_removed() {
+        assert_unverified_is_preserved("dir", |p| {
+            std::fs::create_dir(p).unwrap();
+            Existing::Dir
+        });
+    }
+
+    #[test]
+    fn a_symlink_at_the_plist_path_is_never_replaced_or_removed() {
+        // Dangling, and pointing at a foreign file: neither is verifiably ours.
+        assert_unverified_is_preserved("dangling", |p| {
+            let t = PathBuf::from("/nonexistent/fornax-test-target.plist");
+            std::os::unix::fs::symlink(&t, p).unwrap();
+            Existing::Symlink(t)
+        });
+        assert_unverified_is_preserved("symlink-foreign", |p| {
+            let target = p.parent().unwrap().join("elsewhere.txt");
+            std::fs::write(&target, "<plist>foreign</plist>").unwrap();
+            std::os::unix::fs::symlink(&target, p).unwrap();
+            Existing::Symlink(target)
+        });
+    }
+
+    #[test]
+    fn only_a_genuinely_absent_plist_is_created_and_our_own_is_replaced() {
+        let d = scratch("absent-then-ours");
+        let daemon = d.join("fornax-daemon");
+        std::fs::write(&daemon, "").unwrap();
+        assert!(!uninstall(&d).unwrap(), "absent: nothing to remove");
+        let path = install(&d, &d.join("fh"), &daemon).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains(OWNER_MARK));
+        install(&d, &d.join("fh2"), &daemon).expect("our own plist may be rewritten");
+        assert!(uninstall(&d).unwrap());
+        std::fs::remove_dir_all(&d).ok();
+    }
 }
