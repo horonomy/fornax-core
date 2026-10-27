@@ -6,8 +6,10 @@
 //!
 //! Configuration is not execution: a hook entry in `settings.json` shows what
 //! Claude Code was told to run, never that it ran. Only recorded events show
-//! that. No subprocess and no writes; the database is opened only if it already
-//! exists, and only to count rows.
+//! that. No subprocess and no config writes. The database is opened only if it
+//! already exists, read-only (no create, no migration, file unchanged), and only
+//! to count rows; SQLite may create empty `-wal`/`-shm` sidecars to read a WAL
+//! database.
 
 use std::path::{Path, PathBuf};
 
@@ -97,7 +99,8 @@ pub fn checks(i: &Inputs) -> Vec<Check> {
     let capture = capture_state(i.fornax_home, i.codex_config);
     let wiring = wiring_at(i.claude_settings);
     let claude_in_use = matches!(wiring, Wiring::Full | Wiring::Partial { .. });
-    let codex_in_use = matches!(notify, NotifyState::Fornax(_)) || capture != Capture::Off;
+    let codex_in_use = matches!(notify, NotifyState::Fornax(_) | NotifyState::Unreadable(_))
+        || capture != Capture::Off;
 
     // Codex.
     if claude_in_use && !codex_in_use {
@@ -239,7 +242,7 @@ pub fn checks(i: &Inputs) -> Vec<Check> {
                 None => Check::new(
                     false,
                     "claude code events",
-                    "no events recorded yet (no database to read) -- start the daemon, then \
+                    "no events recorded yet (no readable database) -- start the daemon, then \
                      start a new Claude Code session; an already-open one may not have loaded \
                      the hooks"
                         .into(),
@@ -255,7 +258,7 @@ pub fn checks(i: &Inputs) -> Vec<Check> {
                     true,
                     "claude code events",
                     format!(
-                        "{} events recorded, so hooks ran; no \"tests passed\" claim seen yet",
+                        "{} Claude Code events recorded; no \"tests passed\" claim seen yet",
                         a.events
                     ),
                 ),
@@ -309,7 +312,8 @@ pub fn render(checks: &[Check]) -> String {
     s
 }
 
-/// Counts Claude Code rows if a database already exists. Never creates one.
+/// Counts Claude Code rows if a database already exists. Read-only: never
+/// creates the file, runs migrations, or changes journal mode.
 async fn claude_activity(fornax_home: &Path) -> Option<ClaudeActivity> {
     let db = fornax_home.join("fornax.db");
     if !db.exists() {
@@ -318,7 +322,7 @@ async fn claude_activity(fornax_home: &Path) -> Option<ClaudeActivity> {
     let provider = serde_json::to_value(fornax_types::Provider::ClaudeCode).ok()?;
     let provider = provider.as_str()?.to_owned();
     let read = async {
-        let store = fornax_store::Store::open(&db).await.ok()?;
+        let store = fornax_store::Store::open_read_only(&db).await.ok()?;
         let rows = store.sessions_overview().await.ok()?;
         Some(rows.iter().filter(|r| r.provider == provider).fold(
             ClaudeActivity {
@@ -653,7 +657,7 @@ mod tests {
             t.contains("[!!] claude code events: no events recorded yet"),
             "{t}"
         );
-        assert!(!t.contains("hooks ran"), "{t}");
+        assert!(!t.contains("events recorded;"), "{t}");
     }
 
     #[test]
@@ -670,7 +674,7 @@ mod tests {
         w.activity = act(7, 0, 0);
         let t = w.text();
         assert!(
-            t.contains("[ok] claude code events: 7 events recorded, so hooks ran; no"),
+            t.contains("[ok] claude code events: 7 Claude Code events recorded; no"),
             "{t}"
         );
 
@@ -696,5 +700,82 @@ mod tests {
         let before = std::fs::read(w.claude_cfg()).unwrap();
         let _ = w.text();
         assert_eq!(std::fs::read(w.claude_cfg()).unwrap(), before);
+    }
+
+    #[test]
+    fn a_broken_codex_config_is_not_hidden_when_claude_is_wired() {
+        let w = World::new("broken-codex");
+        w.install_claude();
+        w.put_hook_on_path(0o755);
+        std::fs::write(w.codex_cfg(), "notify = [unterminated\n").unwrap();
+        let t = w.text();
+        assert!(t.contains("[!!] codex wiring"), "{t}");
+        assert!(!t.contains("[--] codex: not installed"), "{t}");
+    }
+
+    fn dir_state(d: &Path) -> Vec<(String, u64, std::time::SystemTime)> {
+        let mut v: Vec<_> = std::fs::read_dir(d)
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                let m = e.metadata().unwrap();
+                (
+                    e.file_name().to_string_lossy().into_owned(),
+                    m.len(),
+                    m.modified().unwrap(),
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn run_async<T>(f: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    #[test]
+    fn reading_activity_never_creates_or_changes_the_database() {
+        let w = World::new("db-readonly");
+        // No database: nothing is read and nothing is created.
+        assert!(run_async(claude_activity(&w.d)).is_none());
+        assert!(!w.d.join("fornax.db").exists());
+        assert!(std::fs::read_dir(&w.d).unwrap().next().is_none());
+
+        // An existing database: counted without touching a single file.
+        run_async(async {
+            let s = fornax_store::Store::open(w.d.join("fornax.db"))
+                .await
+                .unwrap();
+            s.close().await;
+        });
+        let db = w.d.join("fornax.db");
+        let snapshot = || {
+            (
+                std::fs::read(&db).unwrap(),
+                db.metadata().unwrap().modified().unwrap(),
+            )
+        };
+        let before = snapshot();
+        let a = run_async(claude_activity(&w.d)).expect("existing db is readable");
+        assert_eq!((a.events, a.claims, a.findings), (0, 0, 0));
+        assert_eq!(
+            snapshot(),
+            before,
+            "doctor must not change the database file"
+        );
+        // SQLite itself may create the empty WAL sidecars when it opens a WAL
+        // database to read; nothing else may appear and they hold no data.
+        for (name, len, _) in dir_state(&w.d) {
+            match name.as_str() {
+                "fornax.db" | "fornax.db-shm" => {}
+                "fornax.db-wal" => assert_eq!(len, 0, "wal sidecar must be empty"),
+                other => panic!("unexpected file created: {other}"),
+            }
+        }
     }
 }
