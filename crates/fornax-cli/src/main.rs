@@ -864,7 +864,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Receipt { action } => receipt_cmd::handle(action, &fornax_home()).await?,
         Commands::Doctor => println!(
             "{}\nExecution-identity capture (what a finding can be attributed to):\n{}",
-            doctor_cmd::report(&fornax_home()),
+            doctor_cmd::report(&fornax_home()).await,
             execution_identity_capture_report()
         ),
     }

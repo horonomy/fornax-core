@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 pub mod hook;
 pub mod rollout_tail;
+pub mod watch_marker;
 pub use hook::CodexHookAdapter;
 
 /// This adapter implementation's own version — independent of the Codex CLI

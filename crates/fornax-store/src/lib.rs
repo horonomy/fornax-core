@@ -332,6 +332,28 @@ impl Store {
         Ok(Self { pool })
     }
 
+    /// Close every connection, waiting for them: a writable store checkpoints
+    /// its WAL on the last close, so the files on disk are settled afterwards.
+    pub async fn close(self) {
+        self.pool.close().await;
+    }
+
+    /// Open an existing store for reading only: never creates the file, never
+    /// runs migrations, never changes the journal mode or permissions. For
+    /// diagnostics (`fornax doctor`) that must not alter a live user database.
+    pub async fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let opts = SqliteConnectOptions::new()
+            .filename(path.as_ref())
+            .read_only(true)
+            .create_if_missing(false)
+            .busy_timeout(std::time::Duration::from_secs(1));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await?;
+        Ok(Self { pool })
+    }
+
     /// Insert one `agent_events` row and, atomically in the same
     /// transaction, its `dataset_lineage_tags` row (FORNX-319 AC1) — a
     /// failed tag insert rolls back the event insert too, so AC1 ("every
@@ -1449,6 +1471,40 @@ mod tests {
 
     fn tmp_db_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("fornax-store-test-{name}-{}.db", Uuid::new_v4()))
+    }
+
+    #[tokio::test]
+    async fn read_only_open_never_creates_migrates_or_writes() {
+        // Missing file: refuses, creates nothing.
+        let missing = tmp_db_path("ro-missing");
+        assert!(Store::open_read_only(&missing).await.is_err());
+        assert!(!missing.exists());
+
+        // An unmigrated (empty) file is not migrated: it stays empty.
+        let empty = tmp_db_path("ro-empty");
+        std::fs::write(&empty, b"").unwrap();
+        if let Ok(s) = Store::open_read_only(&empty).await {
+            assert!(
+                s.sessions_overview().await.is_err(),
+                "no schema was created"
+            );
+        }
+        assert_eq!(std::fs::metadata(&empty).unwrap().len(), 0);
+        std::fs::remove_file(&empty).ok();
+
+        // A real store reads, and a write through it is refused.
+        let path = tmp_db_path("ro-real");
+        Store::open(&path).await.unwrap().close().await;
+        let ro = Store::open_read_only(&path).await.unwrap();
+        assert!(ro.sessions_overview().await.unwrap().is_empty());
+        assert!(sqlx::query("CREATE TABLE intruder (x INTEGER)")
+            .execute(&ro.pool)
+            .await
+            .is_err());
+        ro.close().await;
+        for ext in ["", "-wal", "-shm"] {
+            std::fs::remove_file(append_ext(&path, ext)).ok();
+        }
     }
 
     /// FORNX-466 AC3: a bound host observation keeps the agent/turn/lineage

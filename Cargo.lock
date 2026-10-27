@@ -1061,6 +1061,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "clap",
+ "fornax-adapter-codex",
  "fornax-bench",
  "fornax-corpus",
  "fornax-experiment-runner",

@@ -91,6 +91,50 @@ fn group_has_fornax_command(group: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+/// What `settings.json` says about Fornax's Claude Code hooks, read-only.
+/// This is configuration only -- it cannot show that Claude Code ever ran a hook.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Wiring {
+    /// No file, or no Fornax hook in it.
+    Absent,
+    /// The file exists but cannot be read as a JSON object.
+    Unreadable(String),
+    /// Some, not all, of the wired events carry the Fornax hook.
+    Partial {
+        missing: Vec<&'static str>,
+    },
+    Full,
+}
+
+pub(crate) fn wiring_at(path: &std::path::Path) -> Wiring {
+    let settings = match load_settings(path) {
+        Ok(v) => v,
+        Err(e) => return Wiring::Unreadable(e.to_string()),
+    };
+    let wired = |event: &str| {
+        settings
+            .get("hooks")
+            .and_then(|h| h.get(event))
+            .and_then(|e| e.as_array())
+            .is_some_and(|groups| groups.iter().any(group_has_fornax_command))
+    };
+    let missing: Vec<&'static str> = CLAUDE_HOOK_EVENTS
+        .iter()
+        .copied()
+        .filter(|e| !wired(e))
+        .collect();
+    match missing.len() {
+        0 => Wiring::Full,
+        n if n == CLAUDE_HOOK_EVENTS.len() => Wiring::Absent,
+        _ => Wiring::Partial { missing },
+    }
+}
+
+/// The `command` value install writes, for resolving it the way Claude Code would.
+pub(crate) const fn hook_command() -> &'static str {
+    FORNAX_HOOK_COMMAND
+}
+
 /// Pre-existing empty structures that `install` found in `settings.json` and
 /// that `uninstall` must therefore leave in place if removing the Fornax entry
 /// leaves them empty again. Install pushes into a user's empty `Stop: []` (or

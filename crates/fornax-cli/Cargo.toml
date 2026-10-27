@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 fornax-types = { path = "../fornax-types" }
+fornax-adapter-codex = { path = "../fornax-adapter-codex" }
 fornax-store = { path = "../fornax-store" }
 fornax-verify = { path = "../fornax-verify" }
 fornax-replay = { path = "../fornax-replay" }
