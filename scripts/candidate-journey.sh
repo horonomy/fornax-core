@@ -1,0 +1,67 @@
+#!/bin/bash
+# Offline acceptance journey on release-profile binaries (FORNX-472). It runs
+# entirely under a throwaway HOME/FORNAX_HOME/CODEX_HOME: no launchctl, no real
+# ~/.codex ~/.claude ~/.fornax ~/Library/LaunchAgents, no network, no model, no
+# credentials. It never runs a fornax binary with --version. It does NOT run a
+# real Codex or Claude Code session, so it proves install/uninstall/doctor/
+# preservation behavior only, not host capture of a real model run.
+# Usage: candidate-journey.sh <dir-with-fornax-and-fornax-daemon> <receipt-file>
+set -u
+BIN=$1; RECEIPT=$2
+J=$(mktemp -d "${TMPDIR:-/tmp}/fnx-journey.XXXXXX")
+trap 'kill "$(cat "$J/daemon.pid" 2>/dev/null)" 2>/dev/null; rm -rf "$J"' EXIT
+mkdir -p "$J/bin" "$J/home/.codex" "$J/home/.claude" "$J/home/Library/LaunchAgents"
+cp "$BIN/fornax" "$BIN/fornax-daemon" "$BIN/fornax-hook-claude" "$J/bin/"
+export HOME="$J/home" CODEX_HOME="$J/home/.codex" FORNAX_HOME="$J/fh" FORNAX_HTTP_PORT=47393
+export PATH="$J/bin:/usr/bin:/bin"
+F="$J/bin/fornax"; LA="$HOME/Library/LaunchAgents/com.horonomy.fornax-daemon.plist"
+fail=0
+check(){ if eval "$2"; then echo "PASS: $1"; else echo "FAIL: $1"; fail=1; fi; }
+step(){ echo; echo "== $*"; }
+{
+step "A1 doctor on a fresh machine"
+$F doctor
+check "fresh doctor reports gaps" "$F doctor | grep -q '^  \[!!\]'"
+
+step "A2 foreign binary plist already at the LaunchAgent path"
+printf 'bplist00\321\001\002\377\376' > "$LA"; before=$(shasum -a 256 < "$LA")
+$F install codex; $F uninstall codex
+after=$(shasum -a 256 < "$LA")
+check "foreign plist byte-identical after install + uninstall" "[ '$before' = '$after' ]"
+rm -f "$LA"
+
+step "B1 codex install on a clean LaunchAgents dir"
+$F install codex
+check "plist written by install" "[ -f '$LA' ] && grep -q 'managed by fornax' '$LA'"
+check "notify wiring present" "grep -q fornax-codex-notify.sh '$CODEX_HOME/config.toml'"
+step "B2 doctor before the daemon runs"
+$F doctor
+check "daemon gap, codex wiring ok" "$F doctor | grep -q '^  \[!!\] daemon' && $F doctor | grep -q '^  \[ok\] codex wiring'"
+step "B3 start the daemon (stand-in for launchctl bootstrap)"
+( "$J/bin/fornax-daemon" >"$J/daemon.log" 2>&1 & echo $! >"$J/daemon.pid" )
+for _ in $(seq 1 40); do [ -S "$FORNAX_HOME/fornax.sock" ] && break; sleep 0.5; done
+$F doctor
+check "daemon reachable, capture ok" "$F doctor | grep -q '^  \[ok\] daemon' && $F doctor | grep -q '^  \[ok\] codex capture'"
+kill "$(cat "$J/daemon.pid")" 2>/dev/null; sleep 1
+step "B4 uninstall codex"
+$F uninstall codex
+check "our plist removed" "[ ! -e '$LA' ]"
+check "notify wiring removed" "! grep -q fornax-codex-notify.sh '$CODEX_HOME/config.toml' 2>/dev/null"
+
+step "C1 claude code: foreign hook + setting, install, idempotence, doctor, uninstall"
+cat > "$HOME/.claude/settings.json" <<'JSON'
+{"theme":"dark","hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/usr/local/bin/foreign-hook"}]}]}}
+JSON
+$F install claude-code
+cp "$HOME/.claude/settings.json" "$J/after1.json"
+$F install claude-code
+check "second install byte-identical" "cmp -s '$HOME/.claude/settings.json' '$J/after1.json'"
+check "foreign hook and theme kept after install" "grep -q foreign-hook '$J/after1.json' && grep -q '\"theme\"' '$J/after1.json'"
+$F doctor
+check "doctor says configuration only, never Verified" "$F doctor | grep -q 'configuration only' && $F doctor | grep -q 'never Verified'"
+$F uninstall claude-code
+check "uninstall keeps foreign hook" "grep -q foreign-hook '$HOME/.claude/settings.json'"
+check "uninstall removes fornax hook" "! grep -q fornax-hook-claude '$HOME/.claude/settings.json'"
+echo; [ $fail = 0 ] && echo "JOURNEY-PASS" || echo "JOURNEY-FAIL"
+} 2>&1 | tee "$RECEIPT"
+grep -q JOURNEY-PASS "$RECEIPT"
