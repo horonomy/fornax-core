@@ -25,8 +25,11 @@ check "fresh doctor reports gaps" "$F doctor | grep -q '^  \[!!\]'"
 
 step "A2 foreign binary plist already at the LaunchAgent path"
 printf 'bplist00\321\001\002\377\376' > "$LA"; before=$(shasum -a 256 < "$LA")
-$F install codex; $F uninstall codex
+inst=$($F install codex 2>&1); inst_rc=$?; echo "$inst"
+uninst=$($F uninstall codex 2>&1); uninst_rc=$?; echo "$uninst"
 after=$(shasum -a 256 < "$LA")
+check "install ran and refused to touch the foreign plist" "[ $inst_rc = 0 ] && echo \"\$inst\" | grep -q 'leaving it alone'"
+check "uninstall ran and refused to remove the foreign plist" "[ $uninst_rc = 0 ] && echo \"\$uninst\" | grep -q 'leaving it alone'"
 check "foreign plist byte-identical after install + uninstall" "[ '$before' = '$after' ]"
 rm -f "$LA"
 
@@ -42,7 +45,8 @@ step "B3 start the daemon (stand-in for launchctl bootstrap)"
 for _ in $(seq 1 40); do [ -S "$FORNAX_HOME/fornax.sock" ] && break; sleep 0.5; done
 $F doctor
 check "daemon reachable, capture ok" "$F doctor | grep -q '^  \[ok\] daemon' && $F doctor | grep -q '^  \[ok\] codex capture'"
-kill "$(cat "$J/daemon.pid")" 2>/dev/null; sleep 1
+kill "$(cat "$J/daemon.pid")" 2>/dev/null
+for _ in $(seq 1 20); do kill -0 "$(cat "$J/daemon.pid")" 2>/dev/null || break; sleep 0.5; done
 step "B4 uninstall codex"
 $F uninstall codex
 check "our plist removed" "[ ! -e '$LA' ]"
