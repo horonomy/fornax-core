@@ -385,7 +385,7 @@ pub fn plan_install_all(
         Err(e) => (false, format!("notify: refused — {e}")),
     };
     let changed = notify_changed || hooks_changed;
-    let message = format!("{notify_message} | {hooks_message}");
+    let message = format!("{notify_message}\n{hooks_message}");
     Ok(mk(config_path, changed, message))
 }
 
@@ -412,7 +412,7 @@ pub fn install_all(
     };
 
     let changed = hooks_changed || notify_changed;
-    let message = format!("{notify_message} | {hooks_message}");
+    let message = format!("{notify_message}\n{hooks_message}");
     Ok(mk(config_path, changed, message))
 }
 
@@ -425,7 +425,7 @@ pub fn uninstall_all(
     let hooks_result = crate::codex_hooks::uninstall_at(hooks_path)?;
     let notify_result = uninstall_at(config_path)?;
     let changed = hooks_result.changed || notify_result.changed;
-    let message = format!("{} | {}", notify_result.message, hooks_result.message);
+    let message = format!("{}\n{}", notify_result.message, hooks_result.message);
     Ok(mk(config_path, changed, message))
 }
 

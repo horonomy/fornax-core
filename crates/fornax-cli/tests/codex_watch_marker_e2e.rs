@@ -127,3 +127,35 @@ fn doctor_tells_a_new_user_what_is_missing_then_what_is_ready() {
     // No daemon runs in this test, and doctor must say so.
     assert!(after.contains("[!!] daemon"), "{after}");
 }
+
+/// FORNX-473: every outcome is its own line, so the `launchctl` command a new
+/// user must copy is not buried at the end of one 300-character line.
+#[test]
+fn install_plan_and_uninstall_print_one_outcome_per_line() {
+    let s = Scratch::new();
+    for (label, args) in [
+        ("plan", &["adapter", "plan", "codex"][..]),
+        ("install", &["install", "codex"][..]),
+        ("uninstall", &["uninstall", "codex"][..]),
+    ] {
+        let out = s.run(args);
+        assert!(
+            out.status.success(),
+            "{label}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = stdout(&out);
+        assert!(
+            !text.contains(" | "),
+            "{label} joins outcomes on one line: {text}"
+        );
+        if label != "plan" {
+            let starts = |p: &str| text.lines().any(|l| l.starts_with(p));
+            assert!(starts("daemon autostart"), "{label}: {text}");
+        }
+        if label == "install" {
+            assert!(text.lines().count() >= 4, "{text}");
+            assert!(text.lines().any(|l| l.starts_with("capture:")), "{text}");
+        }
+    }
+}

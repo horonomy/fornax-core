@@ -141,7 +141,7 @@ impl AdapterPlugin for CodexAdapter {
         let installed = crate::codex_watch_marker::is_installed(&crate::fornax_home());
         r.changed |= !installed;
         r.message = format!(
-            "{} | capture: {}",
+            "{}\ncapture: {}",
             r.message,
             if installed {
                 "daemon Codex capture already enabled"
@@ -165,11 +165,11 @@ impl AdapterPlugin for CodexAdapter {
         let wrote = crate::codex_watch_marker::install(&crate::fornax_home(), &self.target_path())?;
         r.changed |= wrote;
         r.message = format!(
-            "{} | capture: {}",
+            "{}\ncapture: {}",
             r.message,
             crate::codex_watch_marker::DISCLOSURE
         );
-        r.message.push_str(" | ");
+        r.message.push('\n');
         r.message.push_str(&crate::launchd_plist::install_message(
             &crate::dirs_home(),
             &crate::fornax_home(),
@@ -187,9 +187,9 @@ impl AdapterPlugin for CodexAdapter {
         )?;
         r.changed |= removed;
         if removed {
-            r.message = format!("{} | capture: daemon Codex capture turned off", r.message);
+            r.message = format!("{}\ncapture: daemon Codex capture turned off", r.message);
         }
-        r.message.push_str(" | ");
+        r.message.push('\n');
         r.message
             .push_str(&crate::launchd_plist::uninstall_message(&crate::dirs_home()));
         Ok(r)
