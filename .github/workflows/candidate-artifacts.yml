@@ -15,7 +15,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: candidate-artifacts-${{ github.ref }}
+  group: candidate-artifacts-${{ inputs.ref || github.sha }}
   cancel-in-progress: false
 
 jobs:
@@ -28,18 +28,23 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      # Pinned action and toolchain, and no shared build cache: this job makes
+      # the bytes QA trusts, so two runs of one SHA must not differ by cache.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-16
+        with:
+          toolchain: 1.99.1
 
       - name: Build release binaries
         run: cargo build --release --locked -p fornax-cli -p fornax-daemon -p fornax-adapter-claude
 
       - name: Collect bundle (checksums + provenance)
+        id: bundle
         run: |
           set -eu
           out=bundle; mkdir -p "$out/bin"
           for b in fornax fornax-daemon fornax-hook-claude; do cp "target/release/$b" "$out/bin/$b"; done
           sha=$(git rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
           {
             echo "# Fornax candidate artifacts - build provenance"
             echo
@@ -61,18 +66,19 @@ jobs:
         run: bash scripts/candidate-journey.sh bundle/bin bundle/journey-receipt.txt
 
       - name: Checksums
-        if: always()
+        if: ${{ !cancelled() }}
         run: |
           set -eu
+          [ -d bundle ] || exit 0
           cd bundle
           find . -type f ! -name SHA256SUMS | sed 's|^\./||' | sort | xargs shasum -a 256 > SHA256SUMS
           shasum -a 256 -c SHA256SUMS
           cat SHA256SUMS
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: always()
+        if: ${{ !cancelled() && steps.bundle.outputs.sha != '' }}
         with:
-          name: fornax-candidate-${{ inputs.ref || github.sha }}
+          name: fornax-candidate-${{ steps.bundle.outputs.sha }}
           path: bundle/
           if-no-files-found: error
           retention-days: 30
