@@ -71,16 +71,17 @@ pub fn install(user_home: &Path, fornax_home: &Path, daemon_bin: &Path) -> anyho
         );
     }
     let path = plist_path(user_home);
-    ensure_ours(&path)?;
+    let existed = ensure_ours(&path)?;
     let dir = path.parent().expect("plist path has a parent");
     std::fs::create_dir_all(dir)?;
     std::fs::create_dir_all(fornax_home.join("logs"))?;
-    let tmp = dir.join(format!(".{LABEL}.plist.tmp"));
+    let tmp = staging_path(dir);
     stage(&tmp, &render(daemon_bin, fornax_home))?;
-    // A verified-ours plist is replaced atomically. An absent one is published
-    // with a hard link, which fails rather than clobbers if something appears
-    // at the path between the check above and now.
-    let published = if std::fs::symlink_metadata(&path).is_ok() {
+    // A verified-ours plist is replaced atomically. One that was absent at the
+    // check is published with a hard link, which fails rather than clobbers if
+    // anything appears there since. (Replacing a verified-ours file can still
+    // race a same-user writer: POSIX has no atomic compare-and-replace.)
+    let published = if existed {
         std::fs::rename(&tmp, &path)
     } else {
         std::fs::hard_link(&tmp, &path).and_then(|()| std::fs::remove_file(&tmp))
@@ -90,6 +91,11 @@ pub fn install(user_home: &Path, fornax_home: &Path, daemon_bin: &Path) -> anyho
         return Err(e.into());
     }
     Ok(path)
+}
+
+/// Per-process, so concurrent installs never share or delete each other's file.
+fn staging_path(dir: &Path) -> PathBuf {
+    dir.join(format!(".{LABEL}.plist.{}.tmp", std::process::id()))
 }
 
 /// Writes the staging file with `create_new`, so a pre-planted symlink or file
@@ -118,21 +124,27 @@ fn stage(tmp: &Path, body: &str) -> anyhow::Result<()> {
         }
         other => other?,
     };
-    if let Err(e) = file.write_all(body.as_bytes()) {
+    // Flushed before publish so a crash cannot leave a truncated plist at the
+    // real path, which the strict ownership check would then refuse to heal.
+    if let Err(e) = file
+        .write_all(body.as_bytes())
+        .and_then(|()| file.sync_all())
+    {
         let _ = std::fs::remove_file(tmp);
         return Err(e.into());
     }
     Ok(())
 }
 
+/// Returns whether a verified-ours file is present (false: genuinely absent).
 /// Only a path that is genuinely absent, or a regular file we can read and that
 /// carries our ownership mark, may be written or removed. Anything else
 /// (foreign, binary, invalid UTF-8, unreadable, a directory or symlink) is
 /// unverified and is left alone.
-fn ensure_ours(path: &Path) -> anyhow::Result<()> {
+fn ensure_ours(path: &Path) -> anyhow::Result<bool> {
     let leave = |why: &str| anyhow::anyhow!("{} {why}; leaving it alone", path.display());
     match std::fs::symlink_metadata(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(leave(&format!("cannot be inspected ({e})"))),
         Ok(m) if !m.is_file() => return Err(leave("is not a regular file")),
         Ok(_) => {}
@@ -146,7 +158,7 @@ fn ensure_ours(path: &Path) -> anyhow::Result<()> {
         "{} exists and was not written by Fornax; leaving it alone",
         path.display()
     );
-    Ok(())
+    Ok(true)
 }
 
 /// Removes the plist; true if one was there.
@@ -441,7 +453,7 @@ mod tests {
         std::fs::create_dir_all(dir).unwrap();
         let victim = d.join("victim.txt");
         std::fs::write(&victim, "precious").unwrap();
-        std::os::unix::fs::symlink(&victim, dir.join(format!(".{LABEL}.plist.tmp"))).unwrap();
+        std::os::unix::fs::symlink(&victim, staging_path(dir)).unwrap();
 
         let err =
             install(&d, &d.join("fh"), &daemon).expect_err("must refuse a symlinked staging path");
@@ -459,7 +471,7 @@ mod tests {
         let path = plist_path(&d);
         let dir = path.parent().unwrap();
         std::fs::create_dir_all(dir).unwrap();
-        let tmp = dir.join(format!(".{LABEL}.plist.tmp"));
+        let tmp = staging_path(dir);
         std::fs::write(&tmp, "half-written").unwrap();
 
         install(&d, &d.join("fh"), &daemon).expect("stale staging file is ours to replace");
