@@ -33,12 +33,12 @@ use std::time::{Duration, Instant, SystemTime};
 use fornax_adapter_codex::rollout_tail::{
     discover, last_newline_before, read_new_lines, read_prefix, resume_cursor, Start, TailCursor,
 };
+use fornax_adapter_codex::watch_marker::{self, Marker, MarkerError};
 use fornax_adapter_codex::{stamped_capabilities, CodexAdapter};
 use fornax_types::{AgentAdapter, IngestMessage, NormalizationOutcome};
 
 use crate::AppState;
 
-pub(crate) const MARKER_FILE: &str = "codex-watch.json";
 const CURSOR_FILE: &str = "codex-watch-cursors.json";
 
 const SCAN_EVERY: Duration = Duration::from_secs(5);
@@ -50,11 +50,6 @@ const MAX_LINE_BYTES: u64 = 8 * 1024 * 1024;
 /// Largest prefix replayed to recover adapter state; beyond it only the first
 /// line (`session_meta`) is replayed.
 const WARM_REPLAY_CAP: u64 = 8 * 1024 * 1024;
-
-#[derive(serde::Deserialize)]
-struct Marker {
-    sessions_dir: PathBuf,
-}
 
 struct Tracked {
     adapter: CodexAdapter,
@@ -70,17 +65,17 @@ pub(crate) fn spawn(state: AppState, home: PathBuf) -> tokio::task::JoinHandle<(
 }
 
 fn read_marker(home: &Path) -> Option<Marker> {
-    let raw = std::fs::read_to_string(home.join(MARKER_FILE)).ok()?;
-    match serde_json::from_str::<Marker>(&raw) {
-        Ok(m) if m.sessions_dir.is_absolute() => Some(m),
-        Ok(_) => {
+    match watch_marker::read(home) {
+        Ok(m) => Some(m),
+        Err(MarkerError::Missing) => None,
+        Err(MarkerError::RelativeSessionsDir) => {
             tracing::warn!(
                 "codex-watch.json sessions_dir must be absolute; codex capture stays off"
             );
             None
         }
         Err(e) => {
-            tracing::warn!(error = %e, "codex-watch.json is unreadable; codex capture stays off");
+            tracing::warn!(error = ?e, "codex-watch.json is unreadable; codex capture stays off");
             None
         }
     }
