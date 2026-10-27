@@ -129,6 +129,41 @@ fn notify_is_fornax(item: &toml_edit::Item) -> bool {
         .unwrap_or(false)
 }
 
+/// What `config.toml` actually wires as Codex's `notify`, read-only. Parsed as
+/// TOML, so a mention of the script in a comment or another key is not wiring.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum NotifyState {
+    /// No `notify` entry (or no config file).
+    Absent,
+    /// The first element is a Fornax-owned script at this path.
+    Fornax(std::path::PathBuf),
+    /// `notify` is set to something else; Fornax will not overwrite it.
+    Foreign(String),
+    /// The config cannot be parsed, or `notify` is not an array.
+    Unreadable(String),
+}
+
+pub(crate) fn notify_state_at(config_path: &std::path::Path) -> NotifyState {
+    let doc = match load_codex_config_with_digest(config_path) {
+        Ok((doc, _)) => doc,
+        Err(e) => return NotifyState::Unreadable(e.to_string()),
+    };
+    let Some(item) = doc.get("notify") else {
+        return NotifyState::Absent;
+    };
+    let Some(first) = item
+        .as_array()
+        .map(|a| a.get(0).and_then(|v| v.as_str()).unwrap_or(""))
+    else {
+        return NotifyState::Unreadable("\"notify\" is not an array".into());
+    };
+    if notify_is_fornax(item) {
+        NotifyState::Fornax(std::path::PathBuf::from(first))
+    } else {
+        NotifyState::Foreign(first.to_string())
+    }
+}
+
 enum InstallPlan {
     AlreadyInstalled,
     WouldInstall(Box<toml_edit::DocumentMut>, ContentDigest),

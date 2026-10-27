@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-pub const MARKER_FILE: &str = "codex-watch.json";
+pub use fornax_adapter_codex::watch_marker::MARKER_FILE;
 
 /// What capture reads, stated at the moment the user opts in.
 pub const DISCLOSURE: &str = "the fornax daemon will now read every Codex session on this machine \
@@ -55,6 +55,35 @@ pub fn uninstall(fornax_home: &Path) -> anyhow::Result<bool> {
 
 pub fn is_installed(fornax_home: &Path) -> bool {
     marker_path(fornax_home).exists()
+}
+
+/// Whether capture is actually on, by the daemon's own rule, and whether it
+/// reads the sessions directory the current Codex config writes to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Capture {
+    Off,
+    /// A marker the daemon will ignore.
+    Unusable(String),
+    On {
+        dir_matches_config: bool,
+        dir: PathBuf,
+    },
+}
+
+pub fn capture_state(fornax_home: &Path, codex_config: &Path) -> Capture {
+    use fornax_adapter_codex::watch_marker::{read, MarkerError};
+    match read(fornax_home) {
+        Err(MarkerError::Missing) => Capture::Off,
+        Err(MarkerError::RelativeSessionsDir) => {
+            Capture::Unusable("sessions_dir is not an absolute path".into())
+        }
+        Err(MarkerError::Invalid(e)) => Capture::Unusable(format!("not valid marker JSON ({e})")),
+        Err(MarkerError::Unreadable(e)) => Capture::Unusable(format!("cannot be read ({e})")),
+        Ok(m) => Capture::On {
+            dir_matches_config: m.sessions_dir == sessions_dir(codex_config),
+            dir: m.sessions_dir,
+        },
+    }
 }
 
 #[cfg(unix)]
