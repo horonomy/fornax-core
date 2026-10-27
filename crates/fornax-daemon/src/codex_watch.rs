@@ -74,8 +74,11 @@ fn read_marker(home: &Path) -> Option<Marker> {
             );
             None
         }
-        Err(e) => {
-            tracing::warn!(error = ?e, "codex-watch.json is unreadable; codex capture stays off");
+        // Unreadable (permissions, not a file): silent, as before this moved
+        // into the shared rule, so a bad mode does not log on every scan.
+        Err(MarkerError::Unreadable(_)) => None,
+        Err(MarkerError::Invalid(e)) => {
+            tracing::warn!(error = %e, "codex-watch.json is unreadable; codex capture stays off");
             None
         }
     }
