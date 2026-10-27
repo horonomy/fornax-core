@@ -1473,6 +1473,40 @@ mod tests {
         std::env::temp_dir().join(format!("fornax-store-test-{name}-{}.db", Uuid::new_v4()))
     }
 
+    #[tokio::test]
+    async fn read_only_open_never_creates_migrates_or_writes() {
+        // Missing file: refuses, creates nothing.
+        let missing = tmp_db_path("ro-missing");
+        assert!(Store::open_read_only(&missing).await.is_err());
+        assert!(!missing.exists());
+
+        // An unmigrated (empty) file is not migrated: it stays empty.
+        let empty = tmp_db_path("ro-empty");
+        std::fs::write(&empty, b"").unwrap();
+        if let Ok(s) = Store::open_read_only(&empty).await {
+            assert!(
+                s.sessions_overview().await.is_err(),
+                "no schema was created"
+            );
+        }
+        assert_eq!(std::fs::metadata(&empty).unwrap().len(), 0);
+        std::fs::remove_file(&empty).ok();
+
+        // A real store reads, and a write through it is refused.
+        let path = tmp_db_path("ro-real");
+        Store::open(&path).await.unwrap().close().await;
+        let ro = Store::open_read_only(&path).await.unwrap();
+        assert!(ro.sessions_overview().await.unwrap().is_empty());
+        assert!(sqlx::query("CREATE TABLE intruder (x INTEGER)")
+            .execute(&ro.pool)
+            .await
+            .is_err());
+        ro.close().await;
+        for ext in ["", "-wal", "-shm"] {
+            std::fs::remove_file(append_ext(&path, ext)).ok();
+        }
+    }
+
     /// FORNX-466 AC3: a bound host observation keeps the agent/turn/lineage
     /// its validated canonical identity carried, and invents nothing.
     #[tokio::test]

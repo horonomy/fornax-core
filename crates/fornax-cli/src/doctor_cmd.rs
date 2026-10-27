@@ -754,6 +754,9 @@ mod tests {
             s.close().await;
         });
         let db = w.d.join("fornax.db");
+        // Store::open would tighten this to 0600; a diagnostic must leave the
+        // user's file mode alone (and this is what makes the test discriminating).
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
         let snapshot = || {
             (
                 std::fs::read(&db).unwrap(),
@@ -767,6 +770,11 @@ mod tests {
             snapshot(),
             before,
             "doctor must not change the database file"
+        );
+        assert_eq!(
+            db.metadata().unwrap().permissions().mode() & 0o777,
+            0o644,
+            "doctor must not change the database file mode"
         );
         // SQLite itself may create the empty WAL sidecars when it opens a WAL
         // database to read; nothing else may appear and they hold no data.
