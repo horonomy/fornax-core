@@ -332,6 +332,28 @@ impl Store {
         Ok(Self { pool })
     }
 
+    /// Close every connection, waiting for them: a writable store checkpoints
+    /// its WAL on the last close, so the files on disk are settled afterwards.
+    pub async fn close(self) {
+        self.pool.close().await;
+    }
+
+    /// Open an existing store for reading only: never creates the file, never
+    /// runs migrations, never changes the journal mode or permissions. For
+    /// diagnostics (`fornax doctor`) that must not alter a live user database.
+    pub async fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let opts = SqliteConnectOptions::new()
+            .filename(path.as_ref())
+            .read_only(true)
+            .create_if_missing(false)
+            .busy_timeout(std::time::Duration::from_secs(1));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await?;
+        Ok(Self { pool })
+    }
+
     /// Insert one `agent_events` row and, atomically in the same
     /// transaction, its `dataset_lineage_tags` row (FORNX-319 AC1) — a
     /// failed tag insert rolls back the event insert too, so AC1 ("every
