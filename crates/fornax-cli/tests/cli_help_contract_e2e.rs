@@ -130,7 +130,9 @@ fn adapter_list_prints_known_adapters_and_touches_no_filesystem_state() {
     let home = std::env::temp_dir().join(format!("fornax-e2e-home-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&home).unwrap();
     let mut cmd = Command::new(fornax_bin());
-    cmd.args(["adapter", "list"]).env("HOME", &home);
+    cmd.args(["adapter", "list"])
+        .env("HOME", &home)
+        .env_remove("CODEX_HOME");
     let out = cmd.output().expect("spawn");
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -153,7 +155,8 @@ fn adapter_plan_json_round_trips_adapter_field() {
     std::fs::create_dir_all(&home).unwrap();
     let mut cmd = Command::new(fornax_bin());
     cmd.args(["adapter", "plan", "claude-code", "--json"])
-        .env("HOME", &home);
+        .env("HOME", &home)
+        .env_remove("CODEX_HOME");
     let out = cmd.output().expect("spawn");
     assert!(out.status.success());
     let v: serde_json::Value =
@@ -185,7 +188,9 @@ fn legacy_adapter_commands_are_gone_and_write_nothing() {
         let home = std::env::temp_dir().join(format!("fornax-e2e-home-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&home).unwrap();
         let mut cmd = Command::new(fornax_bin());
-        cmd.args([legacy]).env("HOME", &home);
+        cmd.args([legacy])
+            .env("HOME", &home)
+            .env_remove("CODEX_HOME");
         let out = cmd.output().expect("spawn");
         let code = out.status.code().unwrap_or(-1);
         let stderr = String::from_utf8_lossy(&out.stderr);

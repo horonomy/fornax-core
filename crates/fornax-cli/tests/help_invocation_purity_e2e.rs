@@ -26,6 +26,7 @@ fn run_help_in_scratch_home(args: &[&str]) -> (String, String, i32, std::path::P
     let out = Command::new(fornax_bin())
         .args(args)
         .env("HOME", &home)
+        .env_remove("CODEX_HOME")
         .env("FORNAX_HOME", home.join(".fornax"))
         // A closed, almost-certainly-unbound port: a handler that actually
         // tried to reach the daemon would fail to connect, not time out

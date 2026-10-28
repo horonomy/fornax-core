@@ -45,6 +45,13 @@ impl World {
         c.output().unwrap()
     }
 
+    /// A second, distinct Codex home.
+    fn other(&self) -> PathBuf {
+        let d = self.root.join("other-codex");
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
     fn custom_str(&self) -> String {
         self.custom.to_str().unwrap().to_owned()
     }
@@ -192,4 +199,79 @@ fn a_relative_codex_home_is_refused_before_anything_is_written() {
     assert!(!w.root.join("relative").exists());
     assert!(w.marker_dir().is_none());
     assert!(!w.fornax_home.join("bin").exists());
+}
+
+impl Drop for World {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+#[test]
+fn uninstall_leaves_capture_on_when_it_watches_a_different_home() {
+    // The marker is global. Wire home A, then home B (the marker now names
+    // B). Uninstalling A must not switch off capture B still depends on.
+    let w = World::new();
+    let a = w.custom_str();
+    let b_path = w.other();
+    let b = b_path.to_str().unwrap().to_owned();
+    assert!(w.run(&["install", "codex"], Some(&a)).status.success());
+    assert!(w.run(&["install", "codex"], Some(&b)).status.success());
+    assert_eq!(
+        w.marker_dir().as_deref(),
+        Some(b_path.join("sessions").to_str().unwrap())
+    );
+
+    let un = w.run(&["uninstall", "codex"], Some(&a));
+    assert!(un.status.success(), "{}", out(&un));
+    assert!(!wired(&w.custom.join("config.toml")));
+    assert!(wired(&b_path.join("config.toml")));
+    assert_eq!(
+        w.marker_dir().as_deref(),
+        Some(b_path.join("sessions").to_str().unwrap()),
+        "capture for home B must stay on: {}",
+        out(&un)
+    );
+    assert!(out(&un).contains("left on"), "{}", out(&un));
+
+    let un_b = w.run(&["uninstall", "codex"], Some(&b));
+    assert!(un_b.status.success(), "{}", out(&un_b));
+    assert!(w.marker_dir().is_none(), "{}", out(&un_b));
+}
+
+#[test]
+fn doctor_flags_a_relative_codex_home_and_ignores_a_stray_config_in_the_cwd() {
+    let w = World::new();
+    let stray = w.root.join("relative").join("codex");
+    fs::create_dir_all(&stray).unwrap();
+    fs::write(
+        stray.join("config.toml"),
+        "notify = [\"/x/fornax-codex-notify.sh\"]\n",
+    )
+    .unwrap();
+    let doctor = out(&w.run(&["doctor"], Some("relative/codex")));
+    assert!(doctor.contains("[!!] codex wiring"), "{doctor}");
+    assert!(doctor.contains("CODEX_HOME"), "{doctor}");
+    assert!(!doctor.contains("[ok] codex wiring"), "{doctor}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_codex_home_is_refused_before_anything_is_written() {
+    use std::os::unix::ffi::OsStrExt;
+    let w = World::new();
+    let bad = std::ffi::OsStr::from_bytes(b"/tmp/fornax-\xff-codex");
+    let o = Command::new(env!("CARGO_BIN_EXE_fornax"))
+        .args(["install", "codex"])
+        .current_dir(&w.root)
+        .env("HOME", &w.home)
+        .env("FORNAX_HOME", &w.fornax_home)
+        .env("PATH", "/usr/bin:/bin")
+        .env("CODEX_HOME", bad)
+        .output()
+        .unwrap();
+    assert!(!o.status.success(), "{}", out(&o));
+    assert!(out(&o).contains("CODEX_HOME"), "{}", out(&o));
+    assert!(!w.default_tree().exists());
+    assert!(w.marker_dir().is_none());
 }
