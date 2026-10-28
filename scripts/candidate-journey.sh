@@ -52,6 +52,24 @@ $F uninstall codex
 check "our plist removed" "[ ! -e '$LA' ]"
 check "notify wiring removed" "! grep -q fornax-codex-notify.sh '$CODEX_HOME/config.toml' 2>/dev/null"
 
+step "D1 redirected CODEX_HOME (FORNX-474): one active root for install, capture and doctor"
+DEF="$HOME/.codex"; RED="$J/redirected-codex"; EMPTY="$J/unwired-codex"; mkdir -p "$RED" "$EMPTY"
+CODEX_HOME="$DEF" $F install codex
+check "default tree is wired" "grep -q fornax-codex-notify.sh '$DEF/config.toml'"
+cp "$DEF/config.toml" "$J/default-config.before"
+check "doctor on an unwired redirected home is a gap although the default tree is wired" "CODEX_HOME='$EMPTY' $F doctor | grep -q '^  \[!!\] codex wiring' && ! CODEX_HOME='$EMPTY' $F doctor | grep -q '^  \[ok\] codex wiring'"
+printf 'model = "x"\n' > "$RED/config.toml"
+CODEX_HOME="$RED" $F install codex
+check "install wired the redirected home" "grep -q fornax-codex-notify.sh '$RED/config.toml'"
+check "foreign key in the redirected config survived" "grep -q 'model = \"x\"' '$RED/config.toml'"
+check "default tree config untouched by the redirected install" "cmp -s '$DEF/config.toml' '$J/default-config.before'"
+check "capture marker names the redirected sessions dir" "grep -q '$RED/sessions' '$FORNAX_HOME/codex-watch.json'"
+check "doctor on the redirected home is ok" "CODEX_HOME='$RED' $F doctor | grep -q '^  \[ok\] codex wiring' && CODEX_HOME='$RED' $F doctor | grep -q '^  \[ok\] codex capture'"
+check "relative CODEX_HOME is refused" "! CODEX_HOME=relative/codex $F install codex"
+CODEX_HOME="$RED" $F uninstall codex
+check "uninstall removed our wiring from the redirected home only" "! grep -q fornax-codex-notify.sh '$RED/config.toml' && grep -q fornax-codex-notify.sh '$DEF/config.toml'"
+CODEX_HOME="$DEF" $F uninstall codex
+
 step "C1 claude code: foreign hook + setting, install, idempotence, doctor, uninstall"
 cat > "$HOME/.claude/settings.json" <<'JSON'
 {"theme":"dark","hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/usr/local/bin/foreign-hook"}]}]}}
