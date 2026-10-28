@@ -1282,7 +1282,7 @@ mod tests {
             json!("pytest -q; true"),
             json!("pytest;true"),
             json!("pytest -q > out.txt"),
-            json!("pytest 2>&1"),
+            json!("pytest 2>err.txt"),
             json!("pytest < in.txt"),
             json!("pytest (a)"),
             json!("pytest {a,b}"),
