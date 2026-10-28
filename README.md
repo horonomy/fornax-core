@@ -117,8 +117,9 @@ file to a clean state:
    `SessionStart`) to `hooks.json`. Codex skips them until you trust them
    with `/hooks`; findings do not need them.
 4. **Writes a LaunchAgent plist file** for the daemon (macOS only, and only
-   when `fornax-daemon` sits next to `fornax`; otherwise it prints "daemon
-   autostart skipped" and why) and prints the exact `launchctl bootstrap`
+   when `fornax-daemon` sits next to `fornax`; on other platforms it says
+   autostart is macOS-only, and when it cannot write the file it prints
+   "daemon autostart skipped" with the reason) and prints the exact `launchctl bootstrap`
    command. Fornax never runs `launchctl` itself:
    loading a login item is your call. Until the daemon is running, nothing is
    recorded. An existing plist that Fornax did not write (or cannot read) is
@@ -140,7 +141,8 @@ idempotent). `uninstall codex` removes the entries `install` added (never a
 foreign `notify` value) and leaves every other key, table and comment alone;
 it does not delete the notify script file under `$FORNAX_HOME/bin`, and it
 stops with an error if `config.toml` cannot be parsed (capture and hooks are
-already off by then).
+already off by then, but the LaunchAgent plist is not removed; fix the file
+and run `uninstall codex` again).
 
 `fornax doctor` is the first-run checklist: daemon reachable, Codex wiring and
 capture (judged by the same rules the daemon uses, so a comment, a leftover

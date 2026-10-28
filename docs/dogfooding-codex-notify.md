@@ -111,7 +111,7 @@ turn, on the next prompt render — which is the honest ceiling of what
 > `$FORNAX_HOME/bin` with the binary path baked in, wires `notify` in the
 > selected Codex home's `config.toml`, opts in to daemon capture and writes a
 > LaunchAgent plist file (see the README, "Installing the Codex integration").
-> The manual steps below are the same thing done by hand from a checkout.
+> The manual steps below wire only the `notify` entry, by hand, from a checkout; they do not opt in to capture or write the plist.
 
 1. Build the binaries: `cargo build --workspace` (from the repo root).
 2. Start the daemon once per session: `./target/debug/fornax-daemon &`
