@@ -93,7 +93,7 @@ file to a clean state:
 ```bash
 ./target/debug/fornax install codex     # opt in
 ./target/debug/fornax doctor            # what is wired, what is missing, the next step
-./target/debug/fornax uninstall codex   # exactly undoes it
+./target/debug/fornax uninstall codex   # removes the entries install added
 ```
 
 `fornax install codex` does four things, and prints each on its own line:
@@ -101,18 +101,25 @@ file to a clean state:
 1. **Turns on daemon capture of Codex sessions.** The Fornax daemon then reads
    **every Codex session on this machine** (tool commands and their output,
    and the final assistant message) so that a claim such as "tests passed"
-   can be checked against the run's own exit code. It stores them locally with
+   can be checked against the run's own output. It stores them locally with
    secret-pattern redaction only (no PII redaction). This is the opt-in; it is
    recorded in `$FORNAX_HOME/codex-watch.json`, and `fornax uninstall codex`
-   turns it off.
+   turns it off. In practice it watches the `sessions/` directory of the
+   selected Codex home (below) and only activity that happens after capture is
+   on; sessions already on disk are not backfilled. A claim can be Verified
+   only when Codex reports a literal exit code for the run (Codex 0.160+ item
+   format); older default shell modes expose none, and those results stay
+   Review/Unverified (ADR-0025).
 2. **Wires the ambient-status `notify` entry** in `config.toml` to a script
    under `$FORNAX_HOME/bin` (so Codex writes its turn status to
    `$FORNAX_HOME/last-status`).
 3. **Adds optional lifecycle hooks** (`PreToolUse`, `PostToolUse`,
    `SessionStart`) to `hooks.json`. Codex skips them until you trust them
    with `/hooks`; findings do not need them.
-4. **Writes a LaunchAgent plist file** for the daemon and prints the exact
-   `launchctl bootstrap` command. Fornax never runs `launchctl` itself:
+4. **Writes a LaunchAgent plist file** for the daemon (macOS only, and only
+   when `fornax-daemon` sits next to `fornax`; otherwise it prints "daemon
+   autostart skipped" and why) and prints the exact `launchctl bootstrap`
+   command. Fornax never runs `launchctl` itself:
    loading a login item is your call. Until the daemon is running, nothing is
    recorded. An existing plist that Fornax did not write (or cannot read) is
    left untouched.
@@ -129,9 +136,11 @@ not parse, `install codex` refuses to touch that file and leaves it
 byte-for-byte unchanged, rather than replacing or corrupting an unrelated
 integration; wire Fornax in manually in that case (the capture opt-in and the
 hooks are separate and still apply). Running it again is safe (it is
-idempotent), and `uninstall codex` removes exactly what `install`
-added (never a foreign `notify` value), leaving every other key, table and
-comment alone.
+idempotent). `uninstall codex` removes the entries `install` added (never a
+foreign `notify` value) and leaves every other key, table and comment alone;
+it does not delete the notify script file under `$FORNAX_HOME/bin`, and it
+stops with an error if `config.toml` cannot be parsed (capture and hooks are
+already off by then).
 
 `fornax doctor` is the first-run checklist: daemon reachable, Codex wiring and
 capture (judged by the same rules the daemon uses, so a comment, a leftover
