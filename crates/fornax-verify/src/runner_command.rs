@@ -145,7 +145,7 @@ const BENIGN_ASSIGNMENTS: &[&str] = &[
 ];
 
 /// True when `command` (a Claude Bash command string, or a Codex argv array,
-/// optionally wrapped in `sh|bash|zsh -c`) shows a test runner executing tests
+/// optionally run through a `sh|bash|zsh` command-string wrapper) shows a test runner executing tests
 /// and `exit_code` is the exit status of that command.
 ///
 /// * One simple command: the runner's own exit status, any value.
@@ -184,7 +184,7 @@ fn command_segments(command: Option<&Value>) -> Option<Vec<Vec<Word>>> {
                 return None;
             }
             if is_shell(argv[0]) {
-                // `sh -c <script>`: anything but exactly that shape (extra
+                // shell command-string wrapper: anything but exactly that shape (extra
                 // positional arguments, a missing script) is ambiguous.
                 let flag = argv.get(1)?;
                 if is_shell_command_flag(flag) {
