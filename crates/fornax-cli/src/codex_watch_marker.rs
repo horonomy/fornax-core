@@ -21,7 +21,7 @@ pub fn marker_path(fornax_home: &Path) -> PathBuf {
     fornax_home.join(MARKER_FILE)
 }
 
-fn sessions_dir(codex_config: &Path) -> PathBuf {
+pub(crate) fn sessions_dir(codex_config: &Path) -> PathBuf {
     codex_config
         .parent()
         .map(|p| p.join("sessions"))
@@ -80,10 +80,6 @@ pub fn uninstall_for(fornax_home: &Path, codex_config: &Path) -> anyhow::Result<
     } else {
         Uninstalled::Absent
     })
-}
-
-pub fn is_installed(fornax_home: &Path) -> bool {
-    marker_path(fornax_home).exists()
 }
 
 /// Whether capture is actually on, by the daemon's own rule, and whether it
@@ -173,7 +169,7 @@ mod tests {
         let config = tmp("codex2").join("config.toml");
         install(&home, &config).unwrap();
         assert!(uninstall(&home).unwrap());
-        assert!(!is_installed(&home));
+        assert!(!marker_path(&home).exists());
         assert!(!uninstall(&home).unwrap(), "nothing left to remove");
     }
 
@@ -188,9 +184,9 @@ mod tests {
             uninstall_for(&fh, a).unwrap(),
             Uninstalled::KeptForOtherHome(PathBuf::from("/b/sessions"))
         );
-        assert!(is_installed(&fh));
+        assert!(marker_path(&fh).exists());
         assert_eq!(uninstall_for(&fh, b).unwrap(), Uninstalled::Removed);
-        assert!(!is_installed(&fh));
+        assert!(!marker_path(&fh).exists());
         // A marker the daemon would ignore protects nothing and is removed.
         std::fs::create_dir_all(&fh).unwrap();
         std::fs::write(marker_path(&fh), "not json").unwrap();

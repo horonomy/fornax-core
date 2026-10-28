@@ -139,17 +139,29 @@ impl AdapterPlugin for CodexAdapter {
             &crate::codex_adapter::default_notify_script(),
             &crate::codex_hooks::default_path(),
         )?;
-        let installed = crate::codex_watch_marker::is_installed(&crate::fornax_home());
-        r.changed |= !installed;
-        r.message = format!(
-            "{}\ncapture: {}",
-            r.message,
-            if installed {
-                "daemon Codex capture already enabled"
-            } else {
-                "would enable daemon Codex capture (reads all Codex sessions on this machine)"
+        use crate::codex_watch_marker::{capture_state, sessions_dir, Capture};
+        let this_home = sessions_dir(&self.target_path());
+        let line = match capture_state(&crate::fornax_home(), &self.target_path()) {
+            Capture::On {
+                dir_matches_config: true,
+                ..
+            } => "daemon Codex capture already enabled".to_owned(),
+            Capture::On { dir, .. } => {
+                r.changed = true;
+                format!(
+                    "would move daemon Codex capture from {} to {}; only one Codex home is \
+                     captured at a time, so capture for the other home stops",
+                    dir.display(),
+                    this_home.display()
+                )
             }
-        );
+            Capture::Off | Capture::Unusable(_) => {
+                r.changed = true;
+                "would enable daemon Codex capture (reads all Codex sessions on this machine)"
+                    .to_owned()
+            }
+        };
+        r.message = format!("{}\ncapture: {line}", r.message);
         Ok(r)
     }
 
@@ -164,6 +176,8 @@ impl AdapterPlugin for CodexAdapter {
             &crate::codex_adapter::default_notify_script(),
             &crate::codex_hooks::default_path(),
         )?;
+        let before =
+            crate::codex_watch_marker::capture_state(&crate::fornax_home(), &self.target_path());
         let wrote = crate::codex_watch_marker::install(&crate::fornax_home(), &self.target_path())?;
         r.changed |= wrote;
         r.message = format!(
@@ -171,6 +185,19 @@ impl AdapterPlugin for CodexAdapter {
             r.message,
             crate::codex_watch_marker::DISCLOSURE
         );
+        if let crate::codex_watch_marker::Capture::On {
+            dir_matches_config: false,
+            dir,
+        } = before
+        {
+            r.message = format!(
+                "{}\ncapture: moved daemon Codex capture from {} to {}; only one Codex home is \
+                 captured at a time, so capture for the other home has stopped",
+                r.message,
+                dir.display(),
+                crate::codex_watch_marker::sessions_dir(&self.target_path()).display()
+            );
+        }
         r.message.push('\n');
         r.message.push_str(&crate::launchd_plist::install_message(
             &crate::dirs_home(),
@@ -190,6 +217,12 @@ impl AdapterPlugin for CodexAdapter {
             &self.target_path(),
             &crate::codex_hooks::default_path(),
         )?;
+        let mut keep_autostart = match &capture {
+            Uninstalled::KeptForOtherHome(dir) => {
+                Some(format!("Codex capture is still on for {}", dir.display()))
+            }
+            _ => None,
+        };
         match capture {
             Uninstalled::Removed => {
                 r.changed = true;
@@ -205,9 +238,33 @@ impl AdapterPlugin for CodexAdapter {
             }
             Uninstalled::Absent => {}
         }
+        if keep_autostart.is_none() {
+            use crate::claude_adapter::{wiring_at, Wiring};
+            // Fail closed: if Claude's settings cannot be read, Fornax cannot
+            // tell that no hooks remain.
+            match wiring_at(&crate::claude_adapter::default_path()) {
+                Wiring::Full | Wiring::Partial { .. } => {
+                    keep_autostart = Some("Claude Code hooks are still installed".to_owned());
+                }
+                Wiring::Unreadable(_) => {
+                    keep_autostart = Some(
+                        "Claude Code settings could not be read, so its hooks may remain"
+                            .to_owned(),
+                    );
+                }
+                Wiring::Absent => {}
+            }
+        }
         r.message.push('\n');
-        r.message
-            .push_str(&crate::launchd_plist::uninstall_message(&crate::dirs_home()));
+        match keep_autostart {
+            Some(why) if crate::launchd_plist::is_ours(&crate::dirs_home()) => {
+                r.message
+                    .push_str(&crate::launchd_plist::kept_message(&why));
+            }
+            _ => r
+                .message
+                .push_str(&crate::launchd_plist::uninstall_message(&crate::dirs_home())),
+        }
         Ok(r)
     }
 }
