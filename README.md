@@ -88,36 +88,62 @@ file to a clean state:
 ./target/debug/fornax uninstall claude-code
 ```
 
-### Installing the Codex integration (FORNX-16)
-
-Codex's evidence capture needs no installation at all: `fornax-hook-codex`
-reads Codex's own always-on rollout JSONL transcripts directly — just run
-it (see `docs/research/adapter-capability-matrix.md` for the payload shape
-and `crates/fornax-adapter-codex` for the translation logic).
-
-`install codex`/`uninstall codex` wire only the separate, optional
-ambient-status surface (FORNX-17) — a `notify` entry in
-`~/.codex/config.toml` pointing at `scripts/fornax-codex-notify.sh`, so
-Codex writes its own turn-status to `$FORNAX_HOME/last-status` (Codex
-discards `notify`'s stdout, so the script must write to a file — see
-`docs/dogfooding-codex-notify.md`):
+### Installing the Codex integration (FORNX-16, FORNX-468, FORNX-474)
 
 ```bash
-./target/debug/fornax install codex
+./target/debug/fornax install codex     # opt in
+./target/debug/fornax doctor            # what is wired, what is missing, the next step
+./target/debug/fornax uninstall codex   # exactly undoes it
 ```
+
+`fornax install codex` does four things, and prints each on its own line:
+
+1. **Turns on daemon capture of Codex sessions.** The Fornax daemon then reads
+   **every Codex session on this machine** (tool commands and their output,
+   and the final assistant message) so that a claim such as "tests passed"
+   can be checked against the run's own exit code. It stores them locally with
+   secret-pattern redaction only (no PII redaction). This is the opt-in; it is
+   recorded in `$FORNAX_HOME/codex-watch.json`, and `fornax uninstall codex`
+   turns it off.
+2. **Wires the ambient-status `notify` entry** in `config.toml` to a script
+   under `$FORNAX_HOME/bin` (so Codex writes its turn status to
+   `$FORNAX_HOME/last-status`).
+3. **Adds optional lifecycle hooks** (`PreToolUse`, `PostToolUse`,
+   `SessionStart`) to `hooks.json`. Codex skips them until you trust them
+   with `/hooks`; findings do not need them.
+4. **Writes a LaunchAgent plist file** for the daemon and prints the exact
+   `launchctl bootstrap` command. Fornax never runs `launchctl` itself:
+   loading a login item is your call. Until the daemon is running, nothing is
+   recorded. An existing plist that Fornax did not write (or cannot read) is
+   left untouched.
+
+**Which Codex home.** An explicit, non-empty `CODEX_HOME` selects the Codex
+home (config, hooks and the sessions directory the daemon watches); unset or
+empty means `~/.codex`. A relative or non-UTF-8 `CODEX_HOME` is refused before
+anything is written. `uninstall` acts on the home currently selected, and
+leaves capture on (and says so) if it is watching a different one.
 
 Codex's `notify` holds exactly one command, unlike Claude's per-event hook
-arrays — so if `notify` is already wired to something else (e.g. a
-different tool your session already uses), `install codex` refuses to
-overwrite it and leaves the file byte-for-byte unchanged, rather than
-silently replacing or corrupting an unrelated integration. Wire Fornax in
-manually in that case. Running it again when Fornax is already installed
-is a no-op. To remove exactly the entry `install codex` added (never a
-foreign `notify` value), leaving every other key/table/comment untouched:
+arrays. If `notify` is already wired to something else, or `config.toml` does
+not parse, `install codex` refuses to touch that file and leaves it
+byte-for-byte unchanged, rather than replacing or corrupting an unrelated
+integration; wire Fornax in manually in that case (the capture opt-in and the
+hooks are separate and still apply). Running it again is safe (it is
+idempotent), and `uninstall codex` removes exactly what `install`
+added (never a foreign `notify` value), leaving every other key, table and
+comment alone.
 
-```bash
-./target/debug/fornax uninstall codex
-```
+`fornax doctor` is the first-run checklist: daemon reachable, Codex wiring and
+capture (judged by the same rules the daemon uses, so a comment, a leftover
+marker or a config file alone is never reported as working), and the Claude
+Code hooks. A hook entry in Claude's `settings.json` is reported as
+configuration only; only recorded events show it ran. For Claude Code (no exit
+code in its hook payload) a test result shows as Review, never Verified
+(ADR-0025). A finding appears after an agent says it ran tests and the run's
+own output is seen; see them with `fornax status` and `fornax detail`.
+
+For the optional ambient-status surface only, see
+`docs/dogfooding-codex-notify.md`.
 
 The dashboard at `/dashboard` on the daemon's HTTP port works the same way
 across every adapter.
