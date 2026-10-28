@@ -1081,36 +1081,169 @@ fn translate_item_completed(
 
 /// Best-effort extraction of the shell command from a `custom_tool_call`'s
 /// `input`, which is a JS snippet string like
-/// `const r = await tools.exec_command({cmd:"echo hi",workdir:...}); ...`
+/// `const r = await tools.exec_command({cmd:"echo hi",workdir:...}); ...` or
+/// `const r = await tools.shell_command({command:"pytest -q",workdir:...}); text(r)`
 /// — not structured JSON. No regex dependency; a small manual scan for the
-/// `cmd:"..."` argument is enough for provenance purposes. Falls back to
-/// the raw input string if the pattern isn't found, rather than dropping
-/// the command entirely.
+/// `cmd:"..."` / `command:"..."` argument is enough for provenance purposes.
+///
+/// FORNX-477: the extracted string is later treated as *the* executed command
+/// (the verifier identifies a test runner from it), so it is only extracted
+/// when the snippet is exactly one tool call. A snippet with a second
+/// `tools.`/`await`, dynamic code, or an unterminated string yields the raw
+/// input, which the verifier cannot identify as a test run (`Unverified`) --
+/// otherwise `shell_command({command:"pytest"}); ...shell_command({command:
+/// "true"})` could attribute the last call's exit code to `pytest`.
 fn extract_cmd(input: &str) -> String {
-    if let Some(start) = input.find("cmd:") {
-        let rest = &input[start + 4..];
-        let rest = rest.trim_start();
-        if let Some(quote) = rest.chars().next() {
-            if quote == '"' || quote == '\'' {
-                let body = &rest[1..];
-                let mut result = String::new();
-                let mut chars = body.chars();
-                while let Some(c) = chars.next() {
-                    if c == '\\' {
-                        if let Some(next) = chars.next() {
-                            result.push(next);
-                        }
-                        continue;
-                    }
-                    if c == quote {
-                        return result;
-                    }
-                    result.push(c);
+    // The argument key must be unambiguous: exactly one `cmd:` / `command:` in
+    // the whole snippet (a second one inside another string literal could be
+    // mistaken for the real argument), and it must open a property
+    // (`{command:` / `, command:`), not end a longer name (`subcommand:`).
+    if input.matches("cmd:").count() + input.matches("command:").count() != 1 {
+        return input.to_string();
+    }
+    for key in ["cmd:", "command:"] {
+        let Some(start) = input.find(key) else {
+            continue;
+        };
+        if !input[..start].trim_end().ends_with(['{', ',']) {
+            return input.to_string();
+        }
+        let rest = input[start + key.len()..].trim_start();
+        let offset = input.len() - rest.len();
+        let Some(quote) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+            continue;
+        };
+        let mut result = String::new();
+        let mut chars = rest[1..].char_indices();
+        while let Some((i, c)) = chars.next() {
+            if c == '\\' {
+                // Only escapes that decode to themselves are understood. `\n`,
+                // `\x41`, `\u0026`, ... would make the shell see something
+                // other than what is decoded here, so keep the raw snippet.
+                match chars.next() {
+                    Some((_, next @ ('\\' | '"' | '\''))) => result.push(next),
+                    _ => return input.to_string(),
                 }
+                continue;
             }
+            if c == quote {
+                let command_end = offset + 1 + i + c.len_utf8();
+                return if is_single_tool_call(input, start, command_end, key) {
+                    result
+                } else {
+                    input.to_string()
+                };
+            }
+            result.push(c);
         }
     }
     input.to_string()
+}
+
+/// `input` is exactly `const r = await tools.<x>({<props>command:"..."<props>});
+/// text(r)` (or `text(r.output)`): one tool call, only known option
+/// properties around the command argument, nothing else executable.
+fn is_single_tool_call(input: &str, key_start: usize, command_end: usize, key: &str) -> bool {
+    let Some(head) = input[..key_start]
+        .trim_start()
+        .strip_prefix("const r = await tools.")
+    else {
+        return false;
+    };
+    let Some((tool, props_before)) = head.split_once("({") else {
+        return false;
+    };
+    // Only the two shell tools, each with its own argument name. Any other
+    // tool (`apply_patch`, `write_stdin`, MCP tools, ...) or a mismatched key
+    // does not record a shell command.
+    if !matches!(
+        (tool, key),
+        ("shell_command", "command:") | ("exec_command", "cmd:")
+    ) {
+        return false;
+    }
+    let tail = input[command_end..].trim_end();
+    let Some(props_after) = [
+        "}); text(r)",
+        "}); text(r);",
+        "}); text(r.output)",
+        "}); text(r.output);",
+    ]
+    .iter()
+    .find_map(|end| tail.strip_suffix(end)) else {
+        return false;
+    };
+    // Before the command: `a:1,b:2,` (each property followed by a comma);
+    // after it: `,c:3,d:4` (each preceded by one). Exact separators only.
+    let before = props_before.trim();
+    let after = props_after.trim();
+    let before_ok = before.is_empty()
+        || before
+            .strip_suffix(',')
+            .is_some_and(only_known_simple_props);
+    let after_ok = after.is_empty() || after.strip_prefix(',').is_some_and(only_known_simple_props);
+    before_ok && after_ok
+}
+
+/// Option properties Codex's shell tools take besides the command itself.
+const KNOWN_TOOL_PROPS: &[&str] = &[
+    "workdir",
+    "timeout_ms",
+    "yield_time_ms",
+    "max_output_tokens",
+    "sandbox_permissions",
+    "justification",
+    "tty",
+    "login",
+];
+
+/// `name: "value"` / `name: 123` / `name: true` pairs, comma separated, with
+/// bare known names only. Quoted or computed keys, spreads, escapes, calls and
+/// nested values are all rejected, so no property can redefine the command
+/// (JS keeps the *last* duplicate key).
+fn only_known_simple_props(text: &str) -> bool {
+    let mut rest = text.trim();
+    if rest.is_empty() {
+        return false;
+    }
+    loop {
+        let Some((name, after_name)) = rest.split_once(':') else {
+            return false;
+        };
+        if !KNOWN_TOOL_PROPS.contains(&name.trim()) {
+            return false;
+        }
+        let value = after_name.trim_start();
+        rest = match value.chars().next() {
+            Some(quote @ ('"' | '\'')) => {
+                let body = &value[1..];
+                let Some(end) = body.find(quote) else {
+                    return false;
+                };
+                if body[..end].contains('\\') {
+                    return false;
+                }
+                &body[end + 1..]
+            }
+            _ => {
+                let end = value.find(',').unwrap_or(value.len());
+                let literal = value[..end].trim();
+                let simple = matches!(literal, "true" | "false")
+                    || (!literal.is_empty() && literal.chars().all(|c| c.is_ascii_digit()));
+                if !simple {
+                    return false;
+                }
+                &value[end..]
+            }
+        }
+        .trim_start();
+        match rest.strip_prefix(',') {
+            None => return rest.is_empty(),
+            // A comma must be followed by another property.
+            Some(next) if next.trim().is_empty() => return false,
+            Some(next) => rest = next.trim_start(),
+        }
+    }
 }
 
 fn claims_tests_passed(text: &str) -> bool {
@@ -1874,6 +2007,90 @@ mod tests {
                 assert!(ev.provenance.contains("0.160.1"));
             }
             other => panic!("expected Evidence, got {other:?}"),
+        }
+    }
+
+    /// FORNX-477: `tools.shell_command({command:"..."})` -- the shape
+    /// real Codex captures use when `unified_exec` is disabled -- must record
+    /// the command itself, not the surrounding JS snippet, so the verifier can
+    /// identify a test runner from it.
+    #[test]
+    fn extract_cmd_reads_both_tool_shapes_from_a_single_call() {
+        assert_eq!(
+            extract_cmd(
+                "const r = await tools.shell_command({command:\"pytest -q\",workdir:\"/workspace\",timeout_ms:120000}); text(r)\n"
+            ),
+            "pytest -q"
+        );
+        assert_eq!(
+            extract_cmd(
+                "const r = await tools.exec_command({cmd:\"cargo test\",workdir:\"/tmp\"}); text(r.output);\n"
+            ),
+            "cargo test"
+        );
+        assert_eq!(
+            extract_cmd(
+                "const r = await tools.shell_command({command:\"echo \\\"hi\\\"\"}); text(r)"
+            ),
+            "echo \"hi\""
+        );
+    }
+
+    /// FORNX-477: known option properties may surround the command argument.
+    #[test]
+    fn extract_cmd_accepts_known_option_properties_around_the_command() {
+        assert_eq!(
+            extract_cmd(
+                "const r = await tools.shell_command({workdir:\"/w\",command:\"cargo test\",timeout_ms:120000,tty:true}); text(r.output);\n"
+            ),
+            "cargo test"
+        );
+    }
+
+    /// FORNX-477: anything that is not exactly one tool call keeps the raw
+    /// snippet, so a later call's exit code is never attributed to the first
+    /// call's command.
+    #[test]
+    fn extract_cmd_keeps_the_raw_snippet_unless_it_is_a_single_tool_call() {
+        for input in [
+            "const r = await tools.shell_command({command:\"pytest\"}); const q = await tools.shell_command({command:\"true\"}); text(q)",
+            "const r = await tools.shell_command({command:\"pytest\"}); text(eval(\"x\"))",
+            "const r = await tools.shell_command({command:\"pytest\",workdir:`/${d}`}); text(r)",
+            "tools.shell_command({command:\"pytest\"}); text(r)",
+            "if (x) { const r = await tools.shell_command({command:\"pytest\"}); text(r) } await y",
+            "const r = await tools.shell_command({command:\"pytest",
+            "pytest -q",
+            "const r = await tools.shell_command({description:\"x command:'pytest'\",command:\"true\"}); text(r)",
+            "const r = await tools.shell_command({command:\"pytest\",workdir:\"/w\",cmd:\"true\"}); text(r)",
+            "const r = await tools.shell_command({subcommand:\"pytest\"}); text(r)",
+            "const r = await tools.shell_command({command:\"echo command:x\"}); text(r)",
+            "const r = await tools.shell_command({command:\"pytest \\n true\"}); text(r)",
+            "const r = await tools.shell_command({command:\"pytest \\u0026\\u0026 true\"}); text(r)",
+            "const r = await tools.shell_command({command:\"pytest \\x3b true\"}); text(r)",
+            "const r = await tools.shell_command({a:f(),command:\"pytest\"}); text(r)",
+            "const r = await tools.shell_command({command:\"pytest\"}); text(r); process.exit(0)",
+            "const r = await tools.shell_command({command:\"pytest\"}); text(r) || x",
+            "const r = await tools.shell_command({command:\"pytest\",extra:g()}); text(r)",
+            "const r = await tools.shell_command({command:\"pytest\",w:\"/a;b\"}); text(r)",
+            "const r = await tools.shell_command({command:\"pytest\",\"command\":\"true\"}); text(r)",
+            "const r = await tools.shell_command({command:\"pytest\",['command']:\"true\"}); text(r)",
+            "const r = await tools.shell_command({command:\"pytest\",...x}); text(r)",
+            "const r = await tools.shell_command({command:\"pytest\",workdir:\"a\\\\b\"}); text(r)",
+            "const r = await tools.shell_command({command:\"pytest\",foo:\"x\"}); text(r)",
+            "const r = await tools.shell_command({\"command\":\"true\",command:\"pytest\"}); text(r)",
+            "const r = await tools.shell_command({command:\"pytest -q\",shell:\"/bin/true\"}); text(r)",
+            "const r = await tools.apply_patch({command:\"pytest -q\"}); text(r)",
+            "const r = await tools.write_stdin({command:\"pytest -q\"}); text(r)",
+            "const r = await tools.exec_command({command:\"pytest -q\"}); text(r)",
+            "const r = await tools.shell_command({cmd:\"pytest -q\"}); text(r)",
+            "const r = await tools.shell_command({workdir:\"/w\",,command:\"pytest\"}); text(r)",
+            "const r = await tools.shell_command({command:\"pytest\" workdir:\"/w\"}); text(r)",
+            "const r = await tools.shell_command({command:\"pytest\",}); text(r)",
+            "const r = await tools.shell_command({command:\"pytest\",timeout_ms:f()}); text(r)",
+            "const r = await tools.shell_command({command:\"pytest\",tty:maybe}); text(r)",
+            "const r = await tools.shell_command({workdir:\"/w\" command:\"pytest\"}); text(r)",
+        ] {
+            assert_eq!(extract_cmd(input), input, "{input}");
         }
     }
 

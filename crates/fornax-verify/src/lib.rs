@@ -17,6 +17,7 @@ pub mod independence;
 pub mod judge;
 pub mod meta_verification;
 pub mod reliability;
+mod runner_command;
 pub mod verification_budget;
 pub mod voi;
 
@@ -85,9 +86,9 @@ impl Verifier for TestResultVerifier {
         // Find the most recent exit-code-bearing evidence for a test-runner
         // invocation in this session, most recent first (evidence is stored
         // oldest-first; scan from the end).
-        let test_evidence = evidence.iter().rev().find(|e| is_test_runner_evidence(e));
+        let test_evidence = evidence.iter().rposition(is_test_runner_evidence);
 
-        let Some(ev) = test_evidence else {
+        let Some(ev_idx) = test_evidence else {
             return Finding {
                 id: Uuid::new_v4(),
                 claim_id: claim.id,
@@ -100,7 +101,16 @@ impl Verifier for TestResultVerifier {
             };
         };
 
+        let ev = &evidence[ev_idx];
         let exit_code = ev.payload.get("exit_code").and_then(|v| v.as_i64());
+
+        // FORNX-477: only *identified* runner rows are evidence, but a newer
+        // exit-code row that merely mentions a runner (`cd repo && pytest`
+        // exiting 1, `pytest | tail`, ...) may be the real run -- failing,
+        // passing or masked. An older result must not decide over it.
+        let newer_unidentified_runner_mention = evidence[ev_idx + 1..]
+            .iter()
+            .any(mentions_unidentified_runner);
 
         match exit_code {
             // FORNX-433 follow-up: a heuristic `exit_code=0` (no real exit
@@ -121,6 +131,17 @@ impl Verifier for TestResultVerifier {
                      ({})",
                     ev.provenance
                 ),
+                computed_at: now,
+            },
+            Some(0) if newer_unidentified_runner_mention => Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Unverified,
+                evidence_ids: vec![ev.id],
+                verifier_name: self.name().to_string(),
+                rationale: "an earlier test-runner run exited 0, but a more recent command that \
+                            mentions a test runner could not be identified as a test run"
+                    .to_string(),
                 computed_at: now,
             },
             Some(0) => Finding {
@@ -914,20 +935,46 @@ fn command_text(payload: &serde_json::Value) -> String {
 }
 
 fn is_test_runner_evidence(e: &Evidence) -> bool {
-    // FORNX-295: must use the space-joined `command_text` normalization, not
-    // a raw `Value::to_string()` — Codex's real rollout shape is a JSON argv
-    // array (e.g. `["cargo","test"]`), whose `to_string()` renders as
-    // `["cargo","test"]` (quotes and brackets intact) and never contains the
-    // literal substring "cargo test". Using the shared helper here matches
-    // how `command_text` is already used elsewhere in this file.
+    // FORNX-477: identify the runner from the executed command's structure
+    // (see `runner_command`), never from a substring of the command text --
+    // `echo pytest` or `pip install pytest` exiting 0 is not a test run. The
+    // exit code itself must still be present on the same evidence row.
+    runner_command::is_test_run(
+        e.payload.get("command"),
+        e.payload.get("exit_code").and_then(|v| v.as_i64()),
+    ) && e.payload.get("exit_code").is_some()
+}
+
+/// An exit-code row whose command text names a test runner but which
+/// `is_test_runner_evidence` could not identify as one. Used only to *withhold*
+/// `Verified` (see `TestResultVerifier::verify`); a substring match never
+/// grants a verdict.
+fn mentions_unidentified_runner(e: &Evidence) -> bool {
+    if e.payload.get("exit_code").is_none() || is_test_runner_evidence(e) {
+        return false;
+    }
     let cmd = command_text(&e.payload);
-    e.payload.get("exit_code").is_some()
-        && (cmd.contains("pytest")
-            || cmd.contains("cargo test")
-            || cmd.contains("cargo nextest")
-            || cmd.contains("npm test")
-            || cmd.contains("vitest")
-            || cmd.contains("jest"))
+    let tokens: Vec<&str> = cmd
+        .split(|c: char| !(c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | '/' | '+')))
+        .filter(|t| !t.is_empty())
+        .collect();
+    // Substring, not equality: `pytest-3`, `python3-pytest`, `./node_modules/.bin/jest`
+    // all count. A false mention only withholds Verified.
+    let names_runner = |t: &&str| {
+        ["pytest", "py.test", "vitest", "jest"]
+            .iter()
+            .any(|r| t.contains(r))
+    };
+    // `cargo` or `npm` followed, anywhere later, by `test` / `nextest`.
+    let subcommand_after = |program: &str, subs: &[&str]| {
+        tokens
+            .iter()
+            .position(|t| t.rsplit('/').next() == Some(program))
+            .is_some_and(|i| tokens[i + 1..].iter().any(|t| subs.contains(t)))
+    };
+    tokens.iter().any(names_runner)
+        || subcommand_after("cargo", &["test", "nextest"])
+        || subcommand_after("npm", &["test"])
 }
 
 /// True when `e.payload["heuristic"]` is `true` — the evidence's `exit_code`
@@ -1153,6 +1200,363 @@ mod tests {
         let ev2 = vec![evidence_for_command(&["cargo", "nextest", "run"], 0)];
         let f2 = v.verify(&c, &ev2, &caps());
         assert_eq!(f2.verdict, Verdict::Verified);
+    }
+
+    /// FORNX-477: evidence_for_command with a raw `command` JSON value, so a
+    /// string (Claude Bash) and an argv array (Codex) are both expressible.
+    fn verdict_for_command(command: serde_json::Value, exit_code: i64) -> Verdict {
+        let mut ev = evidence_with_exit_code(exit_code);
+        ev.payload["command"] = command;
+        TestResultVerifier
+            .verify(&claim("All tests passed."), &[ev], &caps())
+            .verdict
+    }
+
+    /// FORNX-477: a command that merely *mentions* a runner (or only
+    /// installs/reads/commits about it) is not a test run, so a claim of
+    /// "tests passed" must stay Unverified -- never Verified, and never
+    /// Contradicted by an unrelated command's exit code either.
+    #[test]
+    fn commands_that_only_mention_a_runner_never_verify_or_contradict() {
+        use serde_json::json;
+        let not_runs = [
+            json!("echo pytest"),
+            json!("true # jest"),
+            json!("rm -rf /nonexistent/vitest"),
+            json!("pip install pytest"),
+            json!("cat jest.config.js"),
+            json!("git commit -m \"add vitest dep\""),
+            json!("npm install jest"),
+            json!("cargo build --tests && echo cargo test"),
+            json!("echo ok; pytest"),
+            json!("true || pytest"),
+            json!("pytest || true"),
+            json!("pytest -q || echo failed"),
+            json!("printf 'cargo test'"),
+            json!("echo pytest && true"),
+            json!("pip install pytest && echo ok"),
+            json!("cd repo && echo jest"),
+            json!("pytest &&"),
+            json!("&& pytest"),
+            json!("pytest && && true"),
+            json!("pytest &&& true"),
+            json!("exit 0 && pytest -q"),
+            json!("exec true && pytest"),
+            json!(["bash", "-c", "exit 0 && pytest"]),
+            json!(["bash", "-nc", "pytest"]),
+            json!(["sh", "-ncx", "pytest"]),
+            json!("pytest 2>&1 | tail"),
+            json!("pytest 2>&1x"),
+            json!("pytest 3>&1"),
+            json!("pytest 2>&1>out"),
+            json!("pytest 2>&2"),
+            json!("pytest a2>&1"),
+            json!("echo 2>&1 pytest"),
+            json!("source env.sh && pytest -q"),
+            json!("true && . ./env.sh && cargo test"),
+            json!("uv run --with pytest python script.py"),
+            json!("pytest\u{a0}-q"),
+            json!("pytest\u{b}-q"),
+            json!(["bash", "-c", "pytest\u{c}-q"]),
+            json!("readonly A=1 && pytest -q"),
+            json!("PATH=/tmp/evil && pytest -q"),
+            json!("CI=1 && pytest -q"),
+            json!("local x && pytest -q"),
+            json!("logout && pytest"),
+            json!("pushd x && cargo test"),
+            json!("uv run --with jest echo hi"),
+            json!("npx -p jest node x.js"),
+            json!("pytest -q | tee out.txt"),
+            json!("pytest -q &"),
+            json!("(pytest -q)"),
+            json!("pytest -q\ntrue"),
+            json!("echo $(pytest)"),
+            json!("echo `pytest`"),
+            json!("$RUNNER -q"),
+            json!("pytest $ARGS"),
+            json!("PYTHONPATH=src pytest -q"),
+            json!("PATH=/tmp/evil pytest -q"),
+            json!("PYTEST_ADDOPTS=--collect-only pytest"),
+            json!("NODE_OPTIONS=--require=x.js jest"),
+            json!("FOO='a b' pytest"),
+            json!("vitest list"),
+            json!("pytest -q # jest"),
+            json!("pytest -q; true"),
+            json!("pytest;true"),
+            json!("pytest -q > out.txt"),
+            json!("pytest 2>err.txt"),
+            json!("pytest < in.txt"),
+            json!("pytest (a)"),
+            json!("pytest {a,b}"),
+            json!("pytest `true`"),
+            json!("pytest \"$X\""),
+            json!("pytest \"`true`\""),
+            json!("'CI=1' pytest"),
+            json!("python3 -m pip install pytest"),
+            json!("python3 -m unittest -v"),
+            json!("pnpm run vitest"),
+            json!(["bash", "-x", "pytest"]),
+            json!(["echo", "pytest"]),
+            json!(["cat", "jest.config.js"]),
+            json!(["git", "commit", "-m", "cargo test"]),
+            json!(["/bin/zsh", "-lc", "echo pytest"]),
+            json!(["/bin/bash", "-c", "true # jest"]),
+            json!(["/bin/sh", "-lc", "pip install pytest"]),
+            json!(["/bin/sh", "-c", "echo hi; cargo test"]),
+            json!(["/bin/sh", "-c", "pytest", "extra-arg"]),
+            json!(["/bin/sh", "-c"]),
+            json!("pytest 'unterminated"),
+            json!(""),
+            json!(null),
+            json!(42),
+        ];
+        for cmd in not_runs {
+            for code in [0, 1] {
+                assert_eq!(
+                    verdict_for_command(cmd.clone(), code),
+                    Verdict::Unverified,
+                    "command {cmd} exit {code} must not be treated as a test run"
+                );
+            }
+        }
+    }
+
+    /// FORNX-477: omitting a spoofable-substring match must not cost real
+    /// runs. Each executed runner (any shell wrapper Codex/Claude use) with a
+    /// real exit code keeps its verdict: 0 -> Verified, nonzero -> Contradicted.
+    #[test]
+    fn genuine_runner_invocations_keep_their_verdicts() {
+        use serde_json::json;
+        let runs = [
+            json!("pytest"),
+            json!("pytest -q tests/"),
+            json!("python3 -m pytest -q ."),
+            json!("CI=1 pytest -q"),
+            json!("pytest -v tests/"),
+            json!("pytest --cov=src --maxfail=1 -q"),
+            json!("jest --coverage --ci --color"),
+            json!("cargo test 2>&1"),
+            json!(["zsh", "-lc", "pytest -q 2>&1"]),
+            json!("pytest -xvs -k smoke"),
+            json!("CI=1 RUST_BACKTRACE=1 cargo test"),
+            json!("./.venv/bin/pytest -q"),
+            json!("uv run pytest -q"),
+            json!("cargo test"),
+            json!("cargo test --workspace"),
+            json!("cargo +nightly test -p fornax-verify --lib -- some::test"),
+            json!("cargo nextest run -p fornax-verify"),
+            json!("npm test"),
+            json!("npx vitest run"),
+            json!("bunx vitest run"),
+            json!("npx --yes jest --ci"),
+            json!("vitest run"),
+            json!("jest"),
+            json!("pnpm exec vitest run"),
+            json!("'pytest' -q \"tests/a b\""),
+            json!(["pytest"]),
+            json!(["cargo", "test"]),
+            json!(["cargo", "nextest", "run"]),
+            json!(["/bin/sh", "-lc", "python3 -m pytest -q ."]),
+            json!(["/bin/zsh", "-lc", "cargo test --workspace"]),
+            json!(["/bin/bash", "-c", "npm test"]),
+            json!(["bash", "-ic", "pytest -q"]),
+        ];
+        for cmd in runs {
+            assert_eq!(
+                verdict_for_command(cmd.clone(), 0),
+                Verdict::Verified,
+                "command {cmd} exit 0"
+            );
+            assert_eq!(
+                verdict_for_command(cmd.clone(), 1),
+                Verdict::Contradicted,
+                "command {cmd} exit 1"
+            );
+        }
+    }
+
+    /// FORNX-477: an older genuine pass must not verify the claim when a
+    /// *newer* command that mentions a runner could not be identified as a test
+    /// run (it may be the real, failing -- or masked -- run, e.g.
+    /// `cd repo && pytest` exiting 1, or `pytest | tail` exiting 0). A genuine
+    /// failure stays Contradicted; an older ambiguous row never hurts a newer
+    /// genuine pass.
+    #[test]
+    fn an_older_pass_is_not_verified_over_a_newer_unidentified_runner_command() {
+        let pass = evidence_for_command(&["pytest", "-q"], 0);
+        for (newer, code) in [
+            ("cd repo && pytest -q", 1),
+            ("pytest -q | tail", 0),
+            ("pytest -q | tail", 1),
+            ("git commit -m pytest", 0),
+            ("git commit -m 'run py.test'", 0),
+            ("cargo +nightly test | tail", 1),
+            ("cargo nextest run | tee out", 0),
+            ("npx jest | tail", 0),
+            ("pytest-3 -q | tail", 0),
+            ("./node_modules/.bin/jest | tail", 0),
+        ] {
+            let newer_ev = evidence_for_command(&["/bin/zsh", "-lc", newer], code);
+            let f = TestResultVerifier.verify(
+                &claim("All tests passed."),
+                &[pass.clone(), newer_ev],
+                &caps(),
+            );
+            assert_eq!(f.verdict, Verdict::Unverified, "{newer} exit {code}");
+        }
+
+        let fail = evidence_for_command(&["pytest", "-q"], 1);
+        let ambiguous = evidence_for_command(&["/bin/zsh", "-lc", "git commit -m pytest"], 0);
+        let f = TestResultVerifier.verify(
+            &claim("All tests passed."),
+            &[fail.clone(), ambiguous.clone()],
+            &caps(),
+        );
+        // A genuine failure stays Contradicted: following it with a command
+        // that merely mentions a runner must not let an agent dodge it.
+        assert_eq!(f.verdict, Verdict::Contradicted);
+        assert_eq!(f.evidence_ids, vec![fail.id]);
+
+        let f = TestResultVerifier.verify(
+            &claim("All tests passed."),
+            &[ambiguous, pass.clone()],
+            &caps(),
+        );
+        assert_eq!(f.verdict, Verdict::Verified);
+        assert_eq!(f.evidence_ids, vec![pass.id]);
+    }
+
+    /// FORNX-477: an `&&` list exits 0 only if every command in it ran and
+    /// exited 0, so a runner inside it is proven by an overall 0; a non-zero
+    /// overall status does not say which command failed and must never be
+    /// pinned on the runner (no Contradicted, no Verified).
+    #[test]
+    fn and_lists_prove_the_runner_only_through_an_overall_zero() {
+        use serde_json::json;
+        for cmd in [
+            json!("cd repo && cargo test"),
+            json!("make build && pytest -q"),
+            json!("CI=1 pytest && echo done"),
+            json!("cargo test -p x 2>&1 && echo done"),
+            json!(["/bin/zsh", "-lc", "cd crates/x && cargo nextest run"]),
+            json!(["bash", "-c", "uv run pytest -q && ruff check"]),
+        ] {
+            assert_eq!(
+                verdict_for_command(cmd.clone(), 0),
+                Verdict::Verified,
+                "{cmd}"
+            );
+            assert_eq!(
+                verdict_for_command(cmd.clone(), 1),
+                Verdict::Unverified,
+                "{cmd}"
+            );
+        }
+        for cmd in [
+            json!("make build && pytest --collect-only"),
+            json!("echo pytest && true"),
+            json!("cd repo && git commit -m 'cargo test'"),
+        ] {
+            assert_eq!(
+                verdict_for_command(cmd.clone(), 0),
+                Verdict::Unverified,
+                "{cmd}"
+            );
+        }
+    }
+
+    /// FORNX-477: invocations that exit 0 without executing tests (listing,
+    /// help, compile-only, "no tests found is fine") are not a test run.
+    #[test]
+    fn runner_invocations_that_do_not_execute_tests_are_unverified() {
+        use serde_json::json;
+        for cmd in [
+            json!("pytest --collect-only"),
+            json!("pytest --co -q"),
+            json!("pytest --collect-only=yes"),
+            json!("pytest --collect"),
+            json!("pytest --setup-plan"),
+            json!("pytest --setup-only"),
+            json!("pytest --fixtures-per-test"),
+            json!("jest --showConfig"),
+            json!("pytest --collectonly"),
+            json!("pytest -o addopts=--collect-only"),
+            json!("pytest --override-ini=addopts=--co"),
+            json!("pytest -qh"),
+            json!("pytest -ofoo=bar"),
+            json!("pytest -xo addopts=--co"),
+            json!("pytest -hx"),
+            json!("pytest --setupplan"),
+            json!("pytest --setuponly"),
+            json!("pytest --funcargs"),
+            json!("pytest -oaddopts=--co"),
+            json!("jest --list-tests"),
+            json!("jest --pass-with-no-tests -t nomatch"),
+            json!("jest --changedFilesWithAncestor"),
+            json!("vitest bench"),
+            json!("pytest -Vq"),
+            json!("jest -v"),
+            json!("vitest -v"),
+            json!("jest --clearCache"),
+            json!("jest --init"),
+            json!("jest --onlyChanged"),
+            json!("jest --changedSince=HEAD"),
+            json!("vitest init"),
+            json!("npm test --if-present"),
+            json!("cargo nextest run --no-tests=pass"),
+            json!("pytest --help"),
+            json!("pytest -h"),
+            json!("cargo test --no-run"),
+            json!("cargo test -- --list"),
+            json!("cargo nextest list"),
+            json!("jest --listTests"),
+            json!("jest --passWithNoTests"),
+            json!("vitest --version"),
+            json!(["pytest", "--collect-only"]),
+        ] {
+            assert_eq!(
+                verdict_for_command(cmd.clone(), 0),
+                Verdict::Unverified,
+                "{cmd}"
+            );
+        }
+    }
+
+    /// FORNX-477: the heuristic ceiling (FORNX-433) must survive the
+    /// stricter matcher -- a heuristic exit 0 from a genuine runner stays
+    /// Review, and a spoof-shaped command with a heuristic exit stays
+    /// Unverified (it never reaches the exit-code branch at all).
+    #[test]
+    fn heuristic_ceiling_is_unchanged_by_command_identification() {
+        let mut real = evidence_for_command(&["pytest", "-q"], 0);
+        real.payload["heuristic"] = serde_json::json!(true);
+        let f = TestResultVerifier.verify(&claim("All tests passed."), &[real], &caps());
+        assert_eq!(f.verdict, Verdict::Review);
+
+        let mut spoof = evidence_for_command(&["echo", "pytest"], 0);
+        spoof.payload["heuristic"] = serde_json::json!(true);
+        let f = TestResultVerifier.verify(&claim("All tests passed."), &[spoof], &caps());
+        assert_eq!(f.verdict, Verdict::Unverified);
+    }
+
+    /// FORNX-477: a spoof-shaped command appearing *after* a genuine failing
+    /// run must not mask it, and one appearing before must not satisfy it:
+    /// only genuine runner evidence is selected.
+    #[test]
+    fn spoof_commands_neither_mask_nor_replace_genuine_runner_evidence() {
+        let genuine_fail = evidence_for_command(&["pytest", "-q"], 1);
+        let spoof_after = evidence_for_command(&["echo", "pytest"], 0);
+        let f = TestResultVerifier.verify(
+            &claim("All tests passed."),
+            &[genuine_fail.clone(), spoof_after],
+            &caps(),
+        );
+        assert_eq!(f.verdict, Verdict::Contradicted);
+        assert_eq!(f.evidence_ids, vec![genuine_fail.id]);
+
+        let spoof_only = evidence_for_command(&["echo", "pytest"], 0);
+        let f = TestResultVerifier.verify(&claim("All tests passed."), &[spoof_only], &caps());
+        assert_eq!(f.verdict, Verdict::Unverified);
     }
 
     #[test]
