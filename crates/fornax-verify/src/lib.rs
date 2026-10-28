@@ -958,11 +958,12 @@ fn mentions_unidentified_runner(e: &Evidence) -> bool {
         .split(|c: char| !(c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | '/' | '+')))
         .filter(|t| !t.is_empty())
         .collect();
+    // Substring, not equality: `pytest-3`, `python3-pytest`, `./node_modules/.bin/jest`
+    // all count. A false mention only withholds Verified.
     let names_runner = |t: &&str| {
-        matches!(
-            t.rsplit('/').next().unwrap_or(t),
-            "pytest" | "py.test" | "vitest" | "jest"
-        )
+        ["pytest", "py.test", "vitest", "jest"]
+            .iter()
+            .any(|r| t.contains(r))
     };
     // `cargo` or `npm` followed, anywhere later, by `test` / `nextest`.
     let subcommand_after = |program: &str, subs: &[&str]| {
@@ -1390,6 +1391,8 @@ mod tests {
             ("cargo +nightly test | tail", 1),
             ("cargo nextest run | tee out", 0),
             ("npx jest | tail", 0),
+            ("pytest-3 -q | tail", 0),
+            ("./node_modules/.bin/jest | tail", 0),
         ] {
             let newer_ev = evidence_for_command(&["/bin/zsh", "-lc", newer], code);
             let f = TestResultVerifier.verify(

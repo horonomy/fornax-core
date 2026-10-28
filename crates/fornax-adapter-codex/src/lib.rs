@@ -1117,14 +1117,18 @@ fn extract_cmd(input: &str) -> String {
         let mut chars = rest[1..].char_indices();
         while let Some((i, c)) = chars.next() {
             if c == '\\' {
-                if let Some((_, next)) = chars.next() {
-                    result.push(next);
+                // Only escapes that decode to themselves are understood. `\n`,
+                // `\x41`, `\u0026`, ... would make the shell see something
+                // other than what is decoded here, so keep the raw snippet.
+                match chars.next() {
+                    Some((_, next @ ('\\' | '"' | '\''))) => result.push(next),
+                    _ => return input.to_string(),
                 }
                 continue;
             }
             if c == quote {
                 let command_end = offset + 1 + i + c.len_utf8();
-                return if is_single_tool_call(input, command_end) {
+                return if is_single_tool_call(input, start, command_end) {
                     result
                 } else {
                     input.to_string()
@@ -1136,19 +1140,45 @@ fn extract_cmd(input: &str) -> String {
     input.to_string()
 }
 
-/// `input` is one `const r = await tools.<x>({...}); text(...)` call: no
-/// second tool call, no dynamic code after the command argument.
-fn is_single_tool_call(input: &str, command_end: usize) -> bool {
-    let after_command = &input[command_end..];
-    input.trim_start().starts_with("const r = await tools.")
-        && input.matches("tools.").count() == 1
-        && input.matches("await").count() == 1
-        && after_command.matches(';').count() <= 2
-        && ![
-            "tools.", "await", "eval", "Function", "require", "import", "`", "${",
-        ]
-        .iter()
-        .any(|dynamic| after_command.contains(dynamic))
+/// `input` is exactly `const r = await tools.<x>({<simple props>command:"..."
+/// <simple props>}); text(r)` (or `text(r.output)`): one tool call, nothing
+/// executable around the command argument.
+fn is_single_tool_call(input: &str, key_start: usize, command_end: usize) -> bool {
+    // Plain `name: "value", name2: 12` properties only: no calls, operators,
+    // semicolons, templates or nested code.
+    let simple_props = |text: &str| {
+        text.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(
+                    c,
+                    ' ' | ',' | ':' | '"' | '\'' | '/' | '.' | '_' | '-' | '~'
+                )
+        })
+    };
+    let Some(head) = input[..key_start]
+        .trim_start()
+        .strip_prefix("const r = await tools.")
+    else {
+        return false;
+    };
+    let Some((tool, props_before)) = head.split_once("({") else {
+        return false;
+    };
+    if tool.is_empty() || !tool.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return false;
+    }
+    let tail = input[command_end..].trim_end();
+    let Some(props_after) = [
+        "}); text(r)",
+        "}); text(r);",
+        "}); text(r.output)",
+        "}); text(r.output);",
+    ]
+    .iter()
+    .find_map(|end| tail.strip_suffix(end)) else {
+        return false;
+    };
+    simple_props(props_before) && simple_props(props_after)
 }
 
 fn claims_tests_passed(text: &str) -> bool {
@@ -1958,6 +1988,14 @@ mod tests {
             "const r = await tools.shell_command({command:\"pytest\",workdir:\"/w\",cmd:\"true\"}); text(r)",
             "const r = await tools.shell_command({subcommand:\"pytest\"}); text(r)",
             "const r = await tools.shell_command({command:\"echo command:x\"}); text(r)",
+            "const r = await tools.shell_command({command:\"pytest \\n true\"}); text(r)",
+            "const r = await tools.shell_command({command:\"pytest \\u0026\\u0026 true\"}); text(r)",
+            "const r = await tools.shell_command({command:\"pytest \\x3b true\"}); text(r)",
+            "const r = await tools.shell_command({a:f(),command:\"pytest\"}); text(r)",
+            "const r = await tools.shell_command({command:\"pytest\"}); text(r); process.exit(0)",
+            "const r = await tools.shell_command({command:\"pytest\"}); text(r) || x",
+            "const r = await tools.shell_command({command:\"pytest\",extra:g()}); text(r)",
+            "const r = await tools.shell_command({command:\"pytest\",w:\"/a;b\"}); text(r)",
         ] {
             assert_eq!(extract_cmd(input), input, "{input}");
         }
