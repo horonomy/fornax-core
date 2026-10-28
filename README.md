@@ -195,15 +195,18 @@ Codex side.
 
 A "tests passed" claim is checked against the exit code of a command Fornax
 can identify as a test-runner execution (FORNX-477). The command must be one
-simple command, or an `&&` list containing one, optionally inside `sh|bash|zsh
--c`, whose program is one of: `pytest` / `py.test`, `python -m pytest`,
+simple command, or an `&&` list containing one, optionally run as an argv
+wrapper `["sh"|"bash"|"zsh", "-c"|"-lc", "<script>"]` (Codex form; a Claude
+string command is parsed as the script itself, and `bash -c "..."` typed inside
+it is `Unverified`), whose program is one of: `pytest` / `py.test`, `python -m pytest`,
 `cargo test`, `cargo nextest run`, `npm test`, `vitest`, `jest`, or one of
 those started by `npx`, `pnpx`, `bunx`, `pnpm exec`, `uv run` or `poetry run`.
 A few harmless environment assignments (`CI=1`, `RUST_BACKTRACE=1`, ...) may
 precede it.
 
 * A single runner command keeps its own exit code: 0 can be `Verified`,
-  non-zero is `Contradicted`.
+  non-zero is `Contradicted`. `2>&1` after the command is allowed (it does not
+  change the exit status); other redirections are not.
 * An `&&` list (`cd dir && cargo test`) can be `Verified` only when it exits 0,
   because `&&` runs the next command only after the previous one succeeded. A
   non-zero exit says nothing about which command failed, so it is `Unverified`.
@@ -216,8 +219,8 @@ precede it.
   `mocha`, ...) and list/help/version/compile-only invocations
   (`--collect-only`, `--no-run`, `--list`, `-h`, `-V`, ...).
 * A more recent command that mentions a runner but cannot be identified as a
-  test run (for example `pytest | tail`) stops an older passing run from
-  being `Verified`.
+  test run (for example `pytest | tail`, or `git commit -m "fix pytest"`) stops
+  an older run from deciding the claim: it becomes `Unverified`.
 
 Known limits: an executable merely *named* like a runner is trusted to be that
 runner; and a runner invocation whose filter selects no tests (for example
