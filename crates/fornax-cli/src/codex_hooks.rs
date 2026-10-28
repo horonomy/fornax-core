@@ -1,4 +1,4 @@
-//! Codex `~/.codex/hooks.json` install/uninstall for the lifecycle-hook
+//! Codex `<codex home>/hooks.json` install/uninstall for the lifecycle-hook
 //! binding (HORO-1712 part B, `fornax-hook-codex-event`).
 //!
 //! `hooks.json` is shared with other tools — confirmed live on this machine:
@@ -10,7 +10,7 @@
 //! basename of its `command` — the same rule `codex_adapter::notify_is_fornax`
 //! already uses for `notify`.
 //!
-//! Codex's hook trust is positional: `~/.codex/config.toml` records
+//! Codex's hook trust is positional: `<codex home>/config.toml` records
 //! `trusted_hash` under a key keyed by `(event, group_idx, handler_idx)`,
 //! and the hash itself covers only the hook's own normalized fields (command,
 //! timeout, async, …), not file formatting or key order. So install must

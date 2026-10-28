@@ -183,14 +183,27 @@ impl AdapterPlugin for CodexAdapter {
         crate::codex_adapter::ensure_codex_home_usable()?;
         // Capture goes off first: a failed edit of the Codex config must not
         // leave the daemon still reading every Codex session.
-        let removed = crate::codex_watch_marker::uninstall(&crate::fornax_home())?;
+        use crate::codex_watch_marker::Uninstalled;
+        let capture =
+            crate::codex_watch_marker::uninstall_for(&crate::fornax_home(), &self.target_path())?;
         let mut r = crate::codex_adapter::uninstall_all(
             &self.target_path(),
             &crate::codex_hooks::default_path(),
         )?;
-        r.changed |= removed;
-        if removed {
-            r.message = format!("{}\ncapture: daemon Codex capture turned off", r.message);
+        match capture {
+            Uninstalled::Removed => {
+                r.changed = true;
+                r.message = format!("{}\ncapture: daemon Codex capture turned off", r.message);
+            }
+            Uninstalled::KeptForOtherHome(dir) => {
+                r.message = format!(
+                    "{}\ncapture: left on; it watches {}, which is not this Codex home -- run \
+                     `fornax uninstall codex` with CODEX_HOME set to that home to turn it off",
+                    r.message,
+                    dir.display()
+                );
+            }
+            Uninstalled::Absent => {}
         }
         r.message.push('\n');
         r.message

@@ -53,6 +53,35 @@ pub fn uninstall(fornax_home: &Path) -> anyhow::Result<bool> {
     }
 }
 
+/// What `uninstall_for` did to the (global) capture marker.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Uninstalled {
+    Removed,
+    Absent,
+    /// The marker names another Codex home's sessions; it was left on.
+    KeptForOtherHome(PathBuf),
+}
+
+/// Turns capture off only if it is this Codex home's. The marker is one file
+/// shared by every home, so uninstalling home A must not switch off the
+/// capture home B still depends on. A marker the daemon would ignore anyway
+/// (unreadable, invalid, relative) protects nothing and is removed.
+pub fn uninstall_for(fornax_home: &Path, codex_config: &Path) -> anyhow::Result<Uninstalled> {
+    use fornax_adapter_codex::watch_marker::{read, MarkerError};
+    match read(fornax_home) {
+        Err(MarkerError::Missing) => return Ok(Uninstalled::Absent),
+        Ok(m) if m.sessions_dir != sessions_dir(codex_config) => {
+            return Ok(Uninstalled::KeptForOtherHome(m.sessions_dir))
+        }
+        _ => {}
+    }
+    Ok(if uninstall(fornax_home)? {
+        Uninstalled::Removed
+    } else {
+        Uninstalled::Absent
+    })
+}
+
 pub fn is_installed(fornax_home: &Path) -> bool {
     marker_path(fornax_home).exists()
 }
@@ -146,5 +175,26 @@ mod tests {
         assert!(uninstall(&home).unwrap());
         assert!(!is_installed(&home));
         assert!(!uninstall(&home).unwrap(), "nothing left to remove");
+    }
+
+    #[test]
+    fn uninstall_for_removes_only_this_homes_marker() {
+        let fh = std::env::temp_dir().join(format!("fnx-ufor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&fh);
+        let (a, b) = (Path::new("/a/config.toml"), Path::new("/b/config.toml"));
+        assert_eq!(uninstall_for(&fh, a).unwrap(), Uninstalled::Absent);
+        install(&fh, b).unwrap();
+        assert_eq!(
+            uninstall_for(&fh, a).unwrap(),
+            Uninstalled::KeptForOtherHome(PathBuf::from("/b/sessions"))
+        );
+        assert!(is_installed(&fh));
+        assert_eq!(uninstall_for(&fh, b).unwrap(), Uninstalled::Removed);
+        assert!(!is_installed(&fh));
+        // A marker the daemon would ignore protects nothing and is removed.
+        std::fs::create_dir_all(&fh).unwrap();
+        std::fs::write(marker_path(&fh), "not json").unwrap();
+        assert_eq!(uninstall_for(&fh, a).unwrap(), Uninstalled::Removed);
+        std::fs::remove_dir_all(&fh).ok();
     }
 }

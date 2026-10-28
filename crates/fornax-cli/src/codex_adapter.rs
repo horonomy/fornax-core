@@ -7,7 +7,7 @@ use crate::adapter_registry::AdapterActionResult;
 use crate::guarded_write::{digest_of_bytes, write_guarded, ContentDigest};
 
 /// Filename marker identifying a Fornax-owned `notify` entry in
-/// `~/.codex/config.toml`. Matched by suffix (rather than requiring a
+/// `<codex home>/config.toml`. Matched by suffix (rather than requiring a
 /// byte-for-byte absolute-path match) so uninstall still recognizes an
 /// install made from a different checkout of this repo.
 const CODEX_NOTIFY_SCRIPT_MARKER: &str = "fornax-codex-notify.sh";
@@ -41,6 +41,10 @@ pub fn ensure_codex_home_usable() -> anyhow::Result<()> {
 
 fn check_codex_home(explicit: Option<&std::ffi::OsStr>) -> anyhow::Result<()> {
     match explicit {
+        Some(v) if !v.is_empty() && v.to_str().is_none() => anyhow::bail!(
+            "CODEX_HOME is not valid UTF-8; refusing before changing anything. \
+             Use an absolute UTF-8 directory, or unset it to use ~/.codex"
+        ),
         Some(v) if !v.is_empty() && !std::path::Path::new(v).is_absolute() => anyhow::bail!(
             "CODEX_HOME={} is not an absolute path; refusing before changing anything. \
              Set it to an absolute directory, or unset it to use ~/.codex",
@@ -58,7 +62,7 @@ const NOTIFY_SCRIPT_TEMPLATE: &str = include_str!("../../../scripts/fornax-codex
 const NOTIFY_BIN_PLACEHOLDER: &str = "__FORNAX_BIN__";
 
 /// Where `install` puts the notify script: under the Fornax home, so the path
-/// written into `~/.codex/config.toml` does not depend on where this binary
+/// written into `<codex home>/config.toml` does not depend on where this binary
 /// was built or checked out (FORNX-469).
 pub fn default_notify_script() -> std::path::PathBuf {
     crate::fornax_home()
@@ -100,7 +104,7 @@ pub fn write_notify_script(
 
 /// Parses `path` as a format-preserving TOML document (comments and table
 /// ordering survive edits), or an empty document if `path` does not exist.
-/// Unlike the Claude adapter's JSON equivalent, a `~/.codex/config.toml`
+/// Unlike the Claude adapter's JSON equivalent, a `<codex home>/config.toml`
 /// that fails to parse as TOML is always a hard error — there is no
 /// sensible "treat it as empty" fallback for a file this consequential.
 #[cfg(test)]
@@ -764,5 +768,14 @@ mod tests {
         assert!(check_codex_home(Some(OsStr::new("/abs/codex"))).is_ok());
         let err = check_codex_home(Some(OsStr::new("rel/codex"))).unwrap_err();
         assert!(err.to_string().contains("CODEX_HOME"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_codex_home_is_refused() {
+        use std::os::unix::ffi::OsStrExt;
+        let bad = std::ffi::OsStr::from_bytes(b"/tmp/x-\xff");
+        let err = check_codex_home(Some(bad)).unwrap_err();
+        assert!(err.to_string().contains("UTF-8"), "{err}");
     }
 }
