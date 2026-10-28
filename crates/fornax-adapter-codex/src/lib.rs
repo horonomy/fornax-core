@@ -1140,21 +1140,10 @@ fn extract_cmd(input: &str) -> String {
     input.to_string()
 }
 
-/// `input` is exactly `const r = await tools.<x>({<simple props>command:"..."
-/// <simple props>}); text(r)` (or `text(r.output)`): one tool call, nothing
-/// executable around the command argument.
+/// `input` is exactly `const r = await tools.<x>({<props>command:"..."<props>});
+/// text(r)` (or `text(r.output)`): one tool call, only known option
+/// properties around the command argument, nothing else executable.
 fn is_single_tool_call(input: &str, key_start: usize, command_end: usize) -> bool {
-    // Plain `name: "value", name2: 12` properties only: no calls, operators,
-    // semicolons, templates or nested code.
-    let simple_props = |text: &str| {
-        text.chars().all(|c| {
-            c.is_ascii_alphanumeric()
-                || matches!(
-                    c,
-                    ' ' | ',' | ':' | '"' | '\'' | '/' | '.' | '_' | '-' | '~'
-                )
-        })
-    };
     let Some(head) = input[..key_start]
         .trim_start()
         .strip_prefix("const r = await tools.")
@@ -1178,7 +1167,70 @@ fn is_single_tool_call(input: &str, key_start: usize, command_end: usize) -> boo
     .find_map(|end| tail.strip_suffix(end)) else {
         return false;
     };
-    simple_props(props_before) && simple_props(props_after)
+    only_known_simple_props(props_before) && only_known_simple_props(props_after)
+}
+
+/// Option properties Codex's shell tools take besides the command itself.
+const KNOWN_TOOL_PROPS: &[&str] = &[
+    "workdir",
+    "timeout_ms",
+    "yield_time_ms",
+    "max_output_tokens",
+    "sandbox_permissions",
+    "justification",
+    "tty",
+    "login",
+    "shell",
+];
+
+/// `name: "value"` / `name: 123` / `name: true` pairs, comma separated, with
+/// bare known names only. Quoted or computed keys, spreads, escapes, calls and
+/// nested values are all rejected, so no property can redefine the command
+/// (JS keeps the *last* duplicate key).
+fn only_known_simple_props(text: &str) -> bool {
+    let mut rest = text
+        .trim()
+        .trim_start_matches(',')
+        .trim_end_matches(',')
+        .trim();
+    while !rest.is_empty() {
+        let Some((name, after_name)) = rest.split_once(':') else {
+            return false;
+        };
+        if !KNOWN_TOOL_PROPS.contains(&name.trim()) {
+            return false;
+        }
+        let value = after_name.trim_start();
+        rest = match value.chars().next() {
+            Some(quote @ ('"' | '\'')) => {
+                let body = &value[1..];
+                let Some(end) = body.find(quote) else {
+                    return false;
+                };
+                if body[..end].contains('\\') {
+                    return false;
+                }
+                &body[end + 1..]
+            }
+            _ => {
+                let end = value.find(',').unwrap_or(value.len());
+                let literal = value[..end].trim();
+                let simple = matches!(literal, "true" | "false")
+                    || (!literal.is_empty() && literal.chars().all(|c| c.is_ascii_digit()));
+                if !simple {
+                    return false;
+                }
+                &value[end..]
+            }
+        }
+        .trim_start();
+        rest = match rest.strip_prefix(',') {
+            Some(next) => next.trim_start(),
+            None if rest.is_empty() => rest,
+            None => return false,
+        };
+    }
+    true
 }
 
 fn claims_tests_passed(text: &str) -> bool {
@@ -1971,6 +2023,17 @@ mod tests {
         );
     }
 
+    /// FORNX-477: known option properties may surround the command argument.
+    #[test]
+    fn extract_cmd_accepts_known_option_properties_around_the_command() {
+        assert_eq!(
+            extract_cmd(
+                "const r = await tools.shell_command({workdir:\"/w\",command:\"cargo test\",timeout_ms:120000,tty:true}); text(r.output);\n"
+            ),
+            "cargo test"
+        );
+    }
+
     /// FORNX-477: anything that is not exactly one tool call keeps the raw
     /// snippet, so a later call's exit code is never attributed to the first
     /// call's command.
@@ -1996,6 +2059,12 @@ mod tests {
             "const r = await tools.shell_command({command:\"pytest\"}); text(r) || x",
             "const r = await tools.shell_command({command:\"pytest\",extra:g()}); text(r)",
             "const r = await tools.shell_command({command:\"pytest\",w:\"/a;b\"}); text(r)",
+            "const r = await tools.shell_command({command:\"pytest\",\"command\":\"true\"}); text(r)",
+            "const r = await tools.shell_command({command:\"pytest\",['command']:\"true\"}); text(r)",
+            "const r = await tools.shell_command({command:\"pytest\",...x}); text(r)",
+            "const r = await tools.shell_command({command:\"pytest\",workdir:\"a\\\\b\"}); text(r)",
+            "const r = await tools.shell_command({command:\"pytest\",foo:\"x\"}); text(r)",
+            "const r = await tools.shell_command({\"command\":\"true\",command:\"pytest\"}); text(r)",
         ] {
             assert_eq!(extract_cmd(input), input, "{input}");
         }
