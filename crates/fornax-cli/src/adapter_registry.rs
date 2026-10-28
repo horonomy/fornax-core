@@ -240,16 +240,24 @@ impl AdapterPlugin for CodexAdapter {
         }
         if keep_autostart.is_none() {
             use crate::claude_adapter::{wiring_at, Wiring};
-            if matches!(
-                wiring_at(&crate::claude_adapter::default_path()),
-                Wiring::Full | Wiring::Partial { .. }
-            ) {
-                keep_autostart = Some("Claude Code hooks are still installed".to_owned());
+            // Fail closed: if Claude's settings cannot be read, Fornax cannot
+            // tell that no hooks remain.
+            match wiring_at(&crate::claude_adapter::default_path()) {
+                Wiring::Full | Wiring::Partial { .. } => {
+                    keep_autostart = Some("Claude Code hooks are still installed".to_owned());
+                }
+                Wiring::Unreadable(_) => {
+                    keep_autostart = Some(
+                        "Claude Code settings could not be read, so its hooks may remain"
+                            .to_owned(),
+                    );
+                }
+                Wiring::Absent => {}
             }
         }
         r.message.push('\n');
         match keep_autostart {
-            Some(why) if crate::launchd_plist::exists(&crate::dirs_home()) => {
+            Some(why) if crate::launchd_plist::is_ours(&crate::dirs_home()) => {
                 r.message
                     .push_str(&crate::launchd_plist::kept_message(&why));
             }

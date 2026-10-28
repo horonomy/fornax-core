@@ -208,9 +208,9 @@ pub fn install_message(user_home: &Path, fornax_home: &Path) -> String {
     }
 }
 
-/// Whether a login item file (ours or not) is at the plist path.
-pub fn exists(user_home: &Path) -> bool {
-    std::fs::symlink_metadata(plist_path(user_home)).is_ok()
+/// Whether the file at the plist path is verifiably one Fornax wrote.
+pub fn is_ours(user_home: &Path) -> bool {
+    matches!(ensure_ours(&plist_path(user_home)), Ok(true))
 }
 
 /// The login item is shared by everything that needs the daemon, so
