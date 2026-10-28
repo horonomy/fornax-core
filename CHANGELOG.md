@@ -13,28 +13,38 @@ Jira epic FORNX-20.
   (FORNX-468). The daemon reads the selected Codex home's `sessions/` rollouts
   (tool commands and output, final assistant message) so a "tests passed"
   claim is checked against the run's own output, with no hand-started tailer
-  and no `/hooks` trust needed for findings. Capture is recorded in
-  `$FORNAX_HOME/codex-watch.json`, covers only activity after it is on (no
-  backfill of existing sessions), and `fornax uninstall codex` turns it off.
-  **Privacy:** data stays local and passes secret-pattern redaction only; there
-  is no PII redaction. A Codex claim can be `Verified` only when Codex reports
-  a literal exit code; otherwise it stays `Review` (ADR-0025).
+  and no `/hooks` trust needed for findings. The opt-in is recorded in
+  `$FORNAX_HOME/codex-watch.json`. Only activity after the daemon is watching
+  is read; sessions already on disk are not backfilled. `fornax uninstall
+  codex` turns capture off (it is left on, with a message, if it watches a
+  different Codex home). **Privacy:** captured data is stored locally and
+  passes secret-pattern redaction only; there is no PII redaction (cloud upload
+  is a separate opt-in and is off by default). A Codex claim can be `Verified`
+  only when Codex reports a literal exit code of 0; heuristic-only evidence
+  stays `Review` (ADR-0025). Install, uninstall and plan print one outcome per
+  line. Known limit: `install` still writes the capture marker when the
+  `notify` edit is refused, because capture is a separate opt-in.
 
 - **`fornax install codex` writes a LaunchAgent plist file** (FORNX-469, macOS
   only, when `fornax-daemon` sits next to `fornax`) and prints the exact
   `launchctl bootstrap` command. Fornax never runs `launchctl` itself, so the
-  daemon does not start until you load it. The Codex notify script is now
-  copied under `$FORNAX_HOME/bin`, so the path in `config.toml` no longer
-  depends on where the binary was built.
+  daemon does not start until you load it. Only an absent path is created: a
+  plist Fornax did not write, or cannot read (foreign, binary, non-UTF-8,
+  unreadable, a directory or a symlink), is left untouched by install and
+  uninstall, and the staging file never follows a planted symlink. Known
+  limit: replacing or removing a plist verified as Fornax's can still race a
+  same-user writer.
 
 - **`fornax doctor` is a first-run checklist** (FORNX-469, FORNX-471): daemon
-  reachable, Codex wiring and capture (judged by the same marker rule the
-  daemon uses), and Claude Code hooks, each with the next step. A Claude hook
-  entry is reported as configuration only; only recorded events show it ran.
-  Claude Code results are shown as `Review`, never `Verified` (ADR-0025).
-  Doctor reads an existing database read-only: it never creates or migrates
-  it, and the file is left byte-for-byte unchanged (SQLite may create empty
-  `-wal`/`-shm` sidecars to read it).
+  reachable, Codex wiring and capture, and Claude Code hooks, each with the
+  next step. It reports only what it can show: a comment or other key
+  mentioning the notify script, a capture marker the daemon would ignore, or a
+  config file alone are gaps, and capture is judged by the same marker rule the
+  daemon uses. A Claude hook entry is reported as configuration only (only
+  recorded events show it ran), and Claude Code results are `Review`, never
+  `Verified` (ADR-0025). Doctor reads an existing database read-only; it never
+  creates or migrates it and leaves the file byte-for-byte unchanged (SQLite
+  may create empty `-wal`/`-shm` sidecars to read it).
 
 - `fornax adapter register` accepts shared host-adapter descriptors into the
   existing registry, with explicit digest confirmation and disabled registration.
@@ -76,20 +86,17 @@ Jira epic FORNX-20.
 
 ### Changed
 
-- **`fornax install|uninstall codex` and `fornax adapter plan codex` print one
-  outcome per line** (FORNX-473) instead of one ` | `-joined line, so the
-  `launchctl bootstrap` command is easy to find. Wording and exit codes are
-  unchanged.
+- **The Codex integration follows `CODEX_HOME`** (FORNX-474). `config.toml`,
+  `hooks.json` and the sessions directory the daemon watches are now under a
+  non-empty `CODEX_HOME`; unset or empty keeps `~/.codex`. A relative or
+  non-UTF-8 `CODEX_HOME` is refused before anything is written. Known limit: a
+  differently spelled path for the same directory is treated as a different
+  Codex home.
 
-- **`CODEX_HOME` selects the Codex home** (FORNX-474). A non-empty `CODEX_HOME`
-  decides where config, hooks, the capture marker's sessions directory and
-  `fornax doctor` look; unset or empty keeps `~/.codex`. A relative or
-  non-UTF-8 `CODEX_HOME` is refused before anything is written. Uninstall acts
-  on the selected home and leaves the shared capture marker on, saying so, if
-  it watches a different home. Known limits: `install` still writes the
-  capture marker when the `notify` edit is refused (capture is a separate
-  opt-in); a differently spelled path for the same directory leaves capture
-  on.
+- **The Codex notify script lives under `$FORNAX_HOME/bin`** (FORNX-469). It is
+  rendered there with the absolute `fornax` path baked in, so the `notify`
+  entry in `config.toml` no longer depends on where the binary was built or
+  checked out. `uninstall` removes the entry but leaves the script file.
 
 - `fornax adapter unregister` (and the underlying registry `remove`) adopts
   Strict Retention (HORO-1745): the index entry is still removed, but the
@@ -105,18 +112,6 @@ Jira epic FORNX-20.
   special case for either kind.
 
 ### Fixed
-
-- **Install and uninstall no longer overwrite or remove a LaunchAgent plist
-  Fornax did not write** (FORNX-469). Only a genuinely absent path is created;
-  a foreign, binary, non-UTF-8, unreadable, directory or symlinked plist is
-  left untouched with a "leaving it alone" message, and the staging file never
-  follows a planted symlink. Known limit: replacing or removing a plist that
-  was verified as Fornax's can still race a same-user writer.
-
-- **`fornax doctor` no longer reports unproven things as working**
-  (FORNX-471). A comment or other key mentioning the notify script, a capture
-  marker that exists but that the daemon would ignore, or a config file alone
-  are all reported as gaps.
 
 - **Codex completion replay creates duplicate events and claims** (FORNX-446).
   Rollout `task_complete` records with a nonblank native `turn_id` now retain
