@@ -55,6 +55,10 @@ pub struct Inputs<'a> {
     pub daemon_reachable: bool,
     pub autostart_file: bool,
     pub claude_activity: Option<ClaudeActivity>,
+    /// Why the selected Codex home cannot be used (a relative or non-UTF-8
+    /// `CODEX_HOME`). Set, the Codex rows are replaced by this one gap rather
+    /// than read from a path that depends on the working directory.
+    pub codex_home_error: Option<String>,
 }
 
 fn script_is_runnable(p: &Path) -> bool {
@@ -99,7 +103,8 @@ pub fn checks(i: &Inputs) -> Vec<Check> {
     let capture = capture_state(i.fornax_home, i.codex_config);
     let wiring = wiring_at(i.claude_settings);
     let claude_in_use = matches!(wiring, Wiring::Full | Wiring::Partial { .. });
-    let codex_in_use = matches!(notify, NotifyState::Fornax(_) | NotifyState::Unreadable(_))
+    let codex_in_use = i.codex_home_error.is_some()
+        || matches!(notify, NotifyState::Fornax(_) | NotifyState::Unreadable(_))
         || capture != Capture::Off;
 
     // Codex.
@@ -109,6 +114,8 @@ pub fn checks(i: &Inputs) -> Vec<Check> {
             name: "codex",
             detail: "not installed (optional); not needed while you use Claude Code only".into(),
         });
+    } else if let Some(why) = &i.codex_home_error {
+        out.push(Check::new(false, "codex wiring", why.clone()));
     } else {
         out.push(match &notify {
             NotifyState::Fornax(script) if script_is_runnable(script) => Check::new(
@@ -359,6 +366,9 @@ pub async fn report(fornax_home: &Path) -> String {
         daemon_reachable: reachable,
         autostart_file: crate::launchd_plist::plist_path(&crate::dirs_home()).exists(),
         claude_activity: claude_activity(fornax_home).await,
+        codex_home_error: crate::codex_adapter::ensure_codex_home_usable()
+            .err()
+            .map(|e| e.to_string()),
     };
     render(&checks(&inputs))
 }
@@ -443,6 +453,7 @@ mod tests {
                 daemon_reachable: self.reachable,
                 autostart_file: self.autostart,
                 claude_activity: self.activity,
+                codex_home_error: None,
             })
         }
         fn text(&self) -> String {

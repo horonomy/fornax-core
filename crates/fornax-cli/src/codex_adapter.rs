@@ -7,20 +7,62 @@ use crate::adapter_registry::AdapterActionResult;
 use crate::guarded_write::{digest_of_bytes, write_guarded, ContentDigest};
 
 /// Filename marker identifying a Fornax-owned `notify` entry in
-/// `~/.codex/config.toml`. Matched by suffix (rather than requiring a
+/// `<codex home>/config.toml`. Matched by suffix (rather than requiring a
 /// byte-for-byte absolute-path match) so uninstall still recognizes an
 /// install made from a different checkout of this repo.
 const CODEX_NOTIFY_SCRIPT_MARKER: &str = "fornax-codex-notify.sh";
 
+/// The active Codex root (FORNX-474). An explicit non-empty `CODEX_HOME` wins;
+/// unset or empty keeps `$HOME/.codex`, the same rule Codex itself and
+/// `fornax-adapter-codex` use. Config, hooks, the capture marker's sessions
+/// directory and `doctor` all derive from this one root, so they cannot
+/// disagree about which tree Fornax is wired into.
+pub fn codex_home() -> std::path::PathBuf {
+    codex_home_from(std::env::var_os("CODEX_HOME"), &crate::dirs_home())
+}
+
+fn codex_home_from(
+    explicit: Option<std::ffi::OsString>,
+    home: &std::path::Path,
+) -> std::path::PathBuf {
+    match explicit {
+        Some(v) if !v.is_empty() => std::path::PathBuf::from(v),
+        _ => home.join(".codex"),
+    }
+}
+
+/// Refuses a relative `CODEX_HOME` before any write: the capture marker bakes
+/// an absolute sessions directory (the daemon ignores a relative one), and a
+/// relative root would mean a different tree depending on the working
+/// directory. Called by plan, install and uninstall.
+pub fn ensure_codex_home_usable() -> anyhow::Result<()> {
+    check_codex_home(std::env::var_os("CODEX_HOME").as_deref())
+}
+
+fn check_codex_home(explicit: Option<&std::ffi::OsStr>) -> anyhow::Result<()> {
+    match explicit {
+        Some(v) if !v.is_empty() && v.to_str().is_none() => anyhow::bail!(
+            "CODEX_HOME is not valid UTF-8; refusing before changing anything. \
+             Use an absolute UTF-8 directory, or unset it to use ~/.codex"
+        ),
+        Some(v) if !v.is_empty() && !std::path::Path::new(v).is_absolute() => anyhow::bail!(
+            "CODEX_HOME={} is not an absolute path; refusing before changing anything. \
+             Set it to an absolute directory, or unset it to use ~/.codex",
+            std::path::Path::new(v).display()
+        ),
+        _ => Ok(()),
+    }
+}
+
 pub fn default_path() -> std::path::PathBuf {
-    crate::dirs_home().join(".codex").join("config.toml")
+    codex_home().join("config.toml")
 }
 
 const NOTIFY_SCRIPT_TEMPLATE: &str = include_str!("../../../scripts/fornax-codex-notify.sh");
 const NOTIFY_BIN_PLACEHOLDER: &str = "__FORNAX_BIN__";
 
 /// Where `install` puts the notify script: under the Fornax home, so the path
-/// written into `~/.codex/config.toml` does not depend on where this binary
+/// written into `<codex home>/config.toml` does not depend on where this binary
 /// was built or checked out (FORNX-469).
 pub fn default_notify_script() -> std::path::PathBuf {
     crate::fornax_home()
@@ -62,7 +104,7 @@ pub fn write_notify_script(
 
 /// Parses `path` as a format-preserving TOML document (comments and table
 /// ordering survive edits), or an empty document if `path` does not exist.
-/// Unlike the Claude adapter's JSON equivalent, a `~/.codex/config.toml`
+/// Unlike the Claude adapter's JSON equivalent, a `<codex home>/config.toml`
 /// that fails to parse as TOML is always a hard error — there is no
 /// sensible "treat it as empty" fallback for a file this consequential.
 #[cfg(test)]
@@ -700,5 +742,40 @@ mod tests {
         let contents = std::fs::read_to_string(&path).unwrap();
         assert_eq!(contents, "notify = [\"/usr/bin/my-other-tool\"]\n");
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn explicit_codex_home_wins_and_unset_or_empty_keeps_the_home_default() {
+        use std::ffi::OsString;
+        let home = std::path::Path::new("/h");
+        assert_eq!(
+            codex_home_from(Some(OsString::from("/custom")), home),
+            std::path::PathBuf::from("/custom")
+        );
+        for unset in [None, Some(OsString::new())] {
+            assert_eq!(
+                codex_home_from(unset, home),
+                std::path::PathBuf::from("/h/.codex")
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_relative_codex_home_is_refused() {
+        use std::ffi::OsStr;
+        assert!(check_codex_home(None).is_ok());
+        assert!(check_codex_home(Some(OsStr::new(""))).is_ok());
+        assert!(check_codex_home(Some(OsStr::new("/abs/codex"))).is_ok());
+        let err = check_codex_home(Some(OsStr::new("rel/codex"))).unwrap_err();
+        assert!(err.to_string().contains("CODEX_HOME"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_codex_home_is_refused() {
+        use std::os::unix::ffi::OsStrExt;
+        let bad = std::ffi::OsStr::from_bytes(b"/tmp/x-\xff");
+        let err = check_codex_home(Some(bad)).unwrap_err();
+        assert!(err.to_string().contains("UTF-8"), "{err}");
     }
 }
