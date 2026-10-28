@@ -5,6 +5,8 @@
 //! tree with a copied `fornax` and a placeholder sibling `fornax-daemon`; no
 //! real home, no `launchctl`, no model.
 
+#![cfg(unix)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -287,4 +289,51 @@ fn plan_against_the_default_home_also_reports_the_move() {
 
     assert!(w.run(&["install", "codex"], None).status.success());
     assert_eq!(w.marker_dir(), Some(default_sessions));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn unreadable_claude_settings_keep_the_shared_autostart() {
+    // Fail closed: if Claude's settings cannot be parsed, Fornax cannot tell
+    // that no hooks remain, so it must not delete the login item.
+    let w = World::new();
+    let a = w.codex_dir("codex-a");
+    assert!(w.run(&["install", "codex"], Some(&a)).status.success());
+    let plist = fs::read(w.plist()).unwrap();
+    fs::create_dir_all(w.home.join(".claude")).unwrap();
+    fs::write(w.home.join(".claude/settings.json"), "{ not json").unwrap();
+
+    let un = w.run(&["uninstall", "codex"], Some(&a));
+    assert!(un.status.success(), "{}", out(&un));
+    assert_eq!(
+        fs::read(w.plist()).ok().as_deref(),
+        Some(plist.as_slice()),
+        "{}",
+        out(&un)
+    );
+    assert!(out(&un).contains("left in place"), "{}", out(&un));
+    assert!(out(&un).contains("Claude"), "{}", out(&un));
+    assert!(!out(&un).contains("launchctl bootout"), "{}", out(&un));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_foreign_plist_is_reported_as_untouched_not_as_a_kept_fornax_autostart() {
+    // The keep reason applies, but the file is not Fornax's: say what is true.
+    let w = World::new();
+    let a = w.codex_dir("codex-a");
+    assert!(w
+        .run(&["install", "claude-code"], Some(&a))
+        .status
+        .success());
+    fs::create_dir_all(w.plist().parent().unwrap()).unwrap();
+    let foreign = b"<plist><!-- someone else's --></plist>\n";
+    fs::write(w.plist(), foreign).unwrap();
+
+    let un = w.run(&["uninstall", "codex"], Some(&a));
+    assert!(un.status.success(), "{}", out(&un));
+    assert_eq!(fs::read(w.plist()).unwrap(), foreign, "{}", out(&un));
+    assert!(out(&un).contains("leaving it alone"), "{}", out(&un));
+    assert!(!out(&un).contains("left in place"), "{}", out(&un));
+    assert!(!out(&un).contains("launchctl bootout"), "{}", out(&un));
 }
