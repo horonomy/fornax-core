@@ -84,6 +84,7 @@ fn out(o: &Output) -> String {
     )
 }
 
+#[allow(dead_code)] // only the macOS-gated plist tests call it; unused on Linux
 fn wired(config: &Path) -> bool {
     fs::read_to_string(config)
         .map(|t| t.contains("fornax-codex-notify.sh"))
