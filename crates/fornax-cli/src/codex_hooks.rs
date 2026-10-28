@@ -37,7 +37,7 @@ const HOOK_BIN: &str = "fornax-hook-codex-event";
 const EVENTS: [&str; 3] = ["PreToolUse", "PostToolUse", "SessionStart"];
 
 pub fn default_path() -> std::path::PathBuf {
-    crate::dirs_home().join(".codex").join("hooks.json")
+    crate::codex_adapter::codex_home().join("hooks.json")
 }
 
 /// The one group `install` appends to each of [`EVENTS`].

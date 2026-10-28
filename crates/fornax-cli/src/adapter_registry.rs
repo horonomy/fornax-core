@@ -123,9 +123,9 @@ impl AdapterPlugin for CodexAdapter {
     }
 
     fn summary(&self) -> &str {
-        "Wires Fornax's ambient-status notify script into ~/.codex/config.toml's \
-         `notify` entry, and the lifecycle-hook binding (PreToolUse, PostToolUse, \
-         SessionStart) into ~/.codex/hooks.json."
+        "Wires Fornax's ambient-status notify script into config.toml's `notify` \
+         entry, and the lifecycle-hook binding (PreToolUse, PostToolUse, \
+         SessionStart) into hooks.json, under $CODEX_HOME (default ~/.codex)."
     }
 
     fn target_path(&self) -> PathBuf {
@@ -133,6 +133,7 @@ impl AdapterPlugin for CodexAdapter {
     }
 
     fn plan(&self) -> anyhow::Result<AdapterActionResult> {
+        crate::codex_adapter::ensure_codex_home_usable()?;
         let mut r = crate::codex_adapter::plan_install_all(
             &self.target_path(),
             &crate::codex_adapter::default_notify_script(),
@@ -153,6 +154,7 @@ impl AdapterPlugin for CodexAdapter {
     }
 
     fn install(&self) -> anyhow::Result<AdapterActionResult> {
+        crate::codex_adapter::ensure_codex_home_usable()?;
         crate::codex_adapter::write_notify_script(
             &crate::codex_adapter::default_notify_script(),
             &std::env::current_exe()?.canonicalize()?,
@@ -178,6 +180,7 @@ impl AdapterPlugin for CodexAdapter {
     }
 
     fn uninstall(&self) -> anyhow::Result<AdapterActionResult> {
+        crate::codex_adapter::ensure_codex_home_usable()?;
         // Capture goes off first: a failed edit of the Codex config must not
         // leave the daemon still reading every Codex session.
         let removed = crate::codex_watch_marker::uninstall(&crate::fornax_home())?;
