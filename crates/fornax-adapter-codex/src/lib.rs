@@ -1128,7 +1128,7 @@ fn extract_cmd(input: &str) -> String {
             }
             if c == quote {
                 let command_end = offset + 1 + i + c.len_utf8();
-                return if is_single_tool_call(input, start, command_end) {
+                return if is_single_tool_call(input, start, command_end, key) {
                     result
                 } else {
                     input.to_string()
@@ -1143,7 +1143,7 @@ fn extract_cmd(input: &str) -> String {
 /// `input` is exactly `const r = await tools.<x>({<props>command:"..."<props>});
 /// text(r)` (or `text(r.output)`): one tool call, only known option
 /// properties around the command argument, nothing else executable.
-fn is_single_tool_call(input: &str, key_start: usize, command_end: usize) -> bool {
+fn is_single_tool_call(input: &str, key_start: usize, command_end: usize, key: &str) -> bool {
     let Some(head) = input[..key_start]
         .trim_start()
         .strip_prefix("const r = await tools.")
@@ -1153,7 +1153,13 @@ fn is_single_tool_call(input: &str, key_start: usize, command_end: usize) -> boo
     let Some((tool, props_before)) = head.split_once("({") else {
         return false;
     };
-    if tool.is_empty() || !tool.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+    // Only the two shell tools, each with its own argument name. Any other
+    // tool (`apply_patch`, `write_stdin`, MCP tools, ...) or a mismatched key
+    // does not record a shell command.
+    if !matches!(
+        (tool, key),
+        ("shell_command", "command:") | ("exec_command", "cmd:")
+    ) {
         return false;
     }
     let tail = input[command_end..].trim_end();
@@ -1167,7 +1173,16 @@ fn is_single_tool_call(input: &str, key_start: usize, command_end: usize) -> boo
     .find_map(|end| tail.strip_suffix(end)) else {
         return false;
     };
-    only_known_simple_props(props_before) && only_known_simple_props(props_after)
+    // Before the command: `a:1,b:2,` (each property followed by a comma);
+    // after it: `,c:3,d:4` (each preceded by one). Exact separators only.
+    let before = props_before.trim();
+    let after = props_after.trim();
+    let before_ok = before.is_empty()
+        || before
+            .strip_suffix(',')
+            .is_some_and(only_known_simple_props);
+    let after_ok = after.is_empty() || after.strip_prefix(',').is_some_and(only_known_simple_props);
+    before_ok && after_ok
 }
 
 /// Option properties Codex's shell tools take besides the command itself.
@@ -1180,7 +1195,6 @@ const KNOWN_TOOL_PROPS: &[&str] = &[
     "justification",
     "tty",
     "login",
-    "shell",
 ];
 
 /// `name: "value"` / `name: 123` / `name: true` pairs, comma separated, with
@@ -1188,12 +1202,11 @@ const KNOWN_TOOL_PROPS: &[&str] = &[
 /// nested values are all rejected, so no property can redefine the command
 /// (JS keeps the *last* duplicate key).
 fn only_known_simple_props(text: &str) -> bool {
-    let mut rest = text
-        .trim()
-        .trim_start_matches(',')
-        .trim_end_matches(',')
-        .trim();
-    while !rest.is_empty() {
+    let mut rest = text.trim();
+    if rest.is_empty() {
+        return false;
+    }
+    loop {
         let Some((name, after_name)) = rest.split_once(':') else {
             return false;
         };
@@ -1224,13 +1237,13 @@ fn only_known_simple_props(text: &str) -> bool {
             }
         }
         .trim_start();
-        rest = match rest.strip_prefix(',') {
-            Some(next) => next.trim_start(),
-            None if rest.is_empty() => rest,
-            None => return false,
-        };
+        match rest.strip_prefix(',') {
+            None => return rest.is_empty(),
+            // A comma must be followed by another property.
+            Some(next) if next.trim().is_empty() => return false,
+            Some(next) => rest = next.trim_start(),
+        }
     }
-    true
 }
 
 fn claims_tests_passed(text: &str) -> bool {
@@ -2065,6 +2078,15 @@ mod tests {
             "const r = await tools.shell_command({command:\"pytest\",workdir:\"a\\\\b\"}); text(r)",
             "const r = await tools.shell_command({command:\"pytest\",foo:\"x\"}); text(r)",
             "const r = await tools.shell_command({\"command\":\"true\",command:\"pytest\"}); text(r)",
+            "const r = await tools.shell_command({command:\"pytest -q\",shell:\"/bin/true\"}); text(r)",
+            "const r = await tools.apply_patch({command:\"pytest -q\"}); text(r)",
+            "const r = await tools.write_stdin({command:\"pytest -q\"}); text(r)",
+            "const r = await tools.exec_command({command:\"pytest -q\"}); text(r)",
+            "const r = await tools.shell_command({cmd:\"pytest -q\"}); text(r)",
+            "const r = await tools.shell_command({workdir:\"/w\",,command:\"pytest\"}); text(r)",
+            "const r = await tools.shell_command({command:\"pytest\" workdir:\"/w\"}); text(r)",
+            "const r = await tools.shell_command({command:\"pytest\",}); text(r)",
+            "const r = await tools.shell_command({workdir:\"/w\" command:\"pytest\"}); text(r)",
         ] {
             assert_eq!(extract_cmd(input), input, "{input}");
         }
