@@ -1259,6 +1259,8 @@ mod tests {
             json!("pytest\u{b}-q"),
             json!(["bash", "-c", "pytest\u{c}-q"]),
             json!("readonly A=1 && pytest -q"),
+            json!("PATH=/tmp/evil && pytest -q"),
+            json!("CI=1 && pytest -q"),
             json!("local x && pytest -q"),
             json!("logout && pytest"),
             json!("pushd x && cargo test"),

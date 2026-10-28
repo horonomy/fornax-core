@@ -2086,6 +2086,8 @@ mod tests {
             "const r = await tools.shell_command({workdir:\"/w\",,command:\"pytest\"}); text(r)",
             "const r = await tools.shell_command({command:\"pytest\" workdir:\"/w\"}); text(r)",
             "const r = await tools.shell_command({command:\"pytest\",}); text(r)",
+            "const r = await tools.shell_command({command:\"pytest\",timeout_ms:f()}); text(r)",
+            "const r = await tools.shell_command({command:\"pytest\",tty:maybe}); text(r)",
             "const r = await tools.shell_command({workdir:\"/w\" command:\"pytest\"}); text(r)",
         ] {
             assert_eq!(extract_cmd(input), input, "{input}");
