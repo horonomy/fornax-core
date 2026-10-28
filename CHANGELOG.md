@@ -9,6 +9,43 @@ Jira epic FORNX-20.
 
 ### Added
 
+- **Codex first run: `fornax install codex` opts in to daemon capture**
+  (FORNX-468). The daemon reads the selected Codex home's `sessions/` rollouts
+  (tool commands and output, final assistant message) so a "tests passed"
+  claim is checked against the run's own output, with no hand-started tailer
+  and no `/hooks` trust needed for findings. The opt-in is recorded in
+  `$FORNAX_HOME/codex-watch.json`. Only activity after the daemon is watching
+  is read; sessions already on disk are not backfilled. `fornax uninstall
+  codex` turns capture off (it is left on, with a message, if it watches a
+  different Codex home). **Privacy:** captured data is stored locally and
+  passes secret-pattern redaction only; there is no PII redaction (cloud upload
+  is a separate opt-in and is off by default). A Codex claim can be `Verified`
+  only when Codex reports a literal exit code of 0; heuristic-only evidence
+  stays `Review` (ADR-0025). Install, uninstall and plan print one outcome per
+  line. Known limit: `install` still writes the capture marker when the
+  `notify` edit is refused, because capture is a separate opt-in.
+
+- **`fornax install codex` writes a LaunchAgent plist file** (FORNX-469, macOS
+  only, when `fornax-daemon` sits next to `fornax`) and prints the exact
+  `launchctl bootstrap` command. Fornax never runs `launchctl` itself, so the
+  daemon does not start until you load it. Only an absent path is created: a
+  plist Fornax did not write, or cannot read (foreign, binary, non-UTF-8,
+  unreadable, a directory or a symlink), is left untouched by install and
+  uninstall, and the staging file never follows a planted symlink. Known
+  limit: replacing or removing a plist verified as Fornax's can still race a
+  same-user writer.
+
+- **`fornax doctor` is a first-run checklist** (FORNX-469, FORNX-471): daemon
+  reachable, Codex wiring and capture, and Claude Code hooks, each with the
+  next step. It reports only what it can show: a comment or other key
+  mentioning the notify script, a capture marker the daemon would ignore, or a
+  config file alone are gaps, and capture is judged by the same marker rule the
+  daemon uses. A Claude hook entry is reported as configuration only (only
+  recorded events show it ran), and Claude Code results are `Review`, never
+  `Verified` (ADR-0025). Doctor reads an existing database read-only; it never
+  creates or migrates it and leaves the file byte-for-byte unchanged (SQLite
+  may create empty `-wal`/`-shm` sidecars to read it).
+
 - `fornax adapter register` accepts shared host-adapter descriptors into the
   existing registry, with explicit digest confirmation and disabled registration.
   List/inspect report declarations and retained-byte integrity without granting
@@ -48,6 +85,18 @@ Jira epic FORNX-20.
   bounded drain time against the daemon's 256-connection inflight cap.
 
 ### Changed
+
+- **The Codex integration follows `CODEX_HOME`** (FORNX-474). `config.toml`,
+  `hooks.json` and the sessions directory the daemon watches are now under a
+  non-empty `CODEX_HOME`; unset or empty keeps `~/.codex`. A relative or
+  non-UTF-8 `CODEX_HOME` is refused before anything is written. Known limit: a
+  differently spelled path for the same directory is treated as a different
+  Codex home.
+
+- **The Codex notify script lives under `$FORNAX_HOME/bin`** (FORNX-469). It is
+  rendered there with the absolute `fornax` path baked in, so the `notify`
+  entry in `config.toml` no longer depends on where the binary was built or
+  checked out. `uninstall` removes the entry but leaves the script file.
 
 - `fornax adapter unregister` (and the underlying registry `remove`) adopts
   Strict Retention (HORO-1745): the index entry is still removed, but the
