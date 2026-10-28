@@ -65,7 +65,8 @@ check "foreign key in the redirected config survived" "grep -q 'model = \"x\"' '
 check "default tree config untouched by the redirected install" "cmp -s '$DEF/config.toml' '$J/default-config.before'"
 check "capture marker names the redirected sessions dir" "grep -q '$RED/sessions' '$FORNAX_HOME/codex-watch.json'"
 check "doctor on the redirected home is ok" "CODEX_HOME='$RED' $F doctor | grep -q '^  \[ok\] codex wiring' && CODEX_HOME='$RED' $F doctor | grep -q '^  \[ok\] codex capture'"
-check "relative CODEX_HOME is refused" "! CODEX_HOME=relative/codex $F install codex"
+rel_out=$(CODEX_HOME=relative/codex $F install codex 2>&1); rel_rc=$?
+check "relative CODEX_HOME is refused with a clear error and no side effects" "[ $rel_rc != 0 ] && echo \"\$rel_out\" | grep -q CODEX_HOME && [ ! -e relative ] && cmp -s '$DEF/config.toml' '$J/default-config.before'"
 CODEX_HOME="$RED" $F uninstall codex
 check "uninstall removed our wiring from the redirected home only" "! grep -q fornax-codex-notify.sh '$RED/config.toml' && grep -q fornax-codex-notify.sh '$DEF/config.toml'"
 CODEX_HOME="$DEF" $F uninstall codex

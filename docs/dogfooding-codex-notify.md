@@ -109,7 +109,7 @@ turn, on the next prompt render — which is the honest ceiling of what
 
 1. Build the binaries: `cargo build --workspace` (from the repo root).
 2. Start the daemon once per session: `./target/debug/fornax-daemon &`
-3. Add to `~/.codex/config.toml` (global — `notify` has no project-local
+3. Add to `~/.codex/config.toml` (or `$CODEX_HOME/config.toml` when `CODEX_HOME` is set; `fornax install codex` follows `CODEX_HOME`) (global — `notify` has no project-local
    scope in Codex, unlike Claude Code's settings layering):
 
    ```toml
