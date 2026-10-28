@@ -85,6 +85,36 @@ check "doctor says configuration only, never Verified" "$F doctor | grep -q 'con
 $F uninstall claude-code
 check "uninstall keeps foreign hook" "grep -q foreign-hook '$HOME/.claude/settings.json'"
 check "uninstall removes fornax hook" "! grep -q fornax-hook-claude '$HOME/.claude/settings.json'"
+step "E1 test-result trust (FORNX-477): only an executed test runner can verify 'tests passed'"
+# Synthetic Bash hook events with a literal exit code, fed to the real
+# fornax-hook-claude and daemon (README quick start). No command is executed.
+rm -f "$FORNAX_HOME/fornax.sock"
+( "$J/bin/fornax-daemon" >"$J/daemon2.log" 2>&1 & echo $! >"$J/daemon.pid" )
+for _ in $(seq 1 40); do [ -S "$FORNAX_HOME/fornax.sock" ] && break; sleep 0.5; done
+claim(){ # <session> <command-json-string-body> <exit_code>
+  printf '{"hook_event_name":"PostToolUse","session_id":"%s","tool_name":"Bash","tool_input":{"command":"%s"},"tool_response":{"exit_code":%s,"stdout":"","stderr":""}}' "$1" "$2" "$3" | "$J/bin/fornax-hook-claude"
+  printf '{"type":"assistant","message":{"content":[{"type":"text","text":"All tests passed."}]}}\n' > "$J/t-$1.jsonl"
+  printf '{"hook_event_name":"Stop","session_id":"%s","transcript_path":"%s"}' "$1" "$J/t-$1.jsonl" | "$J/bin/fornax-hook-claude"
+}
+verdict_of(){ $F detail | awk -v s="$1" '/^🛡/{v=$0} $1=="session:" && $2==s {print v}' | sed 's/^🛡 //'; }
+claim e1-echo "echo pytest" 0
+claim e1-pip "pip install pytest" 0
+claim e1-cat "cat jest.config.js" 0
+claim e1-or "true || pytest" 0
+claim e1-semi "pytest;true" 0
+claim e1-pipe "pytest -q | cat" 0
+claim e1-runner "pytest -q" 0
+claim e1-fail "cargo test" 1
+claim e1-and "cd repo && cargo test" 0
+sleep 2
+for s in echo pip cat or semi pipe; do
+  check "e1-$s: a command that only mentions or masks a runner stays UNVERIFIED" "[ \"\$(verdict_of e1-$s)\" = '? UNVERIFIED' ]"
+done
+check "e1-runner: a real passing runner is VERIFIED" "[ \"\$(verdict_of e1-runner)\" = '✓ VERIFIED' ]"
+check "e1-fail: a real failing runner is CONTRADICTED" "verdict_of e1-fail | grep -q CONTRADICTED"
+check "e1-and: an && list exiting 0 containing a runner is VERIFIED" "[ \"\$(verdict_of e1-and)\" = '✓ VERIFIED' ]"
+kill "$(cat "$J/daemon.pid")" 2>/dev/null
+
 echo; [ $fail = 0 ] && echo "JOURNEY-PASS" || echo "JOURNEY-FAIL"
 } 2>&1 | tee "$RECEIPT"
 grep -q JOURNEY-PASS "$RECEIPT"
