@@ -86,9 +86,9 @@ impl Verifier for TestResultVerifier {
         // Find the most recent exit-code-bearing evidence for a test-runner
         // invocation in this session, most recent first (evidence is stored
         // oldest-first; scan from the end).
-        let test_evidence = evidence.iter().rev().find(|e| is_test_runner_evidence(e));
+        let test_evidence = evidence.iter().rposition(is_test_runner_evidence);
 
-        let Some(ev) = test_evidence else {
+        let Some(ev_idx) = test_evidence else {
             return Finding {
                 id: Uuid::new_v4(),
                 claim_id: claim.id,
@@ -101,16 +101,15 @@ impl Verifier for TestResultVerifier {
             };
         };
 
+        let ev = &evidence[ev_idx];
         let exit_code = ev.payload.get("exit_code").and_then(|v| v.as_i64());
 
         // FORNX-477: only *identified* runner rows are evidence, but a newer
         // exit-code row that merely mentions a runner (`cd repo && pytest`
-        // exiting 1, `pytest | tail`, ...) may be the real run -- failing or
-        // masked. An older pass must not verify over it.
-        let newer_unidentified_runner_mention = evidence
+        // exiting 1, `pytest | tail`, ...) may be the real run -- failing,
+        // passing or masked. An older result must not decide over it.
+        let newer_unidentified_runner_mention = evidence[ev_idx + 1..]
             .iter()
-            .rev()
-            .take_while(|e| e.id != ev.id)
             .any(mentions_unidentified_runner);
 
         match exit_code {
@@ -955,16 +954,26 @@ fn mentions_unidentified_runner(e: &Evidence) -> bool {
         return false;
     }
     let cmd = command_text(&e.payload);
-    [
-        "pytest",
-        "cargo test",
-        "cargo nextest",
-        "npm test",
-        "vitest",
-        "jest",
-    ]
-    .iter()
-    .any(|runner| cmd.contains(runner))
+    let tokens: Vec<&str> = cmd
+        .split(|c: char| !(c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | '/' | '+')))
+        .filter(|t| !t.is_empty())
+        .collect();
+    let names_runner = |t: &&str| {
+        matches!(
+            t.rsplit('/').next().unwrap_or(t),
+            "pytest" | "py.test" | "vitest" | "jest"
+        )
+    };
+    // `cargo` or `npm` followed, anywhere later, by `test` / `nextest`.
+    let subcommand_after = |program: &str, subs: &[&str]| {
+        tokens
+            .iter()
+            .position(|t| t.rsplit('/').next() == Some(program))
+            .is_some_and(|i| tokens[i + 1..].iter().any(|t| subs.contains(t)))
+    };
+    tokens.iter().any(names_runner)
+        || subcommand_after("cargo", &["test", "nextest"])
+        || subcommand_after("npm", &["test"])
 }
 
 /// True when `e.payload["heuristic"]` is `true` — the evidence's `exit_code`
@@ -1233,9 +1242,25 @@ mod tests {
             json!("exit 0 && pytest -q"),
             json!("exec true && pytest"),
             json!(["bash", "-c", "exit 0 && pytest"]),
+            json!(["bash", "-nc", "pytest"]),
+            json!(["sh", "-ncx", "pytest"]),
+            json!("pytest 2>&1 | tail"),
+            json!("pytest 2>&1x"),
+            json!("pytest 3>&1"),
+            json!("pytest 2>&1>out"),
+            json!("pytest 2>&2"),
+            json!("pytest a2>&1"),
+            json!("echo 2>&1 pytest"),
             json!("source env.sh && pytest -q"),
             json!("true && . ./env.sh && cargo test"),
             json!("uv run --with pytest python script.py"),
+            json!("pytest\u{a0}-q"),
+            json!("pytest\u{b}-q"),
+            json!(["bash", "-c", "pytest\u{c}-q"]),
+            json!("readonly A=1 && pytest -q"),
+            json!("local x && pytest -q"),
+            json!("logout && pytest"),
+            json!("pushd x && cargo test"),
             json!("uv run --with jest echo hi"),
             json!("npx -p jest node x.js"),
             json!("pytest -q | tee out.txt"),
@@ -1305,6 +1330,10 @@ mod tests {
             json!("python3 -m pytest -q ."),
             json!("CI=1 pytest -q"),
             json!("pytest -v tests/"),
+            json!("pytest --cov=src --maxfail=1 -q"),
+            json!("jest --coverage --ci --color"),
+            json!("cargo test 2>&1"),
+            json!(["zsh", "-lc", "pytest -q 2>&1"]),
             json!("pytest -xvs -k smoke"),
             json!("CI=1 RUST_BACKTRACE=1 cargo test"),
             json!("./.venv/bin/pytest -q"),
@@ -1357,6 +1386,10 @@ mod tests {
             ("pytest -q | tail", 0),
             ("pytest -q | tail", 1),
             ("git commit -m pytest", 0),
+            ("git commit -m 'run py.test'", 0),
+            ("cargo +nightly test | tail", 1),
+            ("cargo nextest run | tee out", 0),
+            ("npx jest | tail", 0),
         ] {
             let newer_ev = evidence_for_command(&["/bin/zsh", "-lc", newer], code);
             let f = TestResultVerifier.verify(
@@ -1374,6 +1407,8 @@ mod tests {
             &[fail.clone(), ambiguous.clone()],
             &caps(),
         );
+        // A genuine failure stays Contradicted: following it with a command
+        // that merely mentions a runner must not let an agent dodge it.
         assert_eq!(f.verdict, Verdict::Contradicted);
         assert_eq!(f.evidence_ids, vec![fail.id]);
 
@@ -1397,6 +1432,7 @@ mod tests {
             json!("cd repo && cargo test"),
             json!("make build && pytest -q"),
             json!("CI=1 pytest && echo done"),
+            json!("cargo test -p x 2>&1 && echo done"),
             json!(["/bin/zsh", "-lc", "cd crates/x && cargo nextest run"]),
             json!(["bash", "-c", "uv run pytest -q && ruff check"]),
         ] {
@@ -1442,6 +1478,17 @@ mod tests {
             json!("pytest -o addopts=--collect-only"),
             json!("pytest --override-ini=addopts=--co"),
             json!("pytest -qh"),
+            json!("pytest -ofoo=bar"),
+            json!("pytest -xo addopts=--co"),
+            json!("pytest -hx"),
+            json!("pytest --setupplan"),
+            json!("pytest --setuponly"),
+            json!("pytest --funcargs"),
+            json!("pytest -oaddopts=--co"),
+            json!("jest --list-tests"),
+            json!("jest --pass-with-no-tests -t nomatch"),
+            json!("jest --changedFilesWithAncestor"),
+            json!("vitest bench"),
             json!("pytest -Vq"),
             json!("jest -v"),
             json!("vitest -v"),

@@ -43,6 +43,10 @@ const NON_EXECUTING_LONG_FLAGS: &[&str] = &[
     "--setup-only",
     "--showConfig",
     "--collectonly",
+    "--setupplan",
+    "--setuponly",
+    "--funcargs",
+    "--changedFilesWithAncestor",
     "--cache-show",
     "--override-ini",
     "--clearCache",
@@ -63,9 +67,51 @@ const NON_EXECUTING_SHORT_FLAGS: &[&str] = &["-h", "-V", "-o"];
 /// or run other code. Inside an `&&` list any of them means an overall status
 /// of 0 no longer proves the runner ran, so the list is not identified.
 const SHELL_STATE_BUILTINS: &[&str] = &[
-    "exit", "exec", "return", "break", "continue", "source", ".", "eval", "export", "hash",
-    "alias", "unalias", "set", "enable", "declare", "typeset", "unset", "function", "trap",
-    "shopt", "builtin", "command",
+    "exit",
+    "logout",
+    "exec",
+    "return",
+    "break",
+    "continue",
+    "source",
+    ".",
+    "eval",
+    "export",
+    "hash",
+    "rehash",
+    "alias",
+    "unalias",
+    "set",
+    "setopt",
+    "unsetopt",
+    "emulate",
+    "enable",
+    "declare",
+    "typeset",
+    "integer",
+    "readonly",
+    "local",
+    "unset",
+    "function",
+    "autoload",
+    "trap",
+    "shopt",
+    "builtin",
+    "command",
+    "kill",
+    "wait",
+    "disown",
+    "pushd",
+    "popd",
+    "path",
+    "printf",
+    "read",
+    "mapfile",
+    "readarray",
+    "let",
+    "getopts",
+    "ulimit",
+    "umask",
 ];
 
 /// Valueless launcher flags that may precede the launched runner. Any other
@@ -141,7 +187,7 @@ fn command_segments(command: Option<&Value>) -> Option<Vec<Vec<Word>>> {
                 // `sh -c <script>`: anything but exactly that shape (extra
                 // positional arguments, a missing script) is ambiguous.
                 let flag = argv.get(1)?;
-                if flag.starts_with('-') && !flag.starts_with("--") && flag.contains('c') {
+                if is_shell_command_flag(flag) {
                     return if argv.len() == 3 {
                         shell_segments(argv[2])
                     } else {
@@ -166,6 +212,15 @@ fn basename(program: &str) -> &str {
     program.rsplit('/').next().unwrap_or(program)
 }
 
+/// `-c`, `-lc`, `-ic`, `-ec`, ...: a single-dash cluster that contains `c` and
+/// nothing that stops the shell from running the script (`-n` only parses it).
+fn is_shell_command_flag(flag: &str) -> bool {
+    flag.starts_with('-')
+        && !flag.starts_with("--")
+        && flag.contains('c')
+        && flag[1..].chars().all(|c| "cleuxvi".contains(c))
+}
+
 fn is_shell(program: &str) -> bool {
     matches!(basename(program), "sh" | "bash" | "zsh" | "dash")
 }
@@ -174,6 +229,15 @@ fn is_shell(program: &str) -> bool {
 /// when it is anything else (`;`, `||`, `|`, `&`, redirections, subshells,
 /// expansions, comments, newlines, unterminated quotes, empty commands).
 fn shell_segments(script: &str) -> Option<Vec<Vec<Word>>> {
+    // A shell splits words only on space and tab. Any other whitespace or
+    // control character (NBSP, VT, FF, ...) is part of a word in the shell but
+    // would be a separator here, so such a script is not parsed at all.
+    if script
+        .chars()
+        .any(|c| (c.is_whitespace() || c.is_control()) && !matches!(c, ' ' | '\t' | '\n' | '\r'))
+    {
+        return None;
+    }
     let mut segments: Vec<Vec<Word>> = Vec::new();
     let mut words: Vec<Word> = Vec::new();
     let mut cur = String::new();
@@ -183,7 +247,7 @@ fn shell_segments(script: &str) -> Option<Vec<Vec<Word>>> {
 
     while let Some(c) = chars.next() {
         match c {
-            c if c.is_whitespace() && c != '\n' && c != '\r' => {
+            ' ' | '\t' => {
                 if in_word {
                     words.push(Word {
                         text: std::mem::take(&mut cur),
@@ -192,6 +256,13 @@ fn shell_segments(script: &str) -> Option<Vec<Vec<Word>>> {
                     in_word = false;
                     quoted = false;
                 }
+            }
+            // `2>&1` merges stderr into stdout and leaves the exit status alone.
+            '>' if in_word && !quoted && cur == "2" && stderr_to_stdout_follows(&chars) => {
+                chars.next();
+                chars.next();
+                cur.clear();
+                in_word = false;
             }
             '&' if chars.peek() == Some(&'&') => {
                 chars.next();
@@ -268,6 +339,14 @@ fn shell_segments(script: &str) -> Option<Vec<Vec<Word>>> {
     Some(segments)
 }
 
+/// After the `>` of a lone `2`: the rest is exactly `&1` and a word boundary.
+fn stderr_to_stdout_follows(chars: &std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+    let mut ahead = chars.clone();
+    ahead.next() == Some('&')
+        && ahead.next() == Some('1')
+        && matches!(ahead.next(), None | Some(' ') | Some('\t'))
+}
+
 fn assignment_name(word: &Word) -> Option<&str> {
     if word.quoted {
         return None;
@@ -316,7 +395,7 @@ fn runner_invocation(args: &[&str], allow_launcher: bool) -> bool {
         // `vitest list` / `jest list`-style subcommands only enumerate tests.
         "vitest" | "jest" => {
             // `-v` is `--version` for both; `init`/`list` do not run tests.
-            !matches!(tail, ["list" | "init", ..]) && !tail.contains(&"-v")
+            !matches!(tail, ["list" | "init" | "bench", ..]) && !tail.contains(&"-v")
         }
         n if is_python(n) => matches!(tail, ["-m", "pytest", ..]),
         "cargo" => {
@@ -369,19 +448,37 @@ fn is_non_executing_flag(arg: &str) -> bool {
     if NON_EXECUTING_SHORT_FLAGS.contains(&arg) {
         return true;
     }
-    // A cluster of short flags (`-qh`, `-Vq`) contains `-h` / `-V`.
-    let is_cluster = arg.len() > 2
-        && arg.starts_with('-')
-        && !arg.starts_with("--")
-        && arg[1..].chars().all(|c| c.is_ascii_alphabetic());
-    if is_cluster && arg[1..].contains(['h', 'V']) {
-        return true;
+    if arg.starts_with('-') && !arg.starts_with("--") {
+        let short = &arg[1..];
+        // `-ofoo`, `-hx`, `-Vx`: the flag with an attached value or cluster.
+        if short.starts_with(['o', 'h', 'V']) {
+            return true;
+        }
+        // A cluster of short flags (`-qh`, `-Vq`, `-xo`) containing one.
+        if short.len() > 1
+            && short.chars().all(|c| c.is_ascii_alphabetic())
+            && short.contains(['o', 'h', 'V'])
+        {
+            return true;
+        }
     }
-    // `--flag=value` is the same flag.
+    // `--flag=value` is the same flag; flags compare case-, dash- and
+    // underscore-insensitively (`--list-tests` == `--listTests`) and as an
+    // unambiguous-prefix abbreviation, erring toward `Unverified`.
     let base = arg.split_once('=').map_or(arg, |(flag, _)| flag);
-    base.starts_with("--")
-        && base.len() >= 4
+    if !base.starts_with("--") {
+        return false;
+    }
+    let base = normalize_flag(base);
+    base.len() >= 2
         && NON_EXECUTING_LONG_FLAGS
             .iter()
-            .any(|flag| flag.starts_with(base))
+            .any(|flag| normalize_flag(flag).starts_with(&base))
+}
+
+fn normalize_flag(flag: &str) -> String {
+    flag.chars()
+        .filter(|c| !matches!(c, '-' | '_'))
+        .flat_map(char::to_lowercase)
+        .collect()
 }
