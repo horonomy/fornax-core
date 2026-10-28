@@ -113,6 +113,19 @@ Jira epic FORNX-20.
 
 ### Fixed
 
+- **A command that only mentions a test runner can no longer verify a "tests
+  passed" claim** (FORNX-477). The verifier matched `pytest`, `cargo test`,
+  `jest`, ... as a substring of the command text, so `echo pytest`,
+  `pip install pytest`, `true || pytest` or `git commit -m "add vitest"`
+  exiting 0 produced `Verified`. It now identifies a runner from the executed
+  command's structure: one simple command, or an `&&` list that exits 0,
+  optionally inside `sh -c`. Compound (`;`, `||`, pipes), expanded,
+  unparseable and non-executing (`--collect-only`, `--no-run`, ...) commands
+  are `Unverified`, and a newer unidentified runner command stops an older
+  pass from being `Verified`. Genuine runner passes stay `Verified`, failures
+  stay `Contradicted`, and heuristic exit codes stay capped at `Review`. See
+  the README section "Which commands count as a test run".
+
 - **Codex completion replay creates duplicate events and claims** (FORNX-446).
   Rollout `task_complete` records with a nonblank native `turn_id` now retain
   the same session-scoped completion and claim identities across tailer

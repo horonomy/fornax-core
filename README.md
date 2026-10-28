@@ -191,6 +191,39 @@ Codex's own rollout-file transcripts rather than hooks — see
 verified differences before relying on a specific hook/field existing on the
 Codex side.
 
+### Which commands count as a test run
+
+A "tests passed" claim is checked against the exit code of a command Fornax
+can identify as a test-runner execution (FORNX-477). The command must be one
+simple command, or an `&&` list containing one, optionally inside `sh|bash|zsh
+-c`, whose program is one of: `pytest` / `py.test`, `python -m pytest`,
+`cargo test`, `cargo nextest run`, `npm test`, `vitest`, `jest`, or one of
+those started by `npx`, `pnpx`, `bunx`, `pnpm exec`, `uv run` or `poetry run`.
+A few harmless environment assignments (`CI=1`, `RUST_BACKTRACE=1`, ...) may
+precede it.
+
+* A single runner command keeps its own exit code: 0 can be `Verified`,
+  non-zero is `Contradicted`.
+* An `&&` list (`cd dir && cargo test`) can be `Verified` only when it exits 0,
+  because `&&` runs the next command only after the previous one succeeded. A
+  non-zero exit says nothing about which command failed, so it is `Unverified`.
+  A list containing a shell-state command (`exit`, `exec`, `source`, `export`,
+  `eval`, ...) or an assignment-only step is never identified.
+* Everything else is `Unverified`, never `Verified`: a command that only
+  mentions a runner (`echo pytest`, `pip install pytest`, `git commit -m "add
+  vitest"`), `;`, `||`, pipes, redirections, backgrounding, expansions
+  (`$VAR`, backticks), other runners (`python -m unittest`, `go test`,
+  `mocha`, ...) and list/help/version/compile-only invocations
+  (`--collect-only`, `--no-run`, `--list`, `-h`, `-V`, ...).
+* A more recent command that mentions a runner but cannot be identified as a
+  test run (for example `pytest | tail`) stops an older passing run from
+  being `Verified`.
+
+Known limits: an executable merely *named* like a runner is trusted to be that
+runner; and a runner invocation whose filter selects no tests (for example
+`cargo test no_such_test`) still exits 0, which Fornax cannot tell apart from a
+real pass.
+
 ### Exporting a session for cloud sync (optional)
 
 `fornax export-spool` reads `$FORNAX_HOME/fornax.db` directly (no daemon
