@@ -107,6 +107,12 @@ turn, on the next prompt render — which is the honest ceiling of what
 
 ### Setup
 
+> The supported path is `fornax install codex`: it copies the notify script to
+> `$FORNAX_HOME/bin` with the binary path baked in, wires `notify` in the
+> selected Codex home's `config.toml`, opts in to daemon capture and writes a
+> LaunchAgent plist file (see the README, "Installing the Codex integration").
+> The manual steps below wire only the `notify` entry, by hand, from a checkout; they do not opt in to capture or write the plist.
+
 1. Build the binaries: `cargo build --workspace` (from the repo root).
 2. Start the daemon once per session: `./target/debug/fornax-daemon &`
 3. Add to `~/.codex/config.toml` (or `$CODEX_HOME/config.toml` when `CODEX_HOME` is set; `fornax install codex` follows `CODEX_HOME`) (global — `notify` has no project-local
