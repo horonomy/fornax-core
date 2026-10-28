@@ -208,6 +208,21 @@ pub fn install_message(user_home: &Path, fornax_home: &Path) -> String {
     }
 }
 
+/// Whether a login item file (ours or not) is at the plist path.
+pub fn exists(user_home: &Path) -> bool {
+    std::fs::symlink_metadata(plist_path(user_home)).is_ok()
+}
+
+/// The login item is shared by everything that needs the daemon, so
+/// uninstalling one user of it leaves the file (and says why, with no stop
+/// advice) while another still depends on it.
+pub fn kept_message(why: &str) -> String {
+    format!(
+        "daemon autostart: left in place -- {why}; run `fornax uninstall codex` again once \
+         nothing else needs the daemon"
+    )
+}
+
 pub fn uninstall_message(user_home: &Path) -> String {
     match uninstall(user_home) {
         Ok(true) => format!(
