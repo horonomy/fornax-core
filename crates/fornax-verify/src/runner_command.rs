@@ -1,0 +1,387 @@
+//! FORNX-477: decide from an executed command's *structure* whether it is a
+//! genuine test-runner invocation.
+//!
+//! `TestResultVerifier` turns "exit_code=0 for a test-runner command" into
+//! `Verified`. Matching a runner name as a substring of the command text let
+//! `echo pytest`, `pip install pytest`, `cat jest.config.js` or
+//! `git commit -m "add vitest"` satisfy a "tests passed" claim without any
+//! test having run. This module instead requires that the command, once its
+//! shell wrapper is removed, is exactly one simple command whose program (and
+//! subcommand) is a known runner.
+//!
+//! The rule is deliberately conservative: anything it cannot prove is a single
+//! test-runner execution -- compound commands (`;`, `&&`, `||`, `|`, `&`),
+//! redirections, subshells, expansions (`$`, backticks), comments, newlines,
+//! unterminated quotes, unknown programs, list/help/compile-only flags -- is
+//! "not a test run", which the verifier reports as `Unverified`. A false
+//! `Unverified` costs a missed credit; a false `Verified` breaks the trust
+//! contract.
+//!
+//! Residual (not closable from the command string alone): an executable
+//! *named* like a runner is trusted to be that runner. Exit codes stay
+//! agent-adjacent transcript evidence, so this does not change the trust
+//! class of the evidence, only which commands may carry it.
+
+use serde_json::Value;
+
+/// Flags after which a runner exits 0 without executing any test. Long flags
+/// also match as an abbreviation of at least four characters (argparse and
+/// clap accept unambiguous prefixes), erring toward `Unverified`.
+const NON_EXECUTING_LONG_FLAGS: &[&str] = &[
+    "--collect-only",
+    "--help",
+    "--version",
+    "--no-run",
+    "--list",
+    "--listTests",
+    "--passWithNoTests",
+    "--dry-run",
+    "--fixtures",
+    "--fixtures-per-test",
+    "--markers",
+    "--setup-plan",
+    "--setup-only",
+    "--showConfig",
+    "--collectonly",
+    "--cache-show",
+    "--override-ini",
+    "--clearCache",
+    "--init",
+    "--onlyChanged",
+    "--changedSince",
+    "--lastCommit",
+    "--findRelatedTests",
+    "--changed",
+    "--if-present",
+    "--no-tests",
+];
+/// `-o` is pytest's `--override-ini` (it can set `addopts=--collect-only`) and
+/// jest's `--onlyChanged` (exits 0 when nothing changed).
+const NON_EXECUTING_SHORT_FLAGS: &[&str] = &["-h", "-V", "-o"];
+
+/// Shell builtins that end the shell, change what later commands resolve to,
+/// or run other code. Inside an `&&` list any of them means an overall status
+/// of 0 no longer proves the runner ran, so the list is not identified.
+const SHELL_STATE_BUILTINS: &[&str] = &[
+    "exit", "exec", "return", "break", "continue", "source", ".", "eval", "export", "hash",
+    "alias", "unalias", "set", "enable", "declare", "typeset", "unset", "function", "trap",
+    "shopt", "builtin", "command",
+];
+
+/// Valueless launcher flags that may precede the launched runner. Any other
+/// flag may take a value (`uv run --with pytest python x.py`), which would
+/// make the value look like the program.
+const LAUNCHER_VALUELESS_FLAGS: &[&str] = &[
+    "--yes",
+    "-y",
+    "--no-install",
+    "--frozen",
+    "--locked",
+    "--isolated",
+    "--no-sync",
+    "--",
+];
+
+/// Environment assignments tolerated in front of a runner. Allowlist, not
+/// denylist: anything else (`PATH`, `PYTHONPATH`, `PYTEST_ADDOPTS`, `NODE_OPTIONS`,
+/// ...) can change which code the runner name resolves to or whether it runs
+/// any test, so a command carrying one is not identified as a test run.
+const BENIGN_ASSIGNMENTS: &[&str] = &[
+    "CI",
+    "FORCE_COLOR",
+    "NO_COLOR",
+    "RUST_BACKTRACE",
+    "RUST_LOG",
+    "CARGO_TERM_COLOR",
+    "PYTHONDONTWRITEBYTECODE",
+    "PYTHONUNBUFFERED",
+    "NODE_ENV",
+];
+
+/// True when `command` (a Claude Bash command string, or a Codex argv array,
+/// optionally wrapped in `sh|bash|zsh -c`) shows a test runner executing tests
+/// and `exit_code` is the exit status of that command.
+///
+/// * One simple command: the runner's own exit status, any value.
+/// * `a && b && ...`: `&&` runs the next command only after the previous one
+///   exited 0 and the list's status is the last one executed, so an overall
+///   status of 0 proves every command ran and exited 0. A non-zero status does
+///   not say which command failed (the runner may never have run), so it is
+///   never attributed to the runner.
+pub(crate) fn is_test_run(command: Option<&Value>, exit_code: Option<i64>) -> bool {
+    let Some(segments) = command_segments(command) else {
+        return false;
+    };
+    match segments.as_slice() {
+        [only] => simple_command_runs_tests(only),
+        _ => {
+            exit_code == Some(0)
+                && !segments.iter().any(|s| changes_shell_state(s))
+                && segments.iter().any(|s| simple_command_runs_tests(s))
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Word {
+    text: String,
+    /// Any part of the word was quoted or escaped in the source.
+    quoted: bool,
+}
+
+fn command_segments(command: Option<&Value>) -> Option<Vec<Vec<Word>>> {
+    match command? {
+        Value::String(script) => shell_segments(script),
+        Value::Array(tokens) => {
+            let argv: Vec<&str> = tokens.iter().map(Value::as_str).collect::<Option<_>>()?;
+            if argv.is_empty() {
+                return None;
+            }
+            if is_shell(argv[0]) {
+                // `sh -c <script>`: anything but exactly that shape (extra
+                // positional arguments, a missing script) is ambiguous.
+                let flag = argv.get(1)?;
+                if flag.starts_with('-') && !flag.starts_with("--") && flag.contains('c') {
+                    return if argv.len() == 3 {
+                        shell_segments(argv[2])
+                    } else {
+                        None
+                    };
+                }
+            }
+            // Directly exec'd argv: no shell, so no metacharacter is special.
+            Some(vec![argv
+                .iter()
+                .map(|t| Word {
+                    text: (*t).to_string(),
+                    quoted: true,
+                })
+                .collect()])
+        }
+        _ => None,
+    }
+}
+
+fn basename(program: &str) -> &str {
+    program.rsplit('/').next().unwrap_or(program)
+}
+
+fn is_shell(program: &str) -> bool {
+    matches!(basename(program), "sh" | "bash" | "zsh" | "dash")
+}
+
+/// Split a shell script into simple commands joined only by `&&`, or `None`
+/// when it is anything else (`;`, `||`, `|`, `&`, redirections, subshells,
+/// expansions, comments, newlines, unterminated quotes, empty commands).
+fn shell_segments(script: &str) -> Option<Vec<Vec<Word>>> {
+    let mut segments: Vec<Vec<Word>> = Vec::new();
+    let mut words: Vec<Word> = Vec::new();
+    let mut cur = String::new();
+    let mut in_word = false;
+    let mut quoted = false;
+    let mut chars = script.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            c if c.is_whitespace() && c != '\n' && c != '\r' => {
+                if in_word {
+                    words.push(Word {
+                        text: std::mem::take(&mut cur),
+                        quoted,
+                    });
+                    in_word = false;
+                    quoted = false;
+                }
+            }
+            '&' if chars.peek() == Some(&'&') => {
+                chars.next();
+                if in_word {
+                    words.push(Word {
+                        text: std::mem::take(&mut cur),
+                        quoted,
+                    });
+                    in_word = false;
+                    quoted = false;
+                }
+                if words.is_empty() {
+                    return None;
+                }
+                segments.push(std::mem::take(&mut words));
+            }
+            '\n' | '\r' | ';' | '&' | '|' | '<' | '>' | '(' | ')' | '{' | '}' | '$' | '`' => {
+                return None;
+            }
+            '#' if !in_word => return None,
+            '\\' => {
+                // A trailing backslash or a line continuation is not a plain
+                // word.
+                let next = chars.next()?;
+                if next == '\n' || next == '\r' {
+                    return None;
+                }
+                cur.push(next);
+                in_word = true;
+                quoted = true;
+            }
+            '\'' => {
+                in_word = true;
+                quoted = true;
+                loop {
+                    match chars.next()? {
+                        '\'' => break,
+                        ch => cur.push(ch),
+                    }
+                }
+            }
+            '"' => {
+                in_word = true;
+                quoted = true;
+                loop {
+                    match chars.next()? {
+                        '"' => break,
+                        '$' | '`' => return None,
+                        '\\' => match chars.next()? {
+                            ch @ ('"' | '\\' | '$' | '`') => cur.push(ch),
+                            ch => {
+                                cur.push('\\');
+                                cur.push(ch);
+                            }
+                        },
+                        ch => cur.push(ch),
+                    }
+                }
+            }
+            ch => {
+                in_word = true;
+                cur.push(ch);
+            }
+        }
+    }
+    if in_word {
+        words.push(Word { text: cur, quoted });
+    }
+    if words.is_empty() {
+        // Empty script, or a trailing `&&`.
+        return None;
+    }
+    segments.push(words);
+    Some(segments)
+}
+
+fn assignment_name(word: &Word) -> Option<&str> {
+    if word.quoted {
+        return None;
+    }
+    let (name, _) = word.text.split_once('=')?;
+    let mut chars = name.chars();
+    let valid_start = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+    (valid_start && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')).then_some(name)
+}
+
+/// An assignment-only segment, or one led by a shell-state builtin.
+fn changes_shell_state(words: &[Word]) -> bool {
+    let command = words.iter().position(|w| assignment_name(w).is_none());
+    match command {
+        None => true,
+        Some(i) => SHELL_STATE_BUILTINS.contains(&words[i].text.as_str()),
+    }
+}
+
+fn simple_command_runs_tests(words: &[Word]) -> bool {
+    let mut rest = words;
+    while let Some(first) = rest.first() {
+        match assignment_name(first) {
+            Some(name) if BENIGN_ASSIGNMENTS.contains(&name) => rest = &rest[1..],
+            Some(_) => return false,
+            None => break,
+        }
+    }
+    let args: Vec<&str> = rest.iter().map(|w| w.text.as_str()).collect();
+    runner_invocation(&args, true)
+}
+
+/// `args[0]` is the program. `allow_launcher` is true only at the top level so
+/// `uv run npx pnpm ...` chains are not followed.
+fn runner_invocation(args: &[&str], allow_launcher: bool) -> bool {
+    let Some(program) = args.first().copied() else {
+        return false;
+    };
+    let name = basename(program);
+    let tail = &args[1..];
+
+    let executes = match name {
+        "pytest" | "py.test" => true,
+        // `vitest list` / `jest list`-style subcommands only enumerate tests.
+        "vitest" | "jest" => {
+            // `-v` is `--version` for both; `init`/`list` do not run tests.
+            !matches!(tail, ["list" | "init", ..]) && !tail.contains(&"-v")
+        }
+        n if is_python(n) => matches!(tail, ["-m", "pytest", ..]),
+        "cargo" => {
+            let tail = match tail.first() {
+                Some(t) if t.starts_with('+') => &tail[1..],
+                _ => tail,
+            };
+            matches!(tail, ["test", ..] | ["nextest", "run", ..])
+        }
+        "npm" => matches!(tail, ["test", ..]),
+        "npx" | "pnpx" | "bunx" if allow_launcher => {
+            return launched_runner(tail);
+        }
+        "uv" | "poetry" if allow_launcher => {
+            return match tail {
+                ["run", rest @ ..] => launched_runner(rest),
+                _ => false,
+            };
+        }
+        "pnpm" if allow_launcher => {
+            return match tail {
+                ["exec", rest @ ..] => launched_runner(rest),
+                _ => false,
+            };
+        }
+        _ => false,
+    };
+    executes && !tail.iter().any(|a| is_non_executing_flag(a))
+}
+
+/// After a launcher (`npx`, `uv run`, ...): skip its value-less flags, then
+/// the remainder must itself be a runner invocation.
+fn launched_runner(args: &[&str]) -> bool {
+    let mut skip = 0;
+    while let Some(arg) = args.get(skip).filter(|a| a.starts_with('-')) {
+        if !LAUNCHER_VALUELESS_FLAGS.contains(arg) {
+            return false;
+        }
+        skip += 1;
+    }
+    runner_invocation(&args[skip..], false)
+}
+
+fn is_python(name: &str) -> bool {
+    name.strip_prefix("python")
+        .is_some_and(|v| v.is_empty() || v.chars().all(|c| c.is_ascii_digit() || c == '.'))
+}
+
+fn is_non_executing_flag(arg: &str) -> bool {
+    if NON_EXECUTING_SHORT_FLAGS.contains(&arg) {
+        return true;
+    }
+    // A cluster of short flags (`-qh`, `-Vq`) contains `-h` / `-V`.
+    let is_cluster = arg.len() > 2
+        && arg.starts_with('-')
+        && !arg.starts_with("--")
+        && arg[1..].chars().all(|c| c.is_ascii_alphabetic());
+    if is_cluster && arg[1..].contains(['h', 'V']) {
+        return true;
+    }
+    // `--flag=value` is the same flag.
+    let base = arg.split_once('=').map_or(arg, |(flag, _)| flag);
+    base.starts_with("--")
+        && base.len() >= 4
+        && NON_EXECUTING_LONG_FLAGS
+            .iter()
+            .any(|flag| flag.starts_with(base))
+}
