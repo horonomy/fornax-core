@@ -222,10 +222,31 @@ precede it.
   test run (for example `pytest | tail`, or `git commit -m "fix pytest"`) stops
   an older run from deciding the claim: it becomes `Unverified`.
 
-Known limits: an executable merely *named* like a runner is trusted to be that
-runner; and a runner invocation whose filter selects no tests (for example
-`cargo test no_such_test`) still exits 0, which Fornax cannot tell apart from a
-real pass.
+A recognised runner exiting 0 is still not enough for `Verified`. The runner's
+own final summary must also be seen in that command's output: a QA-owned
+executable named `pytest` that only does `exit 0`, or `cargo test no_such_test`
+(`running 0 tests`), exits 0 without running any test. Fornax therefore reads
+only the *counts* from the output's end and requires all of:
+
+* exactly one runner command (any other `&&` step must be a plain `cd <dir>`,
+  so `echo '3 passed in 0.1s' && cargo test no_such` is `Unverified`);
+* a summary in that runner's own format: pytest's final line
+  (`=== 3 passed, 1 skipped in 0.04s ===`) or every `test result:` line of
+  `cargo test` (all must be `ok.`);
+* at least one test passed and none failed (errors count as failed).
+
+Missing, zero-test, mismatched or unparseable summaries are `Unverified`. The
+summary only ever withholds `Verified`: a failing runner is still
+`Contradicted` by its exit code, and a heuristic exit code stays capped at
+`Review` whatever the output says. In this release only pytest and `cargo test`
+output is read, so `cargo nextest run`, `npm test`, `jest` and `vitest` are
+recognised (a failure is still `Contradicted`) but a pass is never `Verified`.
+
+Known limits: the summary is text the executed program itself printed, so a
+program that deliberately prints a convincing summary (a custom `pytest`
+script, a `conftest.py` hook, `harness = false`, `--nocapture`, a Jest
+reporter) can still produce `Verified`. Only host-attested exit status, a
+controlled runner receipt or CI evidence close that (ADR-0025, FORNX-443).
 
 ### Exporting a session for cloud sync (optional)
 

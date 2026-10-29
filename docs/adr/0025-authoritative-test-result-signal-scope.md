@@ -95,3 +95,18 @@ verification before merge, per this codebase's standing practice.
   `tools.shell_command` path and the `opencode` adapter already carrying a
   real signal today, and other evidence classes (file-diff, git, CI-webhook)
   not being affected by this ceiling at all.
+
+## Addendum (FORNX-477 residual, 2026-10-29): stdout summary as an extra condition
+
+QA showed a runner name plus exit 0 verified a fake `pytest` that ran no test.
+The correction uses stdout in the one way this ADR allows: it is
+*safety-monotonic*. The runner's final summary (counts only) can only add a
+condition for `Verified` (runner identified, summary in that runner's format,
+passed >= 1, failed == 0). It never grants `Verified`, never creates
+`Contradicted`, and never raises the heuristic `Review` ceiling.
+
+Residual (unchanged in kind): the summary is written by the executed program,
+so a program that prints a forged summary can still pass. Closing that needs
+options 1-3 above (host-attested exit, runner receipts, CI evidence), tracked by
+FORNX-443. Runners whose output is not read yet (`nextest`, `jest`, `vitest`,
+`npm test`) are never `Verified` until their formats are added.
