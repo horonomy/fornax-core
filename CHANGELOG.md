@@ -122,7 +122,7 @@ Jira epic FORNX-20.
   optionally inside `sh -c`. Compound (`;`, `||`, pipes), expanded,
   unparseable and non-executing (`--collect-only`, `--no-run`, ...) commands
   are `Unverified`, and a newer unidentified runner command stops an older
-  pass from being `Verified`. Genuine runner passes stay `Verified`, failures
+  pass from being `Verified`. Genuine runner passes stay `Verified` here (superseded by the REVIEW cap in the next entry), failures
   stay `Contradicted`, and heuristic exit codes stay capped at `Review`. See
   the README section "Which commands count as a test run".
 
