@@ -630,7 +630,7 @@ impl Verifier for CommandSuccessVerifier {
             },
             // A test command whose output Fornax does not read: an exit status 0
             // does not show any test ran, and there is no summary to check.
-            Some(0) if claim_is_test_command => Finding {
+            Some(0) if claim_is_test_command && !is_test_runner_evidence(ev) => Finding {
                 id: Uuid::new_v4(),
                 claim_id: claim.id,
                 verdict: Verdict::Unverified,
@@ -2305,6 +2305,29 @@ mod tests {
             "hatch run test",
             "uv run pytest -q",
             "CI=1 go test ./...",
+            // Non-benign env prefixes and wrappers.
+            "GOFLAGS=-count=1 go test ./...",
+            "timeout 60 go test ./...",
+            "time make test",
+            "sudo -E go test ./...",
+            "env CI=1 yarn test",
+            "bash -c 'go test ./...'",
+            // Script and target spellings.
+            "yarn test:unit",
+            "pnpm test:e2e",
+            "make test-unit",
+            "just test_all",
+            "npm run --silent test:unit",
+            "npm run -w pkg test",
+            // Lifecycle goals that run the suite.
+            "mvn verify",
+            "./gradlew check",
+            "make check",
+            "node --test",
+            "playwright test",
+            "turbo test",
+            "gotestsum",
+            "bats tests/",
         ] {
             assert_eq!(succeeded(literal, 0), Verdict::Unverified, "{literal}");
             assert_eq!(succeeded(literal, 1), Verdict::Contradicted, "{literal}");
@@ -2326,6 +2349,18 @@ mod tests {
             "bundle install",
             "uv run ruff check",
             "python3 script.py",
+            // A package or topic named `test`, not a suite.
+            "go build -tags test",
+            "go help test",
+            "go doc test",
+            "npm install test",
+            "yarn add test",
+            "dotnet add package test",
+            "dart pub add test",
+            "tox -e lint,format",
+            "make install",
+            "time make build",
+            "timeout 60 npm install",
         ] {
             assert_eq!(succeeded(literal, 0), Verdict::Verified, "{literal}");
         }
