@@ -240,6 +240,14 @@ zero tests and missing or malformed summaries. Host-controlled runner receipts
 or CI evidence, the route to `Verified`, are tracked as FORNX-443 and are not
 part of v0.0.9.
 
+The same bar applies when a test run is claimed under another subject: a
+`command_succeeded` claim such as "the `pytest -q` run succeeded" whose
+matched command is an identified test run needs the same passing summary and
+the same attested evidence, so it is `Review` (or `Unverified` for a fake
+runner or zero tests), not `Verified`. Commands that are not test runs, such as
+`npm install`, `cargo build` or `pip install pytest`, keep verifying from a
+literal exit code as before.
+
 The conditions below are therefore necessary but not sufficient. A recognised
 runner exiting 0 is not enough even for `Review`. The runner's
 own final summary must also be seen in that command's output: a QA-owned

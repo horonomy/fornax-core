@@ -158,6 +158,17 @@ Jira epic FORNX-20.
   summaries are FORNX-479, both outside v0.0.9. See README "Which commands
   count as a test run" and ADR-0025.
 
+- **A test run claimed as `command_succeeded` gets the same bar as
+  `test_result`** (FORNX-477, QA 29513 residual). "The `pytest -q` run
+  succeeded" reached `Verified` from the same agent-reported exit code. When
+  the command the claim names is an identified test run it now needs that
+  runner's passing summary and attested evidence: `Review` for a normal pytest
+  or `cargo test` run, `Unverified` for a fake runner, zero tests, a runner
+  whose output is not read (`jest`, `vitest`, `npm test`, `cargo nextest run`)
+  or evidence that merely mentions the runner (`echo pytest`). `Contradicted` for a non-zero exit is unchanged,
+  and non-test commands (`npm install`, `cargo build`, `pip install pytest`)
+  still verify from a literal exit code.
+
 - **Codex completion replay creates duplicate events and claims** (FORNX-446).
   Rollout `task_complete` records with a nonblank native `turn_id` now retain
   the same session-scoped completion and claim identities across tailer
