@@ -652,6 +652,108 @@ fn program_fit(claimed: &str, observed: &str) -> Fit {
     }
 }
 
+/// True when any step of the claimed command literal is a test command: a
+/// runner this module identifies, or one of the many test commands whose output
+/// Fornax does not read (`go test`, `make test`, `yarn test`, `npm run test:unit`,
+/// `rspec`, `python -m unittest`, ...). Used only by `CommandSuccessVerifier`,
+/// where such a claim asserts that tests ran and must meet the test bar; it
+/// never feeds `is_test_run` or `TestResultVerifier`.
+pub(crate) fn names_test_command(literal: &str) -> bool {
+    command_segments(Some(&Value::String(literal.to_string()))).is_some_and(|segments| {
+        segments.iter().any(|segment| {
+            let words = core(segment);
+            classify_segment(words).is_some() || known_test_command(words)
+        })
+    })
+}
+
+fn known_test_command(words: &[Word]) -> bool {
+    let args: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
+    known_test_args(&args, true)
+}
+
+/// Programs whose `test` subcommand runs a suite.
+const TEST_SUBCOMMAND_PROGRAMS: &[&str] = &[
+    "go", "mvn", "mvnw", "gradle", "gradlew", "dotnet", "deno", "bun", "swift", "mix", "bazel",
+    "bazelisk", "make", "gmake", "just", "rake", "sbt", "flutter", "dart", "yarn", "pnpm", "npm",
+    "composer", "lein", "stack", "cabal",
+];
+
+/// Programs that are test runners by themselves.
+const STANDALONE_TEST_PROGRAMS: &[&str] = &[
+    "rspec", "phpunit", "ctest", "mocha", "ava", "nose2", "behave", "karma", "jasmine", "pest",
+    "pytest", "py.test", "jest", "vitest",
+];
+
+/// `tox` / `nox` environments that are not test suites.
+const NON_TEST_ENVS: &[&str] = &[
+    "lint", "format", "fmt", "docs", "doc", "type", "types", "mypy", "ruff", "flake8", "black",
+    "isort", "style", "pylint", "clippy",
+];
+
+fn known_test_args(args: &[&str], allow_launcher: bool) -> bool {
+    let Some((program, tail)) = args.split_first() else {
+        return false;
+    };
+    let name = basename(program);
+    if TEST_SUBCOMMAND_PROGRAMS.contains(&name) {
+        // Any argument that is `test`/`tests` (`make -C x test`), or `run test*`
+        // for the JavaScript package managers. Scanning every argument fails
+        // closed on flag/value spellings.
+        let run_test = matches!(name, "npm" | "yarn" | "pnpm" | "bun")
+            && tail
+                .windows(2)
+                .any(|w| w[0] == "run" && w[1].starts_with("test"));
+        let npm_alias = name == "npm" && tail.first() == Some(&"t");
+        return run_test || npm_alias || tail.iter().any(|a| matches!(*a, "test" | "tests"));
+    }
+    if STANDALONE_TEST_PROGRAMS.contains(&name) {
+        return true;
+    }
+    if matches!(name, "tox" | "nox") {
+        // An explicit environment/session that is plainly not a test suite
+        // (`tox -e lint`) is not a test command.
+        let envs = tail
+            .windows(2)
+            .filter(|w| matches!(w[0], "-e" | "-s" | "--session"))
+            .map(|w| w[1]);
+        let mut selected = envs.peekable();
+        return selected.peek().is_none()
+            || selected.any(|e| !NON_TEST_ENVS.iter().any(|n| e.split(',').all(|p| p == *n)));
+    }
+    if is_python(name) {
+        return matches!(tail, ["-m", "unittest" | "nose2", ..]);
+    }
+    if allow_launcher {
+        let rest_after_flags = |rest: &[&str]| -> Vec<String> {
+            rest.iter()
+                .skip_while(|a| a.starts_with('-'))
+                .map(|a| (*a).to_string())
+                .collect()
+        };
+        let launched = match (name, tail) {
+            ("uv" | "poetry" | "pdm" | "hatch" | "rye", ["run", rest @ ..]) => {
+                Some(rest_after_flags(rest))
+            }
+            ("bundle", ["exec", rest @ ..]) => Some(rest_after_flags(rest)),
+            ("npx" | "pnpx" | "bunx", rest) => Some(rest_after_flags(rest)),
+            ("pnpm", ["exec", rest @ ..]) => Some(rest_after_flags(rest)),
+            _ => None,
+        };
+        if let Some(rest) = launched {
+            let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
+            // `hatch run test` / `pdm run test`: a script or environment named test*.
+            if matches!(name, "uv" | "poetry" | "pdm" | "hatch" | "rye")
+                && rest.first().is_some_and(|a| a.starts_with("test"))
+            {
+                return true;
+            }
+            return known_test_args(&rest, false);
+        }
+    }
+    false
+}
+
 /// `cd <dir>`: one plain, non-option argument.
 fn is_plain_cd(words: &[Word]) -> bool {
     matches!(words, [cd, dir] if cd.text == "cd" && !cd.quoted
