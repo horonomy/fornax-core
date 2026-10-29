@@ -47,13 +47,24 @@ fn claim(id: u128, subject: &str, text: &str) -> Claim {
 }
 
 fn exit_code_evidence(id: u128, command: &[&str], exit_code: i64) -> Evidence {
+    // FORNX-477: a passing run of a runner the verifier can read carries that
+    // runner's own passing summary (as the adapters record it); Verified needs it.
+    let mut payload = serde_json::json!({"command": command, "exit_code": exit_code});
+    let format = match command {
+        ["pytest", ..] => Some("pytest"),
+        ["cargo", "test", ..] => Some("cargo"),
+        _ => None,
+    };
+    if let (0, Some(format)) = (exit_code, format) {
+        payload["test_summary"] = serde_json::json!({"format": format, "passed": 3, "failed": 0});
+    }
     Evidence {
         id: uid(id),
         session_id: "bench-session".into(),
         source_event_id: uid(id + 2_000_000),
         kind: EvidenceKind::ExitCode,
         observed_at: FIXED_TIME.into(),
-        payload: serde_json::json!({"command": command, "exit_code": exit_code}),
+        payload,
         provenance: "bench:fixture:exec_command_end".into(),
         source: None,
         extension: None,
@@ -730,9 +741,16 @@ fn evidence_layer_ablation_benchmark() {
     // literal substring "cargo nextest") and came back `Unverified` instead
     // of `Verified` — a false negative on a healthy session, i.e.
     // unnecessary review burden. Now correctly `Verified`: benign review
-    // burden in config B is 0.
+    // burden in config B was 0.
+    //
+    // FORNX-477: a pass is now Verified only with the runner's own passing
+    // summary, which this cut reads for pytest and cargo test only. The two
+    // benign nextest / jest passes stay recognised runners but can no longer
+    // be Verified, so they join the review burden (an honest cost of not
+    // trusting an exit code alone; a runner-receipt contract, FORNX-443,
+    // is what would remove it).
     assert_eq!(
-        b.benign_review_burden, 0,
+        b.benign_review_burden, 2,
         "benign review burden in config B drifted from the doc's reported value"
     );
 }

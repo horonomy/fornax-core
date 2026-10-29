@@ -283,16 +283,23 @@ impl EvidenceSensor for OpenCodeExitCodeSensor {
             source_event_id: event.id,
             kind: EvidenceKind::ExitCode,
             observed_at: event.observed_at.clone(),
-            payload: serde_json::json!({
-                "command": event
-                    .tool_input
-                    .as_ref()
-                    .and_then(|ti| ti.get("command"))
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null),
-                "exit_code": exit,
-                "heuristic": false,
-            }),
+            payload: {
+                let mut payload = serde_json::json!({
+                    "command": event
+                        .tool_input
+                        .as_ref()
+                        .and_then(|ti| ti.get("command"))
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                    "exit_code": exit,
+                    "heuristic": false,
+                });
+                fornax_types::test_output::attach_summary(
+                    &mut payload,
+                    resp.get("output").and_then(|v| v.as_str()),
+                );
+                payload
+            },
             provenance: format!(
                 "opencode:{v}:tool.execute.after#metadata.exit",
                 v = self.adapter_version
@@ -773,6 +780,31 @@ mod tests {
             NormalizationOutcome::Ignored { .. } => {}
             other => panic!("expected Ignored, got {other:?}"),
         }
+    }
+
+    /// FORNX-477: the runner's final summary rides on the evidence as counts
+    /// only; a bare exit 0 with empty output carries none.
+    #[test]
+    fn tool_execute_after_attaches_runner_summary_counts_only() {
+        let native = |output: &str| {
+            serde_json::json!({
+                "hook": "tool.execute.after",
+                "payload": {
+                    "input": {"tool": "bash", "sessionID": "ses-1", "callID": "call_1", "args": {"command": "cargo test"}},
+                    "output": {"title": "cargo test", "metadata": {"output": output, "exit": 0, "truncated": false}, "output": output}
+                }
+            })
+        };
+        let evidence = |output: &str| match normalize(&native(output)).into_messages().remove(2) {
+            IngestMessage::Evidence(ev) => ev,
+            other => panic!("expected Evidence, got {other:?}"),
+        };
+        let ev = evidence("test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n");
+        assert_eq!(
+            ev.payload["test_summary"],
+            serde_json::json!({"format": "cargo", "passed": 5, "failed": 0})
+        );
+        assert!(evidence("").payload.get("test_summary").is_none());
     }
 
     #[test]

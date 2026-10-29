@@ -274,12 +274,18 @@ async fn wait_for_post_tool_evidence(store: &Store, session: &str) -> Evidence {
 }
 
 fn post_tool_use_payload(session_id: &str, exit_code: i64) -> Vec<u8> {
+    // FORNX-477: Verified needs the runner's own passing summary, not just exit 0.
+    let stdout = if exit_code == 0 {
+        "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n"
+    } else {
+        ""
+    };
     serde_json::json!({
         "hook_event_name": "PostToolUse",
         "session_id": session_id,
         "tool_name": "Bash",
         "tool_input": {"command": "cargo test --workspace"},
-        "tool_response": {"exit_code": exit_code, "stdout": "", "stderr": ""}
+        "tool_response": {"exit_code": exit_code, "stdout": stdout, "stderr": ""}
     })
     .to_string()
     .into_bytes()

@@ -38,6 +38,7 @@ pub mod redact;
 pub mod reliability_context;
 pub mod sensor;
 pub mod sensor_config;
+pub mod test_output;
 
 pub use adapter::{AgentAdapter, NormalizationOutcome};
 pub use audit::{

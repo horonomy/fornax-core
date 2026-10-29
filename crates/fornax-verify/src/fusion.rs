@@ -1991,7 +1991,7 @@ mod fusion_tests {
             source_event_id: Uuid::new_v4(),
             kind: EvidenceKind::ExitCode,
             observed_at: chrono::Utc::now().to_rfc3339(),
-            payload: serde_json::json!({"command": ["pytest"], "exit_code": 0}),
+            payload: serde_json::json!({"command": ["pytest"], "exit_code": 0, "test_summary": {"format": "pytest", "passed": 3, "failed": 0}}),
             provenance: "codex:rollout:exec_command_end".into(),
             source: None,
             extension: None,

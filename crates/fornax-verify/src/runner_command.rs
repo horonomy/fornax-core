@@ -369,11 +369,16 @@ fn changes_shell_state(words: &[Word]) -> bool {
 }
 
 fn simple_command_runs_tests(words: &[Word]) -> bool {
+    classify_segment(words).is_some()
+}
+
+/// Which runner a simple command executes, if it is an identified test run.
+fn classify_segment(words: &[Word]) -> Option<RunnerKind> {
     let mut rest = words;
     while let Some(first) = rest.first() {
         match assignment_name(first) {
             Some(name) if BENIGN_ASSIGNMENTS.contains(&name) => rest = &rest[1..],
-            Some(_) => return false,
+            Some(_) => return None,
             None => break,
         }
     }
@@ -381,58 +386,94 @@ fn simple_command_runs_tests(words: &[Word]) -> bool {
     runner_invocation(&args, true)
 }
 
+/// The runner families whose final summary line the output parser
+/// understands (`fornax_types::test_output`); every other identified runner is
+/// `Other` and can therefore never be `Verified` (no execution proof).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunnerKind {
+    Pytest,
+    Cargo,
+    Other,
+}
+
+/// The runner whose own output `command` produced, when that output can be
+/// attributed to it: exactly one runner step, and every other step is a
+/// silent `cd <dir>`. A list such as `echo '3 passed in 1s' && pytest` or
+/// `make && cargo test` mixes in output of another program, so it yields
+/// `None` and the output proves nothing.
+pub(crate) fn proven_runner(command: Option<&Value>) -> Option<RunnerKind> {
+    let segments = command_segments(command)?;
+    let mut runner = None;
+    for segment in &segments {
+        if let Some(kind) = classify_segment(segment) {
+            if runner.replace(kind).is_some() {
+                return None;
+            }
+        } else if !is_plain_cd(segment) {
+            return None;
+        }
+    }
+    runner.filter(|kind| *kind != RunnerKind::Other)
+}
+
+/// `cd <dir>`: one plain, non-option argument.
+fn is_plain_cd(words: &[Word]) -> bool {
+    matches!(words, [cd, dir] if cd.text == "cd" && !cd.quoted
+        && !dir.text.is_empty() && !dir.text.starts_with('-'))
+}
+
 /// `args[0]` is the program. `allow_launcher` is true only at the top level so
 /// `uv run npx pnpm ...` chains are not followed.
-fn runner_invocation(args: &[&str], allow_launcher: bool) -> bool {
-    let Some(program) = args.first().copied() else {
-        return false;
-    };
+fn runner_invocation(args: &[&str], allow_launcher: bool) -> Option<RunnerKind> {
+    let program = args.first().copied()?;
     let name = basename(program);
     let tail = &args[1..];
 
-    let executes = match name {
-        "pytest" | "py.test" => true,
+    let kind = match name {
+        "pytest" | "py.test" => Some(RunnerKind::Pytest),
         // `vitest list` / `jest list`-style subcommands only enumerate tests.
-        "vitest" | "jest" => {
-            // `-v` is `--version` for both; `init`/`list` do not run tests.
-            !matches!(tail, ["list" | "init" | "bench", ..]) && !tail.contains(&"-v")
-        }
-        n if is_python(n) => matches!(tail, ["-m", "pytest", ..]),
+        // `-v` is `--version` for both; `init`/`list` do not run tests.
+        "vitest" | "jest" => (!matches!(tail, ["list" | "init" | "bench", ..])
+            && !tail.contains(&"-v"))
+        .then_some(RunnerKind::Other),
+        n if is_python(n) => matches!(tail, ["-m", "pytest", ..]).then_some(RunnerKind::Pytest),
         "cargo" => {
             let tail = match tail.first() {
                 Some(t) if t.starts_with('+') => &tail[1..],
                 _ => tail,
             };
-            matches!(tail, ["test", ..] | ["nextest", "run", ..])
+            match tail {
+                ["test", ..] => Some(RunnerKind::Cargo),
+                ["nextest", "run", ..] => Some(RunnerKind::Other),
+                _ => None,
+            }
         }
-        "npm" => matches!(tail, ["test", ..]),
-        "npx" | "pnpx" | "bunx" if allow_launcher => {
-            return launched_runner(tail);
-        }
+        "npm" => matches!(tail, ["test", ..]).then_some(RunnerKind::Other),
+        "npx" | "pnpx" | "bunx" if allow_launcher => return launched_runner(tail),
         "uv" | "poetry" if allow_launcher => {
             return match tail {
                 ["run", rest @ ..] => launched_runner(rest),
-                _ => false,
+                _ => None,
             };
         }
         "pnpm" if allow_launcher => {
             return match tail {
                 ["exec", rest @ ..] => launched_runner(rest),
-                _ => false,
+                _ => None,
             };
         }
-        _ => false,
+        _ => None,
     };
-    executes && !tail.iter().any(|a| is_non_executing_flag(a))
+    kind.filter(|_| !tail.iter().any(|a| is_non_executing_flag(a)))
 }
 
 /// After a launcher (`npx`, `uv run`, ...): skip its value-less flags, then
 /// the remainder must itself be a runner invocation.
-fn launched_runner(args: &[&str]) -> bool {
+fn launched_runner(args: &[&str]) -> Option<RunnerKind> {
     let mut skip = 0;
     while let Some(arg) = args.get(skip).filter(|a| a.starts_with('-')) {
         if !LAUNCHER_VALUELESS_FLAGS.contains(arg) {
-            return false;
+            return None;
         }
         skip += 1;
     }

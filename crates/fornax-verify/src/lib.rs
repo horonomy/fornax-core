@@ -144,6 +144,22 @@ impl Verifier for TestResultVerifier {
                     .to_string(),
                 computed_at: now,
             },
+            // FORNX-477: a runner name and exit status 0 do not show any test
+            // ran (a script called `pytest` that only does `exit 0`, or
+            // `cargo test no_such_test`, also exit 0). `Verified` needs the
+            // runner's own passing summary, attributable to this command.
+            Some(0) if !execution_proven(ev) => Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Unverified,
+                evidence_ids: vec![ev.id],
+                verifier_name: self.name().to_string(),
+                rationale:
+                    "the test runner exited 0, but no passing-test summary from that runner \
+                            was observed for this command, so it is not shown that any test ran"
+                        .to_string(),
+                computed_at: now,
+            },
             Some(0) => Finding {
                 id: Uuid::new_v4(),
                 claim_id: claim.id,
@@ -934,6 +950,28 @@ fn command_text(payload: &serde_json::Value) -> String {
     }
 }
 
+/// True when the exit-code evidence for a runner command also carries that
+/// runner's own summary showing at least one test passed and none failed.
+/// The summary only ever adds a condition for `Verified`; it never grants one
+/// (ADR-0025's safety-monotonic bar for stdout-derived signals).
+fn execution_proven(e: &Evidence) -> bool {
+    let Some(kind) = runner_command::proven_runner(e.payload.get("command")) else {
+        return false;
+    };
+    let Some(summary) = e.payload.get("test_summary") else {
+        return false;
+    };
+    let format = summary.get("format").and_then(|v| v.as_str());
+    let passed = summary.get("passed").and_then(|v| v.as_u64());
+    let failed = summary.get("failed").and_then(|v| v.as_u64());
+    let format_matches = match kind {
+        runner_command::RunnerKind::Pytest => format == Some("pytest"),
+        runner_command::RunnerKind::Cargo => format == Some("cargo"),
+        runner_command::RunnerKind::Other => false,
+    };
+    format_matches && passed.is_some_and(|n| n >= 1) && failed == Some(0)
+}
+
 fn is_test_runner_evidence(e: &Evidence) -> bool {
     // FORNX-477: identify the runner from the executed command's structure
     // (see `runner_command`), never from a substring of the command text --
@@ -1090,7 +1128,43 @@ mod tests {
         c
     }
 
+    /// The summary a genuine run of `command` would print, as the adapters
+    /// store it (`None` when the command is not a runner whose output the
+    /// first cut can read: pytest and cargo test).
+    fn passing_summary_for(command: &serde_json::Value) -> Option<serde_json::Value> {
+        match runner_command::proven_runner(Some(command))? {
+            runner_command::RunnerKind::Pytest => {
+                Some(serde_json::json!({"format": "pytest", "passed": 3, "failed": 0}))
+            }
+            runner_command::RunnerKind::Cargo => {
+                Some(serde_json::json!({"format": "cargo", "passed": 3, "failed": 0}))
+            }
+            runner_command::RunnerKind::Other => None,
+        }
+    }
+
+    /// A genuine passing run: the exit code plus the runner's own summary.
+    fn with_passing_summary(mut e: Evidence) -> Evidence {
+        if let Some(summary) = e.payload.get("command").and_then(passing_summary_for) {
+            e.payload["test_summary"] = summary;
+        }
+        e
+    }
+
+    /// `pytest` exiting `code`; a 0 exit carries a genuine passing summary.
+    /// Use `bare_runner_evidence` for the no-output (fake runner) case.
     fn evidence_with_exit_code(code: i64) -> Evidence {
+        let e = bare_runner_evidence(code);
+        if code == 0 {
+            with_passing_summary(e)
+        } else {
+            e
+        }
+    }
+
+    /// `pytest` exiting `code` with no test summary at all: what a QA-owned
+    /// executable named `pytest` that only does `exit 0` produces.
+    fn bare_runner_evidence(code: i64) -> Evidence {
         Evidence {
             id: Uuid::new_v4(),
             session_id: "s1".into(),
@@ -1197,15 +1271,35 @@ mod tests {
         assert_eq!(f.verdict, Verdict::Contradicted);
         assert_eq!(f.evidence_ids, vec![ev[0].id]);
 
-        let ev2 = vec![evidence_for_command(&["cargo", "nextest", "run"], 0)];
+        let ev2 = vec![with_passing_summary(evidence_for_command(
+            &["cargo", "test"],
+            0,
+        ))];
         let f2 = v.verify(&c, &ev2, &caps());
         assert_eq!(f2.verdict, Verdict::Verified);
+
+        // nextest is recognised as a runner (a failure contradicts) but its
+        // output format is not read in this cut, so a pass is never Verified.
+        let ev3 = vec![evidence_for_command(&["cargo", "nextest", "run"], 0)];
+        assert_eq!(v.verify(&c, &ev3, &caps()).verdict, Verdict::Unverified);
     }
 
     /// FORNX-477: evidence_for_command with a raw `command` JSON value, so a
     /// string (Claude Bash) and an argv array (Codex) are both expressible.
     fn verdict_for_command(command: serde_json::Value, exit_code: i64) -> Verdict {
-        let mut ev = evidence_with_exit_code(exit_code);
+        let mut ev = bare_runner_evidence(exit_code);
+        ev.payload["command"] = command;
+        if exit_code == 0 {
+            ev = with_passing_summary(ev);
+        }
+        TestResultVerifier
+            .verify(&claim("All tests passed."), &[ev], &caps())
+            .verdict
+    }
+
+    /// Same as `verdict_for_command` but the run printed no recognised summary.
+    fn verdict_for_command_without_summary(command: serde_json::Value, exit_code: i64) -> Verdict {
+        let mut ev = bare_runner_evidence(exit_code);
         ev.payload["command"] = command;
         TestResultVerifier
             .verify(&claim("All tests passed."), &[ev], &caps())
@@ -1362,15 +1456,30 @@ mod tests {
             json!(["bash", "-ic", "pytest -q"]),
         ];
         for cmd in runs {
+            // Runners whose summary the first cut reads (pytest, cargo test)
+            // are Verified with a genuine passing summary; the others are
+            // still recognised (a failure contradicts) but a pass cannot be
+            // shown from their output yet, so it stays Unverified.
+            let expected_pass = if passing_summary_for(&cmd).is_some() {
+                Verdict::Verified
+            } else {
+                Verdict::Unverified
+            };
             assert_eq!(
                 verdict_for_command(cmd.clone(), 0),
-                Verdict::Verified,
+                expected_pass,
                 "command {cmd} exit 0"
             );
             assert_eq!(
                 verdict_for_command(cmd.clone(), 1),
                 Verdict::Contradicted,
                 "command {cmd} exit 1"
+            );
+            // No summary (a fake runner, or output not captured): never Verified.
+            assert_eq!(
+                verdict_for_command_without_summary(cmd.clone(), 0),
+                Verdict::Unverified,
+                "command {cmd} exit 0 without a summary"
             );
         }
     }
@@ -1383,7 +1492,7 @@ mod tests {
     /// genuine pass.
     #[test]
     fn an_older_pass_is_not_verified_over_a_newer_unidentified_runner_command() {
-        let pass = evidence_for_command(&["pytest", "-q"], 0);
+        let pass = with_passing_summary(evidence_for_command(&["pytest", "-q"], 0));
         for (newer, code) in [
             ("cd repo && pytest -q", 1),
             ("pytest -q | tail", 0),
@@ -1435,11 +1544,7 @@ mod tests {
         use serde_json::json;
         for cmd in [
             json!("cd repo && cargo test"),
-            json!("make build && pytest -q"),
-            json!("CI=1 pytest && echo done"),
-            json!("cargo test -p x 2>&1 && echo done"),
-            json!(["/bin/zsh", "-lc", "cd crates/x && cargo nextest run"]),
-            json!(["bash", "-c", "uv run pytest -q && ruff check"]),
+            json!(["/bin/zsh", "-lc", "cd crates/x && cargo test"]),
         ] {
             assert_eq!(
                 verdict_for_command(cmd.clone(), 0),
@@ -1448,6 +1553,23 @@ mod tests {
             );
             assert_eq!(
                 verdict_for_command(cmd.clone(), 1),
+                Verdict::Unverified,
+                "{cmd}"
+            );
+        }
+        // Another command in the list could have printed the summary
+        // (`echo '3 passed in 0.1s' && cargo test no_such`), so only `cd`
+        // may accompany the runner for its summary to be attributed to it.
+        for cmd in [
+            json!("make build && pytest -q"),
+            json!("CI=1 pytest && echo done"),
+            json!("cargo test -p x 2>&1 && echo done"),
+            json!(["/bin/zsh", "-lc", "cd crates/x && cargo nextest run"]),
+            json!(["bash", "-c", "uv run pytest -q && ruff check"]),
+            json!("echo '3 passed in 0.1s' && cargo test no_such"),
+        ] {
+            assert_eq!(
+                verdict_for_command(cmd.clone(), 0),
                 Verdict::Unverified,
                 "{cmd}"
             );
@@ -1522,13 +1644,157 @@ mod tests {
         }
     }
 
+    fn verdict_with_summary(
+        command: serde_json::Value,
+        exit_code: i64,
+        summary: Option<serde_json::Value>,
+    ) -> Verdict {
+        let mut ev = bare_runner_evidence(exit_code);
+        ev.payload["command"] = command;
+        if let Some(summary) = summary {
+            ev.payload["test_summary"] = summary;
+        }
+        TestResultVerifier
+            .verify(&claim("All tests passed."), &[ev], &caps())
+            .verdict
+    }
+
+    /// FORNX-477 residual: a runner name plus exit 0 is not proof that tests
+    /// ran. A QA-owned executable named `pytest` that only does `exit 0`
+    /// (and `cargo test no_such_test`) exits 0 with no passing-test summary.
+    #[test]
+    fn a_runner_name_with_exit_zero_and_no_passing_summary_is_unverified() {
+        use serde_json::json;
+        // RED: the fake `pytest` (empty output) and zero-selected cargo run.
+        assert_eq!(
+            verdict_with_summary(json!(["pytest"]), 0, None),
+            Verdict::Unverified
+        );
+        assert_eq!(
+            verdict_with_summary(
+                json!("/tmp/qa/bin/pytest"),
+                0,
+                Some(json!({"format": "pytest", "passed": 0, "failed": 0}))
+            ),
+            Verdict::Unverified
+        );
+        assert_eq!(
+            verdict_with_summary(
+                json!(["cargo", "test", "no_such_test"]),
+                0,
+                Some(json!({"format": "cargo", "passed": 0, "failed": 0}))
+            ),
+            Verdict::Unverified
+        );
+        // A summary that reports failures cannot verify, even with exit 0.
+        assert_eq!(
+            verdict_with_summary(
+                json!(["pytest"]),
+                0,
+                Some(json!({"format": "pytest", "passed": 2, "failed": 1}))
+            ),
+            Verdict::Unverified
+        );
+        // The summary must come from the runner kind that was identified.
+        assert_eq!(
+            verdict_with_summary(
+                json!(["pytest"]),
+                0,
+                Some(json!({"format": "cargo", "passed": 3, "failed": 0}))
+            ),
+            Verdict::Unverified
+        );
+        // Malformed summary shapes fail closed.
+        for bad in [
+            json!({"format": "pytest"}),
+            json!({"format": "pytest", "passed": "3", "failed": 0}),
+            json!({"format": "pytest", "passed": 3}),
+            json!("3 passed"),
+        ] {
+            assert_eq!(
+                verdict_with_summary(json!(["pytest"]), 0, Some(bad.clone())),
+                Verdict::Unverified,
+                "{bad}"
+            );
+        }
+        // GREEN: a genuine run with a matching passing summary is Verified.
+        assert_eq!(
+            verdict_with_summary(
+                json!(["pytest"]),
+                0,
+                Some(json!({"format": "pytest", "passed": 1, "failed": 0}))
+            ),
+            Verdict::Verified
+        );
+        assert_eq!(
+            verdict_with_summary(
+                json!(["/bin/zsh", "-lc", "cd crates/x && cargo test"]),
+                0,
+                Some(json!({"format": "cargo", "passed": 12, "failed": 0}))
+            ),
+            Verdict::Verified
+        );
+    }
+
+    /// The summary only ever withholds `Verified`: a genuine failing runner
+    /// stays Contradicted whatever (or nothing) the output claimed, and a
+    /// summary on non-runner evidence neither verifies nor contradicts.
+    #[test]
+    fn the_summary_never_grants_verified_or_contradicted() {
+        use serde_json::json;
+        let good = || Some(json!({"format": "pytest", "passed": 5, "failed": 0}));
+        assert_eq!(
+            verdict_with_summary(json!(["pytest"]), 1, good()),
+            Verdict::Contradicted
+        );
+        assert_eq!(
+            verdict_with_summary(json!(["pytest"]), 1, None),
+            Verdict::Contradicted
+        );
+        assert_eq!(
+            verdict_with_summary(json!(["echo", "pytest"]), 0, good()),
+            Verdict::Unverified
+        );
+        assert_eq!(
+            verdict_with_summary(json!("echo '5 passed in 0.1s' && pytest"), 0, good()),
+            Verdict::Unverified
+        );
+        assert_eq!(
+            verdict_with_summary(json!("pytest --collect-only"), 0, good()),
+            Verdict::Unverified
+        );
+        // Recognised runners whose output format is not read in this cut
+        // can never be Verified, even with a (forged) pytest-shaped summary.
+        for cmd in [
+            json!("npm test"),
+            json!("npx jest"),
+            json!("cargo nextest run"),
+        ] {
+            assert_eq!(
+                verdict_with_summary(cmd.clone(), 0, good()),
+                Verdict::Unverified,
+                "{cmd}"
+            );
+        }
+    }
+
+    /// A heuristic exit 0 (inferred from empty stderr) stays Review even
+    /// when a summary is present; the summary does not raise the ceiling.
+    #[test]
+    fn a_summary_does_not_raise_the_heuristic_ceiling() {
+        let mut ev = with_passing_summary(evidence_for_command(&["pytest", "-q"], 0));
+        ev.payload["heuristic"] = serde_json::json!(true);
+        let f = TestResultVerifier.verify(&claim("All tests passed."), &[ev], &caps());
+        assert_eq!(f.verdict, Verdict::Review);
+    }
+
     /// FORNX-477: the heuristic ceiling (FORNX-433) must survive the
     /// stricter matcher -- a heuristic exit 0 from a genuine runner stays
     /// Review, and a spoof-shaped command with a heuristic exit stays
     /// Unverified (it never reaches the exit-code branch at all).
     #[test]
     fn heuristic_ceiling_is_unchanged_by_command_identification() {
-        let mut real = evidence_for_command(&["pytest", "-q"], 0);
+        let mut real = with_passing_summary(evidence_for_command(&["pytest", "-q"], 0));
         real.payload["heuristic"] = serde_json::json!(true);
         let f = TestResultVerifier.verify(&claim("All tests passed."), &[real], &caps());
         assert_eq!(f.verdict, Verdict::Review);
