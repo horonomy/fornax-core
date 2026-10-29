@@ -105,7 +105,7 @@ claim e1-semi "pytest;true" 0
 claim e1-pipe "pytest -q | cat" 0
 claim e1-runner "pytest -q" 0 '..\n3 passed in 0.03s\n'
 claim e1-fail "cargo test" 1
-claim e1-and "cd repo && cargo test" 0 'test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n'
+claim e1-and "cd repo && cargo test" 0 'running 4 tests\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n'
 claim e1-fake "pytest" 0
 claim e1-fake-abs "/tmp/qa/bin/pytest" 0
 claim e1-zero "cargo test no_such_test" 0 'running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s\n'

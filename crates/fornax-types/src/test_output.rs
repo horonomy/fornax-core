@@ -120,10 +120,10 @@ fn pytest_summary(line: &str) -> Option<TestSummary> {
     let mut any = false;
     for part in counts.split(", ") {
         let (n, word) = part.split_once(' ')?;
-        let n: u64 = n.parse().ok()?;
+        let n = count(n)?;
         match word {
-            "passed" => passed += n,
-            "failed" | "error" | "errors" => failed += n,
+            "passed" => passed = passed.checked_add(n)?,
+            "failed" | "error" | "errors" => failed = failed.checked_add(n)?,
             "skipped" | "deselected" | "xfailed" | "xpassed" | "warning" | "warnings" | "rerun" => {
             }
             _ => return None,
@@ -137,30 +137,49 @@ fn pytest_summary(line: &str) -> Option<TestSummary> {
     })
 }
 
-/// Sum of all `test result:` lines; every one must be `ok.`.
+/// A plain run of ASCII digits that fits a `u64` (no sign, no whitespace).
+fn count(text: &str) -> Option<u64> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
+
+/// Sum of all `test result:` lines; every one must be `ok.` and each must
+/// belong to a `running N tests` header, so a test that merely prints an
+/// extra result line (`--nocapture`) leaves the counts unequal and the
+/// summary unrecognised.
 fn cargo_summary(lines: &[&str]) -> Option<TestSummary> {
     let (mut passed, mut failed) = (0u64, 0u64);
-    let mut seen = false;
+    let mut results = 0usize;
+    let running = lines
+        .iter()
+        .filter(|l| {
+            l.strip_prefix("running ")
+                .and_then(|r| r.strip_suffix(" tests").or_else(|| r.strip_suffix(" test")))
+                .is_some_and(|n| count(n).is_some())
+        })
+        .count();
     for line in lines {
         let Some(rest) = line.strip_prefix("test result: ") else {
             continue;
         };
         let rest = rest.strip_prefix("ok. ")?;
-        seen = true;
+        results += 1;
         for part in rest.split("; ") {
             let part = part.split(';').next()?.trim();
             let Some((n, word)) = part.split_once(' ') else {
                 continue;
             };
-            let Ok(n) = n.parse::<u64>() else { continue };
+            let Some(n) = count(n) else { continue };
             match word {
-                "passed" => passed += n,
-                "failed" => failed += n,
+                "passed" => passed = passed.checked_add(n)?,
+                "failed" => failed = failed.checked_add(n)?,
                 _ => {}
             }
         }
     }
-    seen.then_some(TestSummary {
+    (results > 0 && results == running).then_some(TestSummary {
         format: SummaryFormat::Cargo,
         passed,
         failed,
@@ -235,15 +254,41 @@ mod tests {
         );
         let zero = "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s\n";
         assert_eq!(summarize(zero).map(|s| s.passed), Some(0));
-        let failed = "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
+        let failed = "running 2 tests\ntest result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
         assert_eq!(summarize(failed), None);
-        let one_bad = "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
+        let one_bad = "running 3 tests\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\nrunning 1 test\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
         assert_eq!(summarize(one_bad), None);
     }
 
     #[test]
+    fn counts_that_overflow_or_carry_a_sign_are_rejected() {
+        assert_eq!(summarize("+5 passed in 1s"), None);
+        assert_eq!(
+            summarize("18446744073709551615 passed, 1 passed in 1s"),
+            None
+        );
+        assert_eq!(
+            summarize("1 passed, 18446744073709551615 failed, 1 failed in 1s"),
+            None
+        );
+        assert_eq!(summarize("99999999999999999999 passed in 1s"), None);
+        let cargo = "running 1 test\ntest result: ok. 18446744073709551615 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\nrunning 1 test\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
+        assert_eq!(summarize(cargo), None);
+    }
+
+    #[test]
+    fn a_cargo_result_line_without_its_running_header_is_not_a_summary() {
+        // A test printing its own `test result:` line (--nocapture) adds a
+        // result with no header, so the totals are not trusted.
+        let nested = "running 0 tests\ntest result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
+        assert_eq!(summarize(nested), None);
+        let bare = "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
+        assert_eq!(summarize(bare), None);
+    }
+
+    #[test]
     fn two_formats_at_once_are_ambiguous() {
-        let out = "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n2 passed in 0.02s\n";
+        let out = "running 3 tests\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n2 passed in 0.02s\n";
         assert_eq!(summarize(out), None);
     }
 

@@ -1778,6 +1778,41 @@ mod tests {
         }
     }
 
+    /// The summary must belong to the row that is judged: a later runner row
+    /// without one withholds Verified, a later failure still contradicts, and
+    /// a cargo command cannot be vouched for by a pytest-format summary (nor
+    /// the reverse).
+    #[test]
+    fn the_judged_row_must_carry_its_own_matching_summary() {
+        use serde_json::json;
+        let pass = with_passing_summary(evidence_for_command(&["pytest", "-q"], 0));
+        let later_bare = evidence_for_command(&["pytest", "-k", "x"], 0);
+        let later_fail = evidence_for_command(&["pytest", "-k", "x"], 1);
+        let judge = |rows: &[Evidence]| {
+            TestResultVerifier
+                .verify(&claim("All tests passed."), rows, &caps())
+                .verdict
+        };
+        assert_eq!(judge(&[pass.clone(), later_bare]), Verdict::Unverified);
+        assert_eq!(judge(&[pass, later_fail]), Verdict::Contradicted);
+        assert_eq!(
+            verdict_with_summary(
+                json!(["cargo", "test"]),
+                0,
+                Some(json!({"format": "pytest", "passed": 3, "failed": 0}))
+            ),
+            Verdict::Unverified
+        );
+        assert_eq!(
+            verdict_with_summary(
+                json!("python -m pytest"),
+                0,
+                Some(json!({"format": "cargo", "passed": 3, "failed": 0}))
+            ),
+            Verdict::Unverified
+        );
+    }
+
     /// A heuristic exit 0 (inferred from empty stderr) stays Review even
     /// when a summary is present; the summary does not raise the ceiling.
     #[test]

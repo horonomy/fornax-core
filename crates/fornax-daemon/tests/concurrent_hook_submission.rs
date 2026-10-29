@@ -276,7 +276,7 @@ async fn wait_for_post_tool_evidence(store: &Store, session: &str) -> Evidence {
 fn post_tool_use_payload(session_id: &str, exit_code: i64) -> Vec<u8> {
     // FORNX-477: Verified needs the runner's own passing summary, not just exit 0.
     let stdout = if exit_code == 0 {
-        "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n"
+        "running 3 tests\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n"
     } else {
         ""
     };
@@ -992,7 +992,13 @@ async fn claim_evaluated_during_a_handoff_is_downgraded_not_falsely_bound_to_sta
         source_event_id: old_event_id,
         kind: EvidenceKind::ExitCode,
         observed_at: now.clone(),
-        payload: serde_json::json!({"command": "cargo test", "exit_code": 0}),
+        payload: serde_json::json!({
+            "command": "cargo test",
+            "exit_code": 0,
+            // FORNX-477: a genuine passing run, so the handoff downgrade (not
+            // the missing-summary Unverified) is what this test exercises.
+            "test_summary": {"format": "cargo", "passed": 3, "failed": 0}
+        }),
         provenance: "claude_code:PostToolUse:Bash#tool_response".to_string(),
         // FORNX-431 slice 4: this fixture simulates real exit-code evidence
         // arriving over UDS (see `send_hook`/raw-connection submission
@@ -1172,7 +1178,13 @@ async fn second_concurrent_handoff_for_the_same_session_keeps_claims_downgraded_
         source_event_id: old_event_id,
         kind: EvidenceKind::ExitCode,
         observed_at: now.clone(),
-        payload: serde_json::json!({"command": "cargo test", "exit_code": 0}),
+        payload: serde_json::json!({
+            "command": "cargo test",
+            "exit_code": 0,
+            // FORNX-477: a genuine passing run, so the handoff downgrade (not
+            // the missing-summary Unverified) is what this test exercises.
+            "test_summary": {"format": "cargo", "passed": 3, "failed": 0}
+        }),
         provenance: "claude_code:PostToolUse:Bash#tool_response".to_string(),
         // FORNX-431 slice 4: this fixture simulates real exit-code evidence
         // arriving over UDS (see `send_hook`/raw-connection submission

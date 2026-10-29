@@ -115,7 +115,7 @@ fn send_hook(home: &Path, payload: &Value) -> i32 {
 fn post_tool_use(session: &str, exit_code: i64, agent: Option<(&str, &str)>) -> Value {
     // FORNX-477: Verified needs the runner's own passing summary, not just exit 0.
     let stdout = if exit_code == 0 {
-        "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n"
+        "running 3 tests\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n"
     } else {
         ""
     };

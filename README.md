@@ -232,7 +232,8 @@ only the *counts* from the output's end and requires all of:
   so `echo '3 passed in 0.1s' && cargo test no_such` is `Unverified`);
 * a summary in that runner's own format: pytest's final line
   (`=== 3 passed, 1 skipped in 0.04s ===`) or every `test result:` line of
-  `cargo test` (all must be `ok.`);
+  `cargo test` (all must be `ok.`, each preceded by its `running N tests`
+  header);
 * at least one test passed and none failed (errors count as failed).
 
 Missing, zero-test, mismatched or unparseable summaries are `Unverified`. The

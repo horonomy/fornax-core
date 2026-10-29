@@ -799,7 +799,7 @@ mod tests {
             IngestMessage::Evidence(ev) => ev,
             other => panic!("expected Evidence, got {other:?}"),
         };
-        let ev = evidence("test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n");
+        let ev = evidence("running 5 tests\ntest result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n");
         assert_eq!(
             ev.payload["test_summary"],
             serde_json::json!({"format": "cargo", "passed": 5, "failed": 0})
