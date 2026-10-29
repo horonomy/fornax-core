@@ -338,6 +338,7 @@ impl Verifier for CommandExecutedVerifier {
                 &claimed,
                 ev.payload.get("command"),
                 &command_text(&ev.payload),
+                exit_zero_reliable(ev),
             ) {
                 runner_command::CommandBinding::Exact => {
                     return Finding {
@@ -501,8 +502,12 @@ impl Verifier for CommandSuccessVerifier {
         // newer row that only mentions it may be the real run, so it withholds a
         // success (a recorded failure stays contradicted), as `TestResultVerifier`
         // does for a newer unidentified runner mention.
+        // Prefer the newest exact run. A newer row that ran the claimed command
+        // with extra arguments, or only mentions it, may be its real run, so it
+        // withholds an older success instead of replacing the exact row.
+        let mut mention_seen = false;
         let mut selected = None;
-        let mut newer_mention = false;
+        let mut first_prefix = None;
         for e in evidence
             .iter()
             .rev()
@@ -512,28 +517,33 @@ impl Verifier for CommandSuccessVerifier {
                 &claimed,
                 e.payload.get("command"),
                 &command_text(&e.payload),
+                exit_zero_reliable(e),
             ) {
                 runner_command::CommandBinding::Exact => {
-                    selected = Some((e, false));
+                    selected = Some((e, false, mention_seen));
                     break;
                 }
                 runner_command::CommandBinding::Prefix => {
-                    selected = Some((e, true));
-                    break;
+                    if first_prefix.is_none() {
+                        first_prefix = Some((e, true, mention_seen));
+                    }
+                    mention_seen = true;
                 }
-                runner_command::CommandBinding::Mentioned => newer_mention = true,
+                runner_command::CommandBinding::Mentioned => mention_seen = true,
                 runner_command::CommandBinding::NotBound => {}
             }
         }
+        let selected = selected.or(first_prefix);
+        let newer_mention = selected.is_some_and(|(_, _, m)| m);
 
-        let Some((ev, prefix_only)) = selected else {
+        let Some((ev, prefix_only, _)) = selected else {
             return Finding {
                 id: Uuid::new_v4(),
                 claim_id: claim.id,
                 verdict: Verdict::Unverified,
                 evidence_ids: vec![],
                 verifier_name: self.name().to_string(),
-                rationale: if newer_mention {
+                rationale: if mention_seen {
                     format!(
                         "commands that mention \"{claimed}\" were observed, but none is a run \
                          of that command"
@@ -1124,9 +1134,11 @@ impl Verifier for GitOperationVerifier {
     }
 }
 
-/// Extract the substring between the first pair of `delim` characters in
-/// `text`, trimmed. Returns `None` when `delim` doesn't appear twice or the
-/// enclosed text is empty.
+/// A genuine (non-heuristic) exit status 0.
+fn exit_zero_reliable(e: &Evidence) -> bool {
+    e.payload.get("exit_code").and_then(|v| v.as_i64()) == Some(0) && !is_heuristic_evidence(e)
+}
+
 /// The command a command_executed / command_succeeded claim names.
 enum CommandLiteral {
     None,
@@ -1161,6 +1173,9 @@ fn command_literal(text: &str) -> CommandLiteral {
     CommandLiteral::None
 }
 
+/// Extract the substring between the first pair of `delim` characters in
+/// `text`, trimmed. Returns `None` when `delim` doesn't appear twice or the
+/// enclosed text is empty.
 fn extract_delimited(text: &str, delim: char) -> Option<String> {
     let start = text.find(delim)?;
     let rest = &text[start + delim.len_utf8()..];
@@ -2068,7 +2083,6 @@ mod tests {
         );
         for row in [
             evidence_for_string("CI=1 npm install", 0),
-            evidence_for_command(&["/usr/local/bin/npm", "install"], 0),
             evidence_for_string("npm   install", 0),
         ] {
             assert_eq!(
@@ -2077,13 +2091,22 @@ mod tests {
             );
             assert_eq!(ok("I ran `npm install`.", row).0, Verdict::Verified);
         }
+        // The claim names an env assignment: the run must have used it.
+        assert_eq!(
+            ok(
+                "The `CI=1 npm install` succeeded.",
+                evidence_for_string("CI=1 npm install", 0)
+            )
+            .1,
+            Verdict::Verified
+        );
         assert_eq!(
             ok(
                 "The `CI=1 npm install` succeeded.",
                 evidence_for_command(&["npm", "install"], 0)
             )
             .1,
-            Verdict::Verified
+            Verdict::Unverified
         );
         // Whole compound claim equals a shell-wrapped argv.
         let wrapped = |code| evidence_for_command(&["bash", "-lc", "cd repo && npm install"], code);
@@ -2102,6 +2125,114 @@ mod tests {
                 evidence_for_string("git commit -m 'add jest'", 0)
             )
             .1,
+            Verdict::Verified
+        );
+    }
+
+    /// Weaker fits are capped at Review, never Verified: a bare program name
+    /// reached through an absolute path (it can be another program), and a
+    /// claim that is only part of a `cd dir && cmd` row.
+    #[test]
+    fn a_path_or_cd_wrapped_fit_is_capped_at_review() {
+        assert_eq!(
+            command_verdicts(
+                "I ran `npm install`.",
+                vec![evidence_for_command(&["/tmp/evil/npm", "install"], 0)]
+            ),
+            (Verdict::Review, Verdict::Review)
+        );
+        assert_eq!(
+            command_verdicts(
+                "I ran `pytest`.",
+                vec![evidence_for_string("cd repo && pytest", 0)]
+            )
+            .0,
+            Verdict::Review
+        );
+        // A guessed (heuristic) 0 does not show `cd` succeeded, so it does not
+        // bind at all.
+        let mut guessed = evidence_for_string("cd repo && npm install", 0);
+        guessed.payload["heuristic"] = serde_json::json!(true);
+        assert_eq!(
+            command_verdicts("I ran `npm install`.", vec![guessed]).0,
+            Verdict::Unverified
+        );
+        // A non-zero status does not show the second step ran either.
+        assert_eq!(
+            command_verdicts(
+                "I ran `npm install`.",
+                vec![evidence_for_string("cd repo && npm install", 1)]
+            )
+            .0,
+            Verdict::Unverified
+        );
+    }
+
+    /// Environment values and shell expansion are part of command identity.
+    #[test]
+    fn env_values_and_unquoted_expansions_are_part_of_the_command() {
+        // The claim names a value the run did not use.
+        assert_eq!(
+            command_verdicts(
+                "The `CI=true npm test` succeeded.",
+                vec![evidence_for_string("CI=false npm test", 0)]
+            )
+            .1,
+            Verdict::Unverified
+        );
+        // A value the claim does not mention is ignored.
+        assert_eq!(
+            command_verdicts(
+                "The `npm run build` succeeded.",
+                vec![evidence_for_string("NODE_ENV=production npm run build", 0)]
+            )
+            .1,
+            Verdict::Verified
+        );
+        // `ls *.rs` expands; `ls '*.rs'` does not.
+        assert_eq!(
+            command_verdicts(
+                "I ran `ls *.rs`.",
+                vec![evidence_for_string("ls '*.rs'", 0)]
+            )
+            .0,
+            Verdict::Unverified
+        );
+    }
+
+    /// A short claim is not "mentioned" by an unrelated word that contains it,
+    /// so it does not wrongly withhold an older exact success.
+    #[test]
+    fn a_mention_needs_word_boundaries() {
+        assert_eq!(
+            command_verdicts(
+                "The `make` succeeded.",
+                vec![
+                    evidence_for_command(&["make"], 0),
+                    evidence_for_string("cat Makefile", 0)
+                ]
+            )
+            .1,
+            Verdict::Verified
+        );
+    }
+
+    /// An older exact success is not replaced by a newer failing run of the same
+    /// command with extra arguments: that run may be the real one, so the
+    /// success is withheld rather than contradicted or confirmed.
+    #[test]
+    fn a_newer_prefix_run_withholds_instead_of_overriding_an_exact_success() {
+        let rows = vec![
+            evidence_for_command(&["npm", "install"], 0),
+            evidence_for_command(&["npm", "install", "left-pad"], 1),
+        ];
+        assert_eq!(
+            command_verdicts("The `npm install` succeeded.", rows.clone()).1,
+            Verdict::Unverified
+        );
+        // "I ran" still holds: the exact run happened.
+        assert_eq!(
+            command_verdicts("I ran `npm install`.", rows).0,
             Verdict::Verified
         );
     }

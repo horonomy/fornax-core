@@ -420,11 +420,14 @@ pub(crate) fn proven_runner(command: Option<&Value>) -> Option<RunnerKind> {
 /// (FORNX-477 exact binding). Never inferred from a substring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommandBinding {
-    /// The same command, step for step: same program, same arguments.
+    /// The same command, step for step: the same program string and the same
+    /// arguments.
     Exact,
-    /// The claimed command followed by more arguments (`npm install` claimed,
-    /// `npm install --dry-run` run). The extra arguments can change what the
-    /// command did, so this is weaker than `Exact`.
+    /// Close to the claimed command but not provably it: the claimed command
+    /// followed by more arguments (`npm install` claimed, `npm install
+    /// --dry-run` run), or the same program name reached through an absolute
+    /// path (`/tmp/x/npm`). Extra arguments can change what the command did and
+    /// an absolute path can be another program, so this is weaker than `Exact`.
     Prefix,
     /// The claimed command's text appears in the row but the row is not a run
     /// of it (`echo npm install`, `timeout 60 npm install`, a pipeline, a
@@ -443,35 +446,95 @@ pub(crate) fn claim_command_parses(literal: &str) -> bool {
 
 /// Bind a claim's command literal to one evidence row's `command`.
 /// `evidence_text_lower` is the row's flattened, lowercased command text, used
-/// only to tell `Mentioned` from `NotBound`.
+/// only to tell `Mentioned` from `NotBound`. `exit_zero_reliable` is true only
+/// for a genuine (non-heuristic) exit status 0: a plain `cd dir && cmd` row
+/// binds `cmd` only then, because a guessed 0 does not show `cd` succeeded.
 pub(crate) fn bind_command(
     claimed: &str,
     evidence: Option<&Value>,
     evidence_text_lower: &str,
+    exit_zero_reliable: bool,
 ) -> CommandBinding {
     let Some(claim_segments) = command_segments(Some(&Value::String(claimed.to_string()))) else {
         return CommandBinding::NotBound;
     };
     if let Some(evidence_segments) = command_segments(evidence) {
-        if claim_segments.len() == evidence_segments.len()
-            && claim_segments
-                .iter()
-                .zip(&evidence_segments)
-                .all(|(c, e)| words_equal(core(c), core(e)))
-        {
-            return CommandBinding::Exact;
-        }
-        if let ([claim], [observed]) = (claim_segments.as_slice(), evidence_segments.as_slice()) {
-            if words_prefix(core(claim), core(observed)) {
+        // Whole-command equality, step for step.
+        if claim_segments.len() == evidence_segments.len() {
+            let mut all_exact = true;
+            let mut all_close = true;
+            for (c, e) in claim_segments.iter().zip(&evidence_segments) {
+                match compare(c, e) {
+                    Fit::Exact => {}
+                    Fit::Close => all_exact = false,
+                    Fit::No => {
+                        all_exact = false;
+                        all_close = false;
+                    }
+                }
+            }
+            if all_exact {
+                return CommandBinding::Exact;
+            }
+            if all_close {
                 return CommandBinding::Prefix;
             }
         }
+        // A single claimed command against a single, longer command, or
+        // against `cd <dir> && <command>` with a genuine exit 0 (the only
+        // other step is a silent `cd`, so the command ran and exited 0).
+        if let [claim] = claim_segments.as_slice() {
+            let runs: Vec<&Vec<Word>> = match evidence_segments.as_slice() {
+                [only] => vec![only],
+                list if exit_zero_reliable && list.len() > 1 => {
+                    let others_are_cd = list.iter().filter(|s| !is_plain_cd(s)).count() == 1;
+                    if others_are_cd {
+                        list.iter().filter(|s| !is_plain_cd(s)).collect()
+                    } else {
+                        Vec::new()
+                    }
+                }
+                _ => Vec::new(),
+            };
+            if let [observed] = runs.as_slice() {
+                return match compare_prefix(claim, observed.as_slice()) {
+                    Fit::Exact if evidence_segments.len() == 1 => CommandBinding::Exact,
+                    Fit::Exact | Fit::Close => CommandBinding::Prefix,
+                    Fit::No => mention_or_not(claimed, evidence_text_lower),
+                };
+            }
+        }
     }
-    if !claimed.trim().is_empty() && evidence_text_lower.contains(&claimed.trim().to_lowercase()) {
-        CommandBinding::Mentioned
-    } else {
-        CommandBinding::NotBound
+    mention_or_not(claimed, evidence_text_lower)
+}
+
+/// `Mentioned` only when the claimed command's text appears at word
+/// boundaries, so a short claim such as `make` is not "mentioned" by
+/// `cat Makefile`.
+fn mention_or_not(claimed: &str, evidence_text_lower: &str) -> CommandBinding {
+    let needle = claimed.trim().to_lowercase();
+    if needle.is_empty() {
+        return CommandBinding::NotBound;
     }
+    let is_word = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/');
+    let mut from = 0;
+    while let Some(i) = evidence_text_lower[from..].find(&needle) {
+        let start = from + i;
+        let end = start + needle.len();
+        let before_ok = evidence_text_lower[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_word(c));
+        let after_ok = evidence_text_lower[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !is_word(c));
+        if before_ok && after_ok {
+            return CommandBinding::Mentioned;
+        }
+        from = start + needle.chars().next().map_or(1, char::len_utf8);
+    }
+    CommandBinding::NotBound
 }
 
 /// A segment without its leading benign environment assignments (`CI=1`),
@@ -487,33 +550,93 @@ fn core(words: &[Word]) -> &[Word] {
     rest
 }
 
-/// Same program: identical text, or a bare claimed name against an absolute
-/// path with that basename (`npm` vs `/usr/local/bin/npm`). A claimed program
-/// containing `/` must match exactly, so `./deploy.sh` never binds
-/// `./other/deploy.sh`. (Trusting a PATH-resolved name is a disclosed residual.)
-fn same_program(claimed: &str, observed: &str) -> bool {
-    claimed == observed
-        || (!claimed.contains('/') && observed.starts_with('/') && basename(observed) == claimed)
+/// The leading benign assignments of a segment, verbatim (`CI=1`).
+fn leading_assignments(words: &[Word]) -> Vec<&str> {
+    let n = words.len() - core(words).len();
+    words[..n].iter().map(|w| w.text.as_str()).collect()
 }
 
-fn words_equal(claimed: &[Word], observed: &[Word]) -> bool {
-    !claimed.is_empty()
-        && claimed.len() == observed.len()
-        && same_program(&claimed[0].text, &observed[0].text)
-        && claimed[1..]
+enum Fit {
+    Exact,
+    Close,
+    No,
+}
+
+/// Every environment assignment the claim names must appear, with the same
+/// value, on the observed command (`CI=true` does not bind `CI=false`); an
+/// observed assignment the claim does not mention is ignored.
+fn assignments_fit(claim_seg: &[Word], observed_seg: &[Word]) -> bool {
+    let observed = leading_assignments(observed_seg);
+    leading_assignments(claim_seg)
+        .iter()
+        .all(|a| observed.contains(a))
+}
+
+/// An unquoted word the shell would expand (`*.rs`, `~`) is not the same
+/// argument as its quoted spelling.
+fn word_matches(claimed: &Word, observed: &Word) -> bool {
+    if claimed.text != observed.text {
+        return false;
+    }
+    if claimed.quoted == observed.quoted {
+        return true;
+    }
+    let unquoted = if claimed.quoted { observed } else { claimed };
+    !unquoted.text.contains(['*', '?', '[', ']', '~', '{', '}'])
+}
+
+/// Exact: same program string and equal arguments. Close: the same, but the
+/// program was reached through an absolute path with the claimed basename.
+fn compare(claimed_seg: &[Word], observed_seg: &[Word]) -> Fit {
+    let (claimed, observed) = (core(claimed_seg), core(observed_seg));
+    if !assignments_fit(claimed_seg, observed_seg)
+        || claimed.is_empty()
+        || claimed.len() != observed.len()
+        || !claimed[1..]
             .iter()
             .zip(&observed[1..])
-            .all(|(c, e)| c.text == e.text)
+            .all(|(c, e)| word_matches(c, e))
+    {
+        return Fit::No;
+    }
+    program_fit(&claimed[0].text, &observed[0].text)
 }
 
-fn words_prefix(claimed: &[Word], observed: &[Word]) -> bool {
-    !claimed.is_empty()
-        && claimed.len() < observed.len()
-        && same_program(&claimed[0].text, &observed[0].text)
-        && claimed[1..]
-            .iter()
-            .zip(&observed[1..claimed.len()])
-            .all(|(c, e)| c.text == e.text)
+/// Like `compare` but the claim may be a strict prefix of the observed
+/// arguments (`Close` then, never `Exact`).
+fn compare_prefix(claimed_seg: &[Word], observed_seg: &[Word]) -> Fit {
+    let (claimed, observed) = (core(claimed_seg), core(observed_seg));
+    if !assignments_fit(claimed_seg, observed_seg)
+        || claimed.is_empty()
+        || claimed.len() > observed.len()
+    {
+        return Fit::No;
+    }
+    if !claimed[1..]
+        .iter()
+        .zip(&observed[1..claimed.len()])
+        .all(|(c, e)| word_matches(c, e))
+    {
+        return Fit::No;
+    }
+    match program_fit(&claimed[0].text, &observed[0].text) {
+        Fit::No => Fit::No,
+        _ if claimed.len() < observed.len() => Fit::Close,
+        fit => fit,
+    }
+}
+
+/// A claimed program with a path must match exactly (`./deploy.sh` never binds
+/// `./other/deploy.sh`); a bare claimed name against an absolute path with that
+/// basename is only `Close`, since a path can be a different program.
+fn program_fit(claimed: &str, observed: &str) -> Fit {
+    if claimed == observed {
+        Fit::Exact
+    } else if !claimed.contains('/') && observed.starts_with('/') && basename(observed) == claimed {
+        Fit::Close
+    } else {
+        Fit::No
+    }
 }
 
 /// `cd <dir>`: one plain, non-option argument.
