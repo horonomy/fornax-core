@@ -114,7 +114,7 @@ precision=undefined (0/0) recall=0% evidence_coverage=0% benign_review_burden=10
 
 === Configuration: B=C=D (ExitCode evidence, full verifier pipeline) ===
 verdicts: verified=7 unverified=12 contradicted=4 unavailable=1 review=0
-precision=100% recall=22% evidence_coverage=79% benign_review_burden=0% (n=24, benign_n=6)
+precision=100% recall=22% evidence_coverage=79% benign_review_burden=33% (n=24, benign_n=6)
 
 === Configuration: capability-blind (evidence present, runtime opaque) ===
 verdicts: verified=0 unverified=0 contradicted=0 unavailable=24 review=0
@@ -149,7 +149,7 @@ behavior that no longer exists.
 | Recall | 0% (see note) | 22% | **+22pp** |
 | Precision | undefined (0/0) | 100% | now defined |
 | Evidence coverage | 0% | 79% (19/24) | +79pp |
-| Benign review burden | 100% (every case is `Unverified`, so every benign case burdens review) | 0% (0/6) | **−100pp** |
+| Benign review burden | 100% (every case is `Unverified`, so every benign case burdens review) | 33% (2/6) | **−67pp** |
 
 Note on config A's recall: with zero detections and 18 ground-truth-positive
 cases (5 false-completion + 5 unsupported + 5 hallucinated + 3 of 4
@@ -159,7 +159,7 @@ omitted), recall = 0/18 = 0%, not undefined — recall's denominator
 
 **Going from claim-only to claim+ExitCode evidence is the entire
 measurable effect in this codebase today.** It moves 4 genuine detections
-from impossible to real, and it cuts benign review burden by 100 percentage
+from impossible to real, and it cuts benign review burden by 67 percentage
 points (from "every healthy session looks the same as every unhealthy one,
 because nothing is ever verified" to "no healthy session requires a human
 look"). That is a real, substantial, honestly-measured
@@ -250,7 +250,13 @@ about the current verifiers, not artifacts of fixture phrasing:
   review-burden figure in config B. **Fixed same-day as FORNX-295**
   (`is_test_runner_evidence` now reuses the shared `command_text()`
   space-joined normalization instead of a raw `Value::to_string()`); benign
-  review burden in config B is now 0%.
+  review burden in config B was 0%.
+
+  **FORNX-477 update:** a pass is now `Verified` only with the runner's own
+  passing-test summary, which is read for pytest and `cargo test` only. The two
+  benign `cargo nextest run` / `jest` passes stay recognised runners but can no
+  longer be `Verified`, so config B's benign review burden is now 33% (2/6).
+  This is the deliberate cost of not trusting runner name plus exit 0.
 
 ## Capability-blind axis
 

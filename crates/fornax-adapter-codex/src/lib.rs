@@ -465,10 +465,17 @@ impl EvidenceSensor for CodexExecCommandEndSensor {
             source_event_id: event.id,
             kind: EvidenceKind::ExitCode,
             observed_at: event.observed_at.clone(),
-            payload: serde_json::json!({
-                "command": resp.get("command").cloned().unwrap_or_default(),
-                "exit_code": code,
-            }),
+            payload: {
+                let mut payload = serde_json::json!({
+                    "command": resp.get("command").cloned().unwrap_or_default(),
+                    "exit_code": code,
+                });
+                fornax_types::test_output::attach_summary(
+                    &mut payload,
+                    resp.get("aggregated_output").and_then(|v| v.as_str()),
+                );
+                payload
+            },
             provenance: format!("codex:{v}:rollout:exec_command_end", v = ADAPTER_VERSION),
             source: Some(EvidenceSource::now(
                 self.name(),
@@ -580,11 +587,18 @@ impl EvidenceSensor for CodexCustomToolCallOutputSensor {
                 source_event_id: event.id,
                 kind: EvidenceKind::ExitCode,
                 observed_at: event.observed_at.clone(),
-                payload: serde_json::json!({
-                    "command": command,
-                    "exit_code": code,
-                    "heuristic": false,
-                }),
+                payload: {
+                    let mut payload = serde_json::json!({
+                        "command": command,
+                        "exit_code": code,
+                        "heuristic": false,
+                    });
+                    fornax_types::test_output::attach_summary(
+                        &mut payload,
+                        Some(&blocks.join("\n")),
+                    );
+                    payload
+                },
                 provenance: format!(
                     "codex:{v}:rollout:custom_tool_call_output#exit_code_text",
                     v = ADAPTER_VERSION
@@ -1047,14 +1061,21 @@ fn translate_item_completed(
                 source_event_id: event_id,
                 kind: EvidenceKind::ExitCode,
                 observed_at: now.to_string(),
-                payload: serde_json::json!({
-                    "command": command,
-                    "exit_code": code,
-                    "heuristic": false,
-                    "status": status,
-                    "exec_source": source,
-                    "native_call_id": native_id,
-                }),
+                payload: {
+                    let mut payload = serde_json::json!({
+                        "command": command,
+                        "exit_code": code,
+                        "heuristic": false,
+                        "status": status,
+                        "exec_source": source,
+                        "native_call_id": native_id,
+                    });
+                    fornax_types::test_output::attach_summary(
+                        &mut payload,
+                        item.get("aggregated_output").and_then(|v| v.as_str()),
+                    );
+                    payload
+                },
                 provenance: format!(
                     "codex:{cli_version}:rollout:item_completed:CommandExecution#exit_code"
                 ),
@@ -1959,6 +1980,124 @@ mod tests {
         });
         let _ = normalize(&mut adapter, &entry);
         assert!(adapter.item_format());
+    }
+
+    // ---- FORNX-477: the runner's own summary rides on the exit-code evidence ----
+
+    fn evidence_of(msgs: &[IngestMessage]) -> &fornax_types::Evidence {
+        msgs.iter()
+            .find_map(|m| match m {
+                IngestMessage::Evidence(ev) => Some(ev),
+                _ => None,
+            })
+            .expect("evidence")
+    }
+
+    #[test]
+    fn exec_command_end_attaches_only_the_counts_of_a_runner_summary() {
+        let entry = |output: &str| {
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "exec_command_end",
+                    "command": ["pytest", "-q"],
+                    "exit_code": 0,
+                    "aggregated_output": output
+                }
+            })
+        };
+        let msgs =
+            normalize(&mut CodexAdapter::new(), &entry("..\n2 passed in 0.02s\n")).into_messages();
+        let ev = evidence_of(&msgs);
+        assert_eq!(
+            ev.payload["test_summary"],
+            serde_json::json!({"format": "pytest", "passed": 2, "failed": 0})
+        );
+        // Raw output never lands on the evidence.
+        assert!(!ev.payload.to_string().contains("0.02s"));
+
+        // An executable that only exits 0 prints nothing: no summary.
+        let msgs = normalize(&mut CodexAdapter::new(), &entry("")).into_messages();
+        assert!(evidence_of(&msgs).payload.get("test_summary").is_none());
+
+        // Prose that merely mentions a summary is not one.
+        let msgs = normalize(
+            &mut CodexAdapter::new(),
+            &entry("it said 2 passed in 0.02s ok"),
+        )
+        .into_messages();
+        assert!(evidence_of(&msgs).payload.get("test_summary").is_none());
+    }
+
+    #[test]
+    fn item_completed_command_execution_attaches_a_cargo_summary() {
+        let mut adapter = CodexAdapter::new();
+        let _ = normalize(
+            &mut adapter,
+            &serde_json::json!({
+                "type": "session_meta",
+                "payload": {"session_id": "sess-477", "cli_version": "0.163.0"}
+            }),
+        );
+        let entry = |output: &str| {
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "id": "item_1",
+                        "type": "CommandExecution",
+                        "status": "completed",
+                        "exit_code": 0,
+                        "command": ["cargo", "test"],
+                        "aggregated_output": output,
+                        "source": "agent"
+                    }
+                }
+            })
+        };
+        let msgs = normalize(
+            &mut adapter,
+            &entry("running 3 tests\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n"),
+        )
+        .into_messages();
+        assert_eq!(
+            evidence_of(&msgs).payload["test_summary"],
+            serde_json::json!({"format": "cargo", "passed": 3, "failed": 0})
+        );
+        let msgs = normalize(&mut adapter, &entry("")).into_messages();
+        assert!(evidence_of(&msgs).payload.get("test_summary").is_none());
+    }
+
+    #[test]
+    fn custom_tool_call_output_attaches_a_pytest_summary() {
+        let mut adapter = CodexAdapter::new();
+        let call = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "call_id": "call_sum",
+                "name": "exec",
+                "input": "const r = await tools.shell_command({command:\"pytest -q\",workdir:\"/tmp\"}); text(r)\n"
+            }
+        });
+        let _ = normalize(&mut adapter, &call);
+        let output = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "call_sum",
+                "output": [
+                    {"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"},
+                    {"type": "input_text", "text": "Exit code: 0\nWall time: 0.1 seconds\nOutput:\n..\n4 passed in 0.10s\n"}
+                ]
+            }
+        });
+        let msgs = normalize(&mut adapter, &output).into_messages();
+        assert_eq!(
+            evidence_of(&msgs).payload["test_summary"],
+            serde_json::json!({"format": "pytest", "passed": 4, "failed": 0})
+        );
     }
 
     // ---- HORO-1712: item_completed/CommandExecution translation ------

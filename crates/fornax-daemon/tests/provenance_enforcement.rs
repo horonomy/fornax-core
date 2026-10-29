@@ -582,7 +582,12 @@ fn test_runner_evidence(session_id: &str, source_event_id: Uuid) -> Evidence {
         source_event_id,
         kind: EvidenceKind::ExitCode,
         observed_at: chrono::Utc::now().to_rfc3339(),
-        payload: serde_json::json!({"command": "pytest -q", "exit_code": 0}),
+        payload: serde_json::json!({
+            "command": "pytest -q",
+            "exit_code": 0,
+            // FORNX-477: Verified needs the runner's own passing summary.
+            "test_summary": {"format": "pytest", "passed": 3, "failed": 0}
+        }),
         provenance: "fornx433-sliceb-fixture".to_string(),
         source: Some(EvidenceSource::now(
             "claude_bash_exit_code_sensor_v1",

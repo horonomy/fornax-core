@@ -272,16 +272,23 @@ impl EvidenceSensor for ClaudeBashExitCodeSensor {
             source_event_id: event.id,
             kind: EvidenceKind::ExitCode,
             observed_at: event.observed_at.clone(),
-            payload: serde_json::json!({
-                "command": event
-                    .tool_input
-                    .as_ref()
-                    .and_then(|ti| ti.get("command"))
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null),
-                "exit_code": code,
-                "heuristic": explicit_code.is_none(),
-            }),
+            payload: {
+                let mut payload = serde_json::json!({
+                    "command": event
+                        .tool_input
+                        .as_ref()
+                        .and_then(|ti| ti.get("command"))
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                    "exit_code": code,
+                    "heuristic": explicit_code.is_none(),
+                });
+                fornax_types::test_output::attach_summary(
+                    &mut payload,
+                    resp.get("stdout").and_then(|v| v.as_str()),
+                );
+                payload
+            },
             provenance,
             source: Some(EvidenceSource::now(
                 self.name(),
@@ -1624,6 +1631,35 @@ mod tests {
             }
             _ => panic!("expected Evidence"),
         }
+    }
+
+    /// FORNX-477: a runner's final summary in the Bash stdout rides on the
+    /// exit-code evidence as counts only; empty or unrelated stdout adds none.
+    /// The exit code stays heuristic here, so the verifier still caps it at Review.
+    #[test]
+    fn post_tool_use_attaches_runner_summary_counts_only() {
+        let raw = |stdout: &str| {
+            serde_json::json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": "sess-1",
+                "tool_name": "Bash",
+                "tool_input": {"command": "pytest -q"},
+                "tool_response": {"stdout": stdout, "stderr": "", "interrupted": false}
+            })
+        };
+        let evidence = |stdout: &str| match normalize(&raw(stdout)).into_messages().remove(2) {
+            IngestMessage::Evidence(ev) => ev,
+            other => panic!("expected Evidence, got {other:?}"),
+        };
+        let ev = evidence("..\n2 passed in 0.02s\n");
+        assert_eq!(
+            ev.payload["test_summary"],
+            serde_json::json!({"format": "pytest", "passed": 2, "failed": 0})
+        );
+        assert_eq!(ev.payload["heuristic"], true);
+        assert!(!ev.payload.to_string().contains("0.02s"));
+        assert!(evidence("").payload.get("test_summary").is_none());
+        assert!(evidence("hello\n").payload.get("test_summary").is_none());
     }
 
     #[test]

@@ -7680,7 +7680,8 @@ mod tests {
         let entries = [
             serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
                 "id":"item_fornx446_command","type":"CommandExecution","status":"completed",
-                "exit_code":0,"command":["pytest"],"source":"agent"
+                "exit_code":0,"command":["pytest"],"source":"agent",
+                "aggregated_output":"3 passed in 0.03s\n"
             }}}),
             serde_json::json!({"type":"event_msg","ordinal":20,"timestamp":"2026-10-15T12:00:00Z",
                 "payload":{"type":"task_complete","turn_id":turn_id,"last_agent_message":last_agent_message,

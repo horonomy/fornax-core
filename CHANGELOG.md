@@ -126,6 +126,21 @@ Jira epic FORNX-20.
   stay `Contradicted`, and heuristic exit codes stay capped at `Review`. See
   the README section "Which commands count as a test run".
 
+- **A runner name plus exit 0 no longer verifies a "tests passed" claim**
+  (FORNX-477, residual). An executable named `pytest` that only does `exit 0`,
+  or `cargo test no_such_test` (zero tests selected), still produced
+  `Verified`. The Codex, Claude Code and OpenCode adapters now keep the
+  runner's final summary counts (never the raw output) on the exit-code
+  evidence, and the verifier requires, for `Verified`, exactly one identified
+  runner (other `&&` steps may only be `cd`), a summary in that runner's
+  format, at least one pass and no failure. Anything else is `Unverified`;
+  `Contradicted` and the heuristic `Review` ceiling are unchanged. In this
+  release only pytest and `cargo test` output is read, so `cargo nextest run`,
+  `npm test`, `jest` and `vitest` passes are `Unverified` (benign review burden
+  in the ablation benchmark rises from 0 to 2 of 6). A program that prints a
+  forged summary can still pass; see README "Which commands count as a test
+  run" and ADR-0025.
+
 - **Codex completion replay creates duplicate events and claims** (FORNX-446).
   Rollout `task_complete` records with a nonblank native `turn_id` now retain
   the same session-scoped completion and claim identities across tailer

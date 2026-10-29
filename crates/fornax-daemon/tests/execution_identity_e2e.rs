@@ -113,12 +113,18 @@ fn send_hook(home: &Path, payload: &Value) -> i32 {
 }
 
 fn post_tool_use(session: &str, exit_code: i64, agent: Option<(&str, &str)>) -> Value {
+    // FORNX-477: Verified needs the runner's own passing summary, not just exit 0.
+    let stdout = if exit_code == 0 {
+        "running 3 tests\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n"
+    } else {
+        ""
+    };
     let mut v = serde_json::json!({
         "hook_event_name": "PostToolUse",
         "session_id": session,
         "tool_name": "Bash",
         "tool_input": {"command": "cargo test --workspace"},
-        "tool_response": {"exit_code": exit_code, "stdout": "", "stderr": ""}
+        "tool_response": {"exit_code": exit_code, "stdout": stdout, "stderr": ""}
     });
     if let Some((id, kind)) = agent {
         v["agent_id"] = id.into();

@@ -91,8 +91,8 @@ step "E1 test-result trust (FORNX-477): only an executed test runner can verify 
 rm -f "$FORNAX_HOME/fornax.sock"
 ( "$J/bin/fornax-daemon" >"$J/daemon2.log" 2>&1 & echo $! >"$J/daemon.pid" )
 for _ in $(seq 1 40); do [ -S "$FORNAX_HOME/fornax.sock" ] && break; sleep 0.5; done
-claim(){ # <session> <command-json-string-body> <exit_code>
-  printf '{"hook_event_name":"PostToolUse","session_id":"%s","tool_name":"Bash","tool_input":{"command":"%s"},"tool_response":{"exit_code":%s,"stdout":"","stderr":""}}' "$1" "$2" "$3" | "$J/bin/fornax-hook-claude"
+claim(){ # <session> <command-json-string-body> <exit_code> [stdout-json-string-body]
+  printf '{"hook_event_name":"PostToolUse","session_id":"%s","tool_name":"Bash","tool_input":{"command":"%s"},"tool_response":{"exit_code":%s,"stdout":"%s","stderr":""}}' "$1" "$2" "$3" "${4:-}" | "$J/bin/fornax-hook-claude"
   printf '{"type":"assistant","message":{"content":[{"type":"text","text":"All tests passed."}]}}\n' > "$J/t-$1.jsonl"
   printf '{"hook_event_name":"Stop","session_id":"%s","transcript_path":"%s"}' "$1" "$J/t-$1.jsonl" | "$J/bin/fornax-hook-claude"
 }
@@ -103,16 +103,24 @@ claim e1-cat "cat jest.config.js" 0
 claim e1-or "true || pytest" 0
 claim e1-semi "pytest;true" 0
 claim e1-pipe "pytest -q | cat" 0
-claim e1-runner "pytest -q" 0
+claim e1-runner "pytest -q" 0 '..\n3 passed in 0.03s\n'
 claim e1-fail "cargo test" 1
-claim e1-and "cd repo && cargo test" 0
+claim e1-and "cd repo && cargo test" 0 'running 4 tests\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n'
+claim e1-fake "pytest" 0
+claim e1-fake-abs "/tmp/qa/bin/pytest" 0
+claim e1-zero "cargo test no_such_test" 0 'running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s\n'
+claim e1-forged "echo 3 passed in 0.1s && cargo test no_such_test" 0 '3 passed in 0.1s\n'
+claim e1-wrongfmt "cargo test" 0 '3 passed in 0.03s\n'
 sleep 2
 for s in echo pip cat or semi pipe; do
   check "e1-$s: a command that only mentions or masks a runner stays UNVERIFIED" "[ \"\$(verdict_of e1-$s)\" = '? UNVERIFIED' ]"
 done
-check "e1-runner: a real passing runner is VERIFIED" "[ \"\$(verdict_of e1-runner)\" = '✓ VERIFIED' ]"
+for s in fake fake-abs zero forged wrongfmt; do
+  check "e1-$s: runner name + exit 0 without that runner's passing-test summary stays UNVERIFIED" "[ \"\$(verdict_of e1-$s)\" = '? UNVERIFIED' ]"
+done
+check "e1-runner: a real passing runner with its summary is VERIFIED" "[ \"\$(verdict_of e1-runner)\" = '✓ VERIFIED' ]"
 check "e1-fail: a real failing runner is CONTRADICTED" "verdict_of e1-fail | grep -q CONTRADICTED"
-check "e1-and: an && list exiting 0 containing a runner is VERIFIED" "[ \"\$(verdict_of e1-and)\" = '✓ VERIFIED' ]"
+check "e1-and: cd + runner with its summary is VERIFIED" "[ \"\$(verdict_of e1-and)\" = '✓ VERIFIED' ]"
 kill "$(cat "$J/daemon.pid")" 2>/dev/null
 
 echo; [ $fail = 0 ] && echo "JOURNEY-PASS" || echo "JOURNEY-FAIL"
