@@ -115,6 +115,22 @@ options 1-3 above (host-attested exit, runner receipts, CI evidence), tracked by
 FORNX-443. Runners whose output is not read yet (`nextest`, `jest`, `vitest`,
 `npm test`) are never `Verified` until their formats are added.
 
+## Addendum (FORNX-477, 2026-10-29): a re-labelled claim gets the same bar
+
+The Option A cap below keys on the claim subject `test_result`. A claim that
+asserts a test run succeeded under the subject `command_succeeded` ("the `pytest
+-q` run succeeded") would otherwise reach `Verified` from the same
+`AgentAdjacent` exit code. `CommandSuccessVerifier` therefore applies the
+`test_result` conditions (passing summary from the runner, attested evidence)
+whenever the command it matched is an identified test run, or the claim names a
+test runner but the matched evidence is not one. Production adapters mint only
+`test_result` claims; `command_succeeded` reaches the daemon through the ingest
+socket. Non-test commands are unchanged. Residual, outside this scope: the
+command match is a substring of the evidence's command text, so a non-test
+claim such as "the `npm install` succeeded" can still be satisfied by
+`echo npm install` exiting 0; this is a status-only claim, not a claim that
+tests ran.
+
 ## Addendum (FORNX-477, 2026-10-29): `Verified` requires an attested collector (founder decision, Option A)
 
 QA comment 29501 showed that an executable named `pytest` that prints
