@@ -420,6 +420,55 @@ async fn legitimate_evidence_still_reaches_verified() {
     );
 }
 
+/// FORNX-477 (QA 29513 residual): a test-success assertion must not reach
+/// Verified just because it is submitted as `command_succeeded` instead of
+/// `test_result`. A correctly admitted (registered, AgentAdjacent) exit-code row
+/// for `pytest -q` with a genuine passing summary is the agent's own account of
+/// a test run, so it resolves to Review, as the `test_result` path does.
+#[tokio::test]
+async fn test_run_relabelled_as_command_succeeded_never_reaches_verified() {
+    for (label, summary, expected) in [
+        (
+            "passing-summary",
+            Some(serde_json::json!({"format": "pytest", "passed": 3, "failed": 0})),
+            "review",
+        ),
+        ("fake-runner-no-summary", None, "unverified"),
+    ] {
+        let daemon = start_daemon().await;
+        let store = Store::open(daemon.home.join("fornax.db"))
+            .await
+            .expect("open store db");
+        let session_id = format!("fornx477-relabel-{label}-{}", short_id());
+        let event = command_success_event(&session_id);
+        let event_id = event.id;
+        let mut claim = command_success_claim(&session_id, event_id);
+        claim.text = "the command `pytest -q` succeeded".to_string();
+        let mut evidence = legitimate_evidence(&session_id, event_id);
+        evidence.payload = serde_json::json!({"command": "pytest -q", "exit_code": 0});
+        if let Some(summary) = summary {
+            evidence.payload["test_summary"] = summary;
+        }
+
+        let verdict = submit_and_await_verdict(
+            &daemon.home.join("fornax.sock"),
+            &store,
+            event,
+            evidence,
+            claim,
+        )
+        .await;
+
+        assert_eq!(
+            verdict,
+            Some(expected.to_string()),
+            "{label}: a test run claimed as command_succeeded gets the test_result bar; \
+             daemon log:\n{}",
+            daemon.log_contents()
+        );
+    }
+}
+
 /// FORNX-437's disclosed residual: `adapter_registry_has_zero_references_in_
 /// the_verdict_computing_daemon` proves the registry is structurally
 /// unreachable from the daemon's source code, but that is not the same as a

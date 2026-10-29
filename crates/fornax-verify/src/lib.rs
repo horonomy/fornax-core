@@ -427,6 +427,9 @@ impl Verifier for CommandSuccessVerifier {
         };
 
         let exit_code = ev.payload.get("exit_code").and_then(|v| v.as_i64());
+        let claim_names_test_runner =
+            runner_command::proven_runner(Some(&serde_json::Value::String(claimed.clone())))
+                .is_some();
 
         match exit_code {
             // Same reasoning as `TestResultVerifier`'s mirror branch above:
@@ -445,6 +448,52 @@ impl Verifier for CommandSuccessVerifier {
                      verified ({})",
                     ev.provenance
                 ),
+                computed_at: now,
+            },
+            // FORNX-477: "the `pytest` run succeeded" asserts that tests ran
+            // and passed just as "all tests passed" does, so re-labelling the
+            // claim `command_succeeded` must not buy a different bar. When the
+            // matched command is an identified test run, the same conditions
+            // apply as for `test_result` (a passing summary from that runner,
+            // and evidence the agent did not write: `is_independently_attested`).
+            Some(0) if is_test_runner_evidence(ev) && !execution_proven(ev) => Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Unverified,
+                evidence_ids: vec![ev.id],
+                verifier_name: self.name().to_string(),
+                rationale: "the claimed command is a test run that exited 0, but no passing-test \
+                            summary from that runner was observed, so it is not shown that any \
+                            test ran"
+                    .to_string(),
+                computed_at: now,
+            },
+            Some(0) if is_test_runner_evidence(ev) && !is_independently_attested(ev) => Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Review,
+                evidence_ids: vec![ev.id],
+                verifier_name: self.name().to_string(),
+                rationale: format!(
+                    "the claimed command is a test run that exited 0 with a passing summary, \
+                     but that output is written by the program the agent ran and is not \
+                     independently attested, so it does not show the tests ran -- flagged for \
+                     review, not verified ({})",
+                    ev.provenance
+                ),
+                computed_at: now,
+            },
+            // The claim names a test runner but the evidence it matched is not
+            // an identified run of one (`echo pytest`, a compound command, ...).
+            Some(0) if claim_names_test_runner && !is_test_runner_evidence(ev) => Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Unverified,
+                evidence_ids: vec![ev.id],
+                verifier_name: self.name().to_string(),
+                rationale: "the claimed command is a test runner, but the matching evidence is \
+                            not an identified run of one"
+                    .to_string(),
                 computed_at: now,
             },
             Some(0) => Finding {
@@ -1735,6 +1784,120 @@ mod tests {
         TestResultVerifier
             .verify(&claim("All tests passed."), &[ev], &caps())
             .verdict
+    }
+
+    /// FORNX-477 (QA 29513 residual): "the `pytest` run succeeded" asserts that
+    /// tests passed as much as "all tests passed" does. Re-labelling the claim
+    /// `command_succeeded` must neither skip the runner/summary conditions nor
+    /// the trust bar, while commands that are not test runs keep verifying.
+    #[test]
+    fn a_test_run_relabelled_as_command_succeeded_gets_the_test_result_bar() {
+        use fornax_types::TrustClass;
+        let verdict = |text: &str, ev: Evidence, trust: Option<TrustClass>| {
+            let mut ev = ev;
+            if let Some(trust) = trust {
+                ev.source = Some(source_with(trust));
+            }
+            CommandSuccessVerifier
+                .verify(&claim_for("command_succeeded", text), &[ev], &caps())
+                .verdict
+        };
+        let passing = |cmd: &[&str]| with_passing_summary(evidence_for_command(cmd, 0));
+        let agent = || Some(TrustClass::AgentAdjacent);
+
+        // RED before the fix: these were Verified from the agent's own account.
+        assert_eq!(
+            verdict(
+                "The `pytest -q` run succeeded.",
+                passing(&["pytest", "-q"]),
+                agent()
+            ),
+            Verdict::Review
+        );
+        assert_eq!(
+            verdict(
+                "The `cargo test` run completed successfully.",
+                passing(&["cargo", "test"]),
+                agent()
+            ),
+            Verdict::Review
+        );
+        // No recorded source is not attested either.
+        let mut unsourced = passing(&["pytest", "-q"]);
+        unsourced.source = None;
+        assert_eq!(
+            verdict("The `pytest -q` run succeeded.", unsourced, None),
+            Verdict::Review
+        );
+        // Fake runner (exit 0, no summary) and a zero-test run stay Unverified.
+        assert_eq!(
+            verdict(
+                "The `pytest` run succeeded.",
+                evidence_for_command(&["pytest"], 0),
+                agent()
+            ),
+            Verdict::Unverified
+        );
+        let mut zero = evidence_for_command(&["cargo", "test", "no_such_test"], 0);
+        zero.payload["test_summary"] =
+            serde_json::json!({"format": "cargo", "passed": 0, "failed": 0});
+        assert_eq!(
+            verdict(
+                "The `cargo test no_such_test` run succeeded.",
+                zero,
+                agent()
+            ),
+            Verdict::Unverified
+        );
+        // The claim names a runner but the matched evidence merely mentions it.
+        assert_eq!(
+            verdict(
+                "The `pytest` run succeeded.",
+                evidence_for_command(&["echo", "pytest"], 0),
+                agent()
+            ),
+            Verdict::Unverified
+        );
+        // A real failing run is still contradicted.
+        assert_eq!(
+            verdict(
+                "The `pytest -q` run succeeded.",
+                evidence_for_command(&["pytest", "-q"], 1),
+                agent()
+            ),
+            Verdict::Contradicted
+        );
+        // Positive control: an attested channel still verifies a real run
+        // (fixture attestor; production ships none).
+        assert_eq!(
+            verdict(
+                "The `pytest -q` run succeeded.",
+                passing(&["pytest", "-q"]),
+                Some(TrustClass::HostObserved)
+            ),
+            Verdict::Verified
+        );
+        // Legitimate non-test commands are unaffected, including ones that merely
+        // mention a runner's name.
+        for (text, cmd) in [
+            ("The `npm install` succeeded.", vec!["npm", "install"]),
+            ("The `cargo build` succeeded.", vec!["cargo", "build"]),
+            (
+                "The `pip install pytest` succeeded.",
+                vec!["pip", "install", "pytest"],
+            ),
+        ] {
+            assert_eq!(
+                verdict(text, evidence_for_command(&cmd, 0), agent()),
+                Verdict::Verified,
+                "{text}"
+            );
+            assert_eq!(
+                verdict(text, evidence_for_command(&cmd, 1), agent()),
+                Verdict::Contradicted,
+                "{text}"
+            );
+        }
     }
 
     /// FORNX-477 trust boundary (QA 29501): a forged passing summary printed
