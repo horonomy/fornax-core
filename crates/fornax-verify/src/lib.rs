@@ -558,6 +558,9 @@ impl Verifier for CommandSuccessVerifier {
         };
 
         let exit_code = ev.payload.get("exit_code").and_then(|v| v.as_i64());
+        // A claim that a test command succeeded asserts that tests ran, whatever
+        // the tool (`go test`, `make test`, `yarn test`, `rspec`, ...).
+        let claim_is_test_command = runner_command::names_test_command(&claimed);
 
         let finding = match exit_code {
             // Same reasoning as `TestResultVerifier`'s mirror branch above:
@@ -622,6 +625,19 @@ impl Verifier for CommandSuccessVerifier {
                 verifier_name: self.name().to_string(),
                 rationale: "an earlier run of the command exited 0, but a more recent command \
                             that mentions it could not be identified as a run of it"
+                    .to_string(),
+                computed_at: now,
+            },
+            // A test command whose output Fornax does not read: an exit status 0
+            // does not show any test ran, and there is no summary to check.
+            Some(0) if claim_is_test_command && !is_test_runner_evidence(ev) => Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Unverified,
+                evidence_ids: vec![ev.id],
+                verifier_name: self.name().to_string(),
+                rationale: "the claimed command is a test command whose results Fornax cannot \
+                            read, so an exit status 0 does not show that any test ran"
                     .to_string(),
                 computed_at: now,
             },
@@ -2241,6 +2257,145 @@ mod tests {
             )
             .1,
             Verdict::Unverified
+        );
+    }
+
+    /// FORNX-477: test commands Fornax has no summary format for (`go test`,
+    /// `make test`, `yarn test`, ...) cannot verify "the command succeeded" from an
+    /// exit status 0, while a failure is still a failure and look-alike commands
+    /// that are not test runs keep verifying.
+    #[test]
+    fn unrecognised_test_commands_cannot_verify_a_success_claim() {
+        let succeeded = |literal: &str, code: i64| {
+            command_verdicts(
+                &format!("The `{literal}` succeeded."),
+                vec![evidence_for_string(literal, code)],
+            )
+            .1
+        };
+        for literal in [
+            "go test ./...",
+            "make test",
+            "make -C crates/x test",
+            "yarn test",
+            "yarn --silent test",
+            "pnpm test",
+            "bun test",
+            "npm t",
+            "npm run test",
+            "npm run test:unit",
+            "yarn run test",
+            "tox",
+            "tox -e py312",
+            "nox -s tests",
+            "python3 -m unittest discover",
+            "mvn test",
+            "./gradlew test",
+            "dotnet test",
+            "deno test",
+            "swift test",
+            "mix test",
+            "bazel test //...",
+            "rspec",
+            "bundle exec rspec",
+            "phpunit",
+            "ctest",
+            "mocha",
+            "pdm run pytest",
+            "hatch run test",
+            "uv run pytest -q",
+            "CI=1 go test ./...",
+            // Non-benign env prefixes and wrappers.
+            "GOFLAGS=-count=1 go test ./...",
+            "timeout 60 go test ./...",
+            "time make test",
+            "sudo -E go test ./...",
+            "env CI=1 yarn test",
+            "bash -lc 'go test ./...'",
+            // Script and target spellings.
+            "yarn test:unit",
+            "pnpm test:e2e",
+            "make test-unit",
+            "just test_all",
+            "npm run --silent test:unit",
+            "npm run -w pkg test",
+            // Lifecycle goals that run the suite.
+            "mvn verify",
+            "./gradlew check",
+            "make check",
+            "node --test",
+            "playwright test",
+            "turbo test",
+            "gotestsum",
+            "bats tests/",
+            // A flag value named like a package verb is not the verb.
+            "go -C build test",
+            "dart pub run test",
+            "flutter pub run test",
+            "pnpm exec jest",
+            "sudo -u root go test ./...",
+            "nice -n 10 go test ./...",
+            "sudo -n go test ./...",
+            "env -C crates go test ./...",
+            "nice -n go test ./...",
+            "timeout -k 5 60 go test ./...",
+            "pnpm exec --silent jest",
+            "pnpm -r exec jest",
+            "pnpm exec -- vitest",
+            "timeout -s KILL 60 go test ./...",
+            "ionice -c 2 go test ./...",
+            "time -p go test ./...",
+            "setsid go test ./...",
+            "caffeinate go test ./...",
+            "npm it",
+            "npm install-test",
+            "mvn install",
+            "gradle build",
+            "dart pub global run test",
+        ] {
+            assert_eq!(succeeded(literal, 0), Verdict::Unverified, "{literal}");
+            assert_eq!(succeeded(literal, 1), Verdict::Contradicted, "{literal}");
+        }
+        // Not test commands: still verify from a literal exit status.
+        for literal in [
+            "go build ./...",
+            "go vet ./...",
+            "make build",
+            "make install",
+            "yarn install",
+            "npm run build",
+            "npm install test-utils",
+            "pip install pytest",
+            "dotnet build",
+            "tox -e lint",
+            "nox -s lint",
+            "cargo build",
+            "bundle install",
+            "uv run ruff check",
+            "python3 script.py",
+            // A package or topic named `test`, not a suite.
+            "go build -tags test",
+            "go help test",
+            "go doc test",
+            "npm install test",
+            "yarn add test",
+            "dotnet add package test",
+            "dart pub add test",
+            "tox -e lint,format",
+            "make install",
+            "time make build",
+            "timeout 60 npm install",
+        ] {
+            assert_eq!(succeeded(literal, 0), Verdict::Verified, "{literal}");
+        }
+        // "I ran" only asserts execution and is untouched.
+        assert_eq!(
+            command_verdicts(
+                "I ran `go test ./...`.",
+                vec![evidence_for_string("go test ./...", 0)]
+            )
+            .0,
+            Verdict::Verified
         );
     }
 

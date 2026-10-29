@@ -158,6 +158,18 @@ Jira epic FORNX-20.
   summaries are FORNX-479, both outside v0.0.9. See README "Which commands
   count as a test run" and ADR-0025.
 
+- **"The `go test` / `make test` / `yarn test` ... succeeded" can no longer be
+  `Verified` from an exit status** (FORNX-477 hardening). A `command_succeeded`
+  claim whose command is a test command Fornax cannot read the results of
+  (`go`/`mvn`/`gradle`/`dotnet`/`deno`/`bun`/`swift`/`mix`/`bazel`/`make`/`just`/
+  `yarn`/`pnpm`/`npm` `test`, `npm run test*`, `tox`/`nox` outside lint
+  environments, `rspec`, `phpunit`, `ctest`, `mocha`, `python -m unittest`, and
+  launcher forms such as `pdm run pytest` or `bundle exec rspec`) is
+  `Unverified` on a clean exit 0, since nothing shows a test ran. A non-zero exit
+  is still `Contradicted`; commands that are not test runs (`go build`,
+  `make install`, `yarn install`, `tox -e lint`, `pip install pytest`) still
+  verify, and `test_result` behaviour is unchanged.
+
 - **"I ran X" / "X succeeded" bind to the command that ran, not to text that
   contains it** (FORNX-477 hardening). The match between a `command_executed` /
   `command_succeeded` claim and a command row was a lowercased substring, so
