@@ -167,7 +167,9 @@ Jira epic FORNX-20.
   lists, another program path or letter case) is `Unverified`, and a newer
   mention withholds an older success. A claim naming more than one command, or
   a command that cannot be parsed, is `Unverified`. A claim that is a prefix of
-  the command that ran (`npm install` vs `npm install --dry-run`) is `Review`.
+  the command that ran (`npm install` vs `npm install --dry-run`), a bare program
+  name reached through an absolute path, or one step of a `cd dir && cmd` row is
+  `Review`; an env prefix the claim names (`CI=true`) must match in value.
   A real failure is still `Contradicted`. `npm install`, `cargo build` and
   similar exact runs keep verifying from a literal exit code.
 
