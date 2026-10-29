@@ -762,8 +762,11 @@ fn evidence_layer_ablation_benchmark() {
     // agent's provider account carries (`AgentAdjacent`, every fixture here)
     // never reaches Verified, so the benign pytest pass joins the burden too:
     // 3 of the 6 benign sessions. Only an attested collector (FORNX-443) removes it.
+    //
+    // FORNX-480 (founder decision, Option B): the benign `command_succeeded`
+    // claim is the same agent-adjacent exit code, so it joins the burden: 4 of 6.
     assert_eq!(
-        b.benign_review_burden, 3,
+        b.benign_review_burden, 4,
         "benign review burden in config B drifted from the doc's reported value"
     );
 }

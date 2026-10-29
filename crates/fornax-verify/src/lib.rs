@@ -641,6 +641,24 @@ impl Verifier for CommandSuccessVerifier {
                     .to_string(),
                 computed_at: now,
             },
+            // FORNX-480 (founder, Option B): the same trust bar as `test_result`.
+            // An exit code from the agent's own session cannot show that the
+            // claimed program (rather than a shadowing executable of the same
+            // name) ran and exited 0, so it never reaches `Verified` alone.
+            Some(0) if !is_independently_attested(ev) => Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Review,
+                evidence_ids: vec![ev.id],
+                verifier_name: self.name().to_string(),
+                rationale: format!(
+                    "observed command exit_code=0, but the exit status comes from the agent's \
+                     own session and is not independently attested, so it does not show the \
+                     claimed program ran and succeeded -- flagged for review, not verified ({})",
+                    ev.provenance
+                ),
+                computed_at: now,
+            },
             Some(0) => Finding {
                 id: Uuid::new_v4(),
                 claim_id: claim.id,
@@ -2627,8 +2645,9 @@ mod tests {
             ),
             Verdict::Verified
         );
-        // Legitimate non-test commands are unaffected, including ones that merely
-        // mention a runner's name.
+        // Non-test commands are capped at Review on agent-adjacent evidence
+        // (FORNX-480) and verify only when attested; a failure is still
+        // contradicted. This includes commands that merely mention a runner's name.
         for (text, cmd) in [
             ("The `npm install` succeeded.", vec!["npm", "install"]),
             ("The `cargo build` succeeded.", vec!["cargo", "build"]),
@@ -2639,6 +2658,15 @@ mod tests {
         ] {
             assert_eq!(
                 verdict(text, evidence_for_command(&cmd, 0), agent()),
+                Verdict::Review,
+                "{text}"
+            );
+            assert_eq!(
+                verdict(
+                    text,
+                    evidence_for_command(&cmd, 0),
+                    Some(TrustClass::HostObserved)
+                ),
                 Verdict::Verified,
                 "{text}"
             );
@@ -2648,6 +2676,94 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    /// FORNX-480 (founder, Option B): a program-success claim is not `Verified`
+    /// from exit-code evidence the agent's own session produced. A shadowing
+    /// executable that exits 0 is indistinguishable from the real program there.
+    #[test]
+    fn command_success_needs_an_attested_source_to_verify() {
+        use fornax_types::{CollectionMethod, EvidenceSource, Provider, TrustClass};
+        let claim = claim_for("command_succeeded", "The `npm install` succeeded.");
+        let run = |ev: Evidence| {
+            CommandSuccessVerifier
+                .verify(&claim, &[ev], &caps())
+                .verdict
+        };
+        let with = |name: &'static str, trust: TrustClass, code: i64| {
+            let mut ev = evidence_for_command(&["npm", "install"], code);
+            ev.source = Some(EvidenceSource::now(
+                name,
+                trust,
+                Some(Provider::Codex),
+                CollectionMethod::FilePoll,
+                None,
+            ));
+            ev
+        };
+        // RED before the fix: an executable named `npm` that only exits 0.
+        assert_eq!(
+            run(with("codex_exec_sensor", TrustClass::AgentAdjacent, 0)),
+            Verdict::Review
+        );
+        // Unregistered sensor claiming a host-observed class: the label alone is
+        // not enough.
+        assert_eq!(
+            run(with("forged_sensor", TrustClass::HostObserved, 0)),
+            Verdict::Review
+        );
+        assert_eq!(
+            run(with("forged_sensor", TrustClass::IndependentExternal, 0)),
+            Verdict::Review
+        );
+        // A registered attestor labelled agent-adjacent is not attested either.
+        assert_eq!(
+            run(with(
+                "test_fixture_run_attestor",
+                TrustClass::AgentAdjacent,
+                0
+            )),
+            Verdict::Review
+        );
+        // No recorded source.
+        let mut unsourced = with("x", TrustClass::HostObserved, 0);
+        unsourced.source = None;
+        assert_eq!(run(unsourced), Verdict::Review);
+        // GREEN control: registered attestor with an independent class.
+        assert_eq!(
+            run(with(
+                "test_fixture_run_attestor",
+                TrustClass::HostObserved,
+                0
+            )),
+            Verdict::Verified
+        );
+        assert_eq!(
+            run(with(
+                "test_fixture_run_attestor",
+                TrustClass::IndependentExternal,
+                0
+            )),
+            Verdict::Verified
+        );
+        // Failure semantics are preserved: a recorded non-zero exit is still
+        // contradicted, whatever the source.
+        assert_eq!(
+            run(with("codex_exec_sensor", TrustClass::AgentAdjacent, 1)),
+            Verdict::Contradicted
+        );
+        // `command_executed` keeps its meaning (ran, not succeeded): unchanged.
+        let executed = claim_for("command_executed", "I ran `npm install`.");
+        assert_eq!(
+            CommandExecutedVerifier
+                .verify(
+                    &executed,
+                    &[with("codex_exec_sensor", TrustClass::AgentAdjacent, 0)],
+                    &caps()
+                )
+                .verdict,
+            Verdict::Verified
+        );
     }
 
     /// FORNX-477 trust boundary (QA 29501): a forged passing summary printed

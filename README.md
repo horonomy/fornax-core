@@ -245,8 +245,11 @@ The same bar applies when a test run is claimed under another subject: a
 matched command is an identified test run needs the same passing summary and
 the same attested evidence, so it is `Review` (or `Unverified` for a fake
 runner or zero tests), not `Verified`. Commands that are not test runs, such as
-`npm install`, `cargo build` or `pip install pytest`, keep verifying from a
-literal exit code as before.
+`npm install`, `cargo build` or `pip install pytest`, are capped at `Review` in
+the same way (FORNX-480): the exit status comes from the agent's own session and
+cannot show that the claimed program, rather than a same-named executable, ran
+and succeeded. A literal non-zero exit is still `Contradicted`, and a
+`command_executed` claim ("I ran `cargo build`") keeps its current meaning.
 
 The conditions below are therefore necessary but not sufficient. A recognised
 runner exiting 0 is not enough even for `Review`. The runner's

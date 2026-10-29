@@ -114,7 +114,7 @@ precision=undefined (0/0) recall=0% evidence_coverage=0% benign_review_burden=10
 
 === Configuration: B=C=D (ExitCode evidence, full verifier pipeline) ===
 verdicts: verified=7 unverified=12 contradicted=4 unavailable=1 review=0
-precision=100% recall=22% evidence_coverage=79% benign_review_burden=50% (n=24, benign_n=6)
+precision=100% recall=22% evidence_coverage=79% benign_review_burden=67% (n=24, benign_n=6)
 
 === Configuration: capability-blind (evidence present, runtime opaque) ===
 verdicts: verified=0 unverified=0 contradicted=0 unavailable=24 review=0
@@ -149,7 +149,7 @@ behavior that no longer exists.
 | Recall | 0% (see note) | 22% | **+22pp** |
 | Precision | undefined (0/0) | 100% | now defined |
 | Evidence coverage | 0% | 79% (19/24) | +79pp |
-| Benign review burden | 100% (every case is `Unverified`, so every benign case burdens review) | 50% (3/6) | **−50pp** |
+| Benign review burden | 100% (every case is `Unverified`, so every benign case burdens review) | 67% (4/6) | **−33pp** |
 
 Note on config A's recall: with zero detections and 18 ground-truth-positive
 cases (5 false-completion + 5 unsupported + 5 hallucinated + 3 of 4
@@ -159,9 +159,9 @@ omitted), recall = 0/18 = 0%, not undefined — recall's denominator
 
 **Going from claim-only to claim+ExitCode evidence is the entire
 measurable effect in this codebase today.** It moves 4 genuine detections
-from impossible to real, and it cuts benign review burden by 50 percentage
+from impossible to real, and it cuts benign review burden by 33 percentage
 points (from "every healthy session looks the same as every unhealthy one,
-because nothing is ever verified" to "half of the healthy sessions still
+because nothing is ever verified" to "two thirds of the healthy sessions still
 require a human look", see the FORNX-477 updates below). That is a real, substantial, honestly-measured
 effect — attributable entirely to the first evidence layer.
 
@@ -268,6 +268,11 @@ about the current verifiers, not artifacts of fixture phrasing:
   `benign_review_burden` figure was changed; its `verified`/`review` verdict
   counts predate this change and should be re-run before being quoted.
 
+  **FORNX-480 update (2026-10-29, founder Option B):** a `command_succeeded`
+  claim on agent-adjacent exit-code evidence is capped at `Review` as well, so
+  config B's benign review burden is now 67% (4/6). Same caveat: only the
+  `benign_review_burden` figure was changed.
+
 ## Capability-blind axis
 
 When `ToolTrace` and `FinalResponse` are both reported `Unknown` — the
@@ -286,7 +291,7 @@ owner's decision per the ticket's "final business interpretation remains
 owner decision," not as a declared conclusion.
 
 - Not **PIVOT**: the one evidence layer that exists produces a real,
-  substantial, honestly-measured effect (0 → 4 detections, 100% → 50% drop
+  substantial, honestly-measured effect (0 → 4 detections, 100% → 67% drop
   in benign review burden). The underlying thesis — that evidence improves
   verification over claim-only — is not falsified by anything measured
   here. It has one real, positive data point behind it.

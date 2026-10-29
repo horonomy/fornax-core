@@ -184,13 +184,13 @@ fn legitimate_evidence(session_id: &str, source_event_id: Uuid) -> Evidence {
     }
 }
 
-fn command_success_claim(session_id: &str, source_event_id: Uuid) -> Claim {
+fn command_executed_claim(session_id: &str, source_event_id: Uuid) -> Claim {
     Claim {
         id: Uuid::new_v4(),
         session_id: session_id.to_string(),
         source_event_id,
-        text: "the command `cargo build` succeeded".to_string(),
-        subject: "command_succeeded".to_string(),
+        text: "I ran `cargo build`".to_string(),
+        subject: "command_executed".to_string(),
         claimed_at: chrono::Utc::now().to_rfc3339(),
     }
 }
@@ -218,7 +218,7 @@ async fn critical_evidence_submitted_through_real_pipeline_survives_a_hard_resta
     let session_id = format!("fornx434-restart-{}", short_id());
     let event = command_success_event(&session_id);
     let event_id = event.id;
-    let claim = command_success_claim(&session_id, event_id);
+    let claim = command_executed_claim(&session_id, event_id);
     let claim_id = claim.id;
     let evidence = legitimate_evidence(&session_id, event_id);
 
