@@ -7770,7 +7770,8 @@ mod tests {
             (2, 1, 1)
         );
         assert_eq!(first.findings.len(), 1);
-        assert_eq!(first.findings[0].verdict, "verified");
+        // FORNX-477: a transcript-derived pass is capped at review.
+        assert_eq!(first.findings[0].verdict, "review");
 
         process_codex_completion(
             &state,
@@ -7827,7 +7828,8 @@ mod tests {
             (2, 1, 1)
         );
         assert_eq!(first.findings.len(), 1);
-        assert_eq!(first.findings[0].verdict, "verified");
+        // FORNX-477: a transcript-derived pass is capped at review.
+        assert_eq!(first.findings[0].verdict, "review");
 
         process_codex_completion(
             &state,
@@ -7975,7 +7977,8 @@ mod tests {
             ),
             (2, 1, 1, 1)
         );
-        assert_eq!(first.findings[0].verdict, "verified");
+        // FORNX-477: a transcript-derived pass is capped at review.
+        assert_eq!(first.findings[0].verdict, "review");
         assert_eq!(first.quarantine, 1);
         process_codex_completion(
             &reopened,
@@ -8011,7 +8014,8 @@ mod tests {
         let before = codex_completion_snapshot(&state, session).await;
         assert_eq!(before.claims.len(), 1);
         assert_eq!(before.findings.len(), 1);
-        assert_eq!(before.findings[0].verdict, "verified");
+        // FORNX-477: a transcript-derived pass is capped at review.
+        assert_eq!(before.findings[0].verdict, "review");
         assert!(!before.claims[0].2.contains(&canary));
         assert!(before.claims[0].2.starts_with("All tests passed."));
         let event = state

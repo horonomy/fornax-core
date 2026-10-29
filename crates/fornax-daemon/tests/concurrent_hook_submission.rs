@@ -448,11 +448,20 @@ async fn independent_sessions_submitted_concurrently_are_not_lost_or_mixed_up() 
             1,
             "session {session} should produce exactly its own one finding"
         );
+        // FORNX-477: the hook's tool_response is the agent's own account, so a
+        // passing run is capped at review. The handoff guard also yields review,
+        // so check the rationale to tell the two apart.
         assert_eq!(
-            findings[0].verdict, "verified",
+            findings[0].verdict, "review",
             "session {session}: a concurrently-submitted PostToolUse(exit 0) + Stop pair \
-             should resolve VERIFIED, not {:?}",
+             should resolve REVIEW (unattested passing run), not {:?}",
             findings[0].verdict
+        );
+        assert!(
+            !findings[0].rationale.contains("downgraded"),
+            "session {session}: the finding must be the verifier's own review, not a \
+             handoff/replay downgrade; rationale={}",
+            findings[0].rationale
         );
         let evidence = expected_evidence_by_session
             .get(session)
@@ -559,13 +568,21 @@ async fn many_sessions_evidence_then_claim_phases_stay_serialized_under_contenti
             1,
             "session {session} should produce exactly one finding under contention"
         );
+        // FORNX-477: an unattested passing run is capped at review; the
+        // rationale rules out a handoff/replay downgrade producing the same verdict.
         assert_eq!(
-            findings[0].verdict, "verified",
+            findings[0].verdict, "review",
             "session {session}: concurrent multi-session contention on the processing mutex \
-             must still resolve VERIFIED, not {:?} — a regression here means concurrent \
-             Events/Claims from other sessions are affecting this session's finding despite \
-             its own decoded evidence being present before phase 2 (FORNX-281)",
+             must still resolve REVIEW (unattested passing run), not {:?} — a regression here \
+             means concurrent Events/Claims from other sessions are affecting this session's \
+             finding despite its own decoded evidence being present before phase 2 (FORNX-281)",
             findings[0].verdict
+        );
+        assert!(
+            !findings[0].rationale.contains("downgraded"),
+            "session {session}: the finding must be the verifier's own review, not a \
+             handoff/replay downgrade; rationale={}",
+            findings[0].rationale
         );
         let claims = store
             .claims_for_session(session)
@@ -948,19 +965,21 @@ async fn an_idle_long_lived_connection_does_not_block_a_later_one_shot_connectio
 /// handoff and bind to currently-visible (but about to be superseded)
 /// evidence.
 ///
-/// Reproduces the review's "dangerous direction" finding exactly: an
-/// earlier, unrelated *passing* evidence row already exists for this
-/// session (e.g. an earlier successful run). Connection A reports a new
-/// event, then goes idle well past `DRAIN_READ_BUDGET` without sending its
-/// (contradicting, `exit_code=1`) Evidence -- forcing a handoff. While A is
+/// Reproduces the review's "dangerous direction" finding: an earlier,
+/// unrelated evidence row already exists for this session, and connection A
+/// reports a new event, then goes idle well past `DRAIN_READ_BUDGET` without
+/// sending its Evidence -- forcing a handoff. The stale row is a *failing*
+/// run (`exit_code=1`) and the late evidence a passing one: since FORNX-477 an
+/// unattested passing run is capped at `review` on its own, so only a definite
+/// `contradicted` can show the handoff guard downgrading. While A is
 /// mid-handoff, connection B's Claim ("All tests passed") is evaluated.
 ///
 /// Before the `pending_handoff` fix: `TestResultVerifier` picks the only
-/// evidence currently visible -- the stale, unrelated `exit_code=0` row --
-/// and returns a confident `verified`, not merely an early/conservative
+/// evidence currently visible -- the stale, unrelated `exit_code=1` row --
+/// and returns a confident `contradicted`, not merely an early/conservative
 /// `unverified`. That is a wrong answer, not just an incomplete one.
 ///
-/// After the fix: the session has a handoff in flight, so a `verified`
+/// After the fix: the session has a handoff in flight, so a definite
 /// finding is downgraded to `review` rather than bound to possibly-stale
 /// evidence. Once A's real evidence later lands, nothing about this
 /// finding has asserted something false in the meantime.
@@ -983,7 +1002,7 @@ async fn claim_evaluated_during_a_handoff_is_downgraded_not_falsely_bound_to_sta
         observed_at: now.clone(),
         tool_name: Some("Bash".to_string()),
         tool_input: Some(serde_json::json!({"command": "cargo test"})),
-        tool_response: Some(serde_json::json!({"exit_code": 0})),
+        tool_response: Some(serde_json::json!({"exit_code": 1})),
         raw: serde_json::json!({}),
     };
     let old_evidence = Evidence {
@@ -992,13 +1011,7 @@ async fn claim_evaluated_during_a_handoff_is_downgraded_not_falsely_bound_to_sta
         source_event_id: old_event_id,
         kind: EvidenceKind::ExitCode,
         observed_at: now.clone(),
-        payload: serde_json::json!({
-            "command": "cargo test",
-            "exit_code": 0,
-            // FORNX-477: a genuine passing run, so the handoff downgrade (not
-            // the missing-summary Unverified) is what this test exercises.
-            "test_summary": {"format": "cargo", "passed": 3, "failed": 0}
-        }),
+        payload: serde_json::json!({"command": "cargo test", "exit_code": 1}),
         provenance: "claude_code:PostToolUse:Bash#tool_response".to_string(),
         // FORNX-431 slice 4: this fixture simulates real exit-code evidence
         // arriving over UDS (see `send_hook`/raw-connection submission
@@ -1057,7 +1070,7 @@ async fn claim_evaluated_during_a_handoff_is_downgraded_not_falsely_bound_to_sta
         observed_at: now.clone(),
         tool_name: Some("Bash".to_string()),
         tool_input: Some(serde_json::json!({"command": "cargo test"})),
-        tool_response: Some(serde_json::json!({"exit_code": 1})),
+        tool_response: Some(serde_json::json!({"exit_code": 0})),
         raw: serde_json::json!({}),
     };
     let mut conn_a = connect_raw(&daemon.home).await;
@@ -1101,8 +1114,19 @@ async fn claim_evaluated_during_a_handoff_is_downgraded_not_falsely_bound_to_sta
     assert_eq!(
         finding.verdict, "review",
         "a Claim evaluated while connection A is still mid-handoff must be downgraded \
-         to review, never bound confidently to the stale exit_code=0 evidence as \
-         verified (or any other definite verdict); rationale={}",
+         to review, never bound confidently to the stale exit_code=1 evidence as \
+         contradicted (or any other definite verdict); rationale={}",
+        finding.rationale
+    );
+    // Review is also what an unattested passing run is capped at (FORNX-477),
+    // so the verdict alone would not show the handoff guard worked: the stale
+    // row is a failing run, a definite Contradicted unless downgraded.
+    assert!(
+        finding
+            .rationale
+            .contains("downgraded from a definite verdict"),
+        "the finding must have been downgraded by the handoff guard (HORO-1712), not \
+         merely capped; rationale={}",
         finding.rationale
     );
 
@@ -1114,7 +1138,7 @@ async fn claim_evaluated_during_a_handoff_is_downgraded_not_falsely_bound_to_sta
         source_event_id: new_event_id,
         kind: EvidenceKind::ExitCode,
         observed_at: now.clone(),
-        payload: serde_json::json!({"command": "cargo test", "exit_code": 1}),
+        payload: serde_json::json!({"command": "cargo test", "exit_code": 0}),
         provenance: "claude_code:PostToolUse:Bash#tool_response".to_string(),
         // FORNX-431 slice 4: this fixture simulates real exit-code evidence
         // arriving over UDS (see `send_hook`/raw-connection submission
@@ -1147,7 +1171,7 @@ async fn claim_evaluated_during_a_handoff_is_downgraded_not_falsely_bound_to_sta
 /// refcount were instead a plain set/bool, the first connection's `Drop`
 /// would have cleared the session's pending marker entirely, even though
 /// the second handoff is still genuinely in flight, and the Claim would
-/// wrongly resolve to a confident `verified` against the same kind of
+/// wrongly resolve to a confident `contradicted` against the same kind of
 /// stale evidence `claim_evaluated_during_a_handoff_is_downgraded_not_falsely_bound_to_stale_evidence`
 /// closes for the single-handoff case.
 #[tokio::test]
@@ -1159,7 +1183,7 @@ async fn second_concurrent_handoff_for_the_same_session_keeps_claims_downgraded_
     let now = chrono::Utc::now().to_rfc3339();
 
     // Same stale-evidence setup as the single-handoff case: an earlier,
-    // unrelated *passing* evidence row already on record for this session.
+    // unrelated *failing* evidence row already on record for this session.
     let old_event_id = Uuid::new_v4();
     let old_event = AgentEvent {
         id: old_event_id,
@@ -1169,7 +1193,7 @@ async fn second_concurrent_handoff_for_the_same_session_keeps_claims_downgraded_
         observed_at: now.clone(),
         tool_name: Some("Bash".to_string()),
         tool_input: Some(serde_json::json!({"command": "cargo test"})),
-        tool_response: Some(serde_json::json!({"exit_code": 0})),
+        tool_response: Some(serde_json::json!({"exit_code": 1})),
         raw: serde_json::json!({}),
     };
     let old_evidence = Evidence {
@@ -1178,13 +1202,7 @@ async fn second_concurrent_handoff_for_the_same_session_keeps_claims_downgraded_
         source_event_id: old_event_id,
         kind: EvidenceKind::ExitCode,
         observed_at: now.clone(),
-        payload: serde_json::json!({
-            "command": "cargo test",
-            "exit_code": 0,
-            // FORNX-477: a genuine passing run, so the handoff downgrade (not
-            // the missing-summary Unverified) is what this test exercises.
-            "test_summary": {"format": "cargo", "passed": 3, "failed": 0}
-        }),
+        payload: serde_json::json!({"command": "cargo test", "exit_code": 1}),
         provenance: "claude_code:PostToolUse:Bash#tool_response".to_string(),
         // FORNX-431 slice 4: this fixture simulates real exit-code evidence
         // arriving over UDS (see `send_hook`/raw-connection submission
@@ -1288,8 +1306,16 @@ async fn second_concurrent_handoff_for_the_same_session_keeps_claims_downgraded_
         finding.verdict, "review",
         "connection A's handoff closing must not clear the session's pending marker while \
          connection C's handoff is still open -- a plain set/bool would wrongly let this \
-         Claim resolve to a confident verdict against the stale exit_code=0 evidence; \
+         Claim resolve to a confident verdict against the stale exit_code=1 evidence; \
          rationale={}",
+        finding.rationale
+    );
+    assert!(
+        finding
+            .rationale
+            .contains("downgraded from a definite verdict"),
+        "the finding must have been downgraded by the handoff guard (HORO-1712), not \
+         merely capped; rationale={}",
         finding.rationale
     );
 

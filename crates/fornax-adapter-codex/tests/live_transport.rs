@@ -354,13 +354,21 @@ fn run_case(label: &str, passed: bool, assistant_text: &str) -> (String, fornax_
 }
 
 #[test]
-fn real_codex_shell_command_success_reaches_a_verified_finding_end_to_end() {
+fn real_codex_shell_command_success_reaches_a_review_finding_end_to_end() {
     let (_session_id, finding) = run_case("positive", true, "All tests passed.");
+    // FORNX-477 (founder decision): the exit code and summary come from the
+    // program the agent ran, so even a genuine literal exit 0 from
+    // tools.shell_command is capped at Review until an attested collector exists.
     assert_eq!(
-        finding.verdict, "verified",
+        finding.verdict, "review",
         "a genuine exit-code-0 tools.shell_command result plus a matching task_complete \
-         claim must reach Verified through the real daemon, got verdict={} evidence_ids={}",
+         claim is capped at Review (unattested), got verdict={} evidence_ids={}",
         finding.verdict, finding.evidence_ids
+    );
+    assert!(
+        !finding.rationale.contains("downgraded"),
+        "the cap, not a downgrade, must produce this review: {}",
+        finding.rationale
     );
     let evidence_ids: Vec<uuid::Uuid> =
         serde_json::from_str(&finding.evidence_ids).expect("decode evidence_ids");
@@ -793,9 +801,13 @@ fn a_tailer_without_a_native_id_does_not_downgrade_other_sessions() {
             })
         },
     );
-    assert_eq!(
-        finding.verdict, "verified",
-        "an unrelated tailer with no identity must not downgrade session B's verdict"
+    // FORNX-477: B's own verdict is the unattested-pass review; a downgrade
+    // by the unrelated tailer would add "downgraded" to the rationale.
+    assert_eq!(finding.verdict, "review", "{}", finding.rationale);
+    assert!(
+        !finding.rationale.contains("downgraded"),
+        "an unrelated tailer with no identity must not downgrade session B's verdict: {}",
+        finding.rationale
     );
     drop(daemon_guard);
     std::fs::remove_dir_all(&tmp).ok();
