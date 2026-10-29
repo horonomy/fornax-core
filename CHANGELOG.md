@@ -7,6 +7,15 @@ Jira epic FORNX-20.
 
 ## [Unreleased]
 
+## [v0.0.9] — Operational Scale & Reliability
+
+Stage 7A (epic FORNX-146). Full release notes, including the honest
+**Known limitations** (data egress is configuration, not policy enforcement;
+identity scope; deferred SLO items):
+[`docs/release/v0.0.9-release-notes.md`](docs/release/v0.0.9-release-notes.md).
+Candidate manifest: `release/v0.0.9-candidate-manifest.json`. Nothing here
+claims more than the recorded evidence supports.
+
 ### Added
 
 - **Codex first run: `fornax install codex` opts in to daemon capture**

@@ -114,6 +114,9 @@ hitting GitHub, one file per repo:
 | `manifest.gates.presence` | all of `qa`, `security`, `docs`, `stage` appear at least once | any gate missing entirely |
 | `repo.<owner>/<name>.sha_exists` | `gh api repos/<owner>/<repo>/commits/<sha>` returns 200 | SHA not found (typo, wrong repo, unpushed commit) |
 | `repo.<owner>/<name>.sha_on_main` | `gh api repos/<owner>/<repo>/compare/main...<sha>` status is `identical` or `behind` | status is `ahead`/`diverged` (SHA is real but not an ancestor of `main`) or the compare call errors |
+| `repo.<owner>/<name>.workspace_version_matches_candidate` | for the manifest entry that is this checkout, `[workspace.package].version` equals the manifest `version` (`--cargo-toml`) | the workspace version drifted from the candidate (HORO-1609) |
+| `repo.<owner>/<name>.changelog_has_candidate_section` | for this checkout, `CHANGELOG.md` (`--changelog`) has a `## [<version>]` section | the candidate is still only under `[Unreleased]`, so the published history would lag the release (FORNX-461) |
+| `repo.<owner>/<name>.release_notes_exist` | `docs/release/<version>-release-notes.md` (`--release-notes`) exists | no release notes for the candidate (FORNX-461) |
 | `evidence.<gate>.<key>.exists` | evidence fixture present with `exists: true` | ticket doesn't exist, or evidence wasn't fetched at all — never treated as a silent pass |
 | `evidence.<gate>.<key>.done` | `status_category == "done"` | ticket open/in-progress; keyed off Jira's `statusCategory`, not a display-string guess |
 | `evidence.<gate>.<key>.not_blocked` | ticket text contains no `BLOCK` verdict | a reviewer recorded an explicit BLOCK — Done status alone is not enough |
