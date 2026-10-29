@@ -241,6 +241,37 @@ impl Drop for KillOnDrop {
     }
 }
 
+/// Whether the daemon child is still running, how it exited, and how long ago
+/// it was spawned.
+fn daemon_state(child: &mut std::process::Child, spawned: Instant, home: &str) -> String {
+    let status = match child.try_wait() {
+        Ok(None) => "still running".to_string(),
+        Ok(Some(status)) => format!("exited early: {status}"),
+        Err(e) => format!("try_wait failed: {e}"),
+    };
+    format!(
+        "daemon pid {}: {status} after {:?}; FORNAX_HOME entries: {home}",
+        child.id(),
+        spawned.elapsed()
+    )
+}
+
+/// File names (no contents) in the daemon's home, to show how far startup got
+/// (`fornaxd.pid`, `fornax.db`, `fornax.sock`).
+fn fornax_home_listing(home: &Path) -> String {
+    match std::fs::read_dir(home) {
+        Ok(entries) => {
+            let mut names: Vec<String> = entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names.join(", ")
+        }
+        Err(e) => format!("(could not list {}: {e})", home.display()),
+    }
+}
+
 fn spawn_daemon(fornax_home: &Path) -> (KillOnDrop, PathBuf) {
     let daemon_bin = sibling_workspace_bin("fornax-daemon");
     let http_port = free_tcp_port();
@@ -256,12 +287,22 @@ fn spawn_daemon(fornax_home: &Path) -> (KillOnDrop, PathBuf) {
         .stderr(daemon_log)
         .spawn()
         .expect("spawn fornax-daemon");
-    let guard = KillOnDrop(daemon);
+    let mut guard = KillOnDrop(daemon);
+    let spawned = Instant::now();
 
+    // FORNX-478: one hosted run timed out here with an empty daemon.log, which
+    // cannot tell a slow start from a dead or hung process. Report the child's
+    // state so a recurrence is attributable; the 5s bound is deliberately kept.
     poll_until(
         Duration::from_secs(5),
         "waiting for daemon UDS socket to be created",
-        || tail_log(&daemon_log_path),
+        || {
+            format!(
+                "{}\n{}",
+                daemon_state(&mut guard.0, spawned, &fornax_home_listing(fornax_home)),
+                tail_log(&daemon_log_path)
+            )
+        },
         || sock_path.exists().then_some(()),
     );
     (guard, daemon_log_path)
