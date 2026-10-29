@@ -2335,6 +2335,23 @@ mod tests {
             "pnpm exec jest",
             "sudo -u root go test ./...",
             "nice -n 10 go test ./...",
+            "sudo -n go test ./...",
+            "env -C crates go test ./...",
+            "nice -n go test ./...",
+            "timeout -k 5 60 go test ./...",
+            "pnpm exec --silent jest",
+            "pnpm -r exec jest",
+            "pnpm exec -- vitest",
+            "timeout -s KILL 60 go test ./...",
+            "ionice -c 2 go test ./...",
+            "time -p go test ./...",
+            "setsid go test ./...",
+            "caffeinate go test ./...",
+            "npm it",
+            "npm install-test",
+            "mvn install",
+            "gradle build",
+            "dart pub global run test",
         ] {
             assert_eq!(succeeded(literal, 0), Verdict::Unverified, "{literal}");
             assert_eq!(succeeded(literal, 1), Verdict::Contradicted, "{literal}");

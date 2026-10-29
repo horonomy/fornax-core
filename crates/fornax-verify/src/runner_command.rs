@@ -731,10 +731,10 @@ const STANDALONE_TEST_PROGRAMS: &[&str] = &[
 
 /// Build tools whose lifecycle goal/target also runs the suite.
 const SUITE_RUNNING_TARGETS: &[(&str, &[&str])] = &[
-    ("mvn", &["verify"]),
-    ("mvnw", &["verify"]),
-    ("gradle", &["check"]),
-    ("gradlew", &["check"]),
+    ("mvn", &["verify", "install", "package"]),
+    ("mvnw", &["verify", "install", "package"]),
+    ("gradle", &["check", "build"]),
+    ("gradlew", &["check", "build"]),
     ("make", &["check", "verify", "ci"]),
     ("gmake", &["check", "verify", "ci"]),
     ("just", &["check", "verify", "ci"]),
@@ -778,12 +778,28 @@ const PUB_NON_TEST_VERBS: &[&str] = &[
     "downgrade",
     "outdated",
     "publish",
-    "global",
 ];
 
 /// Programs that run the command that follows them.
 const WRAPPER_PROGRAMS: &[&str] = &[
-    "time", "timeout", "env", "nice", "nohup", "sudo", "command", "exec", "stdbuf", "ionice",
+    "time",
+    "timeout",
+    "env",
+    "nice",
+    "nohup",
+    "sudo",
+    "command",
+    "exec",
+    "stdbuf",
+    "ionice",
+    "setsid",
+    "caffeinate",
+    "arch",
+    "doas",
+    "xcrun",
+    "flock",
+    "unbuffer",
+    "taskset",
 ];
 
 /// `tox` / `nox` environments that are not test suites.
@@ -791,6 +807,19 @@ const NON_TEST_ENVS: &[&str] = &[
     "lint", "format", "fmt", "docs", "doc", "type", "types", "mypy", "ruff", "flake8", "black",
     "isort", "style", "pylint", "clippy",
 ];
+
+/// A command line that starts at `args`: a runner this module identifies, or
+/// one of the test commands from the tables.
+fn suffix_is_test_command(args: &[&str], depth: u8) -> bool {
+    let words: Vec<Word> = args
+        .iter()
+        .map(|t| Word {
+            text: (*t).to_string(),
+            quoted: false,
+        })
+        .collect();
+    classify_segment(&words).is_some() || known_test_args(args, depth)
+}
 
 fn known_test_args(args: &[&str], depth: u8) -> bool {
     if depth > 4 {
@@ -831,38 +860,13 @@ fn known_test_args(args: &[&str], depth: u8) -> bool {
         }
         return false;
     }
-    // `time go test`, `timeout 60 go test`, `sudo -E go test`, `env CI=1 go test`.
+    // `time go test`, `timeout 60 go test`, `sudo -u root go test`, `env CI=1 go
+    // test`: rather than model every wrapper's flags and flag values (a wrong
+    // guess could swallow the wrapped program and fail open), try each later
+    // word as the start of the wrapped command and treat any test command found
+    // as one. This only ever adds test commands.
     if WRAPPER_PROGRAMS.contains(&name) {
-        let mut rest = tail;
-        // Option flags, and for `timeout` its duration argument.
-        while let Some((first, more)) = rest.split_first() {
-            if !first.starts_with('-') {
-                break;
-            }
-            // Flags that take a value (`sudo -u root`, `nice -n 10`).
-            let takes_value = matches!(*first, "-u" | "-g" | "-n" | "-C" | "-p" | "-h" | "-U");
-            rest = if takes_value && !more.is_empty() {
-                &more[1..]
-            } else {
-                more
-            };
-        }
-        if name == "timeout" {
-            rest = rest.get(1..).unwrap_or(&[]);
-        }
-        return known_test_args(rest, depth + 1) || {
-            // The wrapped command may be one `classify_segment` identifies
-            // (pytest, cargo test, ...); those are handled by the caller on the
-            // unwrapped words only at top level, so check the common names here.
-            let inner: Vec<Word> = rest
-                .iter()
-                .map(|t| Word {
-                    text: (*t).to_string(),
-                    quoted: true,
-                })
-                .collect();
-            classify_segment(&inner).is_some()
-        };
+        return (0..tail.len()).any(|i| suffix_is_test_command(&tail[i..], depth + 1));
     }
 
     if TEST_SUBCOMMAND_PROGRAMS.contains(&name) {
@@ -876,8 +880,14 @@ fn known_test_args(args: &[&str], depth: u8) -> bool {
         if PACKAGE_TOOLS.contains(&name) && manages_packages {
             return false;
         }
-        if name == "pnpm" && tail.first() == Some(&"exec") {
-            return known_test_args(&tail[1..], depth + 1);
+        // `pnpm exec [flags] jest`: also try each later word as the wrapped
+        // command; a `test` word elsewhere still counts below.
+        if name == "pnpm" {
+            if let Some(exec) = tail.iter().position(|a| *a == "exec") {
+                if (exec + 1..tail.len()).any(|i| suffix_is_test_command(&tail[i..], depth + 1)) {
+                    return true;
+                }
+            }
         }
         // Any argument that is `test`/`tests` (`make -C x test`), fails closed on
         // flag/value spellings.
@@ -900,7 +910,11 @@ fn known_test_args(args: &[&str], depth: u8) -> bool {
                 }
             }
         }
-        if name == "npm" && tail.first() == Some(&"t") {
+        if name == "npm"
+            && tail.first().is_some_and(|a| {
+                matches!(*a, "t" | "install-test" | "it" | "cit" | "install-ci-test")
+            })
+        {
             return true;
         }
         if let Some((_, goals)) = SUITE_RUNNING_TARGETS.iter().find(|(n, _)| *n == name) {
