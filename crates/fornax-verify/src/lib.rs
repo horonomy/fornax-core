@@ -427,13 +427,17 @@ impl Verifier for CommandSuccessVerifier {
         };
 
         let exit_code = ev.payload.get("exit_code").and_then(|v| v.as_i64());
-        // Identified from the claim's literal as written (not lowercased: an
-        // env assignment such as `CI=1 pytest` is case-sensitive), and for every
-        // runner including those whose output is not read (`jest`, `npm test`).
-        let claim_names_test_runner = CommandExecutedVerifier::extract_command_literal(&claim.text)
-            .is_some_and(|literal| {
-                runner_command::names_test_runner(Some(&serde_json::Value::String(literal)))
-            });
+        // Both spellings of the claim's literal: as written (an env assignment such
+        // as `CI=1 pytest` is case-sensitive) and lowercased (the evidence match
+        // above lowercases, so `PYTEST` matches `echo pytest` and must be seen as
+        // naming a runner too). Every runner counts, including those whose output
+        // is not read (`jest`, `npm test`); OR-ing only adds downgrades.
+        let names_runner = |literal: String| {
+            runner_command::names_test_runner(Some(&serde_json::Value::String(literal)))
+        };
+        let claim_names_test_runner = names_runner(claimed.clone())
+            || CommandExecutedVerifier::extract_command_literal(&claim.text)
+                .is_some_and(names_runner);
 
         match exit_code {
             // Same reasoning as `TestResultVerifier`'s mirror branch above:
@@ -1878,6 +1882,11 @@ mod tests {
                 "The `CI=1 pytest` run succeeded.",
                 vec!["echo", "CI=1 pytest"],
             ),
+            // Spelling that differs only in case still matches the (lowercased)
+            // evidence text, so it must be recognised as naming a runner.
+            ("The `PYTEST` run succeeded.", vec!["echo", "pytest"]),
+            ("The `Jest` run succeeded.", vec!["echo", "jest"]),
+            ("The `Npm Test` run succeeded.", vec!["echo", "npm test"]),
         ] {
             assert_eq!(
                 verdict(text, evidence_for_command(&mention, 0), agent()),
