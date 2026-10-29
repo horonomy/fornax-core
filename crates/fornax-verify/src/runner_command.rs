@@ -416,6 +416,15 @@ pub(crate) fn proven_runner(command: Option<&Value>) -> Option<RunnerKind> {
     runner.filter(|kind| *kind != RunnerKind::Other)
 }
 
+/// True when any step of `command` is an identified test run of any runner
+/// (including the ones whose output is not read, `RunnerKind::Other`), whatever
+/// its exit status. For a claim's command literal: a claim that names a test
+/// runner is a test assertion even when no summary format exists for it.
+pub(crate) fn names_test_runner(command: Option<&Value>) -> bool {
+    command_segments(command)
+        .is_some_and(|segments| segments.iter().any(|s| classify_segment(s).is_some()))
+}
+
 /// `cd <dir>`: one plain, non-option argument.
 fn is_plain_cd(words: &[Word]) -> bool {
     matches!(words, [cd, dir] if cd.text == "cd" && !cd.quoted

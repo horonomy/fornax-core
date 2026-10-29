@@ -427,9 +427,13 @@ impl Verifier for CommandSuccessVerifier {
         };
 
         let exit_code = ev.payload.get("exit_code").and_then(|v| v.as_i64());
-        let claim_names_test_runner =
-            runner_command::proven_runner(Some(&serde_json::Value::String(claimed.clone())))
-                .is_some();
+        // Identified from the claim's literal as written (not lowercased: an
+        // env assignment such as `CI=1 pytest` is case-sensitive), and for every
+        // runner including those whose output is not read (`jest`, `npm test`).
+        let claim_names_test_runner = CommandExecutedVerifier::extract_command_literal(&claim.text)
+            .is_some_and(|literal| {
+                runner_command::names_test_runner(Some(&serde_json::Value::String(literal)))
+            });
 
         match exit_code {
             // Same reasoning as `TestResultVerifier`'s mirror branch above:
@@ -1857,6 +1861,38 @@ mod tests {
                 agent()
             ),
             Verdict::Unverified
+        );
+        // Runners whose output is not read (jest, vitest, npm test, nextest) and
+        // env-prefixed spellings are still test assertions: evidence that merely
+        // mentions them must not verify, and a real run has no summary format.
+        for (text, mention) in [
+            ("The `jest` run succeeded.", vec!["cat", "jest.config.js"]),
+            ("The `npx jest` run succeeded.", vec!["echo", "npx jest"]),
+            ("The `npm test` run succeeded.", vec!["echo", "npm test"]),
+            ("The `vitest` run succeeded.", vec!["echo", "vitest"]),
+            (
+                "The `cargo nextest run` run succeeded.",
+                vec!["echo", "cargo nextest run"],
+            ),
+            (
+                "The `CI=1 pytest` run succeeded.",
+                vec!["echo", "CI=1 pytest"],
+            ),
+        ] {
+            assert_eq!(
+                verdict(text, evidence_for_command(&mention, 0), agent()),
+                Verdict::Unverified,
+                "{text}"
+            );
+        }
+        assert_eq!(
+            verdict(
+                "The `jest` run succeeded.",
+                evidence_for_command(&["jest"], 0),
+                Some(TrustClass::HostObserved)
+            ),
+            Verdict::Unverified,
+            "a real jest run has no readable summary, so it cannot verify"
         );
         // A real failing run is still contradicted.
         assert_eq!(
