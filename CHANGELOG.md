@@ -162,9 +162,10 @@ Jira epic FORNX-20.
   `test_result`** (FORNX-477, QA 29513 residual). "The `pytest -q` run
   succeeded" reached `Verified` from the same agent-reported exit code. When
   the command the claim names is an identified test run it now needs that
-  runner's passing summary and attested evidence: `Review` for a normal run,
-  `Unverified` for a fake runner, zero tests or evidence that merely mentions
-  the runner (`echo pytest`). `Contradicted` for a non-zero exit is unchanged,
+  runner's passing summary and attested evidence: `Review` for a normal pytest
+  or `cargo test` run, `Unverified` for a fake runner, zero tests, a runner
+  whose output is not read (`jest`, `vitest`, `npm test`, `cargo nextest run`)
+  or evidence that merely mentions the runner (`echo pytest`). `Contradicted` for a non-zero exit is unchanged,
   and non-test commands (`npm install`, `cargo build`, `pip install pytest`)
   still verify from a literal exit code.
 

@@ -123,7 +123,9 @@ asserts a test run succeeded under the subject `command_succeeded` ("the `pytest
 `AgentAdjacent` exit code. `CommandSuccessVerifier` therefore applies the
 `test_result` conditions (passing summary from the runner, attested evidence)
 whenever the command it matched is an identified test run, or the claim names a
-test runner but the matched evidence is not one. Production adapters mint only
+test runner (any runner, including `jest`, `vitest`, `npm test` and `cargo
+nextest run`, whose output is not read and so can never verify) but the matched
+evidence is not one. Production adapters mint only
 `test_result` claims; `command_succeeded` reaches the daemon through the ingest
 socket. Non-test commands are unchanged. Residual, outside this scope: the
 command match is a substring of the evidence's command text, so a non-test
