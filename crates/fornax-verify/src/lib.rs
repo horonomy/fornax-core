@@ -2311,7 +2311,7 @@ mod tests {
             "time make test",
             "sudo -E go test ./...",
             "env CI=1 yarn test",
-            "bash -c 'go test ./...'",
+            "bash -lc 'go test ./...'",
             // Script and target spellings.
             "yarn test:unit",
             "pnpm test:e2e",
@@ -2328,6 +2328,13 @@ mod tests {
             "turbo test",
             "gotestsum",
             "bats tests/",
+            // A flag value named like a package verb is not the verb.
+            "go -C build test",
+            "dart pub run test",
+            "flutter pub run test",
+            "pnpm exec jest",
+            "sudo -u root go test ./...",
+            "nice -n 10 go test ./...",
         ] {
             assert_eq!(succeeded(literal, 0), Verdict::Unverified, "{literal}");
             assert_eq!(succeeded(literal, 1), Verdict::Contradicted, "{literal}");

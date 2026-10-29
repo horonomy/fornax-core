@@ -759,13 +759,26 @@ const NON_TEST_VERBS: &[&str] = &[
     "help",
     "doc",
     "build",
-    "pub",
     "list",
     "outdated",
     "update",
     "upgrade",
     "publish",
     "pack",
+];
+
+/// `dart pub <verb>` / `flutter pub <verb>` that manage packages (`pub run test`
+/// runs a suite and is not listed).
+const PUB_NON_TEST_VERBS: &[&str] = &[
+    "add",
+    "get",
+    "remove",
+    "deps",
+    "upgrade",
+    "downgrade",
+    "outdated",
+    "publish",
+    "global",
 ];
 
 /// Programs that run the command that follows them.
@@ -803,7 +816,7 @@ fn known_test_args(args: &[&str], depth: u8) -> bool {
     };
     let name = basename(program);
 
-    // `sh -c '<script>'`: look at the script's steps.
+    // A shell given a command string: look at the script's steps.
     if is_shell(name) {
         if let [flag, script] = tail {
             if is_shell_command_flag(flag) {
@@ -823,11 +836,16 @@ fn known_test_args(args: &[&str], depth: u8) -> bool {
         let mut rest = tail;
         // Option flags, and for `timeout` its duration argument.
         while let Some((first, more)) = rest.split_first() {
-            if first.starts_with('-') {
-                rest = more;
-            } else {
+            if !first.starts_with('-') {
                 break;
             }
+            // Flags that take a value (`sudo -u root`, `nice -n 10`).
+            let takes_value = matches!(*first, "-u" | "-g" | "-n" | "-C" | "-p" | "-h" | "-U");
+            rest = if takes_value && !more.is_empty() {
+                &more[1..]
+            } else {
+                more
+            };
         }
         if name == "timeout" {
             rest = rest.get(1..).unwrap_or(&[]);
@@ -848,10 +866,18 @@ fn known_test_args(args: &[&str], depth: u8) -> bool {
     }
 
     if TEST_SUBCOMMAND_PROGRAMS.contains(&name) {
-        let first_plain = tail.iter().find(|a| !a.starts_with('-')).copied();
-        if PACKAGE_TOOLS.contains(&name) && first_plain.is_some_and(|a| NON_TEST_VERBS.contains(&a))
-        {
+        // Only the subcommand itself (the very first argument) counts as a verb:
+        // `go -C build test` has a flag value `build`, not a build command.
+        let manages_packages = match tail.first().copied() {
+            Some("pub") => tail.get(1).is_some_and(|v| PUB_NON_TEST_VERBS.contains(v)),
+            Some(verb) => NON_TEST_VERBS.contains(&verb),
+            None => false,
+        };
+        if PACKAGE_TOOLS.contains(&name) && manages_packages {
             return false;
+        }
+        if name == "pnpm" && tail.first() == Some(&"exec") {
+            return known_test_args(&tail[1..], depth + 1);
         }
         // Any argument that is `test`/`tests` (`make -C x test`), fails closed on
         // flag/value spellings.
@@ -888,7 +914,7 @@ fn known_test_args(args: &[&str], depth: u8) -> bool {
         return true;
     }
     if name == "node" {
-        return tail.iter().any(|a| *a == "--test");
+        return tail.contains(&"--test");
     }
     if matches!(name, "tox" | "nox") {
         // An explicit environment/session that is plainly not a test suite
