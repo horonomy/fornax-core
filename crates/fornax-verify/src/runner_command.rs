@@ -516,7 +516,10 @@ fn mention_or_not(claimed: &str, evidence_text_lower: &str) -> CommandBinding {
     if needle.is_empty() {
         return CommandBinding::NotBound;
     }
+    // To the left a `/` ends a word, so a path-qualified run (`/tmp/x/make`)
+    // still mentions a bare claimed program; to the right it continues one.
     let is_word = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/');
+    let is_left_word = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-' | '.');
     let mut from = 0;
     while let Some(i) = evidence_text_lower[from..].find(&needle) {
         let start = from + i;
@@ -524,7 +527,7 @@ fn mention_or_not(claimed: &str, evidence_text_lower: &str) -> CommandBinding {
         let before_ok = evidence_text_lower[..start]
             .chars()
             .next_back()
-            .is_none_or(|c| !is_word(c));
+            .is_none_or(|c| !is_left_word(c));
         let after_ok = evidence_text_lower[end..]
             .chars()
             .next()
@@ -567,6 +570,16 @@ enum Fit {
 /// observed assignment the claim does not mention is ignored.
 fn assignments_fit(claim_seg: &[Word], observed_seg: &[Word]) -> bool {
     let observed = leading_assignments(observed_seg);
+    // `CI=1 CI=0 cmd` runs with CI=0: an observed segment that assigns the same
+    // name twice has no single value to compare, so it never fits.
+    let mut names: Vec<&str> = observed
+        .iter()
+        .filter_map(|a| a.split_once('=').map(|(n, _)| n))
+        .collect();
+    names.sort_unstable();
+    if names.windows(2).any(|w| w[0] == w[1]) {
+        return false;
+    }
     leading_assignments(claim_seg)
         .iter()
         .all(|a| observed.contains(a))

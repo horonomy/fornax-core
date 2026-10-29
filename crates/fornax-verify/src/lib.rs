@@ -506,6 +506,7 @@ impl Verifier for CommandSuccessVerifier {
         // with extra arguments, or only mentions it, may be its real run, so it
         // withholds an older success instead of replacing the exact row.
         let mut mention_seen = false;
+        let mut prefix_seen = false;
         let mut selected = None;
         let mut first_prefix = None;
         for e in evidence
@@ -520,23 +521,25 @@ impl Verifier for CommandSuccessVerifier {
                 exit_zero_reliable(e),
             ) {
                 runner_command::CommandBinding::Exact => {
-                    selected = Some((e, false, mention_seen));
+                    selected = Some((e, false, mention_seen, prefix_seen));
                     break;
                 }
                 runner_command::CommandBinding::Prefix => {
                     if first_prefix.is_none() {
-                        first_prefix = Some((e, true, mention_seen));
+                        first_prefix = Some((e, true, mention_seen, false));
                     }
                     mention_seen = true;
+                    prefix_seen = true;
                 }
                 runner_command::CommandBinding::Mentioned => mention_seen = true,
                 runner_command::CommandBinding::NotBound => {}
             }
         }
         let selected = selected.or(first_prefix);
-        let newer_mention = selected.is_some_and(|(_, _, m)| m);
+        let newer_mention = selected.is_some_and(|(_, _, m, _)| m);
+        let newer_prefix = selected.is_some_and(|(_, _, _, p)| p);
 
-        let Some((ev, prefix_only, _)) = selected else {
+        let Some((ev, prefix_only, _, _)) = selected else {
             return Finding {
                 id: Uuid::new_v4(),
                 claim_id: claim.id,
@@ -645,6 +648,21 @@ impl Verifier for CommandSuccessVerifier {
                      Code's tool_response carries no real exit code, so this cannot be \
                      confirmed as a failure -- flagged for review, not treated as \
                      contradicted (heuristic exit_code={code}, {})",
+                    ev.provenance
+                ),
+                computed_at: now,
+            },
+            // An exact run failed, but the command was run again later with extra
+            // arguments: the retry may be the run the claim is about.
+            Some(code) if newer_prefix => Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Review,
+                evidence_ids: vec![ev.id],
+                verifier_name: self.name().to_string(),
+                rationale: format!(
+                    "an exact run of the command exited {code}, but a more recent run with \
+                     extra arguments exists, which may be the run the claim is about ({})",
                     ev.provenance
                 ),
                 computed_at: now,
@@ -2214,6 +2232,48 @@ mod tests {
             )
             .1,
             Verdict::Verified
+        );
+    }
+
+    /// `CI=1 CI=0 cmd` runs with CI=0, so it cannot bind a claimed `CI=1 cmd`;
+    /// a path-qualified run still counts as a mention of a bare program.
+    #[test]
+    fn duplicate_env_assignments_and_path_qualified_mentions() {
+        assert_eq!(
+            command_verdicts(
+                "The `CI=1 npm test` succeeded.",
+                vec![evidence_for_string("CI=1 CI=0 npm test", 0)]
+            )
+            .1,
+            Verdict::Unverified
+        );
+        assert_eq!(
+            command_verdicts(
+                "The `make` succeeded.",
+                vec![
+                    evidence_for_command(&["make"], 0),
+                    evidence_for_command(&["/tmp/x/make", "all"], 0)
+                ]
+            )
+            .1,
+            Verdict::Unverified
+        );
+    }
+
+    /// An exact failure followed by a retry with extra arguments is ambiguous:
+    /// Review, not Contradicted. A mere mention does not soften a recorded failure.
+    #[test]
+    fn an_exact_failure_with_a_newer_retry_is_review_not_contradicted() {
+        assert_eq!(
+            command_verdicts(
+                "The `npm install` succeeded.",
+                vec![
+                    evidence_for_command(&["npm", "install"], 1),
+                    evidence_for_command(&["npm", "install", "--legacy-peer-deps"], 0)
+                ]
+            )
+            .1,
+            Verdict::Review
         );
     }
 
