@@ -168,7 +168,24 @@ Jira epic FORNX-20.
   `Unverified` on a clean exit 0, since nothing shows a test ran. A non-zero exit
   is still `Contradicted`; commands that are not test runs (`go build`,
   `make install`, `yarn install`, `tox -e lint`, `pip install pytest`) still
-  verify, and `test_result` behaviour is unchanged.
+  verify, and `test_result` behaviour is unchanged. *(Superseded in part by the
+  FORNX-480 entry below: a clean exit 0 on agent-adjacent evidence is now
+  `Review` for those commands too.)*
+
+- **`command_succeeded` is capped at `Review` without an attested source**
+  (FORNX-480, founder decision Option B, 2026-10-29). An exit status from the
+  agent's own session cannot show that the claimed program ran and exited 0 (a
+  same-named executable that only does `exit 0` is indistinguishable), so
+  "the `npm install` succeeded" reaches `Verified` only through the same
+  attested-collector gate as `test_result` (`HostObserved` or
+  `IndependentExternal` class *and* a collector `fornax-verify` lists; a label
+  alone is not enough). None ships in v0.0.9. A recorded non-zero exit stays
+  `Contradicted`; `command_executed` ("I ran ...") is unchanged, and its
+  remaining trust limits (it asserts a command row exists, not that the program
+  is the one named) are tracked separately, not resolved. In the ablation
+  benchmark the benign review burden in config B is 4 of 6. Production adapters
+  never mint `command_succeeded`; it reaches the daemon through the ingest
+  socket.
 
 - **"I ran X" / "X succeeded" bind to the command that ran, not to text that
   contains it** (FORNX-477 hardening). The match between a `command_executed` /

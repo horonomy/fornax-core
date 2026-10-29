@@ -268,6 +268,11 @@ about the current verifiers, not artifacts of fixture phrasing:
   `benign_review_burden` figure was changed; its `verified`/`review` verdict
   counts predate this change and should be re-run before being quoted.
 
+  **FORNX-480 update (2026-10-29, founder Option B):** a `command_succeeded`
+  claim on agent-adjacent exit-code evidence is capped at `Review` as well, so
+  config B's benign review burden is now 67% (4/6). Same caveat: only the
+  `benign_review_burden` figure was changed.
+
 ## Capability-blind axis
 
 When `ToolTrace` and `FinalResponse` are both reported `Unknown` — the

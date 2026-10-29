@@ -175,3 +175,29 @@ CI evidence), tracked as FORNX-443, are the only route back to `Verified`.
 Support for more runner summaries (nextest, npm, jest, vitest; FORNX-479) is
 also outside v0.0.9. Benchmark effect: the ablation benchmark's benign review
 burden in config B is 3 of 6 (50%).
+
+## Addendum (FORNX-480, 2026-10-29): `command_succeeded` gets the same bar (founder decision, Option B)
+
+The previous addenda applied the attested-collector bar to test runs only. A
+`command_succeeded` claim for any other command ("the `npm install` succeeded")
+still reached `Verified` from an `AgentAdjacent` exit code, although a
+same-named executable that only does `exit 0` yields the same evidence.
+
+Decision (founder, approved):
+
+- `AgentAdjacent` evidence alone never grants `Verified` to a command-success
+  claim. `Verified` requires a collector listed in `test_run_attestors()` with
+  trust class `HostObserved` or `IndependentExternal`; the label alone is not
+  enough. The production list is still empty, so in v0.0.9 the most such a claim
+  reaches is `Review`.
+- Unchanged: a genuine non-zero literal exit is `Contradicted`; claims that
+  name no command, several commands, unparseable or unmatched commands are
+  `Unverified`; a heuristic `exit_code=0` stays `Review`; an exact-binding
+  prefix match stays capped at `Review`.
+- `command_executed` keeps its meaning (a matching command row was observed)
+  and is not changed here. It does not show that the program was the one named;
+  that limitation is tracked separately and is not resolved by this change.
+- Distinct from FORNX-443, which supplies an authoritative signal (runner
+  receipts / CI) for test results. A future host-observed process-exit
+  collector listed as an attestor would restore `Verified` for plain commands.
+- Effect: ablation benchmark config B benign review burden 4 of 6 (67%).
