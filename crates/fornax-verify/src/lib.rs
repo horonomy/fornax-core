@@ -250,14 +250,6 @@ impl CommandExecutedVerifier {
         let t = text.to_lowercase();
         t.contains("ran ") || t.contains("i ran") || t.contains("executed") || t.contains("running")
     }
-
-    /// Extract the literal command the claim names, from backtick- or
-    /// double-quote-delimited text (e.g. "I ran `npm install`."). Returns
-    /// `None` when the claim names no literal command to check against
-    /// evidence — such a claim is `Unverified`, not fabricated a match for.
-    fn extract_command_literal(text: &str) -> Option<String> {
-        extract_delimited(text, '`').or_else(|| extract_delimited(text, '"'))
-    }
 }
 
 impl Verifier for CommandExecutedVerifier {
@@ -289,48 +281,118 @@ impl Verifier for CommandExecutedVerifier {
             );
         }
 
-        let Some(claimed) = Self::extract_command_literal(&claim.text) else {
+        let claimed = match command_literal(&claim.text) {
+            CommandLiteral::One(literal) => literal,
+            CommandLiteral::Several => {
+                return Finding {
+                    id: Uuid::new_v4(),
+                    claim_id: claim.id,
+                    verdict: Verdict::Unverified,
+                    evidence_ids: vec![],
+                    verifier_name: self.name().to_string(),
+                    rationale: "claim names more than one command; it cannot be bound to a \
+                                single command's evidence"
+                        .to_string(),
+                    computed_at: now,
+                };
+            }
+            CommandLiteral::None => {
+                return Finding {
+                    id: Uuid::new_v4(),
+                    claim_id: claim.id,
+                    verdict: Verdict::Unverified,
+                    evidence_ids: vec![],
+                    verifier_name: self.name().to_string(),
+                    rationale:
+                        "claim text does not name a literal command to check against evidence"
+                            .to_string(),
+                    computed_at: now,
+                };
+            }
+        };
+        if !runner_command::claim_command_parses(&claimed) {
             return Finding {
                 id: Uuid::new_v4(),
                 claim_id: claim.id,
                 verdict: Verdict::Unverified,
                 evidence_ids: vec![],
                 verifier_name: self.name().to_string(),
-                rationale: "claim text does not name a literal command to check against evidence"
-                    .to_string(),
+                rationale: format!(
+                    "the claimed command \"{claimed}\" cannot be parsed as a command"
+                ),
                 computed_at: now,
             };
-        };
-        let claimed_lower = claimed.to_lowercase();
+        }
 
-        let matching = evidence.iter().rev().find(|e| {
-            e.kind == EvidenceKind::ExitCode && command_text(&e.payload).contains(&claimed_lower)
-        });
+        // FORNX-477 exact binding: the claimed command must be the command the
+        // row ran, step for step. A row that merely contains its text
+        // (`echo npm install`) never supports the claim.
+        let mut prefix_row = None;
+        let mut mentioned = false;
+        for ev in evidence
+            .iter()
+            .rev()
+            .filter(|e| e.kind == EvidenceKind::ExitCode)
+        {
+            match runner_command::bind_command(
+                &claimed,
+                ev.payload.get("command"),
+                &command_text(&ev.payload),
+                exit_zero_reliable(ev),
+            ) {
+                runner_command::CommandBinding::Exact => {
+                    return Finding {
+                        id: Uuid::new_v4(),
+                        claim_id: claim.id,
+                        verdict: Verdict::Verified,
+                        evidence_ids: vec![ev.id],
+                        verifier_name: self.name().to_string(),
+                        rationale: format!(
+                            "observed command matching \"{claimed}\" executed ({})",
+                            ev.provenance
+                        ),
+                        computed_at: now,
+                    };
+                }
+                runner_command::CommandBinding::Prefix => {
+                    prefix_row.get_or_insert(ev);
+                }
+                runner_command::CommandBinding::Mentioned => mentioned = true,
+                runner_command::CommandBinding::NotBound => {}
+            }
+        }
 
-        match matching {
-            Some(ev) => Finding {
+        if let Some(ev) = prefix_row {
+            return Finding {
                 id: Uuid::new_v4(),
                 claim_id: claim.id,
-                verdict: Verdict::Verified,
+                verdict: Verdict::Review,
                 evidence_ids: vec![ev.id],
                 verifier_name: self.name().to_string(),
                 rationale: format!(
-                    "observed command matching \"{claimed}\" executed ({})",
+                    "a command starting with \"{claimed}\" ran, but with extra arguments that \
+                     could change what it did (for example a dry run) -- flagged for review, \
+                     not verified ({})",
                     ev.provenance
                 ),
                 computed_at: now,
+            };
+        }
+        Finding {
+            id: Uuid::new_v4(),
+            claim_id: claim.id,
+            verdict: Verdict::Unverified,
+            evidence_ids: vec![],
+            verifier_name: self.name().to_string(),
+            rationale: if mentioned {
+                format!(
+                    "commands that mention \"{claimed}\" were observed, but none is a run of \
+                     that command"
+                )
+            } else {
+                format!("no evidence of a command matching \"{claimed}\" observed in this session")
             },
-            None => Finding {
-                id: Uuid::new_v4(),
-                claim_id: claim.id,
-                verdict: Verdict::Unverified,
-                evidence_ids: vec![],
-                verifier_name: self.name().to_string(),
-                rationale: format!(
-                    "no evidence of a command matching \"{claimed}\" observed in this session"
-                ),
-                computed_at: now,
-            },
+            computed_at: now,
         }
     }
 }
@@ -392,27 +454,36 @@ impl Verifier for CommandSuccessVerifier {
         // contradiction"; also "do not label ordinary mismatch as
         // intentional lying"). Only a claim naming a specific command can be
         // checked at all.
-        let Some(claimed) =
-            CommandExecutedVerifier::extract_command_literal(&claim.text).map(|s| s.to_lowercase())
-        else {
-            return Finding {
-                id: Uuid::new_v4(),
-                claim_id: claim.id,
-                verdict: Verdict::Unverified,
-                evidence_ids: vec![],
-                verifier_name: self.name().to_string(),
-                rationale:
-                    "claim names no specific command; cannot bind to unrelated command evidence"
+        let claimed = match command_literal(&claim.text) {
+            CommandLiteral::One(literal) => literal,
+            CommandLiteral::Several => {
+                return Finding {
+                    id: Uuid::new_v4(),
+                    claim_id: claim.id,
+                    verdict: Verdict::Unverified,
+                    evidence_ids: vec![],
+                    verifier_name: self.name().to_string(),
+                    rationale: "claim names more than one command; it cannot be bound to a \
+                                single command's evidence"
                         .to_string(),
-                computed_at: now,
-            };
+                    computed_at: now,
+                };
+            }
+            CommandLiteral::None => {
+                return Finding {
+                    id: Uuid::new_v4(),
+                    claim_id: claim.id,
+                    verdict: Verdict::Unverified,
+                    evidence_ids: vec![],
+                    verifier_name: self.name().to_string(),
+                    rationale:
+                        "claim names no specific command; cannot bind to unrelated command evidence"
+                            .to_string(),
+                    computed_at: now,
+                };
+            }
         };
-
-        let command_evidence = evidence.iter().rev().find(|e| {
-            e.kind == EvidenceKind::ExitCode && command_text(&e.payload).contains(&claimed)
-        });
-
-        let Some(ev) = command_evidence else {
+        if !runner_command::claim_command_parses(&claimed) {
             return Finding {
                 id: Uuid::new_v4(),
                 claim_id: claim.id,
@@ -420,26 +491,75 @@ impl Verifier for CommandSuccessVerifier {
                 evidence_ids: vec![],
                 verifier_name: self.name().to_string(),
                 rationale: format!(
-                    "no evidence of a command matching \"{claimed}\" observed in this session"
+                    "the claimed command \"{claimed}\" cannot be parsed as a command"
                 ),
+                computed_at: now,
+            };
+        }
+
+        // FORNX-477 exact binding (see `runner_command::bind_command`): the row
+        // must be a run of the claimed command, not merely contain its text. A
+        // newer row that only mentions it may be the real run, so it withholds a
+        // success (a recorded failure stays contradicted), as `TestResultVerifier`
+        // does for a newer unidentified runner mention.
+        // Prefer the newest exact run. A newer row that ran the claimed command
+        // with extra arguments, or only mentions it, may be its real run, so it
+        // withholds an older success instead of replacing the exact row.
+        let mut mention_seen = false;
+        let mut selected = None;
+        let mut first_prefix = None;
+        for e in evidence
+            .iter()
+            .rev()
+            .filter(|e| e.kind == EvidenceKind::ExitCode)
+        {
+            match runner_command::bind_command(
+                &claimed,
+                e.payload.get("command"),
+                &command_text(&e.payload),
+                exit_zero_reliable(e),
+            ) {
+                runner_command::CommandBinding::Exact => {
+                    selected = Some((e, false, mention_seen));
+                    break;
+                }
+                runner_command::CommandBinding::Prefix => {
+                    if first_prefix.is_none() {
+                        first_prefix = Some((e, true, mention_seen));
+                    }
+                    mention_seen = true;
+                }
+                runner_command::CommandBinding::Mentioned => mention_seen = true,
+                runner_command::CommandBinding::NotBound => {}
+            }
+        }
+        let selected = selected.or(first_prefix);
+        let newer_mention = selected.is_some_and(|(_, _, m)| m);
+
+        let Some((ev, prefix_only, _)) = selected else {
+            return Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Unverified,
+                evidence_ids: vec![],
+                verifier_name: self.name().to_string(),
+                rationale: if mention_seen {
+                    format!(
+                        "commands that mention \"{claimed}\" were observed, but none is a run \
+                         of that command"
+                    )
+                } else {
+                    format!(
+                        "no evidence of a command matching \"{claimed}\" observed in this session"
+                    )
+                },
                 computed_at: now,
             };
         };
 
         let exit_code = ev.payload.get("exit_code").and_then(|v| v.as_i64());
-        // Both spellings of the claim's literal: as written (an env assignment such
-        // as `CI=1 pytest` is case-sensitive) and lowercased (the evidence match
-        // above lowercases, so `PYTEST` matches `echo pytest` and must be seen as
-        // naming a runner too). Every runner counts, including those whose output
-        // is not read (`jest`, `npm test`); OR-ing only adds downgrades.
-        let names_runner = |literal: String| {
-            runner_command::names_test_runner(Some(&serde_json::Value::String(literal)))
-        };
-        let claim_names_test_runner = names_runner(claimed.clone())
-            || CommandExecutedVerifier::extract_command_literal(&claim.text)
-                .is_some_and(names_runner);
 
-        match exit_code {
+        let finding = match exit_code {
             // Same reasoning as `TestResultVerifier`'s mirror branch above:
             // a heuristic `exit_code=0` does not prove the command actually
             // succeeded.
@@ -491,16 +611,17 @@ impl Verifier for CommandSuccessVerifier {
                 ),
                 computed_at: now,
             },
-            // The claim names a test runner but the evidence it matched is not
-            // an identified run of one (`echo pytest`, a compound command, ...).
-            Some(0) if claim_names_test_runner && !is_test_runner_evidence(ev) => Finding {
+            // A newer row that only mentions the claimed command may be its real
+            // run (a wrapper, a pipeline, a compound list): do not let an older
+            // success stand over it.
+            Some(0) if newer_mention => Finding {
                 id: Uuid::new_v4(),
                 claim_id: claim.id,
                 verdict: Verdict::Unverified,
                 evidence_ids: vec![ev.id],
                 verifier_name: self.name().to_string(),
-                rationale: "the claimed command is a test runner, but the matching evidence is \
-                            not an identified run of one"
+                rationale: "an earlier run of the command exited 0, but a more recent command \
+                            that mentions it could not be identified as a run of it"
                     .to_string(),
                 computed_at: now,
             },
@@ -546,7 +667,23 @@ impl Verifier for CommandSuccessVerifier {
                 "command evidence found but no exit_code field present",
                 now,
             ),
+        };
+
+        // The claim named a shorter command than the one that ran: extra
+        // arguments can change what it did (`--dry-run`), so a success is not
+        // attributed to the claimed command with full confidence.
+        if prefix_only && finding.verdict == Verdict::Verified {
+            return Finding {
+                verdict: Verdict::Review,
+                rationale: format!(
+                    "{} -- the observed command has more arguments than the claimed one, so \
+                     the exit status is not attributed to the claimed command exactly",
+                    finding.rationale
+                ),
+                ..finding
+            };
         }
+        finding
     }
 }
 
@@ -995,6 +1132,45 @@ impl Verifier for GitOperationVerifier {
             ),
         }
     }
+}
+
+/// A genuine (non-heuristic) exit status 0.
+fn exit_zero_reliable(e: &Evidence) -> bool {
+    e.payload.get("exit_code").and_then(|v| v.as_i64()) == Some(0) && !is_heuristic_evidence(e)
+}
+
+/// The command a command_executed / command_succeeded claim names.
+enum CommandLiteral {
+    None,
+    One(String),
+    /// More than one distinct literal ("`cd repo` then `pytest`"): which one the
+    /// claim is about is ambiguous, so it cannot be bound to evidence.
+    Several,
+}
+
+/// Backtick-delimited literals, else double-quote-delimited ones (as before),
+/// deduplicated. Used only by the two command verifiers; other verifiers keep
+/// `extract_delimited`.
+fn command_literal(text: &str) -> CommandLiteral {
+    for delim in ['`', '"'] {
+        let mut found: Vec<String> = Vec::new();
+        let mut rest = text;
+        while let Some(start) = rest.find(delim) {
+            let after = &rest[start + delim.len_utf8()..];
+            let Some(end) = after.find(delim) else { break };
+            let inner = after[..end].trim();
+            if !inner.is_empty() && !found.iter().any(|f| f == inner) {
+                found.push(inner.to_string());
+            }
+            rest = &after[end + delim.len_utf8()..];
+        }
+        match found.len() {
+            0 => continue,
+            1 => return CommandLiteral::One(found.remove(0)),
+            _ => return CommandLiteral::Several,
+        }
+    }
+    CommandLiteral::None
 }
 
 /// Extract the substring between the first pair of `delim` characters in
@@ -1792,6 +1968,380 @@ mod tests {
         TestResultVerifier
             .verify(&claim("All tests passed."), &[ev], &caps())
             .verdict
+    }
+
+    /// A row whose `command` is a plain string (Claude Bash shape).
+    fn evidence_for_string(command: &str, exit_code: i64) -> Evidence {
+        let mut ev = evidence_for_command(&["x"], exit_code);
+        ev.payload["command"] = serde_json::json!(command);
+        ev
+    }
+
+    fn command_verdicts(text: &str, rows: Vec<Evidence>) -> (Verdict, Verdict) {
+        let run = |subject: &str| {
+            let verifier: Box<dyn Verifier> = if subject == "command_executed" {
+                Box::new(CommandExecutedVerifier)
+            } else {
+                Box::new(CommandSuccessVerifier)
+            };
+            verifier
+                .verify(&claim_for(subject, text), &rows, &caps())
+                .verdict
+        };
+        (run("command_executed"), run("command_succeeded"))
+    }
+
+    /// FORNX-477 exact binding: evidence that merely contains the claimed
+    /// command's text, or runs a respelled/different command, never supports the
+    /// claim. Every row here exited 0, so a substring match used to Verify it.
+    #[test]
+    fn a_row_that_only_mentions_the_claimed_command_never_binds() {
+        let argv = |a: &[&str]| evidence_for_command(a, 0);
+        let string = |c: &str| evidence_for_string(c, 0);
+        let cases: Vec<(&str, Evidence)> = vec![
+            ("echo of the text", argv(&["echo", "npm install"])),
+            ("echo as a string", string("echo npm install")),
+            ("timeout wrapper", string("timeout 60 npm install")),
+            ("sudo wrapper", string("sudo npm install")),
+            ("pipeline", string("npm install | tee log")),
+            ("semicolon list", string("npm install; true")),
+            ("or list", string("true || npm install")),
+            ("and list", string("true && npm install")),
+            ("redirect", string("npm install > /dev/null")),
+            ("relative program", string("./other/npm install")),
+            ("non-benign env prefix", string("PATH=/tmp/x npm install")),
+            ("quoted program", argv(&["npm install"])),
+            ("different case", argv(&["NPM", "install"])),
+        ];
+        for (label, row) in cases {
+            assert_eq!(
+                command_verdicts("I ran `npm install`.", vec![row.clone()]).0,
+                Verdict::Unverified,
+                "executed: {label}"
+            );
+            assert_eq!(
+                command_verdicts("The `npm install` succeeded.", vec![row]).1,
+                Verdict::Unverified,
+                "succeeded: {label}"
+            );
+        }
+        // A claimed program with a path must match that exact path.
+        assert_eq!(
+            command_verdicts("I ran `./deploy.sh`.", vec![string("./other/deploy.sh")]).0,
+            Verdict::Unverified
+        );
+        // A claim spelled in another case does not bind the real run.
+        assert_eq!(
+            command_verdicts("I ran `NPM Install`.", vec![argv(&["npm", "install"])]).0,
+            Verdict::Unverified
+        );
+    }
+
+    #[test]
+    fn a_claim_naming_several_commands_or_none_parseable_cannot_bind() {
+        let row = evidence_for_command(&["pytest"], 0);
+        let (executed, succeeded) = command_verdicts(
+            "I ran `cd repo` then `pytest` and it succeeded.",
+            vec![row.clone()],
+        );
+        assert_eq!(
+            (executed, succeeded),
+            (Verdict::Unverified, Verdict::Unverified)
+        );
+        // The same literal twice is one command, not an ambiguity.
+        assert_eq!(
+            command_verdicts("I ran `pytest`, yes `pytest`.", vec![row.clone()]).0,
+            Verdict::Verified
+        );
+        // A literal that is not a parseable command.
+        assert_eq!(
+            command_verdicts("I ran `npm install |`.", vec![row]).0,
+            Verdict::Unverified
+        );
+    }
+
+    /// What does still bind: the same command step for step, with or without
+    /// benign environment prefixes, an absolute path to the same program, a
+    /// whole-command equal compound or shell wrapper, and quoted arguments.
+    #[test]
+    fn the_same_command_still_binds_and_keeps_its_exit_semantics() {
+        let ok = |text: &str, row: Evidence| command_verdicts(text, vec![row]);
+        assert_eq!(
+            ok(
+                "I ran `npm install`.",
+                evidence_for_command(&["npm", "install"], 0)
+            ),
+            (Verdict::Verified, Verdict::Verified)
+        );
+        // A failing run: ran, but contradicts "succeeded".
+        assert_eq!(
+            ok(
+                "I ran `npm install`.",
+                evidence_for_command(&["npm", "install"], 1)
+            ),
+            (Verdict::Verified, Verdict::Contradicted)
+        );
+        for row in [
+            evidence_for_string("CI=1 npm install", 0),
+            evidence_for_string("npm   install", 0),
+        ] {
+            assert_eq!(
+                ok("The `npm install` succeeded.", row.clone()).1,
+                Verdict::Verified
+            );
+            assert_eq!(ok("I ran `npm install`.", row).0, Verdict::Verified);
+        }
+        // The claim names an env assignment: the run must have used it.
+        assert_eq!(
+            ok(
+                "The `CI=1 npm install` succeeded.",
+                evidence_for_string("CI=1 npm install", 0)
+            )
+            .1,
+            Verdict::Verified
+        );
+        assert_eq!(
+            ok(
+                "The `CI=1 npm install` succeeded.",
+                evidence_for_command(&["npm", "install"], 0)
+            )
+            .1,
+            Verdict::Unverified
+        );
+        // Whole compound claim equals a shell-wrapped argv.
+        let wrapped = |code| evidence_for_command(&["bash", "-lc", "cd repo && npm install"], code);
+        assert_eq!(
+            ok("The `cd repo && npm install` succeeded.", wrapped(0)).1,
+            Verdict::Verified
+        );
+        assert_eq!(
+            ok("The `cd repo && npm install` succeeded.", wrapped(1)).1,
+            Verdict::Contradicted
+        );
+        // Quoted arguments compare as words.
+        assert_eq!(
+            ok(
+                "The `git commit -m 'add jest'` succeeded.",
+                evidence_for_string("git commit -m 'add jest'", 0)
+            )
+            .1,
+            Verdict::Verified
+        );
+    }
+
+    /// Weaker fits are capped at Review, never Verified: a bare program name
+    /// reached through an absolute path (it can be another program), and a
+    /// claim that is only part of a `cd dir && cmd` row.
+    #[test]
+    fn a_path_or_cd_wrapped_fit_is_capped_at_review() {
+        assert_eq!(
+            command_verdicts(
+                "I ran `npm install`.",
+                vec![evidence_for_command(&["/tmp/evil/npm", "install"], 0)]
+            ),
+            (Verdict::Review, Verdict::Review)
+        );
+        assert_eq!(
+            command_verdicts(
+                "I ran `pytest`.",
+                vec![evidence_for_string("cd repo && pytest", 0)]
+            )
+            .0,
+            Verdict::Review
+        );
+        // A guessed (heuristic) 0 does not show `cd` succeeded, so it does not
+        // bind at all.
+        let mut guessed = evidence_for_string("cd repo && npm install", 0);
+        guessed.payload["heuristic"] = serde_json::json!(true);
+        assert_eq!(
+            command_verdicts("I ran `npm install`.", vec![guessed]).0,
+            Verdict::Unverified
+        );
+        // A non-zero status does not show the second step ran either.
+        assert_eq!(
+            command_verdicts(
+                "I ran `npm install`.",
+                vec![evidence_for_string("cd repo && npm install", 1)]
+            )
+            .0,
+            Verdict::Unverified
+        );
+    }
+
+    /// Environment values and shell expansion are part of command identity.
+    #[test]
+    fn env_values_and_unquoted_expansions_are_part_of_the_command() {
+        // The claim names a value the run did not use.
+        assert_eq!(
+            command_verdicts(
+                "The `CI=true npm test` succeeded.",
+                vec![evidence_for_string("CI=false npm test", 0)]
+            )
+            .1,
+            Verdict::Unverified
+        );
+        // A value the claim does not mention is ignored.
+        assert_eq!(
+            command_verdicts(
+                "The `npm run build` succeeded.",
+                vec![evidence_for_string("NODE_ENV=production npm run build", 0)]
+            )
+            .1,
+            Verdict::Verified
+        );
+        // `ls *.rs` expands; `ls '*.rs'` does not.
+        assert_eq!(
+            command_verdicts(
+                "I ran `ls *.rs`.",
+                vec![evidence_for_string("ls '*.rs'", 0)]
+            )
+            .0,
+            Verdict::Unverified
+        );
+    }
+
+    /// A short claim is not "mentioned" by an unrelated word that contains it,
+    /// so it does not wrongly withhold an older exact success.
+    #[test]
+    fn a_mention_needs_word_boundaries() {
+        assert_eq!(
+            command_verdicts(
+                "The `make` succeeded.",
+                vec![
+                    evidence_for_command(&["make"], 0),
+                    evidence_for_string("cat Makefile", 0)
+                ]
+            )
+            .1,
+            Verdict::Verified
+        );
+    }
+
+    /// `CI=1 CI=0 cmd` runs with CI=0, so it cannot bind a claimed `CI=1 cmd`;
+    /// a path-qualified run still counts as a mention of a bare program.
+    #[test]
+    fn duplicate_env_assignments_and_path_qualified_mentions() {
+        assert_eq!(
+            command_verdicts(
+                "The `CI=1 npm test` succeeded.",
+                vec![evidence_for_string("CI=1 CI=0 npm test", 0)]
+            )
+            .1,
+            Verdict::Unverified
+        );
+        assert_eq!(
+            command_verdicts(
+                "The `make` succeeded.",
+                vec![
+                    evidence_for_command(&["make"], 0),
+                    // Not a structural run of `make` (a wrapper), only a mention
+                    // whose match follows a `/`.
+                    evidence_for_string("sudo /tmp/x/make all", 0)
+                ]
+            )
+            .1,
+            Verdict::Unverified
+        );
+    }
+
+    /// A recorded failure of the exact command stays Contradicted however it is
+    /// followed: a later run with extra arguments, or a mere mention, must not
+    /// let an agent soften a failure it caused.
+    #[test]
+    fn a_recorded_exact_failure_is_not_softened_by_later_rows() {
+        for later in [
+            evidence_for_command(&["npm", "install", "--legacy-peer-deps"], 0),
+            evidence_for_string("npm install | cat", 0),
+        ] {
+            assert_eq!(
+                command_verdicts(
+                    "The `npm install` succeeded.",
+                    vec![evidence_for_command(&["npm", "install"], 1), later]
+                )
+                .1,
+                Verdict::Contradicted
+            );
+        }
+    }
+
+    /// An older exact success is not replaced by a newer failing run of the same
+    /// command with extra arguments: that run may be the real one, so the
+    /// success is withheld rather than contradicted or confirmed.
+    #[test]
+    fn a_newer_prefix_run_withholds_instead_of_overriding_an_exact_success() {
+        let rows = vec![
+            evidence_for_command(&["npm", "install"], 0),
+            evidence_for_command(&["npm", "install", "left-pad"], 1),
+        ];
+        assert_eq!(
+            command_verdicts("The `npm install` succeeded.", rows.clone()).1,
+            Verdict::Unverified
+        );
+        // "I ran" still holds: the exact run happened.
+        assert_eq!(
+            command_verdicts("I ran `npm install`.", rows).0,
+            Verdict::Verified
+        );
+    }
+
+    /// The claim is a strict prefix of what ran: extra arguments (a dry run)
+    /// can change what the command did, so success is capped at Review.
+    #[test]
+    fn a_longer_command_than_claimed_is_capped_at_review() {
+        for extra in [
+            vec!["--dry-run"],
+            vec!["left-pad"],
+            vec!["--legacy-peer-deps"],
+        ] {
+            let mut argv = vec!["npm", "install"];
+            argv.extend(extra);
+            let row = evidence_for_command(&argv, 0);
+            assert_eq!(
+                command_verdicts("I ran `npm install`.", vec![row.clone()]),
+                (Verdict::Review, Verdict::Review),
+                "{argv:?}"
+            );
+        }
+        // A failure is still a failure.
+        assert_eq!(
+            command_verdicts(
+                "The `npm install` succeeded.",
+                vec![evidence_for_command(&["npm", "install", "--dry-run"], 1)]
+            )
+            .1,
+            Verdict::Contradicted
+        );
+    }
+
+    /// A newer row that only mentions the command may be its real run.
+    #[test]
+    fn a_newer_mention_withholds_a_success_but_not_a_recorded_failure_or_an_execution() {
+        let mention = || evidence_for_string("npm install | cat", 0);
+        assert_eq!(
+            command_verdicts(
+                "The `npm install` succeeded.",
+                vec![evidence_for_command(&["npm", "install"], 0), mention()]
+            )
+            .1,
+            Verdict::Unverified
+        );
+        assert_eq!(
+            command_verdicts(
+                "The `npm install` succeeded.",
+                vec![evidence_for_command(&["npm", "install"], 1), mention()]
+            )
+            .1,
+            Verdict::Contradicted
+        );
+        // An older real run is not undone by a later mention for "I ran".
+        assert_eq!(
+            command_verdicts(
+                "I ran `npm install`.",
+                vec![evidence_for_command(&["npm", "install"], 0), mention()]
+            )
+            .0,
+            Verdict::Verified
+        );
     }
 
     /// FORNX-477 (QA 29513 residual): "the `pytest` run succeeded" asserts that

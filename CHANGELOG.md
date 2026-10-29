@@ -158,6 +158,21 @@ Jira epic FORNX-20.
   summaries are FORNX-479, both outside v0.0.9. See README "Which commands
   count as a test run" and ADR-0025.
 
+- **"I ran X" / "X succeeded" bind to the command that ran, not to text that
+  contains it** (FORNX-477 hardening). The match between a `command_executed` /
+  `command_succeeded` claim and a command row was a lowercased substring, so
+  `echo npm install` verified "the `npm install` succeeded". A claim now binds
+  only to a row that ran the same command step for step; text that merely
+  mentions it (`echo`, `timeout`/`sudo` wrappers, pipelines, `;`/`||`/`&&`
+  lists, another program path or letter case) is `Unverified`, and a newer
+  mention withholds an older success. A claim naming more than one command, or
+  a command that cannot be parsed, is `Unverified`. A claim that is a prefix of
+  the command that ran (`npm install` vs `npm install --dry-run`), a bare program
+  name reached through an absolute path, or one step of a `cd dir && cmd` row is
+  `Review`; an env prefix the claim names (`CI=true`) must match in value.
+  A real failure is still `Contradicted`. `npm install`, `cargo build` and
+  similar exact runs keep verifying from a literal exit code.
+
 - **A test run claimed as `command_succeeded` gets the same bar as
   `test_result`** (FORNX-477, QA 29513 residual). "The `pytest -q` run
   succeeded" reached `Verified` from the same agent-reported exit code. When

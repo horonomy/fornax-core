@@ -127,11 +127,20 @@ test runner (any runner, including `jest`, `vitest`, `npm test` and `cargo
 nextest run`, whose output is not read and so can never verify) but the matched
 evidence is not one. Production adapters mint only
 `test_result` claims; `command_succeeded` reaches the daemon through the ingest
-socket. Non-test commands are unchanged. Residual, outside this scope: the
-command match is a substring of the evidence's command text, so a non-test
-claim such as "the `npm install` succeeded" can still be satisfied by
-`echo npm install` exiting 0; this is a status-only claim, not a claim that
-tests ran.
+socket. Non-test commands are unchanged. The command match is no longer
+a substring (2026-10-29, exact binding): a claim binds only to a row that ran
+the same command step for step (same program string, same arguments; a benign
+`CI=1`-style prefix the claim does not mention is ignored, one it names must match
+in value). `echo npm
+install`, a wrapper (`timeout`, `sudo`), a pipeline or list, a relative or
+respelled program, another letter case, or a claim naming several commands
+cannot bind and resolve `Unverified`; a claim that is only a prefix of what ran
+(`npm install` against `npm install --dry-run`), the same program name reached
+through an absolute path (`/tmp/x/npm`), or part of a `cd dir && cmd` row with a
+genuine exit 0 is capped at `Review`. Unquoted words the shell would expand
+(`*.rs`, `~`) do not bind their quoted spelling. Residuals:
+a fake program that takes the real program's name is trusted (the same PATH
+residual as test runners), and exit status 126/127 still counts as "ran".
 
 ## Addendum (FORNX-477, 2026-10-29): `Verified` requires an attested collector (founder decision, Option A)
 
