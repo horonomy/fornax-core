@@ -1993,7 +1993,10 @@ mod fusion_tests {
             observed_at: chrono::Utc::now().to_rfc3339(),
             payload: serde_json::json!({"command": ["pytest"], "exit_code": 0, "test_summary": {"format": "pytest", "passed": 3, "failed": 0}}),
             provenance: "codex:rollout:exec_command_end".into(),
-            source: None,
+            // An attested fixture collector: the Verified arm needs one (FORNX-477).
+            source: Some(crate::tests::source_with(
+                fornax_types::TrustClass::HostObserved,
+            )),
             extension: None,
             evidence_purged: false,
         };

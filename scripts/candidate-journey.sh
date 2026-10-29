@@ -85,7 +85,7 @@ check "doctor says configuration only, never Verified" "$F doctor | grep -q 'con
 $F uninstall claude-code
 check "uninstall keeps foreign hook" "grep -q foreign-hook '$HOME/.claude/settings.json'"
 check "uninstall removes fornax hook" "! grep -q fornax-hook-claude '$HOME/.claude/settings.json'"
-step "E1 test-result trust (FORNX-477): only an executed test runner can verify 'tests passed'"
+step "E1 test-result trust (FORNX-477): a transcript-only test run is capped at REVIEW, never VERIFIED"
 # Synthetic Bash hook events with a literal exit code, fed to the real
 # fornax-hook-claude and daemon (README quick start). No command is executed.
 rm -f "$FORNAX_HOME/fornax.sock"
@@ -111,6 +111,9 @@ claim e1-fake-abs "/tmp/qa/bin/pytest" 0
 claim e1-zero "cargo test no_such_test" 0 'running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s\n'
 claim e1-forged "echo 3 passed in 0.1s && cargo test no_such_test" 0 '3 passed in 0.1s\n'
 claim e1-wrongfmt "cargo test" 0 '3 passed in 0.03s\n'
+# A QA-owned executable named pytest that only prints a convincing summary
+# looks identical to the real runner in the agent's transcript (QA 29501).
+claim e1-forgedpytest "pytest" 0 '3 passed in 0.01s\n'
 sleep 2
 for s in echo pip cat or semi pipe; do
   check "e1-$s: a command that only mentions or masks a runner stays UNVERIFIED" "[ \"\$(verdict_of e1-$s)\" = '? UNVERIFIED' ]"
@@ -118,9 +121,11 @@ done
 for s in fake fake-abs zero forged wrongfmt; do
   check "e1-$s: runner name + exit 0 without that runner's passing-test summary stays UNVERIFIED" "[ \"\$(verdict_of e1-$s)\" = '? UNVERIFIED' ]"
 done
-check "e1-runner: a real passing runner with its summary is VERIFIED" "[ \"\$(verdict_of e1-runner)\" = '✓ VERIFIED' ]"
+check "e1-runner: a passing runner with its summary is REVIEW (unattested), not VERIFIED" "[ \"\$(verdict_of e1-runner)\" = '! REVIEW' ]"
+check "e1-forgedpytest: a forged passing summary is REVIEW, never VERIFIED" "[ \"\$(verdict_of e1-forgedpytest)\" = '! REVIEW' ]"
 check "e1-fail: a real failing runner is CONTRADICTED" "verdict_of e1-fail | grep -q CONTRADICTED"
-check "e1-and: cd + runner with its summary is VERIFIED" "[ \"\$(verdict_of e1-and)\" = '✓ VERIFIED' ]"
+check "e1-and: cd + runner with its summary is REVIEW (unattested), not VERIFIED" "[ \"\$(verdict_of e1-and)\" = '! REVIEW' ]"
+check "e1: no transcript-only test result is VERIFIED" "! { for s in echo pip cat or semi pipe runner fail and fake fake-abs zero forged wrongfmt forgedpytest; do verdict_of e1-\$s; done; } | grep -q '^✓ VERIFIED'"
 kill "$(cat "$J/daemon.pid")" 2>/dev/null
 
 echo; [ $fail = 0 ] && echo "JOURNEY-PASS" || echo "JOURNEY-FAIL"

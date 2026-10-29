@@ -175,7 +175,7 @@ async fn codex_watch_inert_without_marker() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn codex_watch_new_rollout_produces_a_verified_finding_not_review() {
+async fn codex_watch_new_rollout_produces_a_review_finding() {
     let env = Env::new("verified");
     env.opt_in();
     let _d = env.start_daemon();
@@ -185,11 +185,10 @@ async fn codex_watch_new_rollout_produces_a_verified_finding_not_review() {
     append_lines(&env.rollout("verified"), &lines);
     let f = wait_for_finding(&env, "cw-verified", 1).await;
     assert_eq!(f.len(), 1);
-    assert_eq!(
-        f[0].verdict, "verified",
-        "no hook, no tailer, no handoff downgrade: {}",
-        f[0].rationale
-    );
+    // FORNX-477: a passing run in the agent's transcript is capped at review
+    // (it was `verified` before the cap). This test pins that a new rollout
+    // yields a finding at all.
+    assert_eq!(f[0].verdict, "review", "{}", f[0].rationale);
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -7770,7 +7770,8 @@ mod tests {
             (2, 1, 1)
         );
         assert_eq!(first.findings.len(), 1);
-        assert_eq!(first.findings[0].verdict, "verified");
+        // FORNX-477: a transcript-derived pass is capped at review.
+        assert_eq!(first.findings[0].verdict, "review");
 
         process_codex_completion(
             &state,
@@ -7827,7 +7828,8 @@ mod tests {
             (2, 1, 1)
         );
         assert_eq!(first.findings.len(), 1);
-        assert_eq!(first.findings[0].verdict, "verified");
+        // FORNX-477: a transcript-derived pass is capped at review.
+        assert_eq!(first.findings[0].verdict, "review");
 
         process_codex_completion(
             &state,
@@ -7875,11 +7877,13 @@ mod tests {
             .iter()
             .find(|row| row.claim_id == later_claim.0.to_string())
             .unwrap();
+        // FORNX-477: an unattested pass is capped at review, so it is never
+        // Verified and never recorded as consumed; the cross-turn replay guard
+        // acts on Verified findings and is exercised by provenance_enforcement.rs.
         assert_eq!(later_finding.verdict, "review");
-        assert!(later_finding.rationale.contains("already consumed"));
         assert!(later_finding
             .rationale
-            .contains(&first.claims[0].0.to_string()));
+            .contains("not independently attested"));
         assert_eq!(later.quarantine, 1);
         drop(state);
         remove_codex_test_store(&path);
@@ -7975,7 +7979,8 @@ mod tests {
             ),
             (2, 1, 1, 1)
         );
-        assert_eq!(first.findings[0].verdict, "verified");
+        // FORNX-477: a transcript-derived pass is capped at review.
+        assert_eq!(first.findings[0].verdict, "review");
         assert_eq!(first.quarantine, 1);
         process_codex_completion(
             &reopened,
@@ -8011,7 +8016,8 @@ mod tests {
         let before = codex_completion_snapshot(&state, session).await;
         assert_eq!(before.claims.len(), 1);
         assert_eq!(before.findings.len(), 1);
-        assert_eq!(before.findings[0].verdict, "verified");
+        // FORNX-477: a transcript-derived pass is capped at review.
+        assert_eq!(before.findings[0].verdict, "review");
         assert!(!before.claims[0].2.contains(&canary));
         assert!(before.claims[0].2.starts_with("All tests passed."));
         let event = state

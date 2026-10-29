@@ -69,12 +69,22 @@ states the resulting, product-visible *verdict* consequence for a
 distinction matters more to anyone reading this doc for product claims than
 the signal taxonomy alone:
 
-| Provider (default config) | Can reach `Verified`? | Can reach `Contradicted`? | Why |
+| Provider / path | Verdict ceiling for a passing run | On a genuine failure | Why |
 |---|---|---|---|
-| Claude Code | **No** | Only via the `stderr_nonempty` heuristic path, and even then capped at `Review` by `is_stderr_heuristic_evidence`, never `Contradicted` | `ProcessResult` is `Unsupported` — no literal exit code exists in this adapter's evidence at all |
-| Codex (default: `unified_exec`/`tools.exec_command`) | **No** | No | The "Script completed" fallback carries no exit status in either direction — not even heuristically distinguishable |
-| Codex (`--disable unified_exec`, i.e. `tools.shell_command`) | **Yes** | **Yes** | Literal, parseable `"Exit code: <n>"` text — genuinely authoritative, `heuristic: false` |
-| opencode | **Yes** | **Yes** | `tool.execute.after`'s `output.metadata.exit` is a literal integer |
+| Claude Code | `Review` | Not `Contradicted`: the `stderr_nonempty` heuristic path is capped at `Review` by `is_stderr_heuristic_evidence` | `ProcessResult` is `Unsupported` — no literal exit code exists in this adapter's evidence at all |
+| Codex (default: `unified_exec`/`tools.exec_command`) | `Review` | No verdict either way | The "Script completed" fallback carries no exit status in either direction — not even heuristically distinguishable |
+| Codex (`--disable unified_exec`, i.e. `tools.shell_command`) | `Review` | `Contradicted` (literal, parseable `"Exit code: <n>"` text, `heuristic: false`) | The literal exit is authoritative for a failure, but a pass comes from the agent's own transcript (trust class `AgentAdjacent`), so it cannot be `Verified` |
+| opencode | `Review` | `Contradicted` (`tool.execute.after`'s `output.metadata.exit` is a literal integer) | Same: the literal exit settles a failure; a pass is transcript-derived and capped |
+
+**`Verified` is reachable only through an attested collector** (FORNX-477,
+founder decision Option A, 2026-10-29): evidence from a collector that
+`fornax-verify`'s `test_run_attestors()` lists with trust class `HostObserved`
+or `IndependentExternal`. That list is deliberately empty in production and no
+shipped sensor attests test runs, so no row above can reach `Verified` in
+v0.0.9. Runner-name and summary conditions still yield `Unverified` for fake
+runners, zero tests and missing or malformed summaries; they never grant
+`Verified`. (An earlier version of this table showed `Verified` as reachable
+for Codex `shell_command` and opencode; that is superseded.)
 
 **This is deliberate, safety-correct behavior, not a defect** (FORNX-442):
 before that fix, Claude Code and default-config Codex could *falsely* reach
@@ -88,10 +98,10 @@ inventing a new unproven heuristic (e.g. parsing stdout text and trusting
 it as if it were authoritative); FORNX-443 is the tracked owner for adding a
 genuinely authoritative signal, preferring independently trustworthy process
 exit evidence, controlled runner receipts, or verified CI evidence over
-parsing arbitrary stdout text. **Do not market default-provider test-result
-verification as already available** — only the two non-default/opt-in paths
-above (Codex with `unified_exec` disabled, or opencode) currently carry an
-authoritative signal.
+parsing arbitrary stdout text. **Do not market test-result verification as
+available** — in v0.0.9 no provider path can produce a `Verified`
+`test_result`; the non-default paths (Codex with `unified_exec` disabled, or
+opencode) carry an authoritative signal only for failures (`Contradicted`).
 
 ## Claude Code
 

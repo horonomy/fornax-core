@@ -122,7 +122,7 @@ Jira epic FORNX-20.
   optionally inside `sh -c`. Compound (`;`, `||`, pipes), expanded,
   unparseable and non-executing (`--collect-only`, `--no-run`, ...) commands
   are `Unverified`, and a newer unidentified runner command stops an older
-  pass from being `Verified`. Genuine runner passes stay `Verified`, failures
+  pass from being `Verified`. Genuine runner passes stay `Verified` here (superseded by the REVIEW cap in the next entry), failures
   stay `Contradicted`, and heuristic exit codes stay capped at `Review`. See
   the README section "Which commands count as a test run".
 
@@ -136,10 +136,27 @@ Jira epic FORNX-20.
   format, at least one pass and no failure. Anything else is `Unverified`;
   `Contradicted` and the heuristic `Review` ceiling are unchanged. In this
   release only pytest and `cargo test` output is read, so `cargo nextest run`,
-  `npm test`, `jest` and `vitest` passes are `Unverified` (benign review burden
-  in the ablation benchmark rises from 0 to 2 of 6). A program that prints a
-  forged summary can still pass; see README "Which commands count as a test
-  run" and ADR-0025.
+  `npm test`, `jest` and `vitest` passes are `Unverified`. A program that
+  prints a forged summary can still pass these conditions; see the next entry.
+
+- **A `test_result` from the agent's own transcript can no longer be `Verified`**
+  (FORNX-477, founder decision Option A, 2026-10-29). QA showed an executable
+  named `pytest` that prints `3 passed in 0.01s` and exits 0 still reached
+  `Verified`; the runner-structure and summary conditions above stay but are
+  not sufficient, because the exit code and summary come from the agent's own
+  session (trust class `AgentAdjacent`). The most such a finding can now be is
+  `Review`. `Verified` needs evidence from a collector `fornax-verify` lists as
+  a test-run attestor with trust class `HostObserved` or `IndependentExternal`;
+  that list is deliberately empty in production and no shipped sensor attests
+  test runs. User-visible consequence: in v0.0.9 every "tests passed" finding
+  from Claude Code, Codex (default and `shell_command`) and OpenCode is at most
+  `Review`. Unchanged: a genuine non-zero literal exit is `Contradicted`; fake
+  runners, zero tests and missing, wrong or malformed summaries are
+  `Unverified`; a heuristic `exit_code=0` stays `Review`. In the ablation
+  benchmark the benign review burden in config B is 3 of 6 (50%). Host-controlled
+  runner receipts or CI evidence are FORNX-443 and nextest/npm/jest/vitest
+  summaries are FORNX-479, both outside v0.0.9. See README "Which commands
+  count as a test run" and ADR-0025.
 
 - **Codex completion replay creates duplicate events and claims** (FORNX-446).
   Rollout `task_complete` records with a nonblank native `turn_id` now retain

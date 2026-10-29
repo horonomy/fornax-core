@@ -165,6 +165,16 @@ fn pytest_success_exec_pair(call_id: &str) -> Vec<serde_json::Value> {
     ]
 }
 
+/// The same shape as `pytest_success_exec_pair` but a genuine failing run
+/// (`Exit code: 1`): a definite `contradicted` against an "all tests passed"
+/// claim, which is what a wrongful HORO-1712 downgrade would turn into `review`.
+fn pytest_failure_exec_pair(call_id: &str) -> Vec<serde_json::Value> {
+    let mut pair = pytest_success_exec_pair(call_id);
+    pair[1]["payload"]["output"][1]["text"] =
+        serde_json::json!("Exit code: 1\n.....F [100%]\n1 failed, 5 passed in 0.02s\n");
+    pair
+}
+
 fn task_complete_line(assistant_text: &str) -> serde_json::Value {
     serde_json::json!({
         "type": "event_msg",
@@ -354,13 +364,21 @@ fn run_case(label: &str, passed: bool, assistant_text: &str) -> (String, fornax_
 }
 
 #[test]
-fn real_codex_shell_command_success_reaches_a_verified_finding_end_to_end() {
+fn real_codex_shell_command_success_reaches_a_review_finding_end_to_end() {
     let (_session_id, finding) = run_case("positive", true, "All tests passed.");
+    // FORNX-477 (founder decision): the exit code and summary come from the
+    // program the agent ran, so even a genuine literal exit 0 from
+    // tools.shell_command is capped at Review until an attested collector exists.
     assert_eq!(
-        finding.verdict, "verified",
+        finding.verdict, "review",
         "a genuine exit-code-0 tools.shell_command result plus a matching task_complete \
-         claim must reach Verified through the real daemon, got verdict={} evidence_ids={}",
+         claim is capped at Review (unattested), got verdict={} evidence_ids={}",
         finding.verdict, finding.evidence_ids
+    );
+    assert!(
+        finding.rationale.contains("not independently attested"),
+        "the unattested cap must produce this review: {}",
+        finding.rationale
     );
     let evidence_ids: Vec<uuid::Uuid> =
         serde_json::from_str(&finding.evidence_ids).expect("decode evidence_ids");
@@ -765,7 +783,7 @@ fn a_tailer_without_a_native_id_does_not_downgrade_other_sessions() {
     let b_id = "fx462-session-b";
     let rollout_b = tmp.join("rollout-b.jsonl");
     let mut lines = vec![session_meta_line(b_id)];
-    lines.extend(pytest_success_exec_pair("fx462-b-call"));
+    lines.extend(pytest_failure_exec_pair("fx462-b-call"));
     lines.push(task_complete_line("All tests passed."));
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     run_hook_codex_over_rollout(&fornax_home, &rollout_b, &lines, || {
@@ -793,9 +811,13 @@ fn a_tailer_without_a_native_id_does_not_downgrade_other_sessions() {
             })
         },
     );
+    // FORNX-477: B is a genuine failing run, a definite `contradicted`. A passing
+    // run would now be `review` on its own and could not show a downgrade; the
+    // unrelated tailer must not turn B's definite verdict into `review`.
     assert_eq!(
-        finding.verdict, "verified",
-        "an unrelated tailer with no identity must not downgrade session B's verdict"
+        finding.verdict, "contradicted",
+        "an unrelated tailer with no identity must not downgrade session B's verdict: {}",
+        finding.rationale
     );
     drop(daemon_guard);
     std::fs::remove_dir_all(&tmp).ok();

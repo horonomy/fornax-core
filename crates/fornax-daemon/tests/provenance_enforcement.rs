@@ -622,8 +622,8 @@ fn test_result_claim(session_id: &str, source_event_id: Uuid) -> Claim {
 }
 
 /// FORNX-433 AC3 Slice B: a claim minted from the main session (no
-/// `agent_id` -- e.g. a `Stop`-derived summary) must still reach Verified
-/// against test-runner evidence that originated from a *different* event
+/// `agent_id` -- e.g. a `Stop`-derived summary) must still be matched to and
+/// judged against test-runner evidence that originated from a *different* event
 /// in the same session (e.g. a Task subagent that actually ran the tests).
 /// `fornax-verify`'s `TestResultVerifier` pools all evidence for the
 /// session rather than filtering by which event produced it -- confirmed
@@ -631,12 +631,15 @@ fn test_result_claim(session_id: &str, source_event_id: Uuid) -> Claim {
 /// runs the tests, main agent reports the result" delegation pattern, not
 /// a cross-agent leak (no code path today mints a claim *from* a
 /// subagent's own output, so there is nothing yet for a wrong agent's
-/// claim to wrongly borrow another agent's evidence). This test pins
+/// claim to wrongly borrow another agent's evidence). Since FORNX-477 that
+/// evidence is the agent's own account (`AgentAdjacent`), so the result is
+/// `review`, not `verified`; the sibling test below shows it differs from the
+/// no-evidence case (`unverified`). This test pins
 /// delegation pooling as intended behavior, so a future agent-scoping
 /// change (FORNX-433 Slice C, gated on a real subagent-originated claim
 /// existing) can't silently break it while fixing an actual leak elsewhere.
 #[tokio::test]
-async fn main_session_claim_is_verified_by_subagent_originated_test_evidence() {
+async fn main_session_claim_is_reviewed_against_subagent_originated_test_evidence() {
     let daemon = start_daemon().await;
     let store = Store::open(daemon.home.join("fornax.db"))
         .await
@@ -671,10 +674,11 @@ async fn main_session_claim_is_verified_by_subagent_originated_test_evidence() {
 
     assert_eq!(
         verdict,
-        Some("verified".to_string()),
-        "the main session's claim must be verified by test evidence a \
-         subagent produced in the same session -- delegation pooling is \
-         intended behavior, not a leak; daemon log:\n{}",
+        Some("review".to_string()),
+        "the main session's claim must be judged against test evidence a \
+         subagent produced in the same session (review: unattested passing \
+         run, FORNX-477) -- delegation pooling is intended behavior, not a \
+         leak; daemon log:\n{}",
         daemon.log_contents()
     );
 }
@@ -682,7 +686,7 @@ async fn main_session_claim_is_verified_by_subagent_originated_test_evidence() {
 /// Mutation proof for the sibling test above: with no test-runner evidence
 /// anywhere in the session (the subagent's event/evidence deliberately
 /// omitted), the same claim must NOT reach Verified -- proving the
-/// sibling's Verified result genuinely depends on the pooled evidence,
+/// sibling's Review result genuinely depends on the pooled evidence,
 /// not a vacuously-passing claim.
 #[tokio::test]
 async fn main_session_claim_without_any_test_evidence_stays_unverified() {
@@ -713,11 +717,11 @@ async fn main_session_claim_without_any_test_evidence_stays_unverified() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
 
-    assert_ne!(
+    assert_eq!(
         verdict,
-        Some("verified".to_string()),
+        Some("unverified".to_string()),
         "with no test-runner evidence anywhere in the session, the claim \
-         must not reach Verified; daemon log:\n{}",
+         must stay Unverified; daemon log:\n{}",
         daemon.log_contents()
     );
 }

@@ -106,9 +106,11 @@ file to a clean state:
    recorded in `$FORNAX_HOME/codex-watch.json`, and `fornax uninstall codex`
    turns it off. In practice it watches the `sessions/` directory of the
    selected Codex home (below) and only activity that happens after capture is
-   on; sessions already on disk are not backfilled. A claim can be Verified
-   only when Codex reports a literal exit code for the run (Codex 0.160+ item
-   format); older default shell modes expose none, and those results stay
+   on; sessions already on disk are not backfilled. A `test_result` claim
+   from Codex is at most Review, even when Codex reports a literal exit code
+   (Codex 0.160+ item format), because no shipped sensor attests test runs
+   (see "Which commands count as a test run"). A genuine non-zero exit is
+   still Contradicted; older default shell modes expose no exit code and stay
    Review/Unverified (ADR-0025).
 2. **Wires the ambient-status `notify` entry** in `config.toml` to a script
    under `$FORNAX_HOME/bin` (so Codex writes its turn status to
@@ -150,7 +152,7 @@ marker or a config file alone is never reported as working), and the Claude
 Code hooks. A hook entry in Claude's `settings.json` is reported as
 configuration only; only recorded events show it ran. For Claude Code (no exit
 code in its hook payload) a test result shows as Review, never Verified
-(ADR-0025). A finding appears after an agent says it ran tests and the run's
+(ADR-0025); the same cap now applies to every provider's test result. A finding appears after an agent says it ran tests and the run's
 own output is seen; see them with `fornax status` and `fornax detail`.
 
 For the optional ambient-status surface only, see
@@ -204,10 +206,10 @@ those started by `npx`, `pnpx`, `bunx`, `pnpm exec`, `uv run` or `poetry run`.
 A few harmless environment assignments (`CI=1`, `RUST_BACKTRACE=1`, ...) may
 precede it.
 
-* A single runner command keeps its own exit code: 0 can be `Verified`,
-  non-zero is `Contradicted`. `2>&1` after the command is allowed (it does not
+* A single runner command keeps its own exit code: 0 is at most `Review`
+  (see the cap below), non-zero is `Contradicted`. `2>&1` after the command is allowed (it does not
   change the exit status); other redirections are not.
-* An `&&` list (`cd dir && cargo test`) can be `Verified` only when it exits 0,
+* An `&&` list (`cd dir && cargo test`) can be a pass only when it exits 0,
   because `&&` runs the next command only after the previous one succeeded. A
   non-zero exit says nothing about which command failed, so it is `Unverified`.
   A list containing a shell-state command (`exit`, `exec`, `source`, `export`,
@@ -222,7 +224,24 @@ precede it.
   test run (for example `pytest | tail`, or `git commit -m "fix pytest"`) stops
   an older run from deciding the claim: it becomes `Unverified`.
 
-A recognised runner exiting 0 is still not enough for `Verified`. The runner's
+**A test run reported from the agent's own transcript is at most `Review`
+(FORNX-477).** The exit code and the printed summary both come from the
+agent's session, so they cannot establish that the tests ran and passed,
+however convincing the runner name, exit code or summary looks. An executable
+named `pytest` that prints `3 passed in 0.01s` and exits 0 is indistinguishable
+from the real runner in that data. `Verified` for a `test_result` claim needs
+evidence from a collector this verifier lists as a test-run attestor with
+trust class `HostObserved` or `IndependentExternal`. No such collector ships
+in v0.0.9 (the production attestor list is empty), so a passing test run from
+Claude Code, Codex (default and `shell_command`) or OpenCode is `Review`.
+Unchanged: a genuine non-zero literal exit is still `Contradicted`, and the
+conditions below still withhold the result (`Unverified`) for fake runners,
+zero tests and missing or malformed summaries. Host-controlled runner receipts
+or CI evidence, the route to `Verified`, are tracked as FORNX-443 and are not
+part of v0.0.9.
+
+The conditions below are therefore necessary but not sufficient. A recognised
+runner exiting 0 is not enough even for `Review`. The runner's
 own final summary must also be seen in that command's output: a QA-owned
 executable named `pytest` that only does `exit 0`, or `cargo test no_such_test`
 (`running 0 tests`), exits 0 without running any test. Fornax therefore reads
@@ -237,17 +256,19 @@ only the *counts* from the output's end and requires all of:
 * at least one test passed and none failed (errors count as failed).
 
 Missing, zero-test, mismatched or unparseable summaries are `Unverified`. The
-summary only ever withholds `Verified`: a failing runner is still
+summary only ever withholds a pass, it never grants `Verified`: a failing runner is still
 `Contradicted` by its exit code, and a heuristic exit code stays capped at
 `Review` whatever the output says. In this release only pytest and `cargo test`
 output is read, so `cargo nextest run`, `npm test`, `jest` and `vitest` are
-recognised (a failure is still `Contradicted`) but a pass is never `Verified`.
+recognised (a failure is still `Contradicted`) but a pass is `Unverified`
+(summary support for them, FORNX-479, is outside v0.0.9).
 
 Known limits: the summary is text the executed program itself printed, so a
 program that deliberately prints a convincing summary (a custom `pytest`
 script, a `conftest.py` hook, `harness = false`, `--nocapture`, a Jest
-reporter) can still produce `Verified`. Only host-attested exit status, a
-controlled runner receipt or CI evidence close that (ADR-0025, FORNX-443).
+reporter) passes the summary conditions. That is why the result stops at
+`Review`; only host-attested exit status, a controlled runner receipt or CI
+evidence can raise it (ADR-0025, FORNX-443).
 
 ### Exporting a session for cloud sync (optional)
 

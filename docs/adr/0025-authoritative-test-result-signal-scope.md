@@ -98,6 +98,10 @@ verification before merge, per this codebase's standing practice.
 
 ## Addendum (FORNX-477 residual, 2026-10-29): stdout summary as an extra condition
 
+> **Superseded in part** by the second addendum below: the summary can no
+> longer lead to `Verified`. The conditions described here remain, but only as
+> necessary conditions that withhold a pass (`Unverified`).
+
 QA showed a runner name plus exit 0 verified a fake `pytest` that ran no test.
 The correction uses stdout in the one way this ADR allows: it is
 *safety-monotonic*. The runner's final summary (counts only) can only add a
@@ -110,3 +114,37 @@ so a program that prints a forged summary can still pass. Closing that needs
 options 1-3 above (host-attested exit, runner receipts, CI evidence), tracked by
 FORNX-443. Runners whose output is not read yet (`nextest`, `jest`, `vitest`,
 `npm test`) are never `Verified` until their formats are added.
+
+## Addendum (FORNX-477, 2026-10-29): `Verified` requires an attested collector (founder decision, Option A)
+
+QA comment 29501 showed that an executable named `pytest` that prints
+`3 passed in 0.01s` and exits 0 still reached `Verified` after the
+runner-structure and summary conditions of PR #326/#327. Those conditions are
+necessary but not sufficient: the exit code and the summary are both produced
+inside the agent's own session.
+
+Decision (founder, approved):
+
+- A `test_result` finding derived from the agent's own transcript (trust class
+  `AgentAdjacent`, unknown or absent source) can never be `Verified`, however
+  convincing the runner name, exit code or printed summary. The most it can be
+  is `Review`.
+- `Verified` requires evidence from a collector that `fornax-verify` lists as a
+  test-run attestor (`test_run_attestors()`) with trust class `HostObserved` or
+  `IndependentExternal`. The label alone is not enough. The production list is
+  deliberately empty. A test-only fixture attestor exists under `cfg(test)`; it
+  proves only the gate logic, not that production attestation exists.
+- No shipped sensor attests test runs, so in v0.0.9 every `test_result` from
+  Claude Code, Codex (default and `shell_command`) and OpenCode is at most
+  `Review`.
+- Unchanged: a genuine non-zero literal exit is `Contradicted`; the runner and
+  summary conditions still produce `Unverified` for fake runners, zero tests and
+  missing, wrong or malformed summaries; a heuristic `exit_code=0` stays
+  `Review`.
+
+Effect on the options above: stdout parsing (option 4) no longer contributes to
+`Verified` on its own; it only withholds a pass. Options 2-3 (runner receipts,
+CI evidence), tracked as FORNX-443, are the only route back to `Verified`.
+Support for more runner summaries (nextest, npm, jest, vitest; FORNX-479) is
+also outside v0.0.9. Benchmark effect: the ablation benchmark's benign review
+burden in config B is 3 of 6 (50%).

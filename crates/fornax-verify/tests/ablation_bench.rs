@@ -66,7 +66,15 @@ fn exit_code_evidence(id: u128, command: &[&str], exit_code: i64) -> Evidence {
         observed_at: FIXED_TIME.into(),
         payload,
         provenance: "bench:fixture:exec_command_end".into(),
-        source: None,
+        // The shape real adapters produce: the agent's provider account of the
+        // command, which FORNX-477 caps at Review for test results.
+        source: Some(fornax_types::EvidenceSource::now(
+            "bench_fixture_sensor",
+            fornax_types::TrustClass::AgentAdjacent,
+            Some(Provider::Codex),
+            fornax_types::CollectionMethod::FilePoll,
+            None,
+        )),
         extension: None,
         evidence_purged: false,
     }
@@ -749,8 +757,13 @@ fn evidence_layer_ablation_benchmark() {
     // be Verified, so they join the review burden (an honest cost of not
     // trusting an exit code alone; a runner-receipt contract, FORNX-443,
     // is what would remove it).
+    //
+    // FORNX-477 (founder decision, Option A): a test result that only the
+    // agent's provider account carries (`AgentAdjacent`, every fixture here)
+    // never reaches Verified, so the benign pytest pass joins the burden too:
+    // 3 of the 6 benign sessions. Only an attested collector (FORNX-443) removes it.
     assert_eq!(
-        b.benign_review_burden, 2,
+        b.benign_review_burden, 3,
         "benign review burden in config B drifted from the doc's reported value"
     );
 }

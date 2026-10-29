@@ -203,7 +203,8 @@ async fn two_live_sessions_and_a_subagent_keep_identity_attribution_and_scope() 
     assert_eq!(send_hook(&daemon.home, &stop(&daemon.home, &a)), 0);
     assert_eq!(send_hook(&daemon.home, &stop(&daemon.home, &b)), 0);
 
-    wait_for_verdict(&store, &a, "verified").await;
+    // FORNX-477: an unattested passing run is capped at review.
+    wait_for_verdict(&store, &a, "review").await;
     wait_for_verdict(&store, &b, "contradicted").await;
 
     // Persistence + query scoping: each session's scoped answer is its own,
@@ -211,7 +212,7 @@ async fn two_live_sessions_and_a_subagent_keep_identity_attribution_and_scope() 
     let ra = http_get_json(daemon.port, &format!("/api/status?session={a}"));
     assert_eq!(ra["scope"], "session");
     assert_eq!(ra["session_scoped"], true);
-    assert_eq!(ra["latest"]["verdict"], "verified");
+    assert_eq!(ra["latest"]["verdict"], "review");
     assert_eq!(ra["latest"]["session_id"], a.as_str());
     assert_eq!(ra["latest"]["attribution"], "native");
     let rb = http_get_json(daemon.port, &format!("/api/status?session={b}"));

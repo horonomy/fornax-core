@@ -5,7 +5,7 @@
 //! return `Unavailable`, not `Verified`.
 
 use fornax_types::{
-    Claim, Evidence, EvidenceKind, Finding, RuntimeCapabilities, SignalClass, Verdict,
+    Claim, Evidence, EvidenceKind, Finding, RuntimeCapabilities, SignalClass, TrustClass, Verdict,
 };
 use uuid::Uuid;
 
@@ -158,6 +158,30 @@ impl Verifier for TestResultVerifier {
                     "the test runner exited 0, but no passing-test summary from that runner \
                             was observed for this command, so it is not shown that any test ran"
                         .to_string(),
+                computed_at: now,
+            },
+            // FORNX-477 trust boundary: the runner's exit status and summary
+            // are written by whatever program the agent ran. A QA-owned
+            // script named `pytest` can print `3 passed` and exit 0 without
+            // running a test, and nothing in the transcript can tell it apart
+            // from the real runner. Evidence that only the agent's own
+            // provider account carries (`AgentAdjacent`, or no recorded
+            // source at all) therefore tops out at `Review`; `Verified` needs
+            // evidence Fornax or an outside system observed (ADR-0025
+            // options 1-3, FORNX-443).
+            Some(0) if !is_independently_attested(ev) => Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Review,
+                evidence_ids: vec![ev.id],
+                verifier_name: self.name().to_string(),
+                rationale: format!(
+                    "claim states tests passed and the agent's transcript shows a test runner \
+                     exiting 0 with a passing summary, but that output is written by the \
+                     program the agent ran and is not independently attested, so it does not \
+                     show the tests ran -- flagged for review, not verified ({})",
+                    ev.provenance
+                ),
                 computed_at: now,
             },
             Some(0) => Finding {
@@ -950,6 +974,46 @@ fn command_text(payload: &serde_json::Value) -> String {
     }
 }
 
+/// Collectors that may attest a test run, by `EvidenceSource::sensor_name`.
+///
+/// Deliberately empty: no shipped sensor measures a test run outside the
+/// agent's own account of it. `claude_git_working_tree_sensor_v1` and
+/// `claude_file_write_confirmed_sensor_v1` are `HostObserved`, but they observe
+/// the working tree, not a runner; letting their identity vouch for an exit
+/// code would let anything that can submit evidence under a registered name
+/// promote itself. The real host-controlled runner receipt / CI evidence is
+/// FORNX-443 and adds its collector here, with its own tests.
+///
+/// Under `cfg(test)` a fixture collector exists so the `Verified` arm can be
+/// exercised. That proves only the gate's logic, not that production
+/// attestation exists.
+fn test_run_attestors() -> &'static [&'static str] {
+    #[cfg(test)]
+    {
+        &["test_fixture_run_attestor"]
+    }
+    #[cfg(not(test))]
+    {
+        &[]
+    }
+}
+
+/// True when the evidence was produced by a collector authorised to attest a
+/// test run *and* carries a trust class other than the agent's own account
+/// (`HostObserved`, or `IndependentExternal` such as CI). The class label alone
+/// never suffices: it is a field of the submitted record, so the collector
+/// identity must also be one this verifier knows (`test_run_attestors`).
+/// Evidence with no recorded source predates the sensor contract and is not
+/// treated as attested.
+fn is_independently_attested(e: &Evidence) -> bool {
+    e.source.as_ref().is_some_and(|s| {
+        matches!(
+            s.trust_class,
+            TrustClass::HostObserved | TrustClass::IndependentExternal
+        ) && test_run_attestors().contains(&s.sensor_name.as_str())
+    })
+}
+
 /// True when the exit-code evidence for a runner command also carries that
 /// runner's own summary showing at least one test passed and none failed.
 /// The summary only ever adds a condition for `Verified`; it never grants one
@@ -1162,6 +1226,20 @@ mod tests {
         }
     }
 
+    /// The evidence source a fixture claims. Most tests here exercise the
+    /// runner/summary rules and use an attested channel (`HostObserved`) so
+    /// those rules, not the attestation gate, decide the verdict; the gate has
+    /// its own tests (`transcript_only_test_evidence_never_reaches_verified`).
+    pub(crate) fn source_with(trust: fornax_types::TrustClass) -> fornax_types::EvidenceSource {
+        fornax_types::EvidenceSource::now(
+            "test_fixture_run_attestor",
+            trust,
+            Some(fornax_types::Provider::Codex),
+            fornax_types::CollectionMethod::FilePoll,
+            None,
+        )
+    }
+
     /// `pytest` exiting `code` with no test summary at all: what a QA-owned
     /// executable named `pytest` that only does `exit 0` produces.
     fn bare_runner_evidence(code: i64) -> Evidence {
@@ -1173,7 +1251,7 @@ mod tests {
             observed_at: chrono::Utc::now().to_rfc3339(),
             payload: serde_json::json!({"command": ["pytest"], "exit_code": code}),
             provenance: "codex:rollout:exec_command_end".into(),
-            source: None,
+            source: Some(source_with(fornax_types::TrustClass::HostObserved)),
             extension: None,
             evidence_purged: false,
         }
@@ -1204,7 +1282,7 @@ mod tests {
             observed_at: chrono::Utc::now().to_rfc3339(),
             payload: serde_json::json!({"command": command, "exit_code": exit_code}),
             provenance: "codex:rollout:exec_command_end".into(),
-            source: None,
+            source: Some(source_with(fornax_types::TrustClass::HostObserved)),
             extension: None,
             evidence_purged: false,
         }
@@ -1657,6 +1735,119 @@ mod tests {
         TestResultVerifier
             .verify(&claim("All tests passed."), &[ev], &caps())
             .verdict
+    }
+
+    /// FORNX-477 trust boundary (QA 29501): a forged passing summary printed
+    /// by an executable named `pytest` is indistinguishable, in the agent's
+    /// transcript, from the real runner's. Evidence that only the agent's own
+    /// provider account carries must never be `Verified`; only evidence Fornax
+    /// or an outside system observed may be.
+    #[test]
+    fn transcript_only_test_evidence_never_reaches_verified() {
+        use fornax_types::TrustClass;
+        let verdict_for = |source: Option<fornax_types::EvidenceSource>| {
+            let mut ev = evidence_with_exit_code(0);
+            ev.source = source;
+            TestResultVerifier
+                .verify(&claim("All tests passed."), &[ev], &caps())
+                .verdict
+        };
+        // RED before the gate: the forged-but-well-formed summary verified.
+        assert_eq!(
+            verdict_for(Some(source_with(TrustClass::AgentAdjacent))),
+            Verdict::Review
+        );
+        // No recorded source (pre-sensor-contract evidence) is not attested.
+        assert_eq!(verdict_for(None), Verdict::Review);
+        assert_eq!(
+            verdict_for(Some(source_with(TrustClass::ModelInternal))),
+            Verdict::Review
+        );
+        assert_eq!(
+            verdict_for(Some(source_with(TrustClass::Unrecognized("x".into())))),
+            Verdict::Review
+        );
+        // Positive controls: an attested channel still verifies a real run.
+        assert_eq!(
+            verdict_for(Some(source_with(TrustClass::HostObserved))),
+            Verdict::Verified
+        );
+        assert_eq!(
+            verdict_for(Some(source_with(TrustClass::IndependentExternal))),
+            Verdict::Verified
+        );
+    }
+
+    /// FORNX-477 founder decision: a trust-class label alone is not enough.
+    /// Anything that can submit evidence could write `HostObserved` or
+    /// `IndependentExternal` into the record, or borrow the name of a shipped
+    /// `HostObserved` sensor (git working tree, file-write confirmation) that
+    /// does not observe test runs. Only a collector this verifier lists as a
+    /// test-run attestor may promote, and none ships in production.
+    #[test]
+    fn a_trusted_class_label_without_an_attesting_collector_never_verifies() {
+        use fornax_types::{CollectionMethod, EvidenceSource, TrustClass};
+        let source = |name: &'static str, trust: TrustClass| {
+            EvidenceSource::now(name, trust, None, CollectionMethod::FilePoll, None)
+        };
+        for (name, trust) in [
+            // A shipped HostObserved sensor's identity, on exit-code evidence.
+            (
+                "claude_git_working_tree_sensor_v1",
+                TrustClass::HostObserved,
+            ),
+            (
+                "claude_file_write_confirmed_sensor_v1",
+                TrustClass::HostObserved,
+            ),
+            // The agent's own sensor claiming a trusted class (forged label).
+            ("codex_exec_command_end_sensor_v1", TrustClass::HostObserved),
+            (
+                "codex_exec_command_end_sensor_v1",
+                TrustClass::IndependentExternal,
+            ),
+            // An unregistered name claiming either trusted class.
+            ("made_up_ci_sensor", TrustClass::IndependentExternal),
+            ("made_up_host_sensor", TrustClass::HostObserved),
+            // A look-alike of the fixture attestor name.
+            ("test_fixture_run_attestor ", TrustClass::HostObserved),
+        ] {
+            let mut ev = evidence_with_exit_code(0);
+            ev.source = Some(source(name, trust.clone()));
+            assert_eq!(
+                TestResultVerifier
+                    .verify(&claim("All tests passed."), &[ev], &caps())
+                    .verdict,
+                Verdict::Review,
+                "{name} / {trust:?}"
+            );
+        }
+    }
+
+    /// The gate only lowers a verdict: it never touches `Contradicted` for a
+    /// failing run, and an unattested run without a passing summary is still
+    /// `Unverified` (the stronger refusal), not `Review`.
+    #[test]
+    fn attestation_gate_only_lowers_and_keeps_other_protections() {
+        use fornax_types::TrustClass;
+        for trust in [TrustClass::AgentAdjacent, TrustClass::HostObserved] {
+            let mut failing = evidence_with_exit_code(1);
+            failing.source = Some(source_with(trust.clone()));
+            assert_eq!(
+                TestResultVerifier
+                    .verify(&claim("All tests passed."), &[failing], &caps())
+                    .verdict,
+                Verdict::Contradicted
+            );
+            let mut fake = bare_runner_evidence(0);
+            fake.source = Some(source_with(trust));
+            assert_eq!(
+                TestResultVerifier
+                    .verify(&claim("All tests passed."), &[fake], &caps())
+                    .verdict,
+                Verdict::Unverified
+            );
+        }
     }
 
     /// FORNX-477 residual: a runner name plus exit 0 is not proof that tests
