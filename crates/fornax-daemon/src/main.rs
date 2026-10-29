@@ -7877,11 +7877,13 @@ mod tests {
             .iter()
             .find(|row| row.claim_id == later_claim.0.to_string())
             .unwrap();
+        // FORNX-477: an unattested pass is capped at review, so it is never
+        // Verified and never recorded as consumed; the cross-turn replay guard
+        // acts on Verified findings and is exercised by provenance_enforcement.rs.
         assert_eq!(later_finding.verdict, "review");
-        assert!(later_finding.rationale.contains("already consumed"));
         assert!(later_finding
             .rationale
-            .contains(&first.claims[0].0.to_string()));
+            .contains("not independently attested"));
         assert_eq!(later.quarantine, 1);
         drop(state);
         remove_codex_test_store(&path);

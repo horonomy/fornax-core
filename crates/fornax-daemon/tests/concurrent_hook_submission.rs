@@ -449,19 +449,14 @@ async fn independent_sessions_submitted_concurrently_are_not_lost_or_mixed_up() 
             "session {session} should produce exactly its own one finding"
         );
         // FORNX-477: the hook's tool_response is the agent's own account, so a
-        // passing run is capped at review. The handoff guard also yields review,
-        // so check the rationale to tell the two apart.
+        // passing run is capped at review. This test pins per-session isolation
+        // (each finding cites its own evidence, below); the handoff downgrade
+        // only rewrites definite verdicts and is covered by the HORO-1712 tests.
         assert_eq!(
             findings[0].verdict, "review",
             "session {session}: a concurrently-submitted PostToolUse(exit 0) + Stop pair \
              should resolve REVIEW (unattested passing run), not {:?}",
             findings[0].verdict
-        );
-        assert!(
-            !findings[0].rationale.contains("downgraded"),
-            "session {session}: the finding must be the verifier's own review, not a \
-             handoff/replay downgrade; rationale={}",
-            findings[0].rationale
         );
         let evidence = expected_evidence_by_session
             .get(session)
@@ -568,8 +563,9 @@ async fn many_sessions_evidence_then_claim_phases_stay_serialized_under_contenti
             1,
             "session {session} should produce exactly one finding under contention"
         );
-        // FORNX-477: an unattested passing run is capped at review; the
-        // rationale rules out a handoff/replay downgrade producing the same verdict.
+        // FORNX-477: an unattested passing run is capped at review. The per-session
+        // evidence-id checks below carry the isolation guarantee; handoff downgrades
+        // are covered by the HORO-1712 tests.
         assert_eq!(
             findings[0].verdict, "review",
             "session {session}: concurrent multi-session contention on the processing mutex \
@@ -577,12 +573,6 @@ async fn many_sessions_evidence_then_claim_phases_stay_serialized_under_contenti
              means concurrent Events/Claims from other sessions are affecting this session's \
              finding despite its own decoded evidence being present before phase 2 (FORNX-281)",
             findings[0].verdict
-        );
-        assert!(
-            !findings[0].rationale.contains("downgraded"),
-            "session {session}: the finding must be the verifier's own review, not a \
-             handoff/replay downgrade; rationale={}",
-            findings[0].rationale
         );
         let claims = store
             .claims_for_session(session)
