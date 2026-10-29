@@ -416,13 +416,104 @@ pub(crate) fn proven_runner(command: Option<&Value>) -> Option<RunnerKind> {
     runner.filter(|kind| *kind != RunnerKind::Other)
 }
 
-/// True when any step of `command` is an identified test run of any runner
-/// (including the ones whose output is not read, `RunnerKind::Other`), whatever
-/// its exit status. For a claim's command literal: a claim that names a test
-/// runner is a test assertion even when no summary format exists for it.
-pub(crate) fn names_test_runner(command: Option<&Value>) -> bool {
-    command_segments(command)
-        .is_some_and(|segments| segments.iter().any(|s| classify_segment(s).is_some()))
+/// How an evidence row's command relates to the command a claim names
+/// (FORNX-477 exact binding). Never inferred from a substring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommandBinding {
+    /// The same command, step for step: same program, same arguments.
+    Exact,
+    /// The claimed command followed by more arguments (`npm install` claimed,
+    /// `npm install --dry-run` run). The extra arguments can change what the
+    /// command did, so this is weaker than `Exact`.
+    Prefix,
+    /// The claimed command's text appears in the row but the row is not a run
+    /// of it (`echo npm install`, `timeout 60 npm install`, a pipeline, a
+    /// compound list). It can withhold a verdict, never support one.
+    Mentioned,
+    NotBound,
+}
+
+/// True when the claim's command literal parses to at least one simple
+/// command, i.e. it can be compared structurally at all.
+pub(crate) fn claim_command_parses(literal: &str) -> bool {
+    command_segments(Some(&Value::String(literal.to_string()))).is_some_and(|segments| {
+        !segments.is_empty() && segments.iter().all(|s| !core(s).is_empty())
+    })
+}
+
+/// Bind a claim's command literal to one evidence row's `command`.
+/// `evidence_text_lower` is the row's flattened, lowercased command text, used
+/// only to tell `Mentioned` from `NotBound`.
+pub(crate) fn bind_command(
+    claimed: &str,
+    evidence: Option<&Value>,
+    evidence_text_lower: &str,
+) -> CommandBinding {
+    let Some(claim_segments) = command_segments(Some(&Value::String(claimed.to_string()))) else {
+        return CommandBinding::NotBound;
+    };
+    if let Some(evidence_segments) = command_segments(evidence) {
+        if claim_segments.len() == evidence_segments.len()
+            && claim_segments
+                .iter()
+                .zip(&evidence_segments)
+                .all(|(c, e)| words_equal(core(c), core(e)))
+        {
+            return CommandBinding::Exact;
+        }
+        if let ([claim], [observed]) = (claim_segments.as_slice(), evidence_segments.as_slice()) {
+            if words_prefix(core(claim), core(observed)) {
+                return CommandBinding::Prefix;
+            }
+        }
+    }
+    if !claimed.trim().is_empty() && evidence_text_lower.contains(&claimed.trim().to_lowercase()) {
+        CommandBinding::Mentioned
+    } else {
+        CommandBinding::NotBound
+    }
+}
+
+/// A segment without its leading benign environment assignments (`CI=1`),
+/// which do not change which command ran.
+fn core(words: &[Word]) -> &[Word] {
+    let mut rest = words;
+    while let Some(first) = rest.first() {
+        match assignment_name(first) {
+            Some(name) if BENIGN_ASSIGNMENTS.contains(&name) => rest = &rest[1..],
+            _ => break,
+        }
+    }
+    rest
+}
+
+/// Same program: identical text, or a bare claimed name against an absolute
+/// path with that basename (`npm` vs `/usr/local/bin/npm`). A claimed program
+/// containing `/` must match exactly, so `./deploy.sh` never binds
+/// `./other/deploy.sh`. (Trusting a PATH-resolved name is a disclosed residual.)
+fn same_program(claimed: &str, observed: &str) -> bool {
+    claimed == observed
+        || (!claimed.contains('/') && observed.starts_with('/') && basename(observed) == claimed)
+}
+
+fn words_equal(claimed: &[Word], observed: &[Word]) -> bool {
+    !claimed.is_empty()
+        && claimed.len() == observed.len()
+        && same_program(&claimed[0].text, &observed[0].text)
+        && claimed[1..]
+            .iter()
+            .zip(&observed[1..])
+            .all(|(c, e)| c.text == e.text)
+}
+
+fn words_prefix(claimed: &[Word], observed: &[Word]) -> bool {
+    !claimed.is_empty()
+        && claimed.len() < observed.len()
+        && same_program(&claimed[0].text, &observed[0].text)
+        && claimed[1..]
+            .iter()
+            .zip(&observed[1..claimed.len()])
+            .all(|(c, e)| c.text == e.text)
 }
 
 /// `cd <dir>`: one plain, non-option argument.
