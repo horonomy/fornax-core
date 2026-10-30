@@ -190,8 +190,8 @@ fn stop_payload_with_transcript(
 
 /// Upper bound for each readiness wait. A wait returns as soon as its condition
 /// holds, so the bound only matters when something is wrong; it must clear a
-/// cold daemon start on a loaded hosted runner (FORNX-478: both tests in this
-/// binary needed ~5.9s there against a former 5s bound) yet still fail with
+/// cold daemon start on a loaded hosted runner (FORNX-478: a sibling test in this
+/// binary took ~5.9s there against a former 5s bound) yet still fail with
 /// diagnostics well before the job's own timeout if the daemon is dead or hung.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
