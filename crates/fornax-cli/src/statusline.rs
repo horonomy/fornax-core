@@ -79,7 +79,7 @@ fn parse_identity_document(buf: &[u8]) -> Option<String> {
         return None;
     }
     let session_id = doc.get("provider_session_id")?.as_str()?;
-    if session_id.is_empty() {
+    if session_id.trim().is_empty() {
         return None;
     }
     Some(session_id.to_string())
@@ -1479,6 +1479,10 @@ mod tests {
             (
                 "empty provider_session_id",
                 br#"{"identity_stdin_version": 1, "provider_session_id": ""}"#,
+            ),
+            (
+                "whitespace-only provider_session_id",
+                br#"{"identity_stdin_version": 1, "provider_session_id": "  \t"}"#,
             ),
             (
                 "provider_session_id wrong type",
