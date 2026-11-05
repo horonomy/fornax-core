@@ -201,3 +201,30 @@ Decision (founder, approved):
   receipts / CI) for test results. A future host-observed process-exit
   collector listed as an attestor would restore `Verified` for plain commands.
 - Effect: ablation benchmark config B benign review burden 4 of 6 (67%).
+
+## Addendum (FORNX-487, 2026-11-06): failing Claude Code commands arrive as `PostToolUseFailure`
+
+A real Claude Code 2.1.306 host run showed that a Bash command exiting
+non-zero fires the hook event `PostToolUseFailure`, never `PostToolUse`. Fornax
+did not install or normalize that event, so a failing `pytest` produced no
+evidence and the "genuine literal non-zero exit is `Contradicted`" rule above
+could not fire for Claude Code at all.
+
+Change (no change to what can reach `Verified`):
+
+- `fornax install claude-code` also wires `PostToolUseFailure`; the adapter
+  maps it to the same post-tool event and Bash exit-code evidence path.
+- The literal exit code is parsed only from the `Exit code <N>` prefix of the
+  payload's `error` string (`N` a non-zero integer); the rest of `error` is
+  treated as the command output, so the existing runner-summary parsing sees
+  the failed counts. Evidence carries `heuristic: false` and provenance
+  `...:PostToolUseFailure:Bash#error_prefix`.
+- No evidence is produced for `is_interrupt: true`, a non-Bash tool, an
+  `error` without the prefix, or `Exit code 0` (a failure event never mints a
+  success signal).
+- A "tests passed" claim in the same session against such evidence is
+  `Contradicted`. Success evidence is unchanged: heuristic `exit_code=0` stays
+  `Review`, and `Verified` still requires an attested collector.
+- No new retention: the `error` text travels in the event `raw` and the
+  rebuilt `tool_response` exactly as `PostToolUse` output does, and evidence
+  keeps counts only (`test_summary`).

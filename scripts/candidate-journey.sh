@@ -86,7 +86,7 @@ check "install wrote the hook path beside the installed binary" "grep -q '\"comm
 cp "$J/after1.json" "$J/after1.keep"
 sed -i.bak "s#$J/bin/fornax-hook-claude#fornax-hook-claude#" "$HOME/.claude/settings.json"; rm -f "$HOME/.claude/settings.json.bak"
 $F install claude-code
-check "upgrade from a bare entry leaves exactly one hook per event" "[ \$(grep -c 'fornax-hook-claude' '$HOME/.claude/settings.json') = 5 ] && cmp -s '$HOME/.claude/settings.json' '$J/after1.keep'"
+check "upgrade from a bare entry leaves exactly one hook per event" "[ \$(grep -c 'fornax-hook-claude' '$HOME/.claude/settings.json') = 6 ] && cmp -s '$HOME/.claude/settings.json' '$J/after1.keep'"
 $F doctor
 check "doctor says configuration only, never Verified" "$F doctor | grep -q 'configuration only' && $F doctor | grep -q 'never Verified'"
 $F uninstall claude-code
@@ -112,6 +112,11 @@ claim e1-semi "pytest;true" 0
 claim e1-pipe "pytest -q | cat" 0
 claim e1-runner "pytest -q" 0 '..\n3 passed in 0.03s\n'
 claim e1-fail "cargo test" 1
+# FORNX-487: Claude Code reports a non-zero Bash exit as PostToolUseFailure
+# (error text "Exit code <N>\n<output>"), not PostToolUse.
+printf '{"hook_event_name":"PostToolUseFailure","session_id":"e1-hookfail","tool_name":"Bash","tool_input":{"command":"pytest -q"},"error":"Exit code 1\\n1 failed in 0.01s","is_interrupt":false}' | "$J/bin/fornax-hook-claude"
+printf '{"type":"assistant","message":{"content":[{"type":"text","text":"All tests passed."}]}}\n' > "$J/t-e1-hookfail.jsonl"
+printf '{"hook_event_name":"Stop","session_id":"e1-hookfail","transcript_path":"%s"}' "$J/t-e1-hookfail.jsonl" | "$J/bin/fornax-hook-claude"
 claim e1-and "cd repo && cargo test" 0 'running 4 tests\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n'
 claim e1-fake "pytest" 0
 claim e1-fake-abs "/tmp/qa/bin/pytest" 0
@@ -131,8 +136,9 @@ done
 check "e1-runner: a passing runner with its summary is REVIEW (unattested), not VERIFIED" "[ \"\$(verdict_of e1-runner)\" = '! REVIEW' ]"
 check "e1-forgedpytest: a forged passing summary is REVIEW, never VERIFIED" "[ \"\$(verdict_of e1-forgedpytest)\" = '! REVIEW' ]"
 check "e1-fail: a real failing runner is CONTRADICTED" "verdict_of e1-fail | grep -q CONTRADICTED"
+check "e1-hookfail: a PostToolUseFailure non-zero exit is CONTRADICTED" "verdict_of e1-hookfail | grep -q CONTRADICTED"
 check "e1-and: cd + runner with its summary is REVIEW (unattested), not VERIFIED" "[ \"\$(verdict_of e1-and)\" = '! REVIEW' ]"
-check "e1: no transcript-only test result is VERIFIED" "! { for s in echo pip cat or semi pipe runner fail and fake fake-abs zero forged wrongfmt forgedpytest; do verdict_of e1-\$s; done; } | grep -q '^✓ VERIFIED'"
+check "e1: no transcript-only test result is VERIFIED" "! { for s in echo pip cat or semi pipe runner fail hookfail and fake fake-abs zero forged wrongfmt forgedpytest; do verdict_of e1-\$s; done; } | grep -q '^✓ VERIFIED'"
 kill "$(cat "$J/daemon.pid")" 2>/dev/null
 
 echo; [ $fail = 0 ] && echo "JOURNEY-PASS" || echo "JOURNEY-FAIL"
