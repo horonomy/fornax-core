@@ -4262,6 +4262,32 @@ mod tests {
         assert!(legacy.0["latest"].is_null());
     }
 
+    /// FORNX-465 follow-up: a blank or whitespace-only `session` is absent,
+    /// so it gets the host-scope answer, never an empty session reading.
+    #[tokio::test]
+    async fn api_status_treats_blank_session_as_absent() {
+        let state = test_state().await;
+        for blank in ["", " ", "   ", "\t"] {
+            let resp = api_status(
+                State(state.clone()),
+                Query(StatusQuery {
+                    session: Some(blank.to_string()),
+                }),
+            )
+            .await;
+            assert_eq!(resp.0["scope"], "host", "session={blank:?}");
+            assert_ne!(
+                resp.0["session_scoped"],
+                true,
+                "session={blank:?} must not be answered as a session reading"
+            );
+            assert!(
+                resp.0.get("unattributed_session").is_none(),
+                "session={blank:?} is absent, not a legacy placeholder"
+            );
+        }
+    }
+
     /// FORNX-85: `/api/capabilities?session=<id>` must surface the exact
     /// signal/state pairs announced by a real capability probe, not a
     /// collapsed boolean summary — proves both the "announced" shape and

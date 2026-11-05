@@ -1481,6 +1481,10 @@ mod tests {
                 br#"{"identity_stdin_version": 1, "provider_session_id": ""}"#,
             ),
             (
+                "whitespace-only provider_session_id",
+                br#"{"identity_stdin_version": 1, "provider_session_id": "  \t"}"#,
+            ),
+            (
                 "provider_session_id wrong type",
                 br#"{"identity_stdin_version": 1, "provider_session_id": 7}"#,
             ),
