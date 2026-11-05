@@ -214,10 +214,19 @@ impl EvidenceSensor for ClaudeBashExitCodeSensor {
         let (code, provenance) = match explicit_code {
             Some(code) => (
                 Some(code),
-                format!(
-                    "claude_code:{v}:PostToolUse:Bash#tool_response",
-                    v = self.adapter_version
-                ),
+                if event.raw.get("hook_event_name").and_then(|v| v.as_str())
+                    == Some("PostToolUseFailure")
+                {
+                    format!(
+                        "claude_code:{v}:PostToolUseFailure:Bash#error_prefix",
+                        v = self.adapter_version
+                    )
+                } else {
+                    format!(
+                        "claude_code:{v}:PostToolUse:Bash#tool_response",
+                        v = self.adapter_version
+                    )
+                },
             ),
             None => {
                 let interrupted = resp
@@ -1215,6 +1224,46 @@ impl EvidenceSensor for ClaudeGitWorkingTreeSensor {
     }
 }
 
+/// FORNX-487: rebuild a Bash `tool_response` from a `PostToolUseFailure`
+/// payload. Claude Code reports a non-zero Bash exit as
+/// `error: "Exit code <N>\n<combined output>"`; that prefix is the only source
+/// of the literal exit code. Returns `None` (no evidence) for a non-Bash tool,
+/// an interrupt, a missing/unprefixed `error`, or `Exit code 0` -- a failure
+/// event must never mint a success signal.
+fn failure_tool_response(
+    raw: &serde_json::Value,
+    tool_name: Option<&str>,
+) -> Option<serde_json::Value> {
+    if tool_name != Some("Bash")
+        || raw
+            .get("is_interrupt")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    {
+        return None;
+    }
+    let error = raw.get("error")?.as_str()?;
+    let after = error.strip_prefix("Exit code ")?;
+    let (digits, output) = match after.split_once('\n') {
+        Some((d, rest)) => (d, rest),
+        None => (after, ""),
+    };
+    let code: i64 = digits
+        .bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| digits.parse().ok())
+        .flatten()?;
+    if code == 0 {
+        return None;
+    }
+    Some(serde_json::json!({
+        "exit_code": code,
+        "stdout": output,
+        "stderr": "",
+        "interrupted": false,
+    }))
+}
+
 fn translate(
     adapter: &ClaudeAdapter,
     // FORNX-433 AC3: no longer used as a fallback session id (see below) --
@@ -1249,7 +1298,10 @@ fn translate(
 
     let kind = match hook_event {
         "PreToolUse" => EventKind::PreToolUse,
-        "PostToolUse" => EventKind::PostToolUse,
+        // FORNX-487: a failing tool call fires `PostToolUseFailure`, not
+        // `PostToolUse`. It feeds the same post-tool path; `tool_response`
+        // is rebuilt below from the failure payload's `error` text.
+        "PostToolUse" | "PostToolUseFailure" => EventKind::PostToolUse,
         "SessionStart" => EventKind::SessionStart,
         "Stop" => EventKind::SessionEnd,
         "UserPromptSubmit" => EventKind::UserPromptSubmit,
@@ -1277,7 +1329,11 @@ fn translate(
         .and_then(|v| v.as_str())
         .map(String::from);
     let tool_input = raw.get("tool_input").cloned();
-    let tool_response = raw.get("tool_response").cloned();
+    let tool_response = if hook_event == "PostToolUseFailure" {
+        failure_tool_response(raw, tool_name.as_deref())
+    } else {
+        raw.get("tool_response").cloned()
+    };
 
     let event = AgentEvent {
         id: event_id,
