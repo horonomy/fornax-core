@@ -86,7 +86,12 @@ release works without being on `PATH`. If that file is missing, or its path
 contains spaces or shell metacharacters, install writes the bare name, says so,
 and `fornax-hook-claude` must then be on `PATH` for Claude Code to find it.
 Re-running install from a newer location updates the existing entries in
-place. To stop Fornax observing Claude Code sessions and return the
+place; if no sibling is usable but an existing absolute entry still works, it
+is kept (with a warning). The path is canonicalized, so a Homebrew install
+records the versioned Cellar path: re-run `fornax install claude-code` after
+an upgrade (doctor flags a path that no longer exists). Entries are matched by
+the exact file name `fornax-hook-claude`, so a user-owned absolute hook with
+that exact name is treated as Fornax's. To stop Fornax observing Claude Code sessions and return the
 file to a clean state:
 
 ```bash

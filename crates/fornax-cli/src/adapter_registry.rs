@@ -99,14 +99,14 @@ impl AdapterPlugin for ClaudeCodeAdapter {
     }
 
     fn plan(&self) -> anyhow::Result<AdapterActionResult> {
-        let hook = resolve_installed_hook();
+        let hook = resolve_installed_hook().keeping_working_entry(&self.target_path());
         let mut r = crate::claude_adapter::plan_install_at(&self.target_path(), &hook.command)?;
         r.message = hook.annotate(r.message);
         Ok(r)
     }
 
     fn install(&self) -> anyhow::Result<AdapterActionResult> {
-        let hook = resolve_installed_hook();
+        let hook = resolve_installed_hook().keeping_working_entry(&self.target_path());
         let mut r = crate::claude_adapter::install_at(&self.target_path(), &hook.command)?;
         r.message = hook.annotate(r.message);
         Ok(r)

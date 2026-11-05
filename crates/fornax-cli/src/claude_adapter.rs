@@ -47,6 +47,36 @@ impl ResolvedHook {
         }
     }
 
+    /// On a bare-name fallback, keeps a working absolute Fornax command already
+    /// in `settings_path` rather than downgrading it to a PATH-dependent one.
+    pub fn keeping_working_entry(self, settings_path: &std::path::Path) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(warning) = &self.warning else {
+            return self;
+        };
+        let existing = load_settings(settings_path)
+            .ok()
+            .and_then(|s| configured_command(&s))
+            .filter(|c| std::path::Path::new(c).is_absolute());
+        match existing {
+            Some(c)
+                if std::fs::metadata(&c)
+                    .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                    .unwrap_or(false) =>
+            {
+                Self {
+                    warning: Some(format!(
+                        "warning: kept the existing hook command {c}; no usable \
+                         `{FORNAX_HOOK_COMMAND}` was found beside this binary ({})",
+                        warning.trim_start_matches("warning: ")
+                    )),
+                    command: c,
+                }
+            }
+            _ => self,
+        }
+    }
+
     /// Appends the warning, if any, to an install/plan message.
     pub fn annotate(&self, message: String) -> String {
         match &self.warning {
@@ -1269,6 +1299,34 @@ mod tests {
                 "fornax-hook-claude --extra".to_string()
             ]
         );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn bare_fallback_keeps_an_existing_working_absolute_entry_and_warns() {
+        let dir = exe_dir("keep", true, 0o755);
+        let existing = dir.join(FORNAX_HOOK_COMMAND);
+        let path = tmp_settings_path("keep-existing");
+        install_at(&path, existing.to_str().unwrap()).unwrap();
+        let no_sibling = exe_dir("nosib", false, 0);
+        let r = resolve_hook_command(&no_sibling.join("fornax")).keeping_working_entry(&path);
+        assert_eq!(r.command, existing.to_str().unwrap());
+        assert!(r.warning.expect("warning").contains("kept the existing"));
+        for d in [&dir, &no_sibling] {
+            std::fs::remove_dir_all(d).ok();
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn bare_fallback_replaces_an_existing_absolute_entry_that_is_missing() {
+        let no_sibling = exe_dir("nosib2", false, 0);
+        let path = tmp_settings_path("missing-existing");
+        install_at(&path, ABS).unwrap();
+        let r = resolve_hook_command(&no_sibling.join("fornax")).keeping_working_entry(&path);
+        assert_eq!(r.command, FORNAX_HOOK_COMMAND);
+        assert!(r.warning.expect("warning").contains("PATH"));
+        std::fs::remove_dir_all(&no_sibling).ok();
         std::fs::remove_file(&path).ok();
     }
 }
