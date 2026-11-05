@@ -2178,4 +2178,110 @@ mod tests {
         );
         std::fs::remove_file(&path).ok();
     }
+
+    /// FORNX-467 follow-up: every in-place purge and hard delete of an
+    /// `agent_events`/`claims` row is audited (like the evidence purge), the
+    /// chain stays valid, and no raw content reaches any audit payload.
+    #[tokio::test]
+    async fn sweep_audits_in_place_purges_and_hard_deletes_without_raw_content() {
+        use crate::audit_ledger::ChainVerification;
+        use fornax_types::{AgentEvent, AuditAction, AuditTarget, Claim, EventKind, Provider};
+        const CANARY: &str = "RAW-CANARY-91c2";
+        let path = std::env::temp_dir().join(format!(
+            "fornax-retention-audit-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::open(&path).await.expect("open db");
+        let now = Utc::now();
+        let old = (now - chrono::Duration::days(40)).to_rfc3339();
+        let mk_event = |session: &str| AgentEvent {
+            id: uuid::Uuid::new_v4(),
+            session_id: session.into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: old.clone(),
+            tool_name: Some("Bash".into()),
+            tool_input: Some(serde_json::json!({"command": CANARY})),
+            tool_response: Some(serde_json::json!({"stdout": CANARY})),
+            raw: serde_json::json!({"cwd": CANARY}),
+        };
+        // Referenced event + claim (purged in place), and a lone event
+        // (hard-deleted).
+        let event = mk_event("s-1");
+        store.insert_event(&event).await.unwrap();
+        let claim = Claim {
+            id: uuid::Uuid::new_v4(),
+            session_id: "s-1".into(),
+            source_event_id: event.id,
+            text: format!("tests pass {CANARY}"),
+            subject: "test_result".into(),
+            claimed_at: old.clone(),
+        };
+        store.insert_claim(&claim).await.unwrap();
+        let finding = fornax_types::Finding {
+            id: uuid::Uuid::new_v4(),
+            claim_id: claim.id,
+            verdict: fornax_types::Verdict::Verified,
+            evidence_ids: vec![],
+            verifier_name: "v".into(),
+            rationale: "kept".into(),
+            computed_at: old.clone(),
+        };
+        store.insert_finding(&finding).await.unwrap();
+        let lone = mk_event("s-2");
+        store.insert_event(&lone).await.unwrap();
+        sqlx::query("UPDATE dataset_lineage_tags SET recorded_at = ?1")
+            .bind(&old)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        let report = store.sweep_expired_records(now, None, 1000).await.unwrap();
+        assert_eq!(report.purged_in_place, 2, "{report:?}");
+        let record_purges = report.purged_in_place + report.deleted_records;
+        assert_eq!(record_purges, 3, "{report:?}");
+
+        let entries = store.audit_events().await.unwrap();
+        let purge_rows: Vec<_> = entries
+            .iter()
+            .filter(|e| e.event.action == AuditAction::RecordPurged)
+            .collect();
+        assert_eq!(purge_rows.len(), record_purges, "{entries:?}");
+        let targets: std::collections::BTreeSet<(String, String, String)> = purge_rows
+            .iter()
+            .map(|e| {
+                let (kind, id) = match &e.event.target {
+                    AuditTarget::AgentEvent { target_id } => ("agent_event", target_id.clone()),
+                    AuditTarget::Claim { target_id } => ("claim", target_id.clone()),
+                    other => panic!("unexpected target {other:?}"),
+                };
+                let disposition = e.event.attributes["disposition"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                (kind.to_string(), id, disposition)
+            })
+            .collect();
+        let expected: std::collections::BTreeSet<_> = [
+            ("agent_event", event.id, "purged_in_place"),
+            ("claim", claim.id, "purged_in_place"),
+            ("agent_event", lone.id, "deleted"),
+        ]
+        .into_iter()
+        .map(|(k, id, d)| (k.to_string(), id.to_string(), d.to_string()))
+        .collect();
+        assert_eq!(targets, expected);
+
+        assert_eq!(
+            store.verify_audit_chain().await.unwrap(),
+            ChainVerification::Valid
+        );
+        let payloads: String =
+            sqlx::query_scalar("SELECT COALESCE(group_concat(payload, '|'), '') FROM audit_events")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert!(!payloads.contains(CANARY), "raw content in audit: {payloads}");
+        std::fs::remove_file(&path).ok();
+    }
 }
