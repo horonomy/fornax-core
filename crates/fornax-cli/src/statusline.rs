@@ -79,7 +79,7 @@ fn parse_identity_document(buf: &[u8]) -> Option<String> {
         return None;
     }
     let session_id = doc.get("provider_session_id")?.as_str()?;
-    if session_id.is_empty() {
+    if session_id.trim().is_empty() {
         return None;
     }
     Some(session_id.to_string())

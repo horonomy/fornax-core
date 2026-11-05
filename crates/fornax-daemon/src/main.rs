@@ -1507,7 +1507,7 @@ async fn api_status(
     State(state): State<AppState>,
     Query(q): Query<StatusQuery>,
 ) -> Json<serde_json::Value> {
-    match q.session {
+    match q.session.filter(|s| !s.trim().is_empty()) {
         // A legacy placeholder ("unknown", a rollout path) is not a session
         // identity: never answer it as a session reading (FORNX-465).
         Some(session_id)
@@ -4277,8 +4277,7 @@ mod tests {
             .await;
             assert_eq!(resp.0["scope"], "host", "session={blank:?}");
             assert_ne!(
-                resp.0["session_scoped"],
-                true,
+                resp.0["session_scoped"], true,
                 "session={blank:?} must not be answered as a session reading"
             );
             assert!(
