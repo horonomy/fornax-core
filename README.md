@@ -80,8 +80,13 @@ session, wire the hooks into `~/.claude/settings.json` with:
 This idempotently adds `SessionStart`, `UserPromptSubmit`, `PreToolUse`,
 `PostToolUse`, and `Stop` hook entries that invoke `fornax-hook-claude` —
 running it again is a no-op, and it never touches any other hook or setting
-already in that file. `fornax-hook-claude` must be on `PATH` for Claude Code
-to find it. To stop Fornax observing Claude Code sessions and return the
+already in that file. The entries use the absolute path of the
+`fornax-hook-claude` that sits next to the `fornax` you ran, so a downloaded
+release works without being on `PATH`. If that file is missing, or its path
+contains spaces or shell metacharacters, install writes the bare name, says so,
+and `fornax-hook-claude` must then be on `PATH` for Claude Code to find it.
+Re-running install from a newer location updates the existing entries in
+place. To stop Fornax observing Claude Code sessions and return the
 file to a clean state:
 
 ```bash
