@@ -1,0 +1,27 @@
+{
+  "provider": "claude_code",
+  "provider_runtime_version": "2.1.306",
+  "description": "Real Claude Code 2.1.306 PostToolUseFailure payload for a Bash command that exits non-zero (FORNX-487): the literal exit code is only the `Exit code <N>` prefix of `error`; there is no tool_response. Session, cwd, transcript and tool-use ids sanitized.",
+  "sanitized": true,
+  "historical_schema_drift_ticket": null,
+  "native_events": [
+    {
+      "session_id": "fixture-claude-session-failure-001",
+      "transcript_path": "/home/user/.claude/projects/fixture/fixture-claude-session-failure-001.jsonl",
+      "cwd": "/home/user/work",
+      "prompt_id": "00000000-0000-0000-0000-000000000001",
+      "permission_mode": "default",
+      "effort": { "level": "medium" },
+      "hook_event_name": "PostToolUseFailure",
+      "tool_name": "Bash",
+      "tool_input": {
+        "command": "pytest -q test_bad.py",
+        "description": "Run pytest on test_bad.py"
+      },
+      "tool_use_id": "toolu_fixture_failure_001",
+      "error": "Exit code 1\nF                                                                        [100%]\n=================================== FAILURES ===================================\n___________________________________ test_bad ___________________________________\n\n>   def test_bad(): assert 1 + 1 == 3\n                    ^^^^^^^^^^^^^^^^^\nE   assert (1 + 1) == 3\n\ntest_bad.py:1: AssertionError\n=========================== short test summary info ============================\nFAILED test_bad.py::test_bad - assert (1 + 1) == 3\n1 failed in 0.01s",
+      "is_interrupt": false,
+      "duration_ms": 1413
+    }
+  ]
+}
