@@ -288,6 +288,10 @@ pub struct ExitCodePayload {
     /// empty") rather than a literal exit-code field the provider reported.
     #[serde(default)]
     pub heuristic: bool,
+    /// Runner summary counts attached by `test_output::attach_summary`
+    /// (FORNX-477); absent unless the output ends in a recognised summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_summary: Option<serde_json::Value>,
 }
 
 /// Not yet produced by any sensor — see [`ExitCodePayload`]'s doc comment

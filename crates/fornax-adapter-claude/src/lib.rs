@@ -84,7 +84,9 @@ impl CapabilityProbe for ClaudeAdapter {
                     state: SignalAvailability::Unsupported,
                     detail: Some(
                         "Bash tool_response carries no literal exit code as of v2.1.238; \
-                         ExitCode evidence is heuristic from stdout/stderr/interrupted"
+                         ExitCode evidence is heuristic from stdout/stderr/interrupted. \
+                         The only literal exit code is a failure: the `Exit code <N>` prefix \
+                         of a PostToolUseFailure `error` (FORNX-487)"
                             .to_string(),
                     ),
                 },
