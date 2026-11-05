@@ -116,6 +116,16 @@ pub enum AuditTarget {
     EgressPolicy {
         target_id: String,
     },
+    /// FORNX-467: an `agent_events` row purged or deleted by the retention
+    /// sweep (`target_id` is the row id, never its content).
+    AgentEvent {
+        target_id: String,
+    },
+    /// FORNX-467: a `claims` row purged or deleted by the retention sweep
+    /// (`target_id` is the row id, never its content).
+    Claim {
+        target_id: String,
+    },
     #[serde(other)]
     Unrecognized,
 }
@@ -136,6 +146,11 @@ pub enum AuditAction {
     /// its retention window elapsed. See
     /// `docs/adr/0011-audit-event-model.md` §2's table.
     EvidencePurged,
+    /// FORNX-467: the retention sweep hard-deleted an `agent_events`/`claims`
+    /// row, or purged its raw content in place because a surviving row still
+    /// references it. The event's `attributes.disposition` is `"deleted"` or
+    /// `"purged_in_place"`; no record content is ever embedded.
+    RecordPurged,
     /// FORNX-322: `fornax audit report` generated a local compliance report.
     /// Recording this as its own auditable action means generating a report
     /// is itself evidenced in the very ledger the report reads from.
@@ -521,6 +536,30 @@ mod tests {
         assert_eq!(back, target);
     }
 
+    /// FORNX-467: the new retention targets round-trip with explicit tags.
+    #[test]
+    fn audit_target_agent_event_and_claim_round_trip_with_explicit_wire_tags() {
+        for (target, tag) in [
+            (
+                AuditTarget::AgentEvent {
+                    target_id: "e-1".to_string(),
+                },
+                "agent_event",
+            ),
+            (
+                AuditTarget::Claim {
+                    target_id: "c-1".to_string(),
+                },
+                "claim",
+            ),
+        ] {
+            let json = serde_json::to_value(&target).unwrap();
+            assert_eq!(json["target_kind"], serde_json::json!(tag));
+            let back: AuditTarget = serde_json::from_value(json).unwrap();
+            assert_eq!(back, target);
+        }
+    }
+
     /// FORNX-322: `AuditTarget::ComplianceReport` round-trips with the
     /// explicit `compliance_report` wire tag.
     #[test]
@@ -556,6 +595,7 @@ mod tests {
                 AuditAction::RoleAssignmentChanged,
             ),
             ("\"evidence_purged\"", AuditAction::EvidencePurged),
+            ("\"record_purged\"", AuditAction::RecordPurged),
             (
                 "\"compliance_report_generated\"",
                 AuditAction::ComplianceReportGenerated,

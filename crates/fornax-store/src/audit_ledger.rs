@@ -177,7 +177,10 @@ impl AuditEventRow {
     }
 }
 
-async fn append_audit_event_locked(
+/// Appends on a connection whose caller already holds the write lock (an open
+/// `BEGIN IMMEDIATE` transaction); opens no transaction of its own. The caller
+/// must redact `event.attributes` first, as [`Store::append_audit_event`] does.
+pub(crate) async fn append_audit_event_locked(
     conn: &mut SqliteConnection,
     event: &AuditEvent,
     now: DateTime<Utc>,
