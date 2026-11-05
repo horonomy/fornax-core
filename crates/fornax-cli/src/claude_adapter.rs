@@ -167,11 +167,14 @@ pub(crate) fn resolve_hook_command(current_exe: &std::path::Path) -> ResolvedHoo
 /// Hook event names the `fornax-adapter-claude` doc comment documents as
 /// the wired set. Kept in sync with that doc comment — see
 /// `crates/fornax-adapter-claude/src/main.rs`.
-const CLAUDE_HOOK_EVENTS: [&str; 5] = [
+const CLAUDE_HOOK_EVENTS: [&str; 6] = [
     "SessionStart",
     "UserPromptSubmit",
     "PreToolUse",
     "PostToolUse",
+    // FORNX-487: Claude Code fires this, not PostToolUse, when a tool call fails
+    // (e.g. a Bash command exits non-zero).
+    "PostToolUseFailure",
     "Stop",
 ];
 
@@ -1271,6 +1274,50 @@ mod tests {
                 command: ABS.to_string()
             }
         );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// FORNX-487: Claude Code fires `PostToolUseFailure` (not `PostToolUse`)
+    /// when a Bash command exits non-zero, so it must be installed, reported
+    /// by doctor wiring, and removed on uninstall.
+    #[test]
+    fn post_tool_use_failure_is_installed_wired_and_uninstalled() {
+        let path = tmp_settings_path("failure-event");
+        install_at(&path, ABS).unwrap();
+        assert_eq!(
+            commands_for(&path, "PostToolUseFailure"),
+            vec![ABS.to_string()]
+        );
+        assert!(matches!(wiring_at(&path), Wiring::Full { .. }));
+        uninstall_at(&path).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(!after.contains("PostToolUseFailure"), "{after}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_stale_five_event_install_gains_post_tool_use_failure_on_reinstall() {
+        let path = tmp_settings_path("stale-five");
+        install_at(&path, ABS).unwrap();
+        let mut settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        settings["hooks"]
+            .as_object_mut()
+            .unwrap()
+            .remove("PostToolUseFailure");
+        std::fs::write(&path, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+        assert_eq!(
+            wiring_at(&path),
+            Wiring::Partial {
+                missing: vec!["PostToolUseFailure"]
+            }
+        );
+        assert!(install_at(&path, ABS).unwrap().changed);
+        assert_eq!(
+            commands_for(&path, "PostToolUseFailure"),
+            vec![ABS.to_string()]
+        );
+        assert!(matches!(wiring_at(&path), Wiring::Full { .. }));
         std::fs::remove_file(&path).ok();
     }
 

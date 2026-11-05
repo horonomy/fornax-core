@@ -646,7 +646,11 @@ mod tests {
             "{t}"
         );
         assert!(
-            !t.contains("PreToolUse, PostToolUse, Stop"),
+            t.contains("PreToolUse, PostToolUse, PostToolUseFailure"),
+            "PostToolUseFailure is a required event: {t}"
+        );
+        assert!(
+            !t.contains("PostToolUseFailure, Stop"),
             "Stop is wired: {t}"
         );
     }

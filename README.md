@@ -78,7 +78,8 @@ session, wire the hooks into `~/.claude/settings.json` with:
 ```
 
 This idempotently adds `SessionStart`, `UserPromptSubmit`, `PreToolUse`,
-`PostToolUse`, and `Stop` hook entries that invoke `fornax-hook-claude` —
+`PostToolUse`, `PostToolUseFailure` (a Bash command that exits non-zero),
+and `Stop` hook entries that invoke `fornax-hook-claude` —
 running it again is a no-op, and it never touches any other hook or setting
 already in that file. The entries use the absolute path of the
 `fornax-hook-claude` that sits next to the `fornax` you ran, so a downloaded
