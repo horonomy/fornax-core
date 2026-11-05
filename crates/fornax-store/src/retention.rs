@@ -672,16 +672,15 @@ impl Store {
             ..Default::default()
         };
         let mut last_key: Option<(String, String, String)> = None;
-        // Evidence ids purged this batch, audited only AFTER `tx` commits
-        // (see below) — `Store::append_audit_event` opens its own `BEGIN
-        // IMMEDIATE` on a separate pool connection, and SQLite serializes
-        // writers at the FILE level, not the connection level: calling it
-        // while `tx` is still open self-deadlocks (this pool's own
-        // in-progress write transaction blocks the audit ledger's write
-        // lock acquisition, forever, since both would need the other to
-        // finish first).
+        // Evidence ids purged this batch. Their audit rows are appended on
+        // `tx` itself (`append_audit_event_locked` opens no transaction and
+        // takes the connection that already holds the write lock) just
+        // before the commit, so a purge and its audit rows are atomic: a
+        // failed append rolls the whole batch back. Calling the pool-level
+        // `Store::append_audit_event` here instead would self-deadlock, as
+        // it takes its own write lock on a second connection.
         let mut purged_evidence_ids: Vec<String> = Vec::new();
-        // FORNX-467 follow-up: same deferral for `agent_events`/`claims`
+        // FORNX-467 follow-up: same for `agent_events`/`claims`
         // hard deletes and in-place purges. Only (table, id, disposition) is
         // kept -- never row content.
         let mut purged_records: Vec<(RecordAuditTable, String, RecordDisposition)> = Vec::new();
@@ -855,34 +854,23 @@ impl Store {
             .await?;
         }
 
-        tx.commit().await?;
+        // FORNX-319/FORNX-315/FORNX-467: every purge emits an AuditEvent,
+        // appended on `tx` before the commit so purge and audit are atomic.
+        // Payloads carry only ids and the disposition; attributes are
+        // redacted exactly as `Store::append_audit_event` does.
+        let mut audit_events: Vec<AuditEvent> = purged_evidence_ids
+            .iter()
+            .map(|id| evidence_purged_audit_event(id, now))
+            .collect();
+        audit_events.extend(purged_records.iter().map(|(table, id, disposition)| {
+            record_purged_audit_event(*table, id, *disposition, now)
+        }));
+        for mut event in audit_events {
+            event.attributes = fornax_types::redact::redact_json(&event.attributes);
+            crate::audit_ledger::append_audit_event_locked(&mut tx, &event, now).await?;
+        }
 
-        // FORNX-319/FORNX-315: every purge action emits an AuditEvent —
-        // appended only now, after `tx` has committed (see the comment
-        // above `purged_evidence_ids` for why appending any earlier
-        // self-deadlocks). This does mean the purge and its audit event
-        // are not cross-table-atomic: a crash between the commit above and
-        // one of these appends leaves that one purge unaudited. Given a
-        // local single-process daemon with no concurrent writer racing
-        // this exact window, that gap is accepted rather than engineered
-        // away — the alternative (holding `tx` open across the ledger's
-        // own transaction) is the deadlock this code avoids.
-        for evidence_id in &purged_evidence_ids {
-            self.append_audit_event(&evidence_purged_audit_event(evidence_id, now), now)
-                .await?;
-        }
-        // FORNX-467 follow-up: one `RecordPurged` row per event/claim purge
-        // or delete, appended the same way. Residual gap: if an append fails
-        // here (after the commit above), the `?` aborts and the remaining
-        // purges of this batch are never audited. Volume is bounded by one
-        // batch (the daemon runs at most 50 batches of 500 per cycle).
-        for (table, id, disposition) in &purged_records {
-            self.append_audit_event(
-                &record_purged_audit_event(*table, id, *disposition, now),
-                now,
-            )
-            .await?;
-        }
+        tx.commit().await?;
 
         report.more_remaining = examined == batch_size as usize;
         report.next_cursor = if report.more_remaining {
@@ -2370,6 +2358,61 @@ mod tests {
         assert!(
             !payloads.contains(CANARY),
             "raw content in audit: {payloads}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// FORNX-467 follow-up: purge and audit are atomic -- if the audit append
+    /// fails, the whole sweep batch rolls back and nothing is purged.
+    #[tokio::test]
+    async fn failed_audit_append_rolls_back_the_sweep_purge() {
+        use fornax_types::{AgentEvent, EventKind, Provider};
+        let path = std::env::temp_dir().join(format!(
+            "fornax-retention-atomic-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::open(&path).await.expect("open db");
+        let now = Utc::now();
+        let old = (now - chrono::Duration::days(40)).to_rfc3339();
+        let event = AgentEvent {
+            id: uuid::Uuid::new_v4(),
+            session_id: "s-1".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: old.clone(),
+            tool_name: None,
+            tool_input: Some(serde_json::json!({"command": "keep-me"})),
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        store.insert_event(&event).await.unwrap();
+        sqlx::query("UPDATE dataset_lineage_tags SET recorded_at = ?1")
+            .bind(&old)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER fail_audit BEFORE INSERT ON audit_events
+             BEGIN SELECT RAISE(ABORT, 'audit append refused'); END",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+        assert!(store.sweep_expired_records(now, None, 1000).await.is_err());
+
+        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        let tags: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dataset_lineage_tags")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            (events, tags),
+            (1, 1),
+            "purge must roll back with the audit"
         );
         std::fs::remove_file(&path).ok();
     }
