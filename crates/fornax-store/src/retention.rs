@@ -681,6 +681,10 @@ impl Store {
         // lock acquisition, forever, since both would need the other to
         // finish first).
         let mut purged_evidence_ids: Vec<String> = Vec::new();
+        // FORNX-467 follow-up: same deferral for `agent_events`/`claims`
+        // hard deletes and in-place purges. Only (table, id, disposition) is
+        // kept -- never row content.
+        let mut purged_records: Vec<(RecordAuditTable, String, RecordDisposition)> = Vec::new();
 
         for row in rows {
             let recorded_at = row.recorded_at.clone();
@@ -713,7 +717,14 @@ impl Store {
                         .execute(&mut *tx)
                         .await
                     {
-                        Ok(_) => report.deleted_records += 1,
+                        Ok(_) => {
+                            report.deleted_records += 1;
+                            purged_records.push((
+                                RecordAuditTable::AgentEvents,
+                                record.record_id.clone(),
+                                RecordDisposition::Deleted,
+                            ));
+                        }
                         Err(e) if is_foreign_key_violation(&e) => {
                             sqlx::query(
                                 "UPDATE agent_events
@@ -725,6 +736,11 @@ impl Store {
                             .execute(&mut *tx)
                             .await?;
                             report.purged_in_place += 1;
+                            purged_records.push((
+                                RecordAuditTable::AgentEvents,
+                                record.record_id.clone(),
+                                RecordDisposition::PurgedInPlace,
+                            ));
                         }
                         Err(e) => return Err(e.into()),
                     }
@@ -735,7 +751,14 @@ impl Store {
                         .execute(&mut *tx)
                         .await
                     {
-                        Ok(_) => report.deleted_records += 1,
+                        Ok(_) => {
+                            report.deleted_records += 1;
+                            purged_records.push((
+                                RecordAuditTable::Claims,
+                                record.record_id.clone(),
+                                RecordDisposition::Deleted,
+                            ));
+                        }
                         Err(e) if is_foreign_key_violation(&e) => {
                             sqlx::query("UPDATE claims SET text = ?2 WHERE id = ?1")
                                 .bind(&record.record_id)
@@ -743,6 +766,11 @@ impl Store {
                                 .execute(&mut *tx)
                                 .await?;
                             report.purged_in_place += 1;
+                            purged_records.push((
+                                RecordAuditTable::Claims,
+                                record.record_id.clone(),
+                                RecordDisposition::PurgedInPlace,
+                            ));
                         }
                         Err(e) => return Err(e.into()),
                     }
@@ -843,6 +871,18 @@ impl Store {
             self.append_audit_event(&evidence_purged_audit_event(evidence_id, now), now)
                 .await?;
         }
+        // FORNX-467 follow-up: one `RecordPurged` row per event/claim purge
+        // or delete, appended the same way. Residual gap: if an append fails
+        // here (after the commit above), the `?` aborts and the remaining
+        // purges of this batch are never audited. Volume is bounded by one
+        // batch (the daemon runs at most 50 batches of 500 per cycle).
+        for (table, id, disposition) in &purged_records {
+            self.append_audit_event(
+                &record_purged_audit_event(*table, id, *disposition, now),
+                now,
+            )
+            .await?;
+        }
 
         report.more_remaining = examined == batch_size as usize;
         report.next_cursor = if report.more_remaining {
@@ -909,6 +949,52 @@ fn evidence_purged_audit_event(evidence_id: &str, now: DateTime<Utc>) -> AuditEv
         AuditOutcome::Expired,
         AuditExportClass::Metadata,
     )
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RecordAuditTable {
+    AgentEvents,
+    Claims,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RecordDisposition {
+    Deleted,
+    PurgedInPlace,
+}
+
+/// The `AuditAction::RecordPurged` event for one swept `agent_events` or
+/// `claims` row (FORNX-467). Same actor/outcome/export class as
+/// [`evidence_purged_audit_event`]; the payload names only the table (via the
+/// target kind), the row id and whether it was deleted or purged in place --
+/// never any row content.
+fn record_purged_audit_event(
+    table: RecordAuditTable,
+    id: &str,
+    disposition: RecordDisposition,
+    now: DateTime<Utc>,
+) -> AuditEvent {
+    let target_id = id.to_string();
+    let target = match table {
+        RecordAuditTable::AgentEvents => AuditTarget::AgentEvent { target_id },
+        RecordAuditTable::Claims => AuditTarget::Claim { target_id },
+    };
+    let mut event = AuditEvent::new(
+        uuid::Uuid::new_v4().to_string(),
+        now.to_rfc3339(),
+        AuditActor::System,
+        AuditAction::RecordPurged,
+        target,
+        AuditOutcome::Expired,
+        AuditExportClass::Metadata,
+    );
+    event.attributes = serde_json::json!({
+        "disposition": match disposition {
+            RecordDisposition::Deleted => "deleted",
+            RecordDisposition::PurgedInPlace => "purged_in_place",
+        },
+    });
+    event
 }
 
 async fn purge_evidence_payload_row<'e, E>(executor: E, evidence_id: &str) -> Result<bool>
@@ -2281,7 +2367,10 @@ mod tests {
                 .fetch_one(&store.pool)
                 .await
                 .unwrap();
-        assert!(!payloads.contains(CANARY), "raw content in audit: {payloads}");
+        assert!(
+            !payloads.contains(CANARY),
+            "raw content in audit: {payloads}"
+        );
         std::fs::remove_file(&path).ok();
     }
 }
