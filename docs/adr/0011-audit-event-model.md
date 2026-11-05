@@ -107,6 +107,7 @@ this ADR:
 | `policy_revocation_ingested` | A signed revocation list was verified and its entries ingested (ADR-0009). |
 | `role_assignment_changed` | A `RoleAssignment` was created, modified, or removed. |
 | `evidence_purged` | FORNX-319: a `RetentionClass::RawLocal` evidence row's payload was purged by the local retention sweep (`fornax-store::retention`) once its retention window elapsed. |
+| `record_purged` | FORNX-467: the retention sweep hard-deleted an `agent_events`/`claims` row, or purged its raw content in place because a surviving row still references it (`attributes.disposition` is `deleted` or `purged_in_place`; outcome `expired`, export class `metadata`; no content is embedded). If an append fails after the sweep batch commits, the remaining purges in that batch are not audited. |
 | _(any other string)_ | Forward-compatibility catch-all. |
 
 This set is deliberately small and will grow additively as new
@@ -152,6 +153,8 @@ Same tagged-object shape as `AuditActor`:
 | `permission` | An abstract permission name being checked (not a stored row). |
 | `device` | A device identity. |
 | `evidence` | FORNX-319: an `evidence` row, identified by its id — the target of an `evidence_purged` action. |
+| `agent_event` | FORNX-467: an `agent_events` row, identified by its id — the target of a `record_purged` action. |
+| `claim` | FORNX-467: a `claims` row, identified by its id — the target of a `record_purged` action. |
 | `organization` | A `fornax-cloud` organization. |
 | _(any other string)_ | Forward-compatibility catch-all. |
 
