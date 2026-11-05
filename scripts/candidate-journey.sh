@@ -9,6 +9,8 @@
 set -u
 BIN=$1; RECEIPT=$2
 J=$(mktemp -d "${TMPDIR:-/tmp}/fnx-journey.XXXXXX")
+# Physical path: install records the canonical location of the running binary.
+J=$(cd "$J" && pwd -P)
 trap 'kill "$(cat "$J/daemon.pid" 2>/dev/null)" 2>/dev/null; rm -rf "$J"' EXIT
 mkdir -p "$J/bin" "$J/home/.codex" "$J/home/.claude" "$J/home/Library/LaunchAgents"
 cp "$BIN/fornax" "$BIN/fornax-daemon" "$BIN/fornax-hook-claude" "$J/bin/"
@@ -80,6 +82,11 @@ cp "$HOME/.claude/settings.json" "$J/after1.json"
 $F install claude-code
 check "second install byte-identical" "cmp -s '$HOME/.claude/settings.json' '$J/after1.json'"
 check "foreign hook and theme kept after install" "grep -q foreign-hook '$J/after1.json' && grep -q '\"theme\"' '$J/after1.json'"
+check "install wrote the hook path beside the installed binary" "grep -q '\"command\": \"$J/bin/fornax-hook-claude\"' '$J/after1.json'"
+cp "$J/after1.json" "$J/after1.keep"
+sed -i.bak "s#$J/bin/fornax-hook-claude#fornax-hook-claude#" "$HOME/.claude/settings.json"; rm -f "$HOME/.claude/settings.json.bak"
+$F install claude-code
+check "upgrade from a bare entry leaves exactly one hook per event" "[ \$(grep -c 'fornax-hook-claude' '$HOME/.claude/settings.json') = 5 ] && cmp -s '$HOME/.claude/settings.json' '$J/after1.keep'"
 $F doctor
 check "doctor says configuration only, never Verified" "$F doctor | grep -q 'configuration only' && $F doctor | grep -q 'never Verified'"
 $F uninstall claude-code

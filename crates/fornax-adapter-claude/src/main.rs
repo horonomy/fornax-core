@@ -8,7 +8,10 @@
 //! (FORNX-15) — it idempotently adds the hook entries below without
 //! touching any other hook or setting already in that file. Run
 //! `fornax uninstall claude-code` to remove them again and return Claude Code
-//! to a clean state. The resulting shape:
+//! to a clean state. The `command` is the absolute path of this binary beside
+//! the installed `fornax` when that path is shell-safe, otherwise the bare
+//! name shown below (which then must be on Claude Code's `PATH`). The
+//! resulting shape:
 //! ```json
 //! "PreToolUse":       [{ "hooks": [{ "type": "command", "command": "fornax-hook-claude" }] }],
 //! "PostToolUse":      [{ "hooks": [{ "type": "command", "command": "fornax-hook-claude" }] }],

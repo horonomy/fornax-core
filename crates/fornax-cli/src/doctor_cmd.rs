@@ -75,7 +75,7 @@ fn find_on_path(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
 }
 
 pub fn checks(i: &Inputs) -> Vec<Check> {
-    use crate::claude_adapter::{hook_command, wiring_at, Wiring};
+    use crate::claude_adapter::{wiring_at, Wiring};
     let mut out = Vec::new();
 
     out.push(if i.daemon_reachable {
@@ -102,7 +102,7 @@ pub fn checks(i: &Inputs) -> Vec<Check> {
     let notify = notify_state_at(i.codex_config);
     let capture = capture_state(i.fornax_home, i.codex_config);
     let wiring = wiring_at(i.claude_settings);
-    let claude_in_use = matches!(wiring, Wiring::Full | Wiring::Partial { .. });
+    let claude_in_use = matches!(wiring, Wiring::Full { .. } | Wiring::Partial { .. });
     let codex_in_use = i.codex_home_error.is_some()
         || matches!(notify, NotifyState::Fornax(_) | NotifyState::Unreadable(_))
         || capture != Capture::Off;
@@ -224,26 +224,64 @@ pub fn checks(i: &Inputs) -> Vec<Check> {
                 i.claude_settings.display()
             ),
         )),
-        Wiring::Full => {
-            let name = hook_command();
-            out.push(match find_on_path(name, i.path_dirs) {
-                Some(p) => Check::new(
-                    true,
-                    "claude code wiring",
-                    format!(
-                        "all hook events configured; `{name}` is executable at {} on this shell's \
-                         PATH (configuration only: Claude Code's own PATH is not checked)",
-                        p.display()
+        Wiring::Full { command } => {
+            out.push(if Path::new(&command).is_absolute() {
+                if let (true, Some(problem)) = (
+                    script_is_runnable(Path::new(command)),
+                    crate::claude_adapter::hook_target_problem(Path::new(command)),
+                ) {
+                    Check::new(
+                        false,
+                        "claude code wiring",
+                        format!(
+                            "hooks are configured but `{command}` is not safe to run: {problem} \
+                             -- fix its ownership or permissions, or run `fornax install \
+                             claude-code` again from the current install"
+                        ),
+                    )
+                } else if script_is_runnable(Path::new(&command)) {
+                    Check::new(
+                        true,
+                        "claude code wiring",
+                        format!(
+                            "all hook events configured; `{command}` exists and is executable \
+                             (configuration only: Claude Code's own PATH is not checked)"
+                        ),
+                    )
+                } else {
+                    Check::new(
+                        false,
+                        "claude code wiring",
+                        format!(
+                            "hooks are configured but `{command}` is missing or not executable, \
+                             so Claude Code may fail to run it -- run `fornax install claude-code` \
+                             again from the current install"
+                        ),
+                    )
+                }
+            } else {
+                match find_on_path(command, i.path_dirs) {
+                    Some(p) => Check::new(
+                        true,
+                        "claude code wiring",
+                        format!(
+                            "all hook events configured; `{command}` is executable at {} on this \
+                             shell's PATH (configuration only: Claude Code's own PATH is not \
+                             checked)",
+                            p.display()
+                        ),
                     ),
-                ),
-                None => Check::new(
-                    false,
-                    "claude code wiring",
-                    format!(
-                        "hooks are configured but `{name}` is not an executable on this shell's \
-                         PATH, so Claude Code may fail to run it -- put its directory on PATH"
+                    None => Check::new(
+                        false,
+                        "claude code wiring",
+                        format!(
+                            "hooks are configured but `{command}` is not an executable on this \
+                             shell's PATH, so Claude Code may fail to run it -- put its directory \
+                             on PATH, or run `fornax install claude-code` from an install that \
+                             has `fornax-hook-claude` beside `fornax`"
+                        ),
                     ),
-                ),
+                }
             });
             out.push(match i.claude_activity {
                 None => Check::new(
@@ -411,7 +449,11 @@ mod tests {
             self.d.join("settings.json")
         }
         fn install_claude(&self) {
-            crate::claude_adapter::install_at(&self.claude_cfg()).unwrap();
+            crate::claude_adapter::install_at(
+                &self.claude_cfg(),
+                crate::claude_adapter::hook_command(),
+            )
+            .unwrap();
         }
         fn script(&self) -> PathBuf {
             self.d.join("bin").join("fornax-codex-notify.sh")
@@ -796,5 +838,45 @@ mod tests {
                 other => panic!("unexpected file created: {other}"),
             }
         }
+    }
+
+    // FORNX-469: an absolute-path hook is checked where it points, not on PATH.
+    fn install_absolute(w: &World, command: &str) {
+        crate::claude_adapter::install_at(&w.claude_cfg(), command).unwrap();
+    }
+
+    #[test]
+    fn absolute_hook_that_exists_is_ok_without_being_on_path() {
+        let w = World::new("abs-ok");
+        w.put_hook_on_path(0o755);
+        let hook = w.d.join("bin").join("fornax-hook-claude");
+        install_absolute(&w, hook.to_str().unwrap());
+        let mut w = w;
+        w.path_dirs = vec![];
+        let t = w.text();
+        assert!(t.contains("[ok] claude code wiring"), "{t}");
+        assert!(t.contains("exists and is executable"), "{t}");
+        assert!(t.contains("configuration only"), "{t}");
+    }
+
+    #[test]
+    fn absolute_hook_that_is_missing_is_flagged() {
+        let w = World::new("abs-missing");
+        let hook = w.d.join("bin").join("fornax-hook-claude");
+        install_absolute(&w, hook.to_str().unwrap());
+        let t = w.text();
+        assert!(t.contains("[!!] claude code wiring"), "{t}");
+        assert!(t.contains("missing or not executable"), "{t}");
+    }
+
+    #[test]
+    fn absolute_hook_that_is_group_writable_is_flagged() {
+        let w = World::new("abs-unsafe");
+        w.put_hook_on_path(0o775);
+        let hook = w.d.join("bin").join("fornax-hook-claude");
+        install_absolute(&w, hook.to_str().unwrap());
+        let t = w.text();
+        assert!(t.contains("[!!] claude code wiring"), "{t}");
+        assert!(t.contains("not safe to run"), "{t}");
     }
 }
