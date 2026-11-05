@@ -107,7 +107,7 @@ this ADR:
 | `policy_revocation_ingested` | A signed revocation list was verified and its entries ingested (ADR-0009). |
 | `role_assignment_changed` | A `RoleAssignment` was created, modified, or removed. |
 | `evidence_purged` | FORNX-319: a `RetentionClass::RawLocal` evidence row's payload was purged by the local retention sweep (`fornax-store::retention`) once its retention window elapsed. |
-| `record_purged` | FORNX-467: the retention sweep hard-deleted an `agent_events`/`claims` row, or purged its raw content in place because a surviving row still references it (`attributes.disposition` is `deleted` or `purged_in_place`; outcome `expired`, export class `metadata`; no content is embedded). If an append fails after the sweep batch commits, the remaining purges in that batch are not audited. |
+| `record_purged` | FORNX-467: the retention sweep hard-deleted an `agent_events`/`claims` row, or purged its raw content in place because a surviving row still references it (`attributes.disposition` is `deleted` or `purged_in_place`; outcome `expired`, export class `metadata`; no content is embedded). The audit rows are appended in the same transaction as the purge, so a failed append rolls the sweep batch back. |
 | _(any other string)_ | Forward-compatibility catch-all. |
 
 This set is deliberately small and will grow additively as new
