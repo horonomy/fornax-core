@@ -46,8 +46,7 @@ pub fn default_path() -> std::path::PathBuf {
 /// changing any of these later forces every already-installed user to
 /// re-trust:
 /// - bare command name, not an absolute path: the hash stays valid across
-///   rebuilds/checkouts (same precedent as Claude's `fornax-hook-claude`,
-///   resolved via `sh -lc` PATH lookup);
+///   rebuilds/checkouts (resolved via `sh -lc` PATH lookup);
 /// - no `matcher`: matches every tool/source;
 /// - `timeout: 5`: Codex's own default is 600s, and this binary only opens a
 ///   Unix socket and writes — a hung daemon socket must not stall a tool
