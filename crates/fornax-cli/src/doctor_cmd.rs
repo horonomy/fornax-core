@@ -226,7 +226,20 @@ pub fn checks(i: &Inputs) -> Vec<Check> {
         )),
         Wiring::Full { command } => {
             out.push(if Path::new(&command).is_absolute() {
-                if script_is_runnable(Path::new(&command)) {
+                if let (true, Some(problem)) = (
+                    script_is_runnable(Path::new(command)),
+                    crate::claude_adapter::hook_target_problem(Path::new(command)),
+                ) {
+                    Check::new(
+                        false,
+                        "claude code wiring",
+                        format!(
+                            "hooks are configured but `{command}` is not safe to run: {problem} \
+                             -- fix its ownership or permissions, or run `fornax install \
+                             claude-code` again from the current install"
+                        ),
+                    )
+                } else if script_is_runnable(Path::new(&command)) {
                     Check::new(
                         true,
                         "claude code wiring",
@@ -854,5 +867,16 @@ mod tests {
         let t = w.text();
         assert!(t.contains("[!!] claude code wiring"), "{t}");
         assert!(t.contains("missing or not executable"), "{t}");
+    }
+
+    #[test]
+    fn absolute_hook_that_is_group_writable_is_flagged() {
+        let w = World::new("abs-unsafe");
+        w.put_hook_on_path(0o775);
+        let hook = w.d.join("bin").join("fornax-hook-claude");
+        install_absolute(&w, hook.to_str().unwrap());
+        let t = w.text();
+        assert!(t.contains("[!!] claude code wiring"), "{t}");
+        assert!(t.contains("not safe to run"), "{t}");
     }
 }

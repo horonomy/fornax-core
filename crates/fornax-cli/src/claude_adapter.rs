@@ -21,8 +21,11 @@ const FORNAX_HOOK_COMMAND: &str = "fornax-hook-claude";
 /// absolute path whose file name is the bare name (an install beside the
 /// binary, current or from an earlier install location).
 fn is_fornax_command(command: &str) -> bool {
+    // An absolute form must be a single shell word, so a wrapper such as
+    // `/usr/bin/audit ; /x/fornax-hook-claude` is never mistaken for ours.
     command == FORNAX_HOOK_COMMAND
         || (std::path::Path::new(command).is_absolute()
+            && is_shell_safe_path(command)
             && std::path::Path::new(command)
                 .file_name()
                 .is_some_and(|n| n == FORNAX_HOOK_COMMAND))
@@ -62,7 +65,8 @@ impl ResolvedHook {
             Some(c)
                 if std::fs::metadata(&c)
                     .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-                    .unwrap_or(false) =>
+                    .unwrap_or(false)
+                    && hook_target_problem(std::path::Path::new(&c)).is_none() =>
             {
                 Self {
                     warning: Some(format!(
@@ -95,6 +99,37 @@ fn is_shell_safe_path(path: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || "/._-+@:,=".contains(c))
 }
 
+/// Why `path` must not be pinned as a hook command, or `None` if it may be.
+/// The file and its directory must be owned by this user or root and not
+/// group/world-writable (the `adapter_store` policy), judged on the resolved
+/// target, so a swapped binary cannot be run by every Claude Code hook.
+pub(crate) fn hook_target_problem(path: &std::path::Path) -> Option<String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let euid = rustix::process::geteuid().as_raw();
+    let check = |p: &std::path::Path, what: &str| -> Option<String> {
+        let m = std::fs::symlink_metadata(p).ok()?;
+        if m.uid() != euid && m.uid() != 0 {
+            return Some(format!("{what} {} is owned by another user", p.display()));
+        }
+        if m.permissions().mode() & 0o022 != 0 {
+            return Some(format!(
+                "{what} {} is group- or world-writable",
+                p.display()
+            ));
+        }
+        None
+    };
+    let Ok(real) = path.canonicalize() else {
+        return Some(format!("{} cannot be resolved", path.display()));
+    };
+    if let Some(parent) = real.parent() {
+        if let Some(p) = check(parent, "directory") {
+            return Some(p);
+        }
+    }
+    check(&real, "file")
+}
+
 /// Prefers the `fornax-hook-claude` that sits beside the running (canonical)
 /// `fornax` binary, so a downloaded release works without being on PATH.
 /// Falls back to the bare name, with a warning, when that sibling is missing,
@@ -112,6 +147,9 @@ pub(crate) fn resolve_hook_command(current_exe: &std::path::Path) -> ResolvedHoo
             "no executable `{FORNAX_HOOK_COMMAND}` was found beside {}",
             current_exe.display()
         ));
+    }
+    if let Some(problem) = hook_target_problem(&sibling) {
+        return ResolvedHook::bare_for(format!("it is not safe to pin: {problem}"));
     }
     match sibling.to_str() {
         Some(s) if is_shell_safe_path(s) => ResolvedHook {
@@ -1327,6 +1365,57 @@ mod tests {
         assert_eq!(r.command, FORNAX_HOOK_COMMAND);
         assert!(r.warning.expect("warning").contains("PATH"));
         std::fs::remove_dir_all(&no_sibling).ok();
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn resolve_refuses_a_group_writable_file_or_world_writable_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let file = exe_dir("gwfile", true, 0o775);
+        let dir = exe_dir("wwdir", true, 0o755);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        for d in [&file, &dir] {
+            let r = resolve_hook_command(&d.join("fornax"));
+            assert_eq!(r.command, FORNAX_HOOK_COMMAND, "{}", d.display());
+            assert!(r.warning.expect("warning").contains("writable"));
+        }
+        // An existing absolute entry that fails the same check is not kept.
+        let path = tmp_settings_path("unsafe-existing");
+        install_at(&path, file.join(FORNAX_HOOK_COMMAND).to_str().unwrap()).unwrap();
+        let no_sibling = exe_dir("nosib3", false, 0);
+        let r = resolve_hook_command(&no_sibling.join("fornax")).keeping_working_entry(&path);
+        assert_eq!(r.command, FORNAX_HOOK_COMMAND);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for d in [&file, &dir, &no_sibling] {
+            std::fs::remove_dir_all(d).ok();
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn wrappers_ending_in_the_hook_name_are_foreign_to_install_and_uninstall() {
+        let path = tmp_settings_path("wrappers");
+        let wrappers = [
+            "/usr/bin/audit ; /x/fornax-hook-claude",
+            "/usr/bin/audit && /x/fornax-hook-claude",
+            "/opt/my tools/fornax-hook-claude",
+        ];
+        let group = |c: &str| serde_json::json!({ "hooks": [{ "type": "command", "command": c }] });
+        write_settings(
+            &path,
+            &serde_json::json!({ "hooks": { "Stop": wrappers.iter().map(|w| group(w)).collect::<Vec<_>>() } }),
+        );
+        install_at(&path, ABS).unwrap();
+        let after_install = commands_for(&path, "Stop");
+        for w in wrappers {
+            assert!(after_install.contains(&w.to_string()), "{w}");
+        }
+        assert!(after_install.contains(&ABS.to_string()));
+        uninstall_at(&path).unwrap();
+        assert_eq!(
+            commands_for(&path, "Stop"),
+            wrappers.iter().map(|w| w.to_string()).collect::<Vec<_>>()
+        );
         std::fs::remove_file(&path).ok();
     }
 }
