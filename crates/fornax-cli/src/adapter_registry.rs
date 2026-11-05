@@ -99,15 +99,32 @@ impl AdapterPlugin for ClaudeCodeAdapter {
     }
 
     fn plan(&self) -> anyhow::Result<AdapterActionResult> {
-        crate::claude_adapter::plan_install_at(&self.target_path())
+        let hook = resolve_installed_hook();
+        let mut r = crate::claude_adapter::plan_install_at(&self.target_path(), &hook.command)?;
+        r.message = hook.annotate(r.message);
+        Ok(r)
     }
 
     fn install(&self) -> anyhow::Result<AdapterActionResult> {
-        crate::claude_adapter::install_at(&self.target_path())
+        let hook = resolve_installed_hook();
+        let mut r = crate::claude_adapter::install_at(&self.target_path(), &hook.command)?;
+        r.message = hook.annotate(r.message);
+        Ok(r)
     }
 
     fn uninstall(&self) -> anyhow::Result<AdapterActionResult> {
         crate::claude_adapter::uninstall_at(&self.target_path())
+    }
+}
+
+/// The hook command for the `fornax` binary that is running now, resolved
+/// through symlinks so a `fornax` linked onto PATH still finds its sibling.
+fn resolve_installed_hook() -> crate::claude_adapter::ResolvedHook {
+    match std::env::current_exe().and_then(|p| p.canonicalize()) {
+        Ok(exe) => crate::claude_adapter::resolve_hook_command(&exe),
+        Err(e) => crate::claude_adapter::ResolvedHook::bare_for(format!(
+            "the running binary's path could not be resolved ({e})"
+        )),
     }
 }
 
@@ -243,7 +260,7 @@ impl AdapterPlugin for CodexAdapter {
             // Fail closed: if Claude's settings cannot be read, Fornax cannot
             // tell that no hooks remain.
             match wiring_at(&crate::claude_adapter::default_path()) {
-                Wiring::Full | Wiring::Partial { .. } => {
+                Wiring::Full { .. } | Wiring::Partial { .. } => {
                     keep_autostart = Some("Claude Code hooks are still installed".to_owned());
                 }
                 Wiring::Unreadable(_) => {

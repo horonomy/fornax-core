@@ -11,9 +11,90 @@
 use crate::adapter_registry::AdapterActionResult;
 use crate::guarded_write::{digest_of_bytes, write_guarded, ContentDigest};
 
-/// The `command` value the `fornax-adapter-claude` doc comment documents for
-/// wiring into `~/.claude/settings.json` hooks.
+/// The bare `command` name the `fornax-adapter-claude` doc comment documents
+/// for wiring into `~/.claude/settings.json` hooks. It is also the file name
+/// of the installed hook binary, which is how an absolute-path entry is
+/// recognised as Fornax's.
 const FORNAX_HOOK_COMMAND: &str = "fornax-hook-claude";
+
+/// True if `command` is a hook command Fornax wrote: the bare name, or an
+/// absolute path whose file name is the bare name (an install beside the
+/// binary, current or from an earlier install location).
+fn is_fornax_command(command: &str) -> bool {
+    command == FORNAX_HOOK_COMMAND
+        || (std::path::Path::new(command).is_absolute()
+            && std::path::Path::new(command)
+                .file_name()
+                .is_some_and(|n| n == FORNAX_HOOK_COMMAND))
+}
+
+/// The hook `command` an install will write, and why it is not the preferred form.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedHook {
+    pub command: String,
+    /// Set when the bare name is written because no usable sibling was found.
+    pub warning: Option<String>,
+}
+
+impl ResolvedHook {
+    pub fn bare_for(reason: String) -> Self {
+        Self {
+            command: FORNAX_HOOK_COMMAND.to_string(),
+            warning: Some(format!(
+                "warning: wrote the bare `{FORNAX_HOOK_COMMAND}` hook command because {reason}; \
+                 the hooks only work if `{FORNAX_HOOK_COMMAND}` is on Claude Code's PATH"
+            )),
+        }
+    }
+
+    /// Appends the warning, if any, to an install/plan message.
+    pub fn annotate(&self, message: String) -> String {
+        match &self.warning {
+            Some(w) => format!("{message}\n{w}"),
+            None => message,
+        }
+    }
+}
+
+/// Claude Code runs a hook command through a shell without quoting, so only
+/// characters that no shell treats specially are accepted in an absolute path.
+fn is_shell_safe_path(path: &str) -> bool {
+    !path.is_empty()
+        && path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+@:,=".contains(c))
+}
+
+/// Prefers the `fornax-hook-claude` that sits beside the running (canonical)
+/// `fornax` binary, so a downloaded release works without being on PATH.
+/// Falls back to the bare name, with a warning, when that sibling is missing,
+/// not executable, or has a path a shell would split or expand.
+pub(crate) fn resolve_hook_command(current_exe: &std::path::Path) -> ResolvedHook {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(sibling) = current_exe.parent().map(|d| d.join(FORNAX_HOOK_COMMAND)) else {
+        return ResolvedHook::bare_for("the running binary has no directory".to_string());
+    };
+    let runnable = std::fs::metadata(&sibling)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false);
+    if !runnable {
+        return ResolvedHook::bare_for(format!(
+            "no executable `{FORNAX_HOOK_COMMAND}` was found beside {}",
+            current_exe.display()
+        ));
+    }
+    match sibling.to_str() {
+        Some(s) if is_shell_safe_path(s) => ResolvedHook {
+            command: s.to_string(),
+            warning: None,
+        },
+        _ => ResolvedHook::bare_for(format!(
+            "{} contains whitespace or shell metacharacters that Claude Code would not pass \
+             through its shell intact",
+            sibling.display()
+        )),
+    }
+}
 
 /// Hook event names the `fornax-adapter-claude` doc comment documents as
 /// the wired set. Kept in sync with that doc comment — see
@@ -78,17 +159,19 @@ fn save_settings(
     write_guarded(path, &json, expected)
 }
 
+/// The first Fornax command string in this hook group, if any.
+fn group_fornax_command(group: &serde_json::Value) -> Option<&str> {
+    group
+        .get("hooks")?
+        .as_array()?
+        .iter()
+        .filter_map(|h| h.get("command").and_then(|c| c.as_str()))
+        .find(|c| is_fornax_command(c))
+}
+
 /// True if this hook group already carries a Fornax command entry.
 fn group_has_fornax_command(group: &serde_json::Value) -> bool {
-    group
-        .get("hooks")
-        .and_then(|h| h.as_array())
-        .map(|entries| {
-            entries
-                .iter()
-                .any(|h| h.get("command").and_then(|c| c.as_str()) == Some(FORNAX_HOOK_COMMAND))
-        })
-        .unwrap_or(false)
+    group_fornax_command(group).is_some()
 }
 
 /// What `settings.json` says about Fornax's Claude Code hooks, read-only.
@@ -100,10 +183,10 @@ pub(crate) enum Wiring {
     /// The file exists but cannot be read as a JSON object.
     Unreadable(String),
     /// Some, not all, of the wired events carry the Fornax hook.
-    Partial {
-        missing: Vec<&'static str>,
-    },
-    Full,
+    Partial { missing: Vec<&'static str> },
+    /// Every wired event carries a Fornax hook; `command` is what the first
+    /// event's entry runs, which doctor resolves the way Claude Code would.
+    Full { command: String },
 }
 
 pub(crate) fn wiring_at(path: &std::path::Path) -> Wiring {
@@ -124,13 +207,29 @@ pub(crate) fn wiring_at(path: &std::path::Path) -> Wiring {
         .filter(|e| !wired(e))
         .collect();
     match missing.len() {
-        0 => Wiring::Full,
+        0 => Wiring::Full {
+            command: configured_command(&settings)
+                .unwrap_or_else(|| FORNAX_HOOK_COMMAND.to_string()),
+        },
         n if n == CLAUDE_HOOK_EVENTS.len() => Wiring::Absent,
         _ => Wiring::Partial { missing },
     }
 }
 
-/// The `command` value install writes, for resolving it the way Claude Code would.
+fn configured_command(settings: &serde_json::Value) -> Option<String> {
+    CLAUDE_HOOK_EVENTS.iter().find_map(|event| {
+        settings
+            .get("hooks")?
+            .get(event)?
+            .as_array()?
+            .iter()
+            .find_map(group_fornax_command)
+            .map(str::to_string)
+    })
+}
+
+/// The bare command name, which is also the hook binary's file name.
+#[cfg(test)]
 pub(crate) const fn hook_command() -> &'static str {
     FORNAX_HOOK_COMMAND
 }
@@ -257,9 +356,11 @@ fn store_keep(settings_path: &std::path::Path, keep: &KeepEmpty) -> anyhow::Resu
     write_guarded(&path, &json, &expected)
 }
 
-/// Idempotently ensures each hook in `CLAUDE_HOOK_EVENTS` has one group
-/// running `fornax-hook-claude`, without touching any other group/event
-/// already present in `settings`.
+/// Idempotently ensures each hook in `CLAUDE_HOOK_EVENTS` runs `command`
+/// exactly once, without touching any other group/event already present in
+/// `settings`. A Fornax entry with a different command (the bare name, or an
+/// earlier install location) is updated in place, and further Fornax entries
+/// in the same event are dropped, so an upgrade never fires a hook twice.
 ///
 /// `settings` must already be a JSON object (guaranteed by `load_settings`).
 /// If an existing `"hooks"` value, or an existing per-event value, is
@@ -267,7 +368,7 @@ fn store_keep(settings_path: &std::path::Path, keep: &KeepEmpty) -> anyhow::Resu
 /// respectively), this refuses to clobber it and returns an error instead —
 /// per the "safe failure mode rather than corrupting Claude Code config"
 /// constraint.
-fn install_claude_hooks(settings: &mut serde_json::Value) -> anyhow::Result<()> {
+fn install_claude_hooks(settings: &mut serde_json::Value, command: &str) -> anyhow::Result<()> {
     let root = settings
         .as_object_mut()
         .expect("caller guarantees settings is a JSON object");
@@ -287,14 +388,42 @@ fn install_claude_hooks(settings: &mut serde_json::Value) -> anyhow::Result<()> 
             "existing \"hooks.{event}\" value in settings.json is not an array — refusing to overwrite it"
         );
         let entries_arr = entries.as_array_mut().expect("just checked is_array");
-        let already_installed = entries_arr.iter().any(group_has_fornax_command);
-        if !already_installed {
+        let mut seen = false;
+        entries_arr.retain_mut(|group| {
+            let Some(group_hooks) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
+                return true;
+            };
+            let had_fornax = group_hooks.iter().any(is_fornax_entry);
+            group_hooks.retain_mut(|h| {
+                if !is_fornax_entry(h) {
+                    return true;
+                }
+                if seen {
+                    return false;
+                }
+                seen = true;
+                if h.get("command").and_then(|c| c.as_str()) != Some(command) {
+                    h["command"] = serde_json::Value::String(command.to_string());
+                }
+                true
+            });
+            // Only a group this dedupe emptied is dropped; a user's own empty
+            // group is not a Fornax entry and is kept.
+            !(had_fornax && group_hooks.is_empty())
+        });
+        if !seen {
             entries_arr.push(serde_json::json!({
-                "hooks": [{ "type": "command", "command": FORNAX_HOOK_COMMAND }]
+                "hooks": [{ "type": "command", "command": command }]
             }));
         }
     }
     Ok(())
+}
+
+fn is_fornax_entry(hook: &serde_json::Value) -> bool {
+    hook.get("command")
+        .and_then(|c| c.as_str())
+        .is_some_and(is_fornax_command)
 }
 
 /// Removes only Fornax hook entries from `settings`, leaving every other
@@ -320,8 +449,7 @@ fn uninstall_claude_hooks(settings: &mut serde_json::Value, keep: &KeepEmpty) {
                 return true;
             };
             let before = group_hooks.len();
-            group_hooks
-                .retain(|h| h.get("command").and_then(|c| c.as_str()) != Some(FORNAX_HOOK_COMMAND));
+            group_hooks.retain(|h| !is_fornax_entry(h));
             let removed = group_hooks.len() < before;
             removed_here |= removed;
             !(removed && group_hooks.is_empty())
@@ -341,10 +469,13 @@ fn uninstall_claude_hooks(settings: &mut serde_json::Value, keep: &KeepEmpty) {
 }
 
 /// Computes what `install_at` would do, without writing anything.
-pub fn plan_install_at(path: &std::path::Path) -> anyhow::Result<AdapterActionResult> {
+pub fn plan_install_at(
+    path: &std::path::Path,
+    command: &str,
+) -> anyhow::Result<AdapterActionResult> {
     let before = load_settings(path)?;
     let mut after = before.clone();
-    install_claude_hooks(&mut after)?;
+    install_claude_hooks(&mut after, command)?;
     let changed = after != before;
     let message = if changed {
         format!(
@@ -370,8 +501,8 @@ fn mk(path: &std::path::Path, changed: bool, message: String) -> AdapterActionRe
     }
 }
 
-pub fn install_at(path: &std::path::Path) -> anyhow::Result<AdapterActionResult> {
-    install_at_with(path, || {})
+pub fn install_at(path: &std::path::Path, command: &str) -> anyhow::Result<AdapterActionResult> {
+    install_at_with(path, command, || {})
 }
 
 /// `install_at` with a hook that runs after the file is read and the new
@@ -380,11 +511,12 @@ pub fn install_at(path: &std::path::Path) -> anyhow::Result<AdapterActionResult>
 /// refuses rather than clobbers.
 fn install_at_with(
     path: &std::path::Path,
+    command: &str,
     before_write: impl FnOnce(),
 ) -> anyhow::Result<AdapterActionResult> {
     let (before, digest) = load_settings_with_digest(path)?;
     let mut settings = before.clone();
-    install_claude_hooks(&mut settings)?;
+    install_claude_hooks(&mut settings, command)?;
     if settings == before {
         return Ok(AdapterActionResult {
             adapter: "claude-code".to_string(),
@@ -484,7 +616,7 @@ mod tests {
     #[test]
     fn install_adds_all_documented_hooks_to_fresh_file() {
         let path = tmp_settings_path("fresh-install");
-        let result = install_at(&path).expect("install");
+        let result = install_at(&path, FORNAX_HOOK_COMMAND).expect("install");
         assert!(result.changed);
         let settings = load_settings(&path).expect("load");
         for event in CLAUDE_HOOK_EVENTS {
@@ -503,8 +635,8 @@ mod tests {
     #[test]
     fn install_is_idempotent_no_duplicate_entries() {
         let path = tmp_settings_path("idempotent-install");
-        install_at(&path).expect("first install");
-        let second = install_at(&path).expect("second install");
+        install_at(&path, FORNAX_HOOK_COMMAND).expect("first install");
+        let second = install_at(&path, FORNAX_HOOK_COMMAND).expect("second install");
         assert!(!second.changed);
         let settings = load_settings(&path).expect("load");
         let count = settings["hooks"]["Stop"].as_array().unwrap().len();
@@ -515,10 +647,10 @@ mod tests {
     #[test]
     fn plan_matches_install_without_writing() {
         let path = tmp_settings_path("plan-no-write");
-        let plan = plan_install_at(&path).expect("plan");
+        let plan = plan_install_at(&path, FORNAX_HOOK_COMMAND).expect("plan");
         assert!(plan.changed);
         assert!(!path.exists(), "plan must not create the file");
-        let install = install_at(&path).expect("install");
+        let install = install_at(&path, FORNAX_HOOK_COMMAND).expect("install");
         assert!(install.changed);
         std::fs::remove_file(&path).ok();
     }
@@ -535,7 +667,7 @@ mod tests {
     fn install_refuses_instead_of_clobbering_an_edit_made_after_the_read() {
         let path = tmp_settings_path("clobber");
         std::fs::write(&path, r#"{"model":"opus"}"#).unwrap();
-        let err = install_at_with(&path, || {
+        let err = install_at_with(&path, FORNAX_HOOK_COMMAND, || {
             std::fs::write(&path, r#"{"model":"opus","env":{"USER_EDIT":"1"}}"#).unwrap();
         })
         .expect_err("must refuse");
@@ -557,7 +689,7 @@ mod tests {
         let path = tmp_settings_path("mode");
         std::fs::write(&path, r#"{"env":{"K":"v"}}"#).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        install_at(&path).expect("install");
+        install_at(&path, FORNAX_HOOK_COMMAND).expect("install");
         let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&path), 0o600);
         uninstall_at(&path).expect("uninstall");
@@ -575,7 +707,7 @@ mod tests {
         let victim = dir.join("victim.txt");
         std::fs::write(&victim, "untouched").unwrap();
         std::os::unix::fs::symlink(&victim, dir.join("settings.json.tmp")).unwrap();
-        install_at(&path).expect("install");
+        install_at(&path, FORNAX_HOOK_COMMAND).expect("install");
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
         assert!(load_settings(&path).unwrap()["hooks"]["Stop"].is_array());
         std::fs::remove_dir_all(&dir).ok();
@@ -657,7 +789,7 @@ mod tests {
     fn uninstall_after_install_still_cleans_up_what_the_owned_removal_emptied() {
         let path = tmp_settings_path("fw-empty-roundtrip");
         write_settings(&path, &serde_json::json!({ "model": "keep" }));
-        install_at(&path).expect("install");
+        install_at(&path, FORNAX_HOOK_COMMAND).expect("install");
         uninstall_at(&path).expect("uninstall");
         assert_eq!(
             load_settings(&path).unwrap(),
@@ -756,7 +888,7 @@ mod tests {
     fn roundtrip_restores(name: &str, original: serde_json::Value) {
         let path = tmp_settings_path(name);
         write_settings(&path, &original);
-        install_at(&path).expect("install");
+        install_at(&path, FORNAX_HOOK_COMMAND).expect("install");
         assert!(uninstall_at(&path).expect("uninstall").changed);
         assert_eq!(read_json(&path), original, "{name}: structure not restored");
         assert!(!state_path(&path).exists(), "{name}: record left behind");
@@ -800,7 +932,7 @@ mod tests {
         let path = tmp_settings_path("keep-nothing");
         let original = serde_json::json!({ "model": "keep" });
         write_settings(&path, &original);
-        install_at(&path).expect("install");
+        install_at(&path, FORNAX_HOOK_COMMAND).expect("install");
         assert!(
             !state_path(&path).exists(),
             "nothing to remember, so no record"
@@ -816,9 +948,13 @@ mod tests {
         let original = serde_json::json!({ "hooks": { "Stop": [] }, "model": "keep" });
         write_settings(&path, &original);
         for _ in 0..3 {
-            install_at(&path).expect("install");
+            install_at(&path, FORNAX_HOOK_COMMAND).expect("install");
             let record = std::fs::read(state_path(&path)).expect("record while installed");
-            assert!(!install_at(&path).expect("repeat install").changed);
+            assert!(
+                !install_at(&path, FORNAX_HOOK_COMMAND)
+                    .expect("repeat install")
+                    .changed
+            );
             assert_eq!(std::fs::read(state_path(&path)).unwrap(), record);
             uninstall_at(&path).expect("uninstall");
             assert_eq!(read_json(&path), original);
@@ -830,7 +966,7 @@ mod tests {
     fn missing_record_falls_back_to_cleaning_up_what_the_removal_emptied() {
         let path = tmp_settings_path("keep-no-record");
         write_settings(&path, &serde_json::json!({ "hooks": { "Stop": [] } }));
-        install_at(&path).expect("install");
+        install_at(&path, FORNAX_HOOK_COMMAND).expect("install");
         std::fs::remove_file(state_path(&path)).unwrap();
         uninstall_at(&path).expect("uninstall");
         assert_eq!(read_json(&path), serde_json::json!({}));
@@ -854,7 +990,7 @@ mod tests {
                 &path,
                 &serde_json::json!({ "model": "keep", "hooks": { "PreToolUse": [{ "hooks": [{ "type": "command", "command": "x" }] }] } }),
             );
-            install_at(&path).expect("install");
+            install_at(&path, FORNAX_HOOK_COMMAND).expect("install");
             std::fs::write(state_path(&path), &record).unwrap();
             assert!(uninstall_at(&path).expect("uninstall").changed, "{name}");
             let after = read_json(&path);
@@ -876,7 +1012,7 @@ mod tests {
     fn a_record_naming_an_event_that_still_holds_foreign_data_deletes_nothing() {
         let path = tmp_settings_path("keep-record-vs-foreign");
         write_settings(&path, &serde_json::json!({ "hooks": { "Stop": [] } }));
-        install_at(&path).expect("install");
+        install_at(&path, FORNAX_HOOK_COMMAND).expect("install");
         let mut settings = read_json(&path);
         settings["hooks"]["Stop"]
             .as_array_mut()
@@ -897,7 +1033,7 @@ mod tests {
     fn an_event_the_user_deleted_after_install_is_not_resurrected() {
         let path = tmp_settings_path("keep-user-deleted");
         write_settings(&path, &serde_json::json!({ "hooks": { "Stop": [] } }));
-        install_at(&path).expect("install");
+        install_at(&path, FORNAX_HOOK_COMMAND).expect("install");
         let mut settings = read_json(&path);
         settings["hooks"].as_object_mut().unwrap().remove("Stop");
         write_settings(&path, &settings);
@@ -910,10 +1046,10 @@ mod tests {
     fn a_stale_record_is_corrected_by_the_next_install_not_trusted() {
         let path = tmp_settings_path("keep-stale");
         write_settings(&path, &serde_json::json!({ "hooks": { "Stop": [] } }));
-        install_at(&path).expect("install");
+        install_at(&path, FORNAX_HOOK_COMMAND).expect("install");
         // The user wipes the file entirely; the old record (Stop) is now stale.
         write_settings(&path, &serde_json::json!({}));
-        install_at(&path).expect("reinstall");
+        install_at(&path, FORNAX_HOOK_COMMAND).expect("reinstall");
         uninstall_at(&path).expect("uninstall");
         assert_eq!(
             read_json(&path),
@@ -949,7 +1085,7 @@ mod tests {
             &path,
             &serde_json::json!({ "hooks": { "Stop": [fornax_group()], "PreToolUse": [] } }),
         );
-        install_at(&path).expect("install");
+        install_at(&path, FORNAX_HOOK_COMMAND).expect("install");
         uninstall_at(&path).expect("uninstall");
         assert_eq!(
             read_json(&path),
@@ -962,11 +1098,15 @@ mod tests {
     fn plan_and_a_no_op_install_write_no_record() {
         let path = tmp_settings_path("keep-plan");
         write_settings(&path, &serde_json::json!({ "hooks": { "Stop": [] } }));
-        plan_install_at(&path).expect("plan");
+        plan_install_at(&path, FORNAX_HOOK_COMMAND).expect("plan");
         assert!(!state_path(&path).exists());
-        install_at(&path).expect("install");
+        install_at(&path, FORNAX_HOOK_COMMAND).expect("install");
         std::fs::remove_file(state_path(&path)).unwrap();
-        assert!(!install_at(&path).expect("no-op install").changed);
+        assert!(
+            !install_at(&path, FORNAX_HOOK_COMMAND)
+                .expect("no-op install")
+                .changed
+        );
         assert!(!state_path(&path).exists());
         cleanup(&path);
     }
@@ -976,7 +1116,7 @@ mod tests {
         let path = tmp_settings_path("keep-refused");
         write_settings(&path, &serde_json::json!({ "hooks": { "Stop": [] } }));
         let racing = path.clone();
-        let err = install_at_with(&path, move || {
+        let err = install_at_with(&path, FORNAX_HOOK_COMMAND, move || {
             std::fs::write(&racing, b"{\"edited\":true}").unwrap();
         });
         assert!(err.is_err());
@@ -988,12 +1128,147 @@ mod tests {
     fn a_stale_hooks_flag_is_corrected_by_the_next_install_not_trusted() {
         let path = tmp_settings_path("keep-stale-hooks-flag");
         write_settings(&path, &serde_json::json!({ "hooks": {} }));
-        install_at(&path).expect("install");
+        install_at(&path, FORNAX_HOOK_COMMAND).expect("install");
         // The user wipes the file; the recorded "hooks was an empty object" is now stale.
         write_settings(&path, &serde_json::json!({ "model": "keep" }));
-        install_at(&path).expect("reinstall");
+        install_at(&path, FORNAX_HOOK_COMMAND).expect("reinstall");
         uninstall_at(&path).expect("uninstall");
         assert_eq!(read_json(&path), serde_json::json!({ "model": "keep" }));
         cleanup(&path);
+    }
+
+    // FORNX-469: the hook command is the binary beside the installed `fornax`.
+    fn exe_dir(name: &str, with_hook: bool, mode: u32) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("fornax-hookpath-{name}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("fornax"), "#!/bin/sh\n").unwrap();
+        if with_hook {
+            let hook = dir.join(FORNAX_HOOK_COMMAND);
+            std::fs::write(&hook, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn resolve_uses_the_executable_sibling_by_absolute_path() {
+        let dir = exe_dir("sibling", true, 0o755);
+        let r = resolve_hook_command(&dir.join("fornax"));
+        assert_eq!(r.command, dir.join(FORNAX_HOOK_COMMAND).to_str().unwrap());
+        assert_eq!(r.warning, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_falls_back_to_the_bare_name_with_a_warning() {
+        let missing = exe_dir("missing", false, 0);
+        let not_exec = exe_dir("noexec", true, 0o644);
+        let spaced = exe_dir("with space", true, 0o755);
+        let meta = exe_dir("meta$(x)", true, 0o755);
+        for dir in [&missing, &not_exec, &spaced, &meta] {
+            let r = resolve_hook_command(&dir.join("fornax"));
+            assert_eq!(r.command, FORNAX_HOOK_COMMAND, "{}", dir.display());
+            let w = r.warning.as_ref().expect("warning");
+            assert!(w.contains("PATH"), "{w}");
+            assert!(r.annotate("m".into()).starts_with("m\nwarning:"));
+            std::fs::remove_dir_all(dir).ok();
+        }
+    }
+
+    const ABS: &str = "/opt/fornax/bin/fornax-hook-claude";
+
+    fn commands_for(path: &std::path::Path, event: &str) -> Vec<String> {
+        load_settings(path).unwrap()["hooks"][event]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().unwrap().clone())
+            .map(|h| h["command"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn install_writes_the_given_absolute_command_and_is_idempotent() {
+        let path = tmp_settings_path("abs-install");
+        assert!(install_at(&path, ABS).unwrap().changed);
+        assert!(!install_at(&path, ABS).unwrap().changed);
+        for event in CLAUDE_HOOK_EVENTS {
+            assert_eq!(commands_for(&path, event), vec![ABS.to_string()]);
+        }
+        assert_eq!(
+            wiring_at(&path),
+            Wiring::Full {
+                command: ABS.to_string()
+            }
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn upgrade_replaces_a_bare_or_stale_entry_leaving_exactly_one() {
+        let path = tmp_settings_path("upgrade");
+        install_at(&path, FORNAX_HOOK_COMMAND).unwrap();
+        assert!(plan_install_at(&path, ABS).unwrap().changed);
+        assert!(install_at(&path, ABS).unwrap().changed);
+        for event in CLAUDE_HOOK_EVENTS {
+            assert_eq!(commands_for(&path, event), vec![ABS.to_string()]);
+        }
+        let newer = "/new/bin/fornax-hook-claude";
+        install_at(&path, newer).unwrap();
+        for event in CLAUDE_HOOK_EVENTS {
+            assert_eq!(commands_for(&path, event), vec![newer.to_string()]);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn install_collapses_duplicate_fornax_entries_and_keeps_foreign_ones() {
+        let path = tmp_settings_path("dedupe");
+        let foreign = serde_json::json!({ "type": "command", "command": "other-tool" });
+        let fornax = |c: &str| serde_json::json!({ "type": "command", "command": c });
+        write_settings(
+            &path,
+            &serde_json::json!({
+                "hooks": { "Stop": [
+                    { "hooks": [fornax(FORNAX_HOOK_COMMAND), foreign.clone()] },
+                    { "hooks": [fornax(ABS)] },
+                ] },
+                "model": "x"
+            }),
+        );
+        install_at(&path, ABS).unwrap();
+        assert_eq!(
+            commands_for(&path, "Stop"),
+            vec![ABS.to_string(), "other-tool".to_string()]
+        );
+        assert_eq!(load_settings(&path).unwrap()["model"], "x");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn uninstall_removes_bare_absolute_and_stale_entries_but_not_foreign_wrappers() {
+        let path = tmp_settings_path("uninstall-mixed");
+        let cmd = |c: &str| serde_json::json!({ "hooks": [{ "type": "command", "command": c }] });
+        write_settings(
+            &path,
+            &serde_json::json!({ "hooks": { "Stop": [
+                cmd(FORNAX_HOOK_COMMAND),
+                cmd(ABS),
+                cmd("/old/place/fornax-hook-claude"),
+                cmd("/usr/bin/my-fornax-hook-claude"),
+                cmd("fornax-hook-claude --extra"),
+            ] } }),
+        );
+        assert!(uninstall_at(&path).unwrap().changed);
+        assert_eq!(
+            commands_for(&path, "Stop"),
+            vec![
+                "/usr/bin/my-fornax-hook-claude".to_string(),
+                "fornax-hook-claude --extra".to_string()
+            ]
+        );
+        std::fs::remove_file(&path).ok();
     }
 }
