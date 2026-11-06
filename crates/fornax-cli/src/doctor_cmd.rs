@@ -328,8 +328,9 @@ pub fn checks(i: &Inputs) -> Vec<Check> {
             out.push(Check::new(
                 true,
                 "claude code limit",
-                "Claude Code gives no exit code, so a test result shows as Review, never \
-                 Verified (accepted v0.0.9 limit, ADR-0025)"
+                "a failing command carries a literal exit code, so a \"tests passed\" claim \
+                 is Contradicted; a passing run has only a heuristic exit 0, so it shows as \
+                 Review, never Verified (ADR-0025)"
                     .into(),
             ));
         }
@@ -747,7 +748,12 @@ mod tests {
         let w = World::new("limit");
         assert!(!w.text().contains("ADR-0025"));
         w.install_claude();
-        assert!(w.text().contains("never Verified"));
+        let t = w.text();
+        assert!(t.contains("never Verified"));
+        assert!(t.contains("literal exit code"));
+        assert!(t.contains("is Contradicted"));
+        assert!(t.contains("heuristic exit 0"));
+        assert!(!t.contains("gives no exit code"));
     }
 
     #[test]
