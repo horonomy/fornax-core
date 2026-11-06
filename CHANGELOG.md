@@ -113,6 +113,11 @@ Jira epic FORNX-20.
 
 ### Fixed
 
+- **Claude Code Stop claim read from `last_assistant_message`** (FORNX-488). The
+  Stop hook fires before the final assistant line reaches the transcript, so a
+  live "tests passed" claim was missed; the adapter now prefers the payload
+  message and falls back to the transcript. Verdict ceiling unchanged (ADR 0025).
+
 - **A command that only mentions a test runner can no longer verify a "tests
   passed" claim** (FORNX-477). The verifier matched `pytest`, `cargo test`,
   `jest`, ... as a substring of the command text, so `echo pytest`,

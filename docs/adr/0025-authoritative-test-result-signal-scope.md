@@ -228,3 +228,12 @@ Change (no change to what can reach `Verified`):
 - No new retention: the `error` text travels in the event `raw` and the
   rebuilt `tool_response` exactly as `PostToolUse` output does, and evidence
   keeps counts only (`test_summary`).
+
+## Addendum (FORNX-488, 2026-11-06): the Claude Code Stop claim is read from `last_assistant_message`
+
+The Stop hook fires before the final assistant line is flushed to the
+transcript, so reading only `transcript_path` missed the final "tests passed"
+message in a live host. The adapter now prefers the Stop payload's non-empty
+string `last_assistant_message` and falls back to the transcript. The
+pre-filter, the `Review` ceiling and the stored claim text are unchanged; no
+path to `Verified` is added.
