@@ -1790,6 +1790,90 @@ mod tests {
         }
     }
 
+    fn write_transcript(text: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("fornax-test-transcript-{}.jsonl", Uuid::new_v4()));
+        let line = serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": text}]}
+        })
+        .to_string();
+        std::fs::write(&path, line).unwrap();
+        path
+    }
+
+    fn claims_of(raw: &serde_json::Value) -> Vec<Claim> {
+        normalize(raw)
+            .into_messages()
+            .into_iter()
+            .filter_map(|m| match m {
+                IngestMessage::Claim(c) => Some(c),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stop_last_assistant_message_without_transcript_yields_claim() {
+        let raw = serde_json::json!({
+            "hook_event_name": "Stop",
+            "session_id": "sess-1",
+            "last_assistant_message": "All tests passed: `pytest -q test_ok.py` reported 1 passed in 0.00s.",
+            "stop_hook_active": false
+        });
+        let claims = claims_of(&raw);
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].subject, "test_result");
+    }
+
+    #[test]
+    fn stop_payload_message_wins_over_stale_transcript() {
+        let path = write_transcript("working on it");
+        let raw = serde_json::json!({
+            "hook_event_name": "Stop",
+            "session_id": "sess-1",
+            "transcript_path": path.to_str().unwrap(),
+            "last_assistant_message": "All tests passed."
+        });
+        let claims = claims_of(&raw);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].text, "All tests passed.");
+    }
+
+    #[test]
+    fn stop_blank_or_non_string_message_falls_back_to_transcript() {
+        let path = write_transcript("all tests passed");
+        for msg in [
+            serde_json::json!(""),
+            serde_json::json!("   \n"),
+            serde_json::json!(null),
+            serde_json::json!(42),
+            serde_json::json!({"text": "x"}),
+        ] {
+            let raw = serde_json::json!({
+                "hook_event_name": "Stop",
+                "session_id": "sess-1",
+                "transcript_path": path.to_str().unwrap(),
+                "last_assistant_message": msg
+            });
+            let claims = claims_of(&raw);
+            assert_eq!(claims.len(), 1, "{msg}");
+            assert_eq!(claims[0].text, "all tests passed");
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn stop_failing_payload_message_yields_no_claim() {
+        let raw = serde_json::json!({
+            "hook_event_name": "Stop",
+            "session_id": "sess-1",
+            "last_assistant_message": "Tests ran: 1 failed, 2 passed."
+        });
+        assert!(claims_of(&raw).is_empty());
+    }
+
     #[test]
     fn stop_event_without_transcript_path_produces_only_event() {
         let raw = serde_json::json!({
