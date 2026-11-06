@@ -104,11 +104,20 @@ fn claude_declares_process_result_unsupported_and_never_emits_a_literal_exit_cod
                     if ev.kind != EvidenceKind::ExitCode {
                         continue;
                     }
+                    // FORNX-487: the sole literal exit code is a non-zero one
+                    // read from a PostToolUseFailure `Exit code <N>` prefix.
+                    let literal_failure = ev.provenance.contains(":PostToolUseFailure:")
+                        && ev.payload["exit_code"].as_i64().is_some_and(|c| c != 0);
+                    if literal_failure {
+                        assert_eq!(ev.payload["heuristic"], serde_json::json!(false));
+                        continue;
+                    }
                     assert_eq!(
                         ev.payload["heuristic"],
                         serde_json::json!(true),
                         "ClaudeAdapter declares ProcessResult Unsupported, so every ExitCode \
-                         Evidence it emits must be heuristic, never a literal exit code"
+                         Evidence it emits must be heuristic, never a literal exit code \
+                         (except a PostToolUseFailure non-zero exit)"
                     );
                 }
             }

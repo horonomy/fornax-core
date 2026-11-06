@@ -15,6 +15,7 @@
 //! ```json
 //! "PreToolUse":       [{ "hooks": [{ "type": "command", "command": "fornax-hook-claude" }] }],
 //! "PostToolUse":      [{ "hooks": [{ "type": "command", "command": "fornax-hook-claude" }] }],
+//! "PostToolUseFailure": [{ "hooks": [{ "type": "command", "command": "fornax-hook-claude" }] }],
 //! "Stop":             [{ "hooks": [{ "type": "command", "command": "fornax-hook-claude" }] }],
 //! "SessionStart":     [{ "hooks": [{ "type": "command", "command": "fornax-hook-claude" }] }],
 //! "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "fornax-hook-claude" }] }]

@@ -91,7 +91,7 @@ impl AdapterPlugin for ClaudeCodeAdapter {
 
     fn summary(&self) -> &str {
         "Wires Fornax hooks into ~/.claude/settings.json (SessionStart, \
-         UserPromptSubmit, PreToolUse, PostToolUse, Stop)."
+         UserPromptSubmit, PreToolUse, PostToolUse, PostToolUseFailure, Stop)."
     }
 
     fn target_path(&self) -> PathBuf {
