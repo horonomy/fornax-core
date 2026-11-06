@@ -161,9 +161,10 @@ and run `uninstall codex` again).
 capture (judged by the same rules the daemon uses, so a comment, a leftover
 marker or a config file alone is never reported as working), and the Claude
 Code hooks. A hook entry in Claude's `settings.json` is reported as
-configuration only; only recorded events show it ran. For Claude Code (no exit
-code in its hook payload) a test result shows as Review, never Verified
-(ADR-0025); the same cap now applies to every provider's test result. A finding appears after an agent says it ran tests and the run's
+configuration only; only recorded events show it ran. For Claude Code a failing
+command carries a literal exit code, so a "tests passed" claim is Contradicted;
+a passing run has only a heuristic exit 0, so it shows as Review, never
+Verified (ADR-0025); the same cap now applies to every provider's test result. A finding appears after an agent says it ran tests and the run's
 own output is seen; see them with `fornax status` and `fornax detail`.
 
 For the optional ambient-status surface only, see

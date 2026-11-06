@@ -7,6 +7,14 @@ Jira epic FORNX-20.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`fornax doctor` no longer says Claude Code "gives no exit code"**
+  (FORNX-489). Since FORNX-487 a failing Bash command carries a literal
+  non-zero exit code, so a "tests passed" claim is Contradicted; a passing run
+  has only a heuristic exit 0 and stays Review, never Verified (ADR-0025).
+  Diagnostic text only; no verifier change.
+
 ### Added
 
 - **Codex first run: `fornax install codex` opts in to daemon capture**
