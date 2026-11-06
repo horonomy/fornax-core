@@ -263,6 +263,7 @@ pub fn run_rerun_test(
         ),
         exit_code,
         heuristic: false,
+        test_summary: None,
     };
     let evidence = Evidence {
         id: Uuid::new_v4(),
