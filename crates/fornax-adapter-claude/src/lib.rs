@@ -1440,10 +1440,12 @@ fn translate(
         out.extend(outcome.evidence.into_iter().map(IngestMessage::Evidence));
     }
 
-    // Stop: best-effort claim extraction from the transcript's last
-    // assistant message, if Claude Code gave us a transcript_path.
+    // Stop: best-effort claim extraction. Prefer the payload's own
+    // `last_assistant_message` (FORNX-488: a live host fires the hook before
+    // the final assistant line is flushed to the transcript); fall back to
+    // the transcript's last assistant text.
     if kind == EventKind::SessionEnd {
-        if let Some(text) = last_assistant_text(raw) {
+        if let Some(text) = stop_assistant_text(raw) {
             if fornax_verify_claims_tests_passed(&text) {
                 out.push(IngestMessage::Claim(Claim {
                     id: Uuid::new_v4(),
@@ -1471,6 +1473,14 @@ fn fornax_verify_claims_tests_passed(text: &str) -> bool {
     (t.contains("test") || t.contains("tests"))
         && (t.contains("passed") || t.contains("succeeded") || t.contains("all green"))
         && !t.contains("failed")
+}
+
+fn stop_assistant_text(raw: &serde_json::Value) -> Option<String> {
+    raw.get("last_assistant_message")
+        .and_then(|v| v.as_str())
+        .filter(|t| !t.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| last_assistant_text(raw))
 }
 
 fn last_assistant_text(raw: &serde_json::Value) -> Option<String> {
