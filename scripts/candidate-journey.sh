@@ -89,6 +89,7 @@ $F install claude-code
 check "upgrade from a bare entry leaves exactly one hook per event" "[ \$(grep -c 'fornax-hook-claude' '$HOME/.claude/settings.json') = 6 ] && cmp -s '$HOME/.claude/settings.json' '$J/after1.keep'"
 $F doctor
 check "doctor says configuration only, never Verified" "$F doctor | grep -q 'configuration only' && $F doctor | grep -q 'never Verified'"
+check "doctor states the Claude Code exit-code limit (FORNX-489), not the old no-exit-code claim" "$F doctor | grep -q 'literal exit code' && $F doctor | grep -q 'heuristic exit 0' && ! $F doctor | grep -q 'gives no exit code'"
 $F uninstall claude-code
 check "uninstall keeps foreign hook" "grep -q foreign-hook '$HOME/.claude/settings.json'"
 check "uninstall removes fornax hook" "! grep -q fornax-hook-claude '$HOME/.claude/settings.json'"
