@@ -163,7 +163,9 @@ pub enum SignalClass {
 
 /// One capability declaration: a signal class paired with its availability
 /// state and optional free-text rationale (the "why", e.g. "Bash
-/// tool_response carries no literal exit code as of v2.1.238" — previously
+/// tool_response carries no literal exit code as of v2.1.238"; the Claude
+/// adapter's live text also notes the failing-command `PostToolUseFailure`
+/// exception, FORNX-487 — previously
 /// only reachable via `RuntimeCapabilities.notes`, now attached to the
 /// specific class it explains).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -43,6 +43,9 @@ impl CapabilityProbe for ClaudeAdapter {
     /// `ProcessResult` is `Unsupported`: Claude Code's Bash `tool_response`
     /// never carries a literal exit code, only a heuristic derived from
     /// stdout/stderr/interrupted (see `normalize`'s `PostToolUse` handling).
+    /// The one exception is a failing command: its `PostToolUseFailure`
+    /// `error` starts `Exit code <N>`, a literal non-zero exit (FORNX-487).
+    /// Passing runs stay heuristic exit 0, so the class stays `Unsupported`.
     fn probe(&self) -> RuntimeCapabilities {
         use fornax_types::{CapabilitySignal, SignalAvailability, SignalClass};
         RuntimeCapabilities {

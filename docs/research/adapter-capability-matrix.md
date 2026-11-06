@@ -71,7 +71,7 @@ the signal taxonomy alone:
 
 | Provider / path | Verdict ceiling for a passing run | On a genuine failure | Why |
 |---|---|---|---|
-| Claude Code | `Review` | Not `Contradicted`: the `stderr_nonempty` heuristic path is capped at `Review` by `is_stderr_heuristic_evidence` | `ProcessResult` is `Unsupported` — no literal exit code exists in this adapter's evidence at all |
+| Claude Code | `Review` | Not `Contradicted`: the `stderr_nonempty` heuristic path is capped at `Review` by `is_stderr_heuristic_evidence` | `ProcessResult` stays `Unsupported` — a passing run has only a heuristic exit 0; the sole literal exit code is a failing Bash call's `PostToolUseFailure` `Exit code <N>` (non-zero, `heuristic: false`, FORNX-487), so a "tests passed" claim after a failing run is `Contradicted`; ADR-0025 ceiling `Review` unchanged |
 | Codex (default: `unified_exec`/`tools.exec_command`) | `Review` | No verdict either way | The "Script completed" fallback carries no exit status in either direction — not even heuristically distinguishable |
 | Codex (`--disable unified_exec`, i.e. `tools.shell_command`) | `Review` | `Contradicted` (literal, parseable `"Exit code: <n>"` text, `heuristic: false`) | The literal exit is authoritative for a failure, but a pass comes from the agent's own transcript (trust class `AgentAdjacent`), so it cannot be `Verified` |
 | opencode | `Review` | `Contradicted` (`tool.execute.after`'s `output.metadata.exit` is a literal integer) | Same: the literal exit settles a failure; a pass is transcript-derived and capped |
