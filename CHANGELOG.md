@@ -16,7 +16,52 @@ identity scope; deferred SLO items):
 Candidate manifest: `release/v0.0.9-candidate-manifest.json`. Nothing here
 claims more than the recorded evidence supports.
 
+### Fixed
+
+- **`fornax doctor` no longer says Claude Code "gives no exit code"**
+  (FORNX-489). Since FORNX-487 a failing Bash command carries a literal
+  non-zero exit code, so a "tests passed" claim is Contradicted; a passing run
+  has only a heuristic exit 0 and stays Review, never Verified (ADR-0025).
+  Diagnostic text only; no verifier change.
+
 ### Added
+
+- **Codex first run: `fornax install codex` opts in to daemon capture**
+  (FORNX-468). The daemon reads the selected Codex home's `sessions/` rollouts
+  (tool commands and output, final assistant message) so a "tests passed"
+  claim is checked against the run's own output, with no hand-started tailer
+  and no `/hooks` trust needed for findings. The opt-in is recorded in
+  `$FORNAX_HOME/codex-watch.json`. Only activity after the daemon is watching
+  is read; sessions already on disk are not backfilled. `fornax uninstall
+  codex` turns capture off (it is left on, with a message, if it watches a
+  different Codex home). **Privacy:** captured data is stored locally and
+  passes secret-pattern redaction only; there is no PII redaction (cloud upload
+  is a separate opt-in and is off by default). A Codex claim can be `Verified`
+  only when Codex reports a literal exit code of 0; heuristic-only evidence
+  stays `Review` (ADR-0025). Install, uninstall and plan print one outcome per
+  line. Known limit: `install` still writes the capture marker when the
+  `notify` edit is refused, because capture is a separate opt-in.
+
+- **`fornax install codex` writes a LaunchAgent plist file** (FORNX-469, macOS
+  only, when `fornax-daemon` sits next to `fornax`) and prints the exact
+  `launchctl bootstrap` command. Fornax never runs `launchctl` itself, so the
+  daemon does not start until you load it. Only an absent path is created: a
+  plist Fornax did not write, or cannot read (foreign, binary, non-UTF-8,
+  unreadable, a directory or a symlink), is left untouched by install and
+  uninstall, and the staging file never follows a planted symlink. Known
+  limit: replacing or removing a plist verified as Fornax's can still race a
+  same-user writer.
+
+- **`fornax doctor` is a first-run checklist** (FORNX-469, FORNX-471): daemon
+  reachable, Codex wiring and capture, and Claude Code hooks, each with the
+  next step. It reports only what it can show: a comment or other key
+  mentioning the notify script, a capture marker the daemon would ignore, or a
+  config file alone are gaps, and capture is judged by the same marker rule the
+  daemon uses. A Claude hook entry is reported as configuration only (only
+  recorded events show it ran), and Claude Code results are `Review`, never
+  `Verified` (ADR-0025). Doctor reads an existing database read-only; it never
+  creates or migrates it and leaves the file byte-for-byte unchanged (SQLite
+  may create empty `-wal`/`-shm` sidecars to read it).
 
 - `fornax adapter register` accepts shared host-adapter descriptors into the
   existing registry, with explicit digest confirmation and disabled registration.
@@ -58,6 +103,18 @@ claims more than the recorded evidence supports.
 
 ### Changed
 
+- **The Codex integration follows `CODEX_HOME`** (FORNX-474). `config.toml`,
+  `hooks.json` and the sessions directory the daemon watches are now under a
+  non-empty `CODEX_HOME`; unset or empty keeps `~/.codex`. A relative or
+  non-UTF-8 `CODEX_HOME` is refused before anything is written. Known limit: a
+  differently spelled path for the same directory is treated as a different
+  Codex home.
+
+- **The Codex notify script lives under `$FORNAX_HOME/bin`** (FORNX-469). It is
+  rendered there with the absolute `fornax` path baked in, so the `notify`
+  entry in `config.toml` no longer depends on where the binary was built or
+  checked out. `uninstall` removes the entry but leaves the script file.
+
 - `fornax adapter unregister` (and the underlying registry `remove`) adopts
   Strict Retention (HORO-1745): the index entry is still removed, but the
   owned descriptor/config copy and any orphaned staging file are never
@@ -72,6 +129,111 @@ claims more than the recorded evidence supports.
   special case for either kind.
 
 ### Fixed
+
+- **Claude Code Stop claim read from `last_assistant_message`** (FORNX-488). The
+  Stop hook fires before the final assistant line reaches the transcript, so a
+  live "tests passed" claim was missed; the adapter now prefers the payload
+  message and falls back to the transcript. Verdict ceiling unchanged (ADR 0025).
+
+- **A command that only mentions a test runner can no longer verify a "tests
+  passed" claim** (FORNX-477). The verifier matched `pytest`, `cargo test`,
+  `jest`, ... as a substring of the command text, so `echo pytest`,
+  `pip install pytest`, `true || pytest` or `git commit -m "add vitest"`
+  exiting 0 produced `Verified`. It now identifies a runner from the executed
+  command's structure: one simple command, or an `&&` list that exits 0,
+  optionally inside `sh -c`. Compound (`;`, `||`, pipes), expanded,
+  unparseable and non-executing (`--collect-only`, `--no-run`, ...) commands
+  are `Unverified`, and a newer unidentified runner command stops an older
+  pass from being `Verified`. Genuine runner passes stay `Verified` here (superseded by the REVIEW cap in the next entry), failures
+  stay `Contradicted`, and heuristic exit codes stay capped at `Review`. See
+  the README section "Which commands count as a test run".
+
+- **A runner name plus exit 0 no longer verifies a "tests passed" claim**
+  (FORNX-477, residual). An executable named `pytest` that only does `exit 0`,
+  or `cargo test no_such_test` (zero tests selected), still produced
+  `Verified`. The Codex, Claude Code and OpenCode adapters now keep the
+  runner's final summary counts (never the raw output) on the exit-code
+  evidence, and the verifier requires, for `Verified`, exactly one identified
+  runner (other `&&` steps may only be `cd`), a summary in that runner's
+  format, at least one pass and no failure. Anything else is `Unverified`;
+  `Contradicted` and the heuristic `Review` ceiling are unchanged. In this
+  release only pytest and `cargo test` output is read, so `cargo nextest run`,
+  `npm test`, `jest` and `vitest` passes are `Unverified`. A program that
+  prints a forged summary can still pass these conditions; see the next entry.
+
+- **A `test_result` from the agent's own transcript can no longer be `Verified`**
+  (FORNX-477, founder decision Option A, 2026-10-29). QA showed an executable
+  named `pytest` that prints `3 passed in 0.01s` and exits 0 still reached
+  `Verified`; the runner-structure and summary conditions above stay but are
+  not sufficient, because the exit code and summary come from the agent's own
+  session (trust class `AgentAdjacent`). The most such a finding can now be is
+  `Review`. `Verified` needs evidence from a collector `fornax-verify` lists as
+  a test-run attestor with trust class `HostObserved` or `IndependentExternal`;
+  that list is deliberately empty in production and no shipped sensor attests
+  test runs. User-visible consequence: in v0.0.9 every "tests passed" finding
+  from Claude Code, Codex (default and `shell_command`) and OpenCode is at most
+  `Review`. Unchanged: a genuine non-zero literal exit is `Contradicted`; fake
+  runners, zero tests and missing, wrong or malformed summaries are
+  `Unverified`; a heuristic `exit_code=0` stays `Review`. In the ablation
+  benchmark the benign review burden in config B is 3 of 6 (50%). Host-controlled
+  runner receipts or CI evidence are FORNX-443 and nextest/npm/jest/vitest
+  summaries are FORNX-479, both outside v0.0.9. See README "Which commands
+  count as a test run" and ADR-0025.
+
+- **"The `go test` / `make test` / `yarn test` ... succeeded" can no longer be
+  `Verified` from an exit status** (FORNX-477 hardening). A `command_succeeded`
+  claim whose command is a test command Fornax cannot read the results of
+  (`go`/`mvn`/`gradle`/`dotnet`/`deno`/`bun`/`swift`/`mix`/`bazel`/`make`/`just`/
+  `yarn`/`pnpm`/`npm` `test`, `npm run test*`, `tox`/`nox` outside lint
+  environments, `rspec`, `phpunit`, `ctest`, `mocha`, `python -m unittest`, and
+  launcher forms such as `pdm run pytest` or `bundle exec rspec`) is
+  `Unverified` on a clean exit 0, since nothing shows a test ran. A non-zero exit
+  is still `Contradicted`; commands that are not test runs (`go build`,
+  `make install`, `yarn install`, `tox -e lint`, `pip install pytest`) still
+  verify, and `test_result` behaviour is unchanged. *(Superseded in part by the
+  FORNX-480 entry below: a clean exit 0 on agent-adjacent evidence is now
+  `Review` for those commands too.)*
+
+- **`command_succeeded` is capped at `Review` without an attested source**
+  (FORNX-480, founder decision Option B, 2026-10-29). An exit status from the
+  agent's own session cannot show that the claimed program ran and exited 0 (a
+  same-named executable that only does `exit 0` is indistinguishable), so
+  "the `npm install` succeeded" reaches `Verified` only through the same
+  attested-collector gate as `test_result` (`HostObserved` or
+  `IndependentExternal` class *and* a collector `fornax-verify` lists; a label
+  alone is not enough). None ships in v0.0.9. A recorded non-zero exit stays
+  `Contradicted`; `command_executed` ("I ran ...") is unchanged, and its
+  remaining trust limits (it asserts a command row exists, not that the program
+  is the one named) are tracked separately, not resolved. In the ablation
+  benchmark the benign review burden in config B is 4 of 6. Production adapters
+  never mint `command_succeeded`; it reaches the daemon through the ingest
+  socket.
+
+- **"I ran X" / "X succeeded" bind to the command that ran, not to text that
+  contains it** (FORNX-477 hardening). The match between a `command_executed` /
+  `command_succeeded` claim and a command row was a lowercased substring, so
+  `echo npm install` verified "the `npm install` succeeded". A claim now binds
+  only to a row that ran the same command step for step; text that merely
+  mentions it (`echo`, `timeout`/`sudo` wrappers, pipelines, `;`/`||`/`&&`
+  lists, another program path or letter case) is `Unverified`, and a newer
+  mention withholds an older success. A claim naming more than one command, or
+  a command that cannot be parsed, is `Unverified`. A claim that is a prefix of
+  the command that ran (`npm install` vs `npm install --dry-run`), a bare program
+  name reached through an absolute path, or one step of a `cd dir && cmd` row is
+  `Review`; an env prefix the claim names (`CI=true`) must match in value.
+  A real failure is still `Contradicted`. `npm install`, `cargo build` and
+  similar exact runs keep verifying from a literal exit code.
+
+- **A test run claimed as `command_succeeded` gets the same bar as
+  `test_result`** (FORNX-477, QA 29513 residual). "The `pytest -q` run
+  succeeded" reached `Verified` from the same agent-reported exit code. When
+  the command the claim names is an identified test run it now needs that
+  runner's passing summary and attested evidence: `Review` for a normal pytest
+  or `cargo test` run, `Unverified` for a fake runner, zero tests, a runner
+  whose output is not read (`jest`, `vitest`, `npm test`, `cargo nextest run`)
+  or evidence that merely mentions the runner (`echo pytest`). `Contradicted` for a non-zero exit is unchanged,
+  and non-test commands (`npm install`, `cargo build`, `pip install pytest`)
+  still verify from a literal exit code.
 
 - **Codex completion replay creates duplicate events and claims** (FORNX-446).
   Rollout `task_complete` records with a nonblank native `turn_id` now retain

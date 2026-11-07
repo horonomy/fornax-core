@@ -61,7 +61,7 @@ echo '{"hook_event_name":"Stop","session_id":"'"$SESSION"'","transcript_path":"/
   | ./target/debug/fornax-hook-claude
 
 # 3. Check the verdict — CONTRADICTED, with the rationale spelling out why.
-./target/debug/fornax status   # compact one-liner: 🛡 ✕ CONTRADICTED
+./target/debug/fornax status   # compact one-liner: 🛡 ✕ CONTRADICTED (host-wide)
 ./target/debug/fornax detail   # full claim/evidence/rationale/verifier detail
 ```
 
@@ -78,46 +78,97 @@ session, wire the hooks into `~/.claude/settings.json` with:
 ```
 
 This idempotently adds `SessionStart`, `UserPromptSubmit`, `PreToolUse`,
-`PostToolUse`, and `Stop` hook entries that invoke `fornax-hook-claude` —
+`PostToolUse`, `PostToolUseFailure` (a Bash command that exits non-zero),
+and `Stop` hook entries that invoke `fornax-hook-claude` —
 running it again is a no-op, and it never touches any other hook or setting
-already in that file. `fornax-hook-claude` must be on `PATH` for Claude Code
-to find it. To stop Fornax observing Claude Code sessions and return the
+already in that file. The entries use the absolute path of the
+`fornax-hook-claude` that sits next to the `fornax` you ran, so a downloaded
+release works without being on `PATH`. If that file is missing, or its path
+contains spaces or shell metacharacters, install writes the bare name, says so,
+and `fornax-hook-claude` must then be on `PATH` for Claude Code to find it.
+Re-running install from a newer location updates the existing entries in
+place; if no sibling is usable but an existing absolute entry still works, it
+is kept (with a warning). The path is canonicalized, so a Homebrew install
+records the versioned Cellar path: re-run `fornax install claude-code` after
+an upgrade (doctor flags a path that no longer exists). Entries are matched by
+the exact file name `fornax-hook-claude`, so a user-owned absolute hook with
+that exact name is treated as Fornax's. To stop Fornax observing Claude Code sessions and return the
 file to a clean state:
 
 ```bash
 ./target/debug/fornax uninstall claude-code
 ```
 
-### Installing the Codex integration (FORNX-16)
-
-Codex's evidence capture needs no installation at all: `fornax-hook-codex`
-reads Codex's own always-on rollout JSONL transcripts directly — just run
-it (see `docs/research/adapter-capability-matrix.md` for the payload shape
-and `crates/fornax-adapter-codex` for the translation logic).
-
-`install codex`/`uninstall codex` wire only the separate, optional
-ambient-status surface (FORNX-17) — a `notify` entry in
-`~/.codex/config.toml` pointing at `scripts/fornax-codex-notify.sh`, so
-Codex writes its own turn-status to `$FORNAX_HOME/last-status` (Codex
-discards `notify`'s stdout, so the script must write to a file — see
-`docs/dogfooding-codex-notify.md`):
+### Installing the Codex integration (FORNX-16, FORNX-468, FORNX-474)
 
 ```bash
-./target/debug/fornax install codex
+./target/debug/fornax install codex     # opt in
+./target/debug/fornax doctor            # what is wired, what is missing, the next step
+./target/debug/fornax uninstall codex   # removes the entries install added
 ```
+
+`fornax install codex` does four things, and prints each on its own line:
+
+1. **Turns on daemon capture of Codex sessions.** The Fornax daemon then reads
+   **every Codex session on this machine** (tool commands and their output,
+   and the final assistant message) so that a claim such as "tests passed"
+   can be checked against the run's own output. It stores them locally with
+   secret-pattern redaction only (no PII redaction). This is the opt-in; it is
+   recorded in `$FORNAX_HOME/codex-watch.json`, and `fornax uninstall codex`
+   turns it off. In practice it watches the `sessions/` directory of the
+   selected Codex home (below) and only activity that happens after capture is
+   on; sessions already on disk are not backfilled. A `test_result` claim
+   from Codex is at most Review, even when Codex reports a literal exit code
+   (Codex 0.160+ item format), because no shipped sensor attests test runs
+   (see "Which commands count as a test run"). A genuine non-zero exit is
+   still Contradicted; older default shell modes expose no exit code and stay
+   Review/Unverified (ADR-0025).
+2. **Wires the ambient-status `notify` entry** in `config.toml` to a script
+   under `$FORNAX_HOME/bin` (so Codex writes its turn status to
+   `$FORNAX_HOME/last-status`).
+3. **Adds optional lifecycle hooks** (`PreToolUse`, `PostToolUse`,
+   `SessionStart`) to `hooks.json`. Codex skips them until you trust them
+   with `/hooks`; findings do not need them.
+4. **Writes a LaunchAgent plist file** for the daemon (macOS only, and only
+   when `fornax-daemon` sits next to `fornax`; on other platforms it says
+   autostart is macOS-only, and when it cannot write the file it prints
+   "daemon autostart skipped" with the reason) and prints the exact `launchctl bootstrap`
+   command. Fornax never runs `launchctl` itself:
+   loading a login item is your call. Until the daemon is running, nothing is
+   recorded. An existing plist that Fornax did not write (or cannot read) is
+   left untouched.
+
+**Which Codex home.** An explicit, non-empty `CODEX_HOME` selects the Codex
+home (config, hooks and the sessions directory the daemon watches); unset or
+empty means `~/.codex`. A relative or non-UTF-8 `CODEX_HOME` is refused before
+anything is written. `uninstall` acts on the home currently selected, and
+leaves capture on (and says so) if it is watching a different one.
 
 Codex's `notify` holds exactly one command, unlike Claude's per-event hook
-arrays — so if `notify` is already wired to something else (e.g. a
-different tool your session already uses), `install codex` refuses to
-overwrite it and leaves the file byte-for-byte unchanged, rather than
-silently replacing or corrupting an unrelated integration. Wire Fornax in
-manually in that case. Running it again when Fornax is already installed
-is a no-op. To remove exactly the entry `install codex` added (never a
-foreign `notify` value), leaving every other key/table/comment untouched:
+arrays. If `notify` is already wired to something else, or `config.toml` does
+not parse, `install codex` refuses to touch that file and leaves it
+byte-for-byte unchanged, rather than replacing or corrupting an unrelated
+integration; wire Fornax in manually in that case (the capture opt-in and the
+hooks are separate and still apply). Running it again is safe (it is
+idempotent). `uninstall codex` removes the entries `install` added (never a
+foreign `notify` value) and leaves every other key, table and comment alone;
+it does not delete the notify script file under `$FORNAX_HOME/bin`, and it
+stops with an error if `config.toml` cannot be parsed (capture and hooks are
+already off by then, but the LaunchAgent plist is not removed; fix the file
+and run `uninstall codex` again).
 
-```bash
-./target/debug/fornax uninstall codex
-```
+`fornax doctor` is the first-run checklist: daemon reachable, Codex wiring and
+capture (judged by the same rules the daemon uses, so a comment, a leftover
+marker or a config file alone is never reported as working), and the Claude
+Code hooks. A hook entry in Claude's `settings.json` is reported as
+configuration only; only recorded events show it ran. For Claude Code a failing
+command carries a literal exit code, so a "tests passed" claim is Contradicted;
+a passing run has only a heuristic exit 0, so it shows as Review, never
+Verified (ADR-0025); the same cap now applies to every provider's test result. A finding appears after an agent says it ran tests and the run's
+own output is seen; see them with `fornax status` and `fornax detail`.
+
+For the optional ambient-status surface only, see
+`docs/dogfooding-codex-notify.md`.
 
 The dashboard at `/dashboard` on the daemon's HTTP port works the same way
 across every adapter.
@@ -153,6 +204,94 @@ Codex's own rollout-file transcripts rather than hooks — see
 `docs/research/adapter-capability-matrix.md` for the exact, empirically
 verified differences before relying on a specific hook/field existing on the
 Codex side.
+
+### Which commands count as a test run
+
+A "tests passed" claim is checked against the exit code of a command Fornax
+can identify as a test-runner execution (FORNX-477). The command must be one
+simple command, or an `&&` list containing one, optionally run as an argv
+wrapper `["sh"|"bash"|"zsh", "-c"|"-lc", "<script>"]` (Codex form; a Claude
+string command is parsed as the script itself, and `bash -c "..."` typed inside
+it is `Unverified`), whose program is one of: `pytest` / `py.test`, `python -m pytest`,
+`cargo test`, `cargo nextest run`, `npm test`, `vitest`, `jest`, or one of
+those started by `npx`, `pnpx`, `bunx`, `pnpm exec`, `uv run` or `poetry run`.
+A few harmless environment assignments (`CI=1`, `RUST_BACKTRACE=1`, ...) may
+precede it.
+
+* A single runner command keeps its own exit code: 0 is at most `Review`
+  (see the cap below), non-zero is `Contradicted`. `2>&1` after the command is allowed (it does not
+  change the exit status); other redirections are not.
+* An `&&` list (`cd dir && cargo test`) can be a pass only when it exits 0,
+  because `&&` runs the next command only after the previous one succeeded. A
+  non-zero exit says nothing about which command failed, so it is `Unverified`.
+  A list containing a shell-state command (`exit`, `exec`, `source`, `export`,
+  `eval`, ...) or an assignment-only step is never identified.
+* Everything else is `Unverified`, never `Verified`: a command that only
+  mentions a runner (`echo pytest`, `pip install pytest`, `git commit -m "add
+  vitest"`), `;`, `||`, pipes, redirections, backgrounding, expansions
+  (`$VAR`, backticks), other runners (`python -m unittest`, `go test`,
+  `mocha`, ...) and list/help/version/compile-only invocations
+  (`--collect-only`, `--no-run`, `--list`, `-h`, `-V`, ...).
+* A more recent command that mentions a runner but cannot be identified as a
+  test run (for example `pytest | tail`, or `git commit -m "fix pytest"`) stops
+  an older run from deciding the claim: it becomes `Unverified`.
+
+**A test run reported from the agent's own transcript is at most `Review`
+(FORNX-477).** The exit code and the printed summary both come from the
+agent's session, so they cannot establish that the tests ran and passed,
+however convincing the runner name, exit code or summary looks. An executable
+named `pytest` that prints `3 passed in 0.01s` and exits 0 is indistinguishable
+from the real runner in that data. `Verified` for a `test_result` claim needs
+evidence from a collector this verifier lists as a test-run attestor with
+trust class `HostObserved` or `IndependentExternal`. No such collector ships
+in v0.0.9 (the production attestor list is empty), so a passing test run from
+Claude Code, Codex (default and `shell_command`) or OpenCode is `Review`.
+Unchanged: a genuine non-zero literal exit is still `Contradicted`, and the
+conditions below still withhold the result (`Unverified`) for fake runners,
+zero tests and missing or malformed summaries. Host-controlled runner receipts
+or CI evidence, the route to `Verified`, are tracked as FORNX-443 and are not
+part of v0.0.9.
+
+The same bar applies when a test run is claimed under another subject: a
+`command_succeeded` claim such as "the `pytest -q` run succeeded" whose
+matched command is an identified test run needs the same passing summary and
+the same attested evidence, so it is `Review` (or `Unverified` for a fake
+runner or zero tests), not `Verified`. Commands that are not test runs, such as
+`npm install`, `cargo build` or `pip install pytest`, are capped at `Review` in
+the same way (FORNX-480): the exit status comes from the agent's own session and
+cannot show that the claimed program, rather than a same-named executable, ran
+and succeeded. A literal non-zero exit is still `Contradicted`, and a
+`command_executed` claim ("I ran `cargo build`") keeps its current meaning.
+
+The conditions below are therefore necessary but not sufficient. A recognised
+runner exiting 0 is not enough even for `Review`. The runner's
+own final summary must also be seen in that command's output: a QA-owned
+executable named `pytest` that only does `exit 0`, or `cargo test no_such_test`
+(`running 0 tests`), exits 0 without running any test. Fornax therefore reads
+only the *counts* from the output's end and requires all of:
+
+* exactly one runner command (any other `&&` step must be a plain `cd <dir>`,
+  so `echo '3 passed in 0.1s' && cargo test no_such` is `Unverified`);
+* a summary in that runner's own format: pytest's final line
+  (`=== 3 passed, 1 skipped in 0.04s ===`) or every `test result:` line of
+  `cargo test` (all must be `ok.`, each preceded by its `running N tests`
+  header);
+* at least one test passed and none failed (errors count as failed).
+
+Missing, zero-test, mismatched or unparseable summaries are `Unverified`. The
+summary only ever withholds a pass, it never grants `Verified`: a failing runner is still
+`Contradicted` by its exit code, and a heuristic exit code stays capped at
+`Review` whatever the output says. In this release only pytest and `cargo test`
+output is read, so `cargo nextest run`, `npm test`, `jest` and `vitest` are
+recognised (a failure is still `Contradicted`) but a pass is `Unverified`
+(summary support for them, FORNX-479, is outside v0.0.9).
+
+Known limits: the summary is text the executed program itself printed, so a
+program that deliberately prints a convincing summary (a custom `pytest`
+script, a `conftest.py` hook, `harness = false`, `--nocapture`, a Jest
+reporter) passes the summary conditions. That is why the result stops at
+`Review`; only host-attested exit status, a controlled runner receipt or CI
+evidence can raise it (ADR-0025, FORNX-443).
 
 ### Exporting a session for cloud sync (optional)
 

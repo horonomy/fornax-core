@@ -25,6 +25,7 @@ impl Fixture {
         Command::new(env!("CARGO_BIN_EXE_fornax"))
             .args(args)
             .env("HOME", &self.home)
+            .env_remove("CODEX_HOME")
             .env("FORNAX_HOME", &self.state)
             .output()
             .unwrap()

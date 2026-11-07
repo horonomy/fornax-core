@@ -1,4 +1,4 @@
-//! Codex `~/.codex/hooks.json` install/uninstall for the lifecycle-hook
+//! Codex `<codex home>/hooks.json` install/uninstall for the lifecycle-hook
 //! binding (HORO-1712 part B, `fornax-hook-codex-event`).
 //!
 //! `hooks.json` is shared with other tools — confirmed live on this machine:
@@ -10,7 +10,7 @@
 //! basename of its `command` — the same rule `codex_adapter::notify_is_fornax`
 //! already uses for `notify`.
 //!
-//! Codex's hook trust is positional: `~/.codex/config.toml` records
+//! Codex's hook trust is positional: `<codex home>/config.toml` records
 //! `trusted_hash` under a key keyed by `(event, group_idx, handler_idx)`,
 //! and the hash itself covers only the hook's own normalized fields (command,
 //! timeout, async, …), not file formatting or key order. So install must
@@ -37,7 +37,7 @@ const HOOK_BIN: &str = "fornax-hook-codex-event";
 const EVENTS: [&str; 3] = ["PreToolUse", "PostToolUse", "SessionStart"];
 
 pub fn default_path() -> std::path::PathBuf {
-    crate::dirs_home().join(".codex").join("hooks.json")
+    crate::codex_adapter::codex_home().join("hooks.json")
 }
 
 /// The one group `install` appends to each of [`EVENTS`].
@@ -46,8 +46,7 @@ pub fn default_path() -> std::path::PathBuf {
 /// changing any of these later forces every already-installed user to
 /// re-trust:
 /// - bare command name, not an absolute path: the hash stays valid across
-///   rebuilds/checkouts (same precedent as Claude's `fornax-hook-claude`,
-///   resolved via `sh -lc` PATH lookup);
+///   rebuilds/checkouts (resolved via `sh -lc` PATH lookup);
 /// - no `matcher`: matches every tool/source;
 /// - `timeout: 5`: Codex's own default is 600s, and this binary only opens a
 ///   Unix socket and writes — a hung daemon socket must not stall a tool
@@ -338,12 +337,15 @@ fn install_at_with(
         .unwrap_or(false);
     let mut message = format!(
         "Installed Fornax Codex hooks in {} (PreToolUse, PostToolUse, SessionStart). \
-         Codex will skip them until you trust them via `/hooks`.",
+         Codex skips them until you trust them via `/hooks`; they are optional extra tool \
+         evidence. Claims are read from the Codex rollout by the daemon's Codex capture, which \
+         `fornax install codex` turns on (check with `fornax doctor`).",
         path.display()
     );
     if !on_path {
         message.push_str(&format!(
-            " Warning: `{HOOK_BIN}` was not found on PATH — hook invocations will fail until it is."
+            " Note: `{HOOK_BIN}` is not on PATH. Findings do not need it; only if you trust these hooks \
+             in `/hooks`, put it on PATH (next to `fornax`) or those hook calls will fail."
         ));
     }
     Ok(mk("install", path, true, message))

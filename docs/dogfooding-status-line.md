@@ -136,12 +136,15 @@ Add `--dry-run` first to see the plan without changing anything, and
 your existing statusline command exactly as configured — it is never read,
 parsed, edited or assumed to be `~/.claude/statusline.py`.
 
-`--scope host` is not a formality. `/api/status` is
-`recent_findings(1)`: one row ordered by `computed_at` across every session
-on this machine, with no session filter. The latest finding may belong to a
-different session than the one you are looking at, so the host labels the
-reading as machine-wide. Declaring `session` would be a false claim about
-what the number means.
+`--scope host` is not a formality. Without a `?session=` parameter
+`/api/status` is `recent_findings(1)`: one row ordered by `computed_at`
+across every session on this machine. It answers `"scope": "host"`, and
+`fornax status` / `fornax detail` (and the wrapper scripts built on them)
+print `(host-wide)` / a host-wide header for the same reason: the latest
+finding may belong to a different session than the one you are looking at.
+Only a `?session=` request, confirmed by the daemon (`"session_scoped": true`),
+is a session reading. Declaring `session` for the unscoped answer would be a
+false claim about what the number means.
 
 ### Migrating off the FORNX-30 setup
 

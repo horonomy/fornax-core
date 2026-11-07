@@ -91,7 +91,7 @@ impl AdapterPlugin for ClaudeCodeAdapter {
 
     fn summary(&self) -> &str {
         "Wires Fornax hooks into ~/.claude/settings.json (SessionStart, \
-         UserPromptSubmit, PreToolUse, PostToolUse, Stop)."
+         UserPromptSubmit, PreToolUse, PostToolUse, PostToolUseFailure, Stop)."
     }
 
     fn target_path(&self) -> PathBuf {
@@ -99,15 +99,32 @@ impl AdapterPlugin for ClaudeCodeAdapter {
     }
 
     fn plan(&self) -> anyhow::Result<AdapterActionResult> {
-        crate::claude_adapter::plan_install_at(&self.target_path())
+        let hook = resolve_installed_hook().keeping_working_entry(&self.target_path());
+        let mut r = crate::claude_adapter::plan_install_at(&self.target_path(), &hook.command)?;
+        r.message = hook.annotate(r.message);
+        Ok(r)
     }
 
     fn install(&self) -> anyhow::Result<AdapterActionResult> {
-        crate::claude_adapter::install_at(&self.target_path())
+        let hook = resolve_installed_hook().keeping_working_entry(&self.target_path());
+        let mut r = crate::claude_adapter::install_at(&self.target_path(), &hook.command)?;
+        r.message = hook.annotate(r.message);
+        Ok(r)
     }
 
     fn uninstall(&self) -> anyhow::Result<AdapterActionResult> {
         crate::claude_adapter::uninstall_at(&self.target_path())
+    }
+}
+
+/// The hook command for the `fornax` binary that is running now, resolved
+/// through symlinks so a `fornax` linked onto PATH still finds its sibling.
+fn resolve_installed_hook() -> crate::claude_adapter::ResolvedHook {
+    match std::env::current_exe().and_then(|p| p.canonicalize()) {
+        Ok(exe) => crate::claude_adapter::resolve_hook_command(&exe),
+        Err(e) => crate::claude_adapter::ResolvedHook::bare_for(format!(
+            "the running binary's path could not be resolved ({e})"
+        )),
     }
 }
 
@@ -123,9 +140,9 @@ impl AdapterPlugin for CodexAdapter {
     }
 
     fn summary(&self) -> &str {
-        "Wires Fornax's ambient-status notify script into ~/.codex/config.toml's \
-         `notify` entry, and the lifecycle-hook binding (PreToolUse, PostToolUse, \
-         SessionStart) into ~/.codex/hooks.json."
+        "Wires Fornax's ambient-status notify script into config.toml's `notify` \
+         entry, and the lifecycle-hook binding (PreToolUse, PostToolUse, \
+         SessionStart) into hooks.json, under $CODEX_HOME (default ~/.codex)."
     }
 
     fn target_path(&self) -> PathBuf {
@@ -133,26 +150,139 @@ impl AdapterPlugin for CodexAdapter {
     }
 
     fn plan(&self) -> anyhow::Result<AdapterActionResult> {
-        crate::codex_adapter::plan_install_all(
+        crate::codex_adapter::ensure_codex_home_usable()?;
+        let mut r = crate::codex_adapter::plan_install_all(
             &self.target_path(),
             &crate::codex_adapter::default_notify_script(),
             &crate::codex_hooks::default_path(),
-        )
+        )?;
+        use crate::codex_watch_marker::{capture_state, sessions_dir, Capture};
+        let this_home = sessions_dir(&self.target_path());
+        let line = match capture_state(&crate::fornax_home(), &self.target_path()) {
+            Capture::On {
+                dir_matches_config: true,
+                ..
+            } => "daemon Codex capture already enabled".to_owned(),
+            Capture::On { dir, .. } => {
+                r.changed = true;
+                format!(
+                    "would move daemon Codex capture from {} to {}; only one Codex home is \
+                     captured at a time, so capture for the other home stops",
+                    dir.display(),
+                    this_home.display()
+                )
+            }
+            Capture::Off | Capture::Unusable(_) => {
+                r.changed = true;
+                "would enable daemon Codex capture (reads all Codex sessions on this machine)"
+                    .to_owned()
+            }
+        };
+        r.message = format!("{}\ncapture: {line}", r.message);
+        Ok(r)
     }
 
     fn install(&self) -> anyhow::Result<AdapterActionResult> {
-        crate::codex_adapter::install_all(
+        crate::codex_adapter::ensure_codex_home_usable()?;
+        crate::codex_adapter::write_notify_script(
+            &crate::codex_adapter::default_notify_script(),
+            &std::env::current_exe()?.canonicalize()?,
+        )?;
+        let mut r = crate::codex_adapter::install_all(
             &self.target_path(),
             &crate::codex_adapter::default_notify_script(),
             &crate::codex_hooks::default_path(),
-        )
+        )?;
+        let before =
+            crate::codex_watch_marker::capture_state(&crate::fornax_home(), &self.target_path());
+        let wrote = crate::codex_watch_marker::install(&crate::fornax_home(), &self.target_path())?;
+        r.changed |= wrote;
+        r.message = format!(
+            "{}\ncapture: {}",
+            r.message,
+            crate::codex_watch_marker::DISCLOSURE
+        );
+        if let crate::codex_watch_marker::Capture::On {
+            dir_matches_config: false,
+            dir,
+        } = before
+        {
+            r.message = format!(
+                "{}\ncapture: moved daemon Codex capture from {} to {}; only one Codex home is \
+                 captured at a time, so capture for the other home has stopped",
+                r.message,
+                dir.display(),
+                crate::codex_watch_marker::sessions_dir(&self.target_path()).display()
+            );
+        }
+        r.message.push('\n');
+        r.message.push_str(&crate::launchd_plist::install_message(
+            &crate::dirs_home(),
+            &crate::fornax_home(),
+        ));
+        Ok(r)
     }
 
     fn uninstall(&self) -> anyhow::Result<AdapterActionResult> {
-        crate::codex_adapter::uninstall_all(
+        crate::codex_adapter::ensure_codex_home_usable()?;
+        // Capture goes off first: a failed edit of the Codex config must not
+        // leave the daemon still reading every Codex session.
+        use crate::codex_watch_marker::Uninstalled;
+        let capture =
+            crate::codex_watch_marker::uninstall_for(&crate::fornax_home(), &self.target_path())?;
+        let mut r = crate::codex_adapter::uninstall_all(
             &self.target_path(),
             &crate::codex_hooks::default_path(),
-        )
+        )?;
+        let mut keep_autostart = match &capture {
+            Uninstalled::KeptForOtherHome(dir) => {
+                Some(format!("Codex capture is still on for {}", dir.display()))
+            }
+            _ => None,
+        };
+        match capture {
+            Uninstalled::Removed => {
+                r.changed = true;
+                r.message = format!("{}\ncapture: daemon Codex capture turned off", r.message);
+            }
+            Uninstalled::KeptForOtherHome(dir) => {
+                r.message = format!(
+                    "{}\ncapture: left on; it watches {}, which is not this Codex home -- run \
+                     `fornax uninstall codex` with CODEX_HOME set to that home to turn it off",
+                    r.message,
+                    dir.display()
+                );
+            }
+            Uninstalled::Absent => {}
+        }
+        if keep_autostart.is_none() {
+            use crate::claude_adapter::{wiring_at, Wiring};
+            // Fail closed: if Claude's settings cannot be read, Fornax cannot
+            // tell that no hooks remain.
+            match wiring_at(&crate::claude_adapter::default_path()) {
+                Wiring::Full { .. } | Wiring::Partial { .. } => {
+                    keep_autostart = Some("Claude Code hooks are still installed".to_owned());
+                }
+                Wiring::Unreadable(_) => {
+                    keep_autostart = Some(
+                        "Claude Code settings could not be read, so its hooks may remain"
+                            .to_owned(),
+                    );
+                }
+                Wiring::Absent => {}
+            }
+        }
+        r.message.push('\n');
+        match keep_autostart {
+            Some(why) if crate::launchd_plist::is_ours(&crate::dirs_home()) => {
+                r.message
+                    .push_str(&crate::launchd_plist::kept_message(&why));
+            }
+            _ => r
+                .message
+                .push_str(&crate::launchd_plist::uninstall_message(&crate::dirs_home())),
+        }
+        Ok(r)
     }
 }
 

@@ -95,3 +95,145 @@ verification before merge, per this codebase's standing practice.
   `tools.shell_command` path and the `opencode` adapter already carrying a
   real signal today, and other evidence classes (file-diff, git, CI-webhook)
   not being affected by this ceiling at all.
+
+## Addendum (FORNX-477 residual, 2026-10-29): stdout summary as an extra condition
+
+> **Superseded in part** by the second addendum below: the summary can no
+> longer lead to `Verified`. The conditions described here remain, but only as
+> necessary conditions that withhold a pass (`Unverified`).
+
+QA showed a runner name plus exit 0 verified a fake `pytest` that ran no test.
+The correction uses stdout in the one way this ADR allows: it is
+*safety-monotonic*. The runner's final summary (counts only) can only add a
+condition for `Verified` (runner identified, summary in that runner's format,
+passed >= 1, failed == 0). It never grants `Verified`, never creates
+`Contradicted`, and never raises the heuristic `Review` ceiling.
+
+Residual (unchanged in kind): the summary is written by the executed program,
+so a program that prints a forged summary can still pass. Closing that needs
+options 1-3 above (host-attested exit, runner receipts, CI evidence), tracked by
+FORNX-443. Runners whose output is not read yet (`nextest`, `jest`, `vitest`,
+`npm test`) are never `Verified` until their formats are added.
+
+## Addendum (FORNX-477, 2026-10-29): a re-labelled claim gets the same bar
+
+The Option A cap below keys on the claim subject `test_result`. A claim that
+asserts a test run succeeded under the subject `command_succeeded` ("the `pytest
+-q` run succeeded") would otherwise reach `Verified` from the same
+`AgentAdjacent` exit code. `CommandSuccessVerifier` therefore applies the
+`test_result` conditions (passing summary from the runner, attested evidence)
+whenever the command it matched is an identified test run, or the claim names a
+test runner (any runner, including `jest`, `vitest`, `npm test` and `cargo
+nextest run`, whose output is not read and so can never verify) but the matched
+evidence is not one. Production adapters mint only
+`test_result` claims; `command_succeeded` reaches the daemon through the ingest
+socket. Non-test commands are unchanged. The command match is no longer
+a substring (2026-10-29, exact binding): a claim binds only to a row that ran
+the same command step for step (same program string, same arguments; a benign
+`CI=1`-style prefix the claim does not mention is ignored, one it names must match
+in value). `echo npm
+install`, a wrapper (`timeout`, `sudo`), a pipeline or list, a relative or
+respelled program, another letter case, or a claim naming several commands
+cannot bind and resolve `Unverified`; a claim that is only a prefix of what ran
+(`npm install` against `npm install --dry-run`), the same program name reached
+through an absolute path (`/tmp/x/npm`), or part of a `cd dir && cmd` row with a
+genuine exit 0 is capped at `Review`. Unquoted words the shell would expand
+(`*.rs`, `~`) do not bind their quoted spelling. Residuals:
+a fake program that takes the real program's name is trusted (the same PATH
+residual as test runners), and exit status 126/127 still counts as "ran".
+
+## Addendum (FORNX-477, 2026-10-29): `Verified` requires an attested collector (founder decision, Option A)
+
+QA comment 29501 showed that an executable named `pytest` that prints
+`3 passed in 0.01s` and exits 0 still reached `Verified` after the
+runner-structure and summary conditions of PR #326/#327. Those conditions are
+necessary but not sufficient: the exit code and the summary are both produced
+inside the agent's own session.
+
+Decision (founder, approved):
+
+- A `test_result` finding derived from the agent's own transcript (trust class
+  `AgentAdjacent`, unknown or absent source) can never be `Verified`, however
+  convincing the runner name, exit code or printed summary. The most it can be
+  is `Review`.
+- `Verified` requires evidence from a collector that `fornax-verify` lists as a
+  test-run attestor (`test_run_attestors()`) with trust class `HostObserved` or
+  `IndependentExternal`. The label alone is not enough. The production list is
+  deliberately empty. A test-only fixture attestor exists under `cfg(test)`; it
+  proves only the gate logic, not that production attestation exists.
+- No shipped sensor attests test runs, so in v0.0.9 every `test_result` from
+  Claude Code, Codex (default and `shell_command`) and OpenCode is at most
+  `Review`.
+- Unchanged: a genuine non-zero literal exit is `Contradicted`; the runner and
+  summary conditions still produce `Unverified` for fake runners, zero tests and
+  missing, wrong or malformed summaries; a heuristic `exit_code=0` stays
+  `Review`.
+
+Effect on the options above: stdout parsing (option 4) no longer contributes to
+`Verified` on its own; it only withholds a pass. Options 2-3 (runner receipts,
+CI evidence), tracked as FORNX-443, are the only route back to `Verified`.
+Support for more runner summaries (nextest, npm, jest, vitest; FORNX-479) is
+also outside v0.0.9. Benchmark effect: the ablation benchmark's benign review
+burden in config B is 3 of 6 (50%).
+
+## Addendum (FORNX-480, 2026-10-29): `command_succeeded` gets the same bar (founder decision, Option B)
+
+The previous addenda applied the attested-collector bar to test runs only. A
+`command_succeeded` claim for any other command ("the `npm install` succeeded")
+still reached `Verified` from an `AgentAdjacent` exit code, although a
+same-named executable that only does `exit 0` yields the same evidence.
+
+Decision (founder, approved):
+
+- `AgentAdjacent` evidence alone never grants `Verified` to a command-success
+  claim. `Verified` requires a collector listed in `test_run_attestors()` with
+  trust class `HostObserved` or `IndependentExternal`; the label alone is not
+  enough. The production list is still empty, so in v0.0.9 the most such a claim
+  reaches is `Review`.
+- Unchanged: a genuine non-zero literal exit is `Contradicted`; claims that
+  name no command, several commands, unparseable or unmatched commands are
+  `Unverified`; a heuristic `exit_code=0` stays `Review`; an exact-binding
+  prefix match stays capped at `Review`.
+- `command_executed` keeps its meaning (a matching command row was observed)
+  and is not changed here. It does not show that the program was the one named;
+  that limitation is tracked separately and is not resolved by this change.
+- Distinct from FORNX-443, which supplies an authoritative signal (runner
+  receipts / CI) for test results. A future host-observed process-exit
+  collector listed as an attestor would restore `Verified` for plain commands.
+- Effect: ablation benchmark config B benign review burden 4 of 6 (67%).
+
+## Addendum (FORNX-487, 2026-11-06): failing Claude Code commands arrive as `PostToolUseFailure`
+
+A real Claude Code 2.1.306 host run showed that a Bash command exiting
+non-zero fires the hook event `PostToolUseFailure`, never `PostToolUse`. Fornax
+did not install or normalize that event, so a failing `pytest` produced no
+evidence and the "genuine literal non-zero exit is `Contradicted`" rule above
+could not fire for Claude Code at all.
+
+Change (no change to what can reach `Verified`):
+
+- `fornax install claude-code` also wires `PostToolUseFailure`; the adapter
+  maps it to the same post-tool event and Bash exit-code evidence path.
+- The literal exit code is parsed only from the `Exit code <N>` prefix of the
+  payload's `error` string (`N` a non-zero integer); the rest of `error` is
+  treated as the command output, so the existing runner-summary parsing sees
+  the failed counts. Evidence carries `heuristic: false` and provenance
+  `...:PostToolUseFailure:Bash#error_prefix`.
+- No evidence is produced for `is_interrupt: true`, a non-Bash tool, an
+  `error` without the prefix, or `Exit code 0` (a failure event never mints a
+  success signal).
+- A "tests passed" claim in the same session against such evidence is
+  `Contradicted`. Success evidence is unchanged: heuristic `exit_code=0` stays
+  `Review`, and `Verified` still requires an attested collector.
+- No new retention: the `error` text travels in the event `raw` and the
+  rebuilt `tool_response` exactly as `PostToolUse` output does, and evidence
+  keeps counts only (`test_summary`).
+
+## Addendum (FORNX-488, 2026-11-06): the Claude Code Stop claim is read from `last_assistant_message`
+
+The Stop hook fires before the final assistant line is flushed to the
+transcript, so reading only `transcript_path` missed the final "tests passed"
+message in a live host. The adapter now prefers the Stop payload's non-empty
+string `last_assistant_message` and falls back to the transcript. The
+pre-filter, the `Review` ceiling and the stored claim text are unchanged; no
+path to `Verified` is added.

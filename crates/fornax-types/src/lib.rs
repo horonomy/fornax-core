@@ -18,7 +18,9 @@ pub mod audit_checkpoint;
 pub mod calibration;
 pub mod capabilities;
 pub mod causal;
+pub mod egress;
 pub mod epistemic_contract;
+pub mod execution_identity;
 pub mod experiment;
 pub mod extension;
 pub mod graph;
@@ -36,6 +38,7 @@ pub mod redact;
 pub mod reliability_context;
 pub mod sensor;
 pub mod sensor_config;
+pub mod test_output;
 
 pub use adapter::{AgentAdapter, NormalizationOutcome};
 pub use audit::{
@@ -285,6 +288,10 @@ pub struct ExitCodePayload {
     /// empty") rather than a literal exit-code field the provider reported.
     #[serde(default)]
     pub heuristic: bool,
+    /// Runner summary counts attached by `test_output::attach_summary`
+    /// (FORNX-477); absent unless the output ends in a recognised summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_summary: Option<serde_json::Value>,
 }
 
 /// Not yet produced by any sensor — see [`ExitCodePayload`]'s doc comment

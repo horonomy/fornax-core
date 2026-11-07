@@ -13,14 +13,19 @@ mod adjudicate_cmd;
 mod claude_adapter;
 mod codex_adapter;
 mod codex_hooks;
+mod codex_watch_marker;
 mod corpus_cmd;
+mod doctor_cmd;
+mod egress_cmd;
 mod evidence_plan_cmd;
 mod experiment_ux;
 mod feedback_cmd;
 mod guarded_write;
+mod launchd_plist;
 mod receipt_cmd;
 mod statusline;
 mod timeline;
+mod upload_cmd;
 
 use adapter_registry::AdapterArg;
 
@@ -380,6 +385,24 @@ enum Commands {
         #[command(subcommand)]
         action: adjudicate_cmd::AdjudicateAction,
     },
+    /// Choose whether and where Fornax data may leave this machine:
+    /// profile (personal / corporate), consents, allowlist.
+    ///
+    /// Nothing is sent until a profile is chosen. `corporate` is local-only
+    /// and cannot be overridden. Reads `$FORNAX_HOME/fornax.db` directly.
+    Egress {
+        #[command(subcommand)]
+        action: egress_cmd::EgressAction,
+    },
+    /// The personal monthly metadata batch upload: status, preview, run.
+    ///
+    /// Operator-invoked (no scheduler in this release). Metadata only, to the
+    /// consented destination, under a live personal-profile consent. Reads
+    /// `$FORNAX_HOME/fornax.db` directly.
+    Upload {
+        #[command(subcommand)]
+        action: upload_cmd::UploadAction,
+    },
     /// Product feedback on a live finding/recommendation.
     ///
     /// Structurally separate from `fornax adjudicate` -- feedback here can
@@ -399,10 +422,11 @@ enum Commands {
         #[command(subcommand)]
         action: receipt_cmd::ReceiptAction,
     },
-    /// Report which execution-identity dimensions this build's own write
-    /// path actually populates.
+    /// Check that Fornax can work on this machine (daemon running, Codex
+    /// wired, capture on), each with its next step, then report which
+    /// execution-identity dimensions this build's own write path populates.
     ///
-    /// Static and side-effect-free -- never a database read, never a daemon
+    /// The identity part is static and side-effect-free -- never a database read, never a daemon
     /// round trip, just a true statement about the current binary. Mirrors
     /// Circinus's `circinus doctor`'s `execution_identity_capture` check and
     /// Libra Governor's `libra-governor doctor` equivalent in intent, not in
@@ -834,9 +858,15 @@ async fn main() -> anyhow::Result<()> {
         Commands::Timeline { finding, session } => handle_timeline_action(finding, session).await?,
         Commands::Corpus { action } => corpus_cmd::handle(action, &fornax_home()).await?,
         Commands::Adjudicate { action } => adjudicate_cmd::handle(action, &fornax_home()).await?,
+        Commands::Egress { action } => egress_cmd::handle(action, &fornax_home()).await?,
+        Commands::Upload { action } => upload_cmd::handle(action, &fornax_home()).await?,
         Commands::Feedback { action } => feedback_cmd::handle(action, &fornax_home()).await?,
         Commands::Receipt { action } => receipt_cmd::handle(action, &fornax_home()).await?,
-        Commands::Doctor => println!("{}", execution_identity_capture_report()),
+        Commands::Doctor => println!(
+            "{}\nExecution-identity capture (what a finding can be attributed to):\n{}",
+            doctor_cmd::report(&fornax_home()).await,
+            execution_identity_capture_report()
+        ),
     }
     Ok(())
 }
@@ -865,17 +895,27 @@ async fn main() -> anyhow::Result<()> {
 /// `host_id` column on any of the three row types), mirroring every other
 /// product's "host" in this contract.
 fn execution_identity_capture_report() -> String {
-    "session: captured (AgentEvent/Claim/Evidence all carry a real session_id, \
-     populated from the native hook session; fornax statusline's latest_finding \
-     segment declares scope:\"session\" once the host confirms it, HORO-1601/1602) \
-     -- agent/turn/task: not captured (no field exists on any persisted row; \
-     CanonicalHostEvent/HostEventIdentity model agent_id/turn_id but that type is \
-     a bounded validation library fornax-daemon never constructs or persists, \
-     HORO-1712) -- host: implicit (one daemon/$FORNAX_HOME per machine; no host_id \
-     column on any row) -- not a defect: partial adoption of the execution-identity \
-     contract is expected (horonomy/.github governance/product/\
-     execution-identity-contract.md#partial-adoption-is-expected-not-a-defect); \
-     remaining dimensions tracked under HORO-1603/HORO-1712"
+    "session: captured (AgentEvent/Claim/Evidence carry the provider-native session_id; \
+     rows written before FORNX-433 (Claude/Codex hooks) or FORNX-462 (Codex tailer) may be \
+     filed under the literal \"unknown\" or a rollout file path -- those are flagged \
+     legacy_unattributed on read and never rewritten; fornax statusline's latest_finding \
+     segment declares scope:\"session\" once the host confirms it) \
+     -- agent: captured per event for Claude Code subagents (agent_id/agent_type) and Codex \
+     hooks (agent_id), read from the provider payload into event_attribution; claims, \
+     evidence and findings are attributed through their source event; no attribution row \
+     means unattributed, NOT the root agent, and rows recorded before attribution existed \
+     are never backfilled; opencode has no contract mapping and is never read \
+     -- turn: captured for Codex hooks only (Claude Code sends no turn_id) -- task: not \
+     captured -- lineage: always unknown (no provider hook exposes a parent link) \
+     -- evidence pooling is per SESSION by design: a subagent shares its parent's \
+     session_id, so its evidence can verify the parent's claims and the reverse; \
+     attribution tells you which agent produced a record, it does not partition \
+     verification \
+     -- host: implicit (one daemon/$FORNAX_HOME per machine; no host_id column on any row) \
+     -- fornax status and fornax detail are host-wide (newest findings across all sessions) \
+     and say so -- not a defect: partial adoption of the execution-identity contract is \
+     expected (horonomy/.github governance/product/\
+     execution-identity-contract.md#partial-adoption-is-expected-not-a-defect)"
         .to_string()
 }
 
@@ -2079,7 +2119,16 @@ fn render_status_line(v: &serde_json::Value) -> String {
         .and_then(|s| s.as_str())
         .unwrap_or("unknown");
     let icon = verdict_icon(verdict);
-    format!("{icon} {}", verdict.to_uppercase())
+    // `/api/status` without `?session=` is the newest finding across every
+    // session on this machine; say so rather than let it read as "this
+    // session's" (FORNX-465). Only a daemon-confirmed session-scoped answer
+    // is left unlabelled.
+    let scope = if v.get("session_scoped").and_then(|b| b.as_bool()) == Some(true) {
+        ""
+    } else {
+        " (host-wide)"
+    };
+    format!("{icon} {}{scope}", verdict.to_uppercase())
 }
 
 fn verdict_icon(verdict: &str) -> &'static str {
@@ -2093,6 +2142,38 @@ fn verdict_icon(verdict: &str) -> &'static str {
     }
 }
 
+/// Why there is nothing to show yet, and the next step. "No findings" reads
+/// the same whether no agent ever reported in or events arrived but no claim
+/// was checked, and the two need different actions.
+fn no_findings_explanation(observed: Option<&serde_json::Value>) -> String {
+    let count = |key: &str| observed.and_then(|o| o.get(key)).and_then(|n| n.as_i64());
+    match (count("events"), count("sessions"), count("claims")) {
+        (Some(0), _, _) => "No findings recorded yet. No agent session has reported to this daemon. \
+            Install an adapter (`fornax adapter list`, `fornax install <adapter>`), trust its hooks \
+            inside the agent (Codex: `/hooks`), then start a session."
+            .to_string(),
+        (Some(events), Some(sessions), Some(0)) => format!(
+            "No findings recorded yet. {events} event(s) from {sessions} session(s) were captured, \
+             but no agent claim has been checked, so there is nothing to verify. Findings need an agent \
+             claim that tests passed: Codex claims are read from the rollout by the daemon's Codex capture \
+             (`fornax doctor` shows whether it is on), Claude Code claims by its Stop hook."
+        ),
+        _ => "No findings recorded yet.".to_string(),
+    }
+}
+
+/// A claim is the agent's whole final message, often several lines with a
+/// code block; `detail` shows one readable line of it.
+fn one_line_claim(claim: &str) -> String {
+    const MAX: usize = 240;
+    let flat = claim.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= MAX {
+        return flat;
+    }
+    let cut: String = flat.chars().take(MAX).collect();
+    format!("{cut}…")
+}
+
 fn print_detail(v: &serde_json::Value) {
     let empty = vec![];
     let findings = v
@@ -2100,9 +2181,10 @@ fn print_detail(v: &serde_json::Value) {
         .and_then(|f| f.as_array())
         .unwrap_or(&empty);
     if findings.is_empty() {
-        println!("No findings recorded yet.");
+        println!("{}", no_findings_explanation(v.get("observed")));
         return;
     }
+    println!("Host-wide: recent findings across all sessions on this machine.\n");
     for f in findings {
         let verdict = f.get("verdict").and_then(|s| s.as_str()).unwrap_or("?");
         let claim = f.get("claim_text").and_then(|s| s.as_str()).unwrap_or("");
@@ -2112,8 +2194,18 @@ fn print_detail(v: &serde_json::Value) {
             .and_then(|s| s.as_str())
             .unwrap_or("");
         let when = f.get("computed_at").and_then(|s| s.as_str()).unwrap_or("");
+        let session = f.get("session_id").and_then(|s| s.as_str()).unwrap_or("?");
+        let session_note = match f.get("attribution").and_then(|s| s.as_str()) {
+            Some("legacy_unattributed") => " (legacy: not a native session identity)",
+            _ => "",
+        };
         println!("{} {}", verdict_icon(verdict), verdict.to_uppercase());
-        println!("  claim:     {claim}");
+        println!("  session:   {session}{session_note}");
+        if let Some(agent) = f.get("agent_id").and_then(|s| s.as_str()) {
+            let kind = f.get("agent_type").and_then(|s| s.as_str()).unwrap_or("?");
+            println!("  agent:     {agent} ({kind})");
+        }
+        println!("  claim:     {}", one_line_claim(claim));
         println!("  rationale: {rationale}");
         println!("  verifier:  {verifier}");
         println!("  when:      {when}");
@@ -3157,6 +3249,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn no_findings_explanation_separates_silence_from_unchecked_claims() {
+        let none = serde_json::json!({"events": 0, "sessions": 0, "claims": 0});
+        assert!(no_findings_explanation(Some(&none)).contains("No agent session has reported"));
+        let some = serde_json::json!({"events": 3, "sessions": 1, "claims": 0});
+        let text = no_findings_explanation(Some(&some));
+        assert!(text.contains("3 event(s) from 1 session(s)"), "{text}");
+        assert!(text.contains("no agent claim has been checked"), "{text}");
+        assert!(text.contains("claim that tests passed"), "{text}");
+        assert_eq!(no_findings_explanation(None), "No findings recorded yet.");
+    }
+
+    #[test]
     fn render_status_line_shows_no_findings_message_when_null() {
         let v = serde_json::json!({"latest": null});
         assert_eq!(render_status_line(&v), "🛡 fornax: no findings yet");
@@ -3165,13 +3269,21 @@ mod tests {
     #[test]
     fn render_status_line_shows_contradicted_icon_and_verdict() {
         let v = serde_json::json!({"latest": {"verdict": "contradicted"}});
-        assert_eq!(render_status_line(&v), "🛡 ✕ CONTRADICTED");
+        assert_eq!(render_status_line(&v), "🛡 ✕ CONTRADICTED (host-wide)");
+    }
+
+    #[test]
+    fn render_status_line_is_unlabelled_only_when_the_daemon_confirmed_session_scope() {
+        let v = serde_json::json!({
+            "latest": {"verdict": "verified"}, "session_scoped": true, "scope": "session"
+        });
+        assert_eq!(render_status_line(&v), "🛡 ✓ VERIFIED");
     }
 
     #[test]
     fn render_status_line_shows_verified_icon() {
         let v = serde_json::json!({"latest": {"verdict": "verified"}});
-        assert_eq!(render_status_line(&v), "🛡 ✓ VERIFIED");
+        assert_eq!(render_status_line(&v), "🛡 ✓ VERIFIED (host-wide)");
     }
 
     #[test]
@@ -4808,6 +4920,22 @@ mod tests {
         }
     }
 
+    mod claim_display {
+        use super::*;
+
+        #[test]
+        fn a_multiline_claim_becomes_one_bounded_line() {
+            let c = "Done.\n\n```\n1 passed in 0.00s\n```\nAll good.";
+            assert_eq!(
+                one_line_claim(c),
+                "Done. ``` 1 passed in 0.00s ``` All good."
+            );
+            let long = "x ".repeat(400);
+            let out = one_line_claim(&long);
+            assert!(out.chars().count() <= 241 && out.ends_with('…'));
+        }
+    }
+
     mod execution_identity_doctor {
         use super::*;
 
@@ -4815,13 +4943,18 @@ mod tests {
         fn reports_session_captured_and_others_truthfully_absent() {
             let report = execution_identity_capture_report();
             assert!(report.contains("session: captured"));
-            assert!(report.contains("agent/turn/task: not captured"));
+            assert!(report.contains("task: not captured"));
+            assert!(report.contains("lineage: always unknown"));
+            assert!(report.contains("agent: captured per event"));
+            assert!(report.contains("evidence pooling is per SESSION"));
+            assert!(report.contains("legacy_unattributed"));
+            assert!(report.contains("host-wide"));
             assert!(report.contains("host: implicit"));
             assert!(report.contains("#partial-adoption-is-expected-not-a-defect"));
             // Never claim a dimension is captured when it isn't -- the exact
             // fabricated-precision failure this check exists to avoid.
-            assert!(!report.contains("agent: captured"));
-            assert!(!report.contains("turn: captured"));
+            // Turn is captured for Codex only -- never claimed for every provider.
+            assert!(report.contains("turn: captured for Codex hooks only"));
             assert!(!report.contains("task: captured"));
         }
 

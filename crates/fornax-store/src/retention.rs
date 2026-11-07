@@ -211,6 +211,17 @@ pub fn longitudinal_persistence_allowed(class: &RetentionClass) -> bool {
     }
 }
 
+/// Replaces an event's `raw` when its content is purged in place (the column
+/// is NOT NULL). Valid JSON, so every reader that parses `raw` still can.
+const RAW_PURGED_MARKER: &str = r#"{"raw_content_expired":true}"#;
+/// Replaces a claim's `text` when its content is purged in place.
+const CLAIM_TEXT_PURGED_MARKER: &str = "[claim text expired]";
+
+/// SQLite `SQLITE_CONSTRAINT_FOREIGNKEY` (extended code 787).
+fn is_foreign_key_violation(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("787"))
+}
+
 /// The egress gate a future replay/research export path must consult before
 /// sending any data off this machine (FORNX-106 AC5). See this module's docs
 /// — no export path exists yet to call this, but the gate is ready and
@@ -661,15 +672,18 @@ impl Store {
             ..Default::default()
         };
         let mut last_key: Option<(String, String, String)> = None;
-        // Evidence ids purged this batch, audited only AFTER `tx` commits
-        // (see below) — `Store::append_audit_event` opens its own `BEGIN
-        // IMMEDIATE` on a separate pool connection, and SQLite serializes
-        // writers at the FILE level, not the connection level: calling it
-        // while `tx` is still open self-deadlocks (this pool's own
-        // in-progress write transaction blocks the audit ledger's write
-        // lock acquisition, forever, since both would need the other to
-        // finish first).
+        // Evidence ids purged this batch. Their audit rows are appended on
+        // `tx` itself (`append_audit_event_locked` opens no transaction and
+        // takes the connection that already holds the write lock) just
+        // before the commit, so a purge and its audit rows are atomic: a
+        // failed append rolls the whole batch back. Calling the pool-level
+        // `Store::append_audit_event` here instead would self-deadlock, as
+        // it takes its own write lock on a second connection.
         let mut purged_evidence_ids: Vec<String> = Vec::new();
+        // FORNX-467 follow-up: same for `agent_events`/`claims`
+        // hard deletes and in-place purges. Only (table, id, disposition) is
+        // kept -- never row content.
+        let mut purged_records: Vec<(RecordAuditTable, String, RecordDisposition)> = Vec::new();
 
         for row in rows {
             let recorded_at = row.recorded_at.clone();
@@ -691,18 +705,74 @@ impl Store {
                     purged_evidence_ids.push(record.record_id.clone());
                 }
                 "agent_events" => {
-                    sqlx::query("DELETE FROM agent_events WHERE id = ?1")
+                    // FORNX-467: a surviving claim/evidence row may still
+                    // reference this event (a finding outlives its claim by
+                    // 335 days; soft-purged evidence is kept), so a plain
+                    // DELETE would fail the foreign key and wedge the whole
+                    // sweep. Delete when unreferenced, otherwise purge the
+                    // raw content in place and keep the stub.
+                    match sqlx::query("DELETE FROM agent_events WHERE id = ?1")
                         .bind(&record.record_id)
                         .execute(&mut *tx)
-                        .await?;
-                    report.deleted_records += 1;
+                        .await
+                    {
+                        Ok(_) => {
+                            report.deleted_records += 1;
+                            purged_records.push((
+                                RecordAuditTable::AgentEvents,
+                                record.record_id.clone(),
+                                RecordDisposition::Deleted,
+                            ));
+                        }
+                        Err(e) if is_foreign_key_violation(&e) => {
+                            sqlx::query(
+                                "UPDATE agent_events
+                                 SET tool_input = NULL, tool_response = NULL, raw = ?2
+                                 WHERE id = ?1",
+                            )
+                            .bind(&record.record_id)
+                            .bind(RAW_PURGED_MARKER)
+                            .execute(&mut *tx)
+                            .await?;
+                            report.purged_in_place += 1;
+                            purged_records.push((
+                                RecordAuditTable::AgentEvents,
+                                record.record_id.clone(),
+                                RecordDisposition::PurgedInPlace,
+                            ));
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
                 }
                 "claims" => {
-                    sqlx::query("DELETE FROM claims WHERE id = ?1")
+                    match sqlx::query("DELETE FROM claims WHERE id = ?1")
                         .bind(&record.record_id)
                         .execute(&mut *tx)
-                        .await?;
-                    report.deleted_records += 1;
+                        .await
+                    {
+                        Ok(_) => {
+                            report.deleted_records += 1;
+                            purged_records.push((
+                                RecordAuditTable::Claims,
+                                record.record_id.clone(),
+                                RecordDisposition::Deleted,
+                            ));
+                        }
+                        Err(e) if is_foreign_key_violation(&e) => {
+                            sqlx::query("UPDATE claims SET text = ?2 WHERE id = ?1")
+                                .bind(&record.record_id)
+                                .bind(CLAIM_TEXT_PURGED_MARKER)
+                                .execute(&mut *tx)
+                                .await?;
+                            report.purged_in_place += 1;
+                            purged_records.push((
+                                RecordAuditTable::Claims,
+                                record.record_id.clone(),
+                                RecordDisposition::PurgedInPlace,
+                            ));
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
                 }
                 "findings" => {
                     sqlx::query("DELETE FROM findings WHERE id = ?1")
@@ -784,22 +854,23 @@ impl Store {
             .await?;
         }
 
-        tx.commit().await?;
-
-        // FORNX-319/FORNX-315: every purge action emits an AuditEvent —
-        // appended only now, after `tx` has committed (see the comment
-        // above `purged_evidence_ids` for why appending any earlier
-        // self-deadlocks). This does mean the purge and its audit event
-        // are not cross-table-atomic: a crash between the commit above and
-        // one of these appends leaves that one purge unaudited. Given a
-        // local single-process daemon with no concurrent writer racing
-        // this exact window, that gap is accepted rather than engineered
-        // away — the alternative (holding `tx` open across the ledger's
-        // own transaction) is the deadlock this code avoids.
-        for evidence_id in &purged_evidence_ids {
-            self.append_audit_event(&evidence_purged_audit_event(evidence_id, now), now)
-                .await?;
+        // FORNX-319/FORNX-315/FORNX-467: every purge emits an AuditEvent,
+        // appended on `tx` before the commit so purge and audit are atomic.
+        // Payloads carry only ids and the disposition; attributes are
+        // redacted exactly as `Store::append_audit_event` does.
+        let mut audit_events: Vec<AuditEvent> = purged_evidence_ids
+            .iter()
+            .map(|id| evidence_purged_audit_event(id, now))
+            .collect();
+        audit_events.extend(purged_records.iter().map(|(table, id, disposition)| {
+            record_purged_audit_event(*table, id, *disposition, now)
+        }));
+        for mut event in audit_events {
+            event.attributes = fornax_types::redact::redact_json(&event.attributes);
+            crate::audit_ledger::append_audit_event_locked(&mut tx, &event, now).await?;
         }
+
+        tx.commit().await?;
 
         report.more_remaining = examined == batch_size as usize;
         report.next_cursor = if report.more_remaining {
@@ -868,6 +939,52 @@ fn evidence_purged_audit_event(evidence_id: &str, now: DateTime<Utc>) -> AuditEv
     )
 }
 
+#[derive(Debug, Clone, Copy)]
+enum RecordAuditTable {
+    AgentEvents,
+    Claims,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RecordDisposition {
+    Deleted,
+    PurgedInPlace,
+}
+
+/// The `AuditAction::RecordPurged` event for one swept `agent_events` or
+/// `claims` row (FORNX-467). Same actor/outcome/export class as
+/// [`evidence_purged_audit_event`]; the payload names only the table (via the
+/// target kind), the row id and whether it was deleted or purged in place --
+/// never any row content.
+fn record_purged_audit_event(
+    table: RecordAuditTable,
+    id: &str,
+    disposition: RecordDisposition,
+    now: DateTime<Utc>,
+) -> AuditEvent {
+    let target_id = id.to_string();
+    let target = match table {
+        RecordAuditTable::AgentEvents => AuditTarget::AgentEvent { target_id },
+        RecordAuditTable::Claims => AuditTarget::Claim { target_id },
+    };
+    let mut event = AuditEvent::new(
+        uuid::Uuid::new_v4().to_string(),
+        now.to_rfc3339(),
+        AuditActor::System,
+        AuditAction::RecordPurged,
+        target,
+        AuditOutcome::Expired,
+        AuditExportClass::Metadata,
+    );
+    event.attributes = serde_json::json!({
+        "disposition": match disposition {
+            RecordDisposition::Deleted => "deleted",
+            RecordDisposition::PurgedInPlace => "purged_in_place",
+        },
+    });
+    event
+}
+
 async fn purge_evidence_payload_row<'e, E>(executor: E, evidence_id: &str) -> Result<bool>
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
@@ -910,6 +1027,11 @@ pub struct SweepReport {
     pub purged_evidence: usize,
     /// `"agent_events"`/`"claims"`/`"findings"` rows hard-deleted.
     pub deleted_records: usize,
+    /// `"agent_events"`/`"claims"` rows that a surviving record still
+    /// references (a longer-lived finding, or soft-purged evidence), so they
+    /// could not be hard-deleted: their raw content was purged in place and
+    /// the identity/timestamp stub kept (FORNX-467).
+    pub purged_in_place: usize,
     /// Expired rows whose `record_table` was not one this store knows how
     /// to act on — their lineage tag was still removed, but the
     /// (unrecognized) underlying record, if any, was left untouched.
@@ -1986,6 +2108,312 @@ mod tests {
             );
         }
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// FORNX-467: the production shape -- an event, the claim made about it,
+    /// evidence from it, and a finding -- all older than the raw window. The
+    /// sweep used to fail on the foreign keys and purge nothing.
+    #[tokio::test]
+    async fn sweep_purges_linked_raw_data_without_breaking_referential_integrity() {
+        use fornax_types::{
+            AgentEvent, Claim, EventKind, Evidence, EvidenceKind, Finding, Provider, Verdict,
+        };
+        const CANARY: &str = "RAW-CANARY-91c2";
+        let path =
+            std::env::temp_dir().join(format!("fornax-retention-fk-{}.db", uuid::Uuid::new_v4()));
+        let store = Store::open(&path).await.expect("open db");
+        let now = Utc::now();
+        let old = (now - chrono::Duration::days(40)).to_rfc3339();
+
+        let event = AgentEvent {
+            id: uuid::Uuid::new_v4(),
+            session_id: "s-1".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: old.clone(),
+            tool_name: Some("Bash".into()),
+            tool_input: Some(serde_json::json!({"command": CANARY})),
+            tool_response: Some(serde_json::json!({"stdout": CANARY})),
+            raw: serde_json::json!({"cwd": CANARY}),
+        };
+        store.insert_event(&event).await.unwrap();
+        let claim = Claim {
+            id: uuid::Uuid::new_v4(),
+            session_id: "s-1".into(),
+            source_event_id: event.id,
+            text: format!("tests pass {CANARY}"),
+            subject: "test_result".into(),
+            claimed_at: old.clone(),
+        };
+        store.insert_claim(&claim).await.unwrap();
+        let evidence = Evidence {
+            id: uuid::Uuid::new_v4(),
+            session_id: "s-1".into(),
+            source_event_id: event.id,
+            kind: EvidenceKind::ExitCode,
+            observed_at: old.clone(),
+            payload: serde_json::json!({"command": CANARY}),
+            provenance: "test".into(),
+            source: None,
+            extension: None,
+            evidence_purged: false,
+        };
+        store.insert_evidence(&evidence).await.unwrap();
+        let finding = Finding {
+            id: uuid::Uuid::new_v4(),
+            claim_id: claim.id,
+            verdict: Verdict::Verified,
+            evidence_ids: vec![evidence.id],
+            verifier_name: "v".into(),
+            rationale: "kept".into(),
+            computed_at: old.clone(),
+        };
+        store.insert_finding(&finding).await.unwrap();
+        // An event nothing references: still hard-deleted.
+        let lone = AgentEvent {
+            id: uuid::Uuid::new_v4(),
+            session_id: "s-2".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: old.clone(),
+            tool_name: None,
+            tool_input: Some(serde_json::json!({"command": CANARY})),
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        store.insert_event(&lone).await.unwrap();
+        sqlx::query("UPDATE dataset_lineage_tags SET recorded_at = ?1")
+            .bind(&old)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        let report = store
+            .sweep_expired_records(now, None, 1000)
+            .await
+            .expect("the sweep must not fail on linked data");
+        assert_eq!(report.purged_evidence, 1, "{report:?}");
+        assert_eq!(
+            report.purged_in_place, 2,
+            "event + claim are still referenced: {report:?}"
+        );
+        assert_eq!(
+            report.deleted_records, 1,
+            "only the unreferenced event is deleted: {report:?}"
+        );
+
+        // Raw content is gone everywhere.
+        let dump: String = sqlx::query_scalar(
+            "SELECT group_concat(COALESCE(tool_input,'') || COALESCE(tool_response,'') || raw, '|') FROM agent_events",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        let claims: String = sqlx::query_scalar("SELECT group_concat(text, '|') FROM claims")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        let payloads: String =
+            sqlx::query_scalar("SELECT group_concat(payload, '|') FROM evidence")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        for (what, text) in [
+            ("events", &dump),
+            ("claims", &claims),
+            ("evidence", &payloads),
+        ] {
+            assert!(
+                !text.contains(CANARY),
+                "{what} still holds raw content: {text}"
+            );
+        }
+        // The finding, verdict and rationale survive, and integrity holds.
+        let (verdict, rationale): (String, String) =
+            sqlx::query_as("SELECT verdict, rationale FROM findings")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!((verdict.as_str(), rationale.as_str()), ("verified", "kept"));
+        let violations: Vec<(String, i64, String, i64)> =
+            sqlx::query_as("PRAGMA foreign_key_check")
+                .fetch_all(&store.pool)
+                .await
+                .unwrap();
+        assert!(violations.is_empty(), "{violations:?}");
+
+        // A second sweep is a clean no-op.
+        let again = store.sweep_expired_records(now, None, 1000).await.unwrap();
+        assert_eq!(
+            again.purged_in_place + again.deleted_records + again.purged_evidence,
+            0,
+            "{again:?}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// FORNX-467 follow-up: every in-place purge and hard delete of an
+    /// `agent_events`/`claims` row is audited (like the evidence purge), the
+    /// chain stays valid, and no raw content reaches any audit payload.
+    #[tokio::test]
+    async fn sweep_audits_in_place_purges_and_hard_deletes_without_raw_content() {
+        use crate::audit_ledger::ChainVerification;
+        use fornax_types::{AgentEvent, AuditAction, AuditTarget, Claim, EventKind, Provider};
+        const CANARY: &str = "RAW-CANARY-91c2";
+        let path = std::env::temp_dir().join(format!(
+            "fornax-retention-audit-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::open(&path).await.expect("open db");
+        let now = Utc::now();
+        let old = (now - chrono::Duration::days(40)).to_rfc3339();
+        let mk_event = |session: &str| AgentEvent {
+            id: uuid::Uuid::new_v4(),
+            session_id: session.into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: old.clone(),
+            tool_name: Some("Bash".into()),
+            tool_input: Some(serde_json::json!({"command": CANARY})),
+            tool_response: Some(serde_json::json!({"stdout": CANARY})),
+            raw: serde_json::json!({"cwd": CANARY}),
+        };
+        // Referenced event + claim (purged in place), and a lone event
+        // (hard-deleted).
+        let event = mk_event("s-1");
+        store.insert_event(&event).await.unwrap();
+        let claim = Claim {
+            id: uuid::Uuid::new_v4(),
+            session_id: "s-1".into(),
+            source_event_id: event.id,
+            text: format!("tests pass {CANARY}"),
+            subject: "test_result".into(),
+            claimed_at: old.clone(),
+        };
+        store.insert_claim(&claim).await.unwrap();
+        let finding = fornax_types::Finding {
+            id: uuid::Uuid::new_v4(),
+            claim_id: claim.id,
+            verdict: fornax_types::Verdict::Verified,
+            evidence_ids: vec![],
+            verifier_name: "v".into(),
+            rationale: "kept".into(),
+            computed_at: old.clone(),
+        };
+        store.insert_finding(&finding).await.unwrap();
+        let lone = mk_event("s-2");
+        store.insert_event(&lone).await.unwrap();
+        sqlx::query("UPDATE dataset_lineage_tags SET recorded_at = ?1")
+            .bind(&old)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        let report = store.sweep_expired_records(now, None, 1000).await.unwrap();
+        assert_eq!(report.purged_in_place, 2, "{report:?}");
+        let record_purges = report.purged_in_place + report.deleted_records;
+        assert_eq!(record_purges, 3, "{report:?}");
+
+        let entries = store.audit_events().await.unwrap();
+        let purge_rows: Vec<_> = entries
+            .iter()
+            .filter(|e| e.event.action == AuditAction::RecordPurged)
+            .collect();
+        assert_eq!(purge_rows.len(), record_purges, "{entries:?}");
+        let targets: std::collections::BTreeSet<(String, String, String)> = purge_rows
+            .iter()
+            .map(|e| {
+                let (kind, id) = match &e.event.target {
+                    AuditTarget::AgentEvent { target_id } => ("agent_event", target_id.clone()),
+                    AuditTarget::Claim { target_id } => ("claim", target_id.clone()),
+                    other => panic!("unexpected target {other:?}"),
+                };
+                let disposition = e.event.attributes["disposition"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                (kind.to_string(), id, disposition)
+            })
+            .collect();
+        let expected: std::collections::BTreeSet<_> = [
+            ("agent_event", event.id, "purged_in_place"),
+            ("claim", claim.id, "purged_in_place"),
+            ("agent_event", lone.id, "deleted"),
+        ]
+        .into_iter()
+        .map(|(k, id, d)| (k.to_string(), id.to_string(), d.to_string()))
+        .collect();
+        assert_eq!(targets, expected);
+
+        assert_eq!(
+            store.verify_audit_chain().await.unwrap(),
+            ChainVerification::Valid
+        );
+        let payloads: String =
+            sqlx::query_scalar("SELECT COALESCE(group_concat(payload, '|'), '') FROM audit_events")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert!(
+            !payloads.contains(CANARY),
+            "raw content in audit: {payloads}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// FORNX-467 follow-up: purge and audit are atomic -- if the audit append
+    /// fails, the whole sweep batch rolls back and nothing is purged.
+    #[tokio::test]
+    async fn failed_audit_append_rolls_back_the_sweep_purge() {
+        use fornax_types::{AgentEvent, EventKind, Provider};
+        let path = std::env::temp_dir().join(format!(
+            "fornax-retention-atomic-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::open(&path).await.expect("open db");
+        let now = Utc::now();
+        let old = (now - chrono::Duration::days(40)).to_rfc3339();
+        let event = AgentEvent {
+            id: uuid::Uuid::new_v4(),
+            session_id: "s-1".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: old.clone(),
+            tool_name: None,
+            tool_input: Some(serde_json::json!({"command": "keep-me"})),
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        store.insert_event(&event).await.unwrap();
+        sqlx::query("UPDATE dataset_lineage_tags SET recorded_at = ?1")
+            .bind(&old)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER fail_audit BEFORE INSERT ON audit_events
+             BEGIN SELECT RAISE(ABORT, 'audit append refused'); END",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+        assert!(store.sweep_expired_records(now, None, 1000).await.is_err());
+
+        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        let tags: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dataset_lineage_tags")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            (events, tags),
+            (1, 1),
+            "purge must roll back with the audit"
+        );
         std::fs::remove_file(&path).ok();
     }
 }

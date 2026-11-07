@@ -33,7 +33,7 @@ use fornax_types::{
     AgentEvent, Claim, CollectionMethod, EventKind, Evidence, EvidenceKind, EvidenceSource,
     IngestMessage, Provider, TrustClass,
 };
-use fornax_verify::{CommandSuccessVerifier, Verifier};
+use fornax_verify::{CommandExecutedVerifier, Verifier};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use uuid::Uuid;
@@ -226,13 +226,13 @@ fn legitimate_evidence(session_id: &str, source_event_id: Uuid) -> Evidence {
     ev
 }
 
-fn command_success_claim(session_id: &str, source_event_id: Uuid) -> Claim {
+fn command_executed_claim(session_id: &str, source_event_id: Uuid) -> Claim {
     Claim {
         id: Uuid::new_v4(),
         session_id: session_id.to_string(),
         source_event_id,
-        text: "the command `cargo build` succeeded".to_string(),
-        subject: "command_succeeded".to_string(),
+        text: "I ran `cargo build`".to_string(),
+        subject: "command_executed".to_string(),
         claimed_at: chrono::Utc::now().to_rfc3339(),
     }
 }
@@ -307,7 +307,7 @@ async fn forged_host_observed_label_never_reaches_verified() {
     let session_id = format!("fornx431-forged-{}", short_id());
     let event = command_success_event(&session_id);
     let event_id = event.id;
-    let claim = command_success_claim(&session_id, event_id);
+    let claim = command_executed_claim(&session_id, event_id);
     let evidence = evidence_with_forged_trust_class(&session_id, event_id);
 
     let verdict = submit_and_await_verdict(
@@ -336,7 +336,7 @@ async fn unregistered_sensor_never_reaches_verified() {
     let session_id = format!("fornx431-unregistered-{}", short_id());
     let event = command_success_event(&session_id);
     let event_id = event.id;
-    let claim = command_success_claim(&session_id, event_id);
+    let claim = command_executed_claim(&session_id, event_id);
     let evidence = evidence_with_unregistered_sensor(&session_id, event_id);
 
     let verdict = submit_and_await_verdict(
@@ -365,7 +365,7 @@ async fn uds_evidence_with_no_source_never_reaches_verified() {
     let session_id = format!("fornx431-nosource-{}", short_id());
     let event = command_success_event(&session_id);
     let event_id = event.id;
-    let claim = command_success_claim(&session_id, event_id);
+    let claim = command_executed_claim(&session_id, event_id);
     let evidence = evidence_with_no_source(&session_id, event_id);
 
     let verdict = submit_and_await_verdict(
@@ -399,7 +399,7 @@ async fn legitimate_evidence_still_reaches_verified() {
     let session_id = format!("fornx431-legit-{}", short_id());
     let event = command_success_event(&session_id);
     let event_id = event.id;
-    let claim = command_success_claim(&session_id, event_id);
+    let claim = command_executed_claim(&session_id, event_id);
     let evidence = legitimate_evidence(&session_id, event_id);
 
     let verdict = submit_and_await_verdict(
@@ -418,6 +418,56 @@ async fn legitimate_evidence_still_reaches_verified() {
          -- the guard must not break the normal path; daemon log:\n{}",
         daemon.log_contents()
     );
+}
+
+/// FORNX-477 (QA 29513 residual): a test-success assertion must not reach
+/// Verified just because it is submitted as `command_succeeded` instead of
+/// `test_result`. A correctly admitted (registered, AgentAdjacent) exit-code row
+/// for `pytest -q` with a genuine passing summary is the agent's own account of
+/// a test run, so it resolves to Review, as the `test_result` path does.
+#[tokio::test]
+async fn test_run_relabelled_as_command_succeeded_never_reaches_verified() {
+    for (label, summary, expected) in [
+        (
+            "passing-summary",
+            Some(serde_json::json!({"format": "pytest", "passed": 3, "failed": 0})),
+            "review",
+        ),
+        ("fake-runner-no-summary", None, "unverified"),
+    ] {
+        let daemon = start_daemon().await;
+        let store = Store::open(daemon.home.join("fornax.db"))
+            .await
+            .expect("open store db");
+        let session_id = format!("fornx477-relabel-{label}-{}", short_id());
+        let event = command_success_event(&session_id);
+        let event_id = event.id;
+        let mut claim = command_executed_claim(&session_id, event_id);
+        claim.subject = "command_succeeded".to_string();
+        claim.text = "the command `pytest -q` succeeded".to_string();
+        let mut evidence = legitimate_evidence(&session_id, event_id);
+        evidence.payload = serde_json::json!({"command": "pytest -q", "exit_code": 0});
+        if let Some(summary) = summary {
+            evidence.payload["test_summary"] = summary;
+        }
+
+        let verdict = submit_and_await_verdict(
+            &daemon.home.join("fornax.sock"),
+            &store,
+            event,
+            evidence,
+            claim,
+        )
+        .await;
+
+        assert_eq!(
+            verdict,
+            Some(expected.to_string()),
+            "{label}: a test run claimed as command_succeeded gets the test_result bar; \
+             daemon log:\n{}",
+            daemon.log_contents()
+        );
+    }
 }
 
 /// FORNX-437's disclosed residual: `adapter_registry_has_zero_references_in_
@@ -531,7 +581,7 @@ async fn disabled_adapter_registration_does_not_affect_live_verdict_computation(
     let session_id = format!("fornx437-disabled-registry-{}", short_id());
     let event = command_success_event(&session_id);
     let event_id = event.id;
-    let claim = command_success_claim(&session_id, event_id);
+    let claim = command_executed_claim(&session_id, event_id);
     let evidence = legitimate_evidence(&session_id, event_id);
 
     let verdict = submit_and_await_verdict(
@@ -582,7 +632,12 @@ fn test_runner_evidence(session_id: &str, source_event_id: Uuid) -> Evidence {
         source_event_id,
         kind: EvidenceKind::ExitCode,
         observed_at: chrono::Utc::now().to_rfc3339(),
-        payload: serde_json::json!({"command": "pytest -q", "exit_code": 0}),
+        payload: serde_json::json!({
+            "command": "pytest -q",
+            "exit_code": 0,
+            // FORNX-477: Verified needs the runner's own passing summary.
+            "test_summary": {"format": "pytest", "passed": 3, "failed": 0}
+        }),
         provenance: "fornx433-sliceb-fixture".to_string(),
         source: Some(EvidenceSource::now(
             "claude_bash_exit_code_sensor_v1",
@@ -617,8 +672,8 @@ fn test_result_claim(session_id: &str, source_event_id: Uuid) -> Claim {
 }
 
 /// FORNX-433 AC3 Slice B: a claim minted from the main session (no
-/// `agent_id` -- e.g. a `Stop`-derived summary) must still reach Verified
-/// against test-runner evidence that originated from a *different* event
+/// `agent_id` -- e.g. a `Stop`-derived summary) must still be matched to and
+/// judged against test-runner evidence that originated from a *different* event
 /// in the same session (e.g. a Task subagent that actually ran the tests).
 /// `fornax-verify`'s `TestResultVerifier` pools all evidence for the
 /// session rather than filtering by which event produced it -- confirmed
@@ -626,12 +681,15 @@ fn test_result_claim(session_id: &str, source_event_id: Uuid) -> Claim {
 /// runs the tests, main agent reports the result" delegation pattern, not
 /// a cross-agent leak (no code path today mints a claim *from* a
 /// subagent's own output, so there is nothing yet for a wrong agent's
-/// claim to wrongly borrow another agent's evidence). This test pins
+/// claim to wrongly borrow another agent's evidence). Since FORNX-477 that
+/// evidence is the agent's own account (`AgentAdjacent`), so the result is
+/// `review`, not `verified`; the sibling test below shows it differs from the
+/// no-evidence case (`unverified`). This test pins
 /// delegation pooling as intended behavior, so a future agent-scoping
 /// change (FORNX-433 Slice C, gated on a real subagent-originated claim
 /// existing) can't silently break it while fixing an actual leak elsewhere.
 #[tokio::test]
-async fn main_session_claim_is_verified_by_subagent_originated_test_evidence() {
+async fn main_session_claim_is_reviewed_against_subagent_originated_test_evidence() {
     let daemon = start_daemon().await;
     let store = Store::open(daemon.home.join("fornax.db"))
         .await
@@ -666,10 +724,11 @@ async fn main_session_claim_is_verified_by_subagent_originated_test_evidence() {
 
     assert_eq!(
         verdict,
-        Some("verified".to_string()),
-        "the main session's claim must be verified by test evidence a \
-         subagent produced in the same session -- delegation pooling is \
-         intended behavior, not a leak; daemon log:\n{}",
+        Some("review".to_string()),
+        "the main session's claim must be judged against test evidence a \
+         subagent produced in the same session (review: unattested passing \
+         run, FORNX-477) -- delegation pooling is intended behavior, not a \
+         leak; daemon log:\n{}",
         daemon.log_contents()
     );
 }
@@ -677,7 +736,7 @@ async fn main_session_claim_is_verified_by_subagent_originated_test_evidence() {
 /// Mutation proof for the sibling test above: with no test-runner evidence
 /// anywhere in the session (the subagent's event/evidence deliberately
 /// omitted), the same claim must NOT reach Verified -- proving the
-/// sibling's Verified result genuinely depends on the pooled evidence,
+/// sibling's Review result genuinely depends on the pooled evidence,
 /// not a vacuously-passing claim.
 #[tokio::test]
 async fn main_session_claim_without_any_test_evidence_stays_unverified() {
@@ -708,11 +767,11 @@ async fn main_session_claim_without_any_test_evidence_stays_unverified() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
 
-    assert_ne!(
+    assert_eq!(
         verdict,
-        Some("verified".to_string()),
+        Some("unverified".to_string()),
         "with no test-runner evidence anywhere in the session, the claim \
-         must not reach Verified; daemon log:\n{}",
+         must stay Unverified; daemon log:\n{}",
         daemon.log_contents()
     );
 }
@@ -736,10 +795,10 @@ async fn same_anchor_related_claims_both_reach_verified_without_downgrade() {
     send_line(&sock_path, &IngestMessage::Event(event)).await;
     send_line(&sock_path, &IngestMessage::Evidence(evidence)).await;
 
-    let claim_a = command_success_claim(&session_id, event_id);
+    let claim_a = command_executed_claim(&session_id, event_id);
     send_line(&sock_path, &IngestMessage::Claim(claim_a.clone())).await;
 
-    let mut claim_b = command_success_claim(&session_id, event_id);
+    let mut claim_b = command_executed_claim(&session_id, event_id);
     claim_b.id = Uuid::new_v4();
     send_line(&sock_path, &IngestMessage::Claim(claim_b.clone())).await;
 
@@ -801,7 +860,7 @@ async fn cross_anchor_replay_is_downgraded_not_verified() {
     send_line(&sock_path, &capability_announcement(&session_id)).await;
     send_line(&sock_path, &IngestMessage::Event(event_a)).await;
     send_line(&sock_path, &IngestMessage::Evidence(evidence.clone())).await;
-    let claim_a = command_success_claim(&session_id, event_a_id);
+    let claim_a = command_executed_claim(&session_id, event_a_id);
     send_line(&sock_path, &IngestMessage::Claim(claim_a.clone())).await;
 
     wait_for(Duration::from_secs(10), || {
@@ -834,7 +893,7 @@ async fn cross_anchor_replay_is_downgraded_not_verified() {
     // session's full evidence history is read for every claim evaluated
     // against it).
     let event_b = command_success_event(&session_id);
-    let claim_b = command_success_claim(&session_id, event_b.id);
+    let claim_b = command_executed_claim(&session_id, event_b.id);
     send_line(&sock_path, &IngestMessage::Event(event_b)).await;
     send_line(&sock_path, &IngestMessage::Claim(claim_b.clone())).await;
 
@@ -901,7 +960,7 @@ async fn foreign_session_provider_claim_is_quarantined_not_verified() {
     // session-owner mismatch, isolating that one failure mode.
     let event = command_success_event(&session_id);
     let event_id = event.id;
-    let claim = command_success_claim(&session_id, event_id);
+    let claim = command_executed_claim(&session_id, event_id);
     let evidence = legitimate_evidence(&session_id, event_id);
 
     let verdict = submit_and_await_verdict(&sock_path, &store, event, evidence, claim).await;
@@ -949,7 +1008,7 @@ async fn concurrent_cross_anchor_replay_is_serialized_not_double_verified() {
     // The actual guarantee under test is narrower and stronger: once an
     // owner anchor exists, a DIFFERENT anchor's concurrent attempt must
     // never also reach Verified.
-    let claim_a = command_success_claim(&session_id, event_a_id);
+    let claim_a = command_executed_claim(&session_id, event_a_id);
     send_line(&sock_path, &IngestMessage::Claim(claim_a.clone())).await;
     wait_for(Duration::from_secs(10), || {
         let store = &store;
@@ -972,9 +1031,9 @@ async fn concurrent_cross_anchor_replay_is_serialized_not_double_verified() {
     // `main.rs`'s accept loop), so these two really do race at the
     // application layer, not just appear sequential.
     let event_b = command_success_event(&session_id);
-    let claim_b = command_success_claim(&session_id, event_b.id);
+    let claim_b = command_executed_claim(&session_id, event_b.id);
     let event_c = command_success_event(&session_id);
-    let claim_c = command_success_claim(&session_id, event_c.id);
+    let claim_c = command_executed_claim(&session_id, event_c.id);
 
     let (send_b, send_c) = tokio::join!(
         async {
@@ -1050,7 +1109,7 @@ async fn identical_claim_retry_over_uds_stays_verified_not_downgraded() {
     let event = command_success_event(&session_id);
     let event_id = event.id;
     let evidence = legitimate_evidence(&session_id, event_id);
-    let claim = command_success_claim(&session_id, event_id);
+    let claim = command_executed_claim(&session_id, event_id);
 
     send_line(&sock_path, &capability_announcement(&session_id)).await;
     send_line(&sock_path, &IngestMessage::Event(event)).await;
@@ -1124,7 +1183,7 @@ fn negative_fixtures_would_have_verified_without_the_guard() {
         }],
         notes: Default::default(),
     };
-    let verifier = CommandSuccessVerifier;
+    let verifier = CommandExecutedVerifier;
 
     for (name, evidence) in [
         (
@@ -1137,7 +1196,7 @@ fn negative_fixtures_would_have_verified_without_the_guard() {
         ),
         ("no_source", evidence_with_no_source(session_id, event_id)),
     ] {
-        let claim = command_success_claim(session_id, event_id);
+        let claim = command_executed_claim(session_id, event_id);
         let finding = verifier.verify(&claim, std::slice::from_ref(&evidence), &caps);
         assert_eq!(
             finding.verdict,
@@ -1355,4 +1414,44 @@ fn adapter_registry_has_zero_references_in_the_verdict_computing_daemon() {
          now needs to change, it needs its own explicit trust-semantics design, not \
          an incidental import."
     );
+}
+
+/// FORNX-480 (founder, Option B): `command_succeeded` is capped at Review
+/// unless a collector authorised to attest a run vouches for the exit code. A
+/// correctly admitted, registered `AgentAdjacent` exit-code row is the agent's
+/// own account, so the claim resolves to Review; a recorded failure stays
+/// Contradicted. `command_executed` (legitimate_evidence_still_reaches_verified)
+/// keeps its meaning.
+#[tokio::test]
+async fn agent_adjacent_command_succeeded_is_review_and_a_failure_stays_contradicted() {
+    for (label, exit_code, expected) in [("exit0", 0, "review"), ("exit1", 1, "contradicted")] {
+        let daemon = start_daemon().await;
+        let store = Store::open(daemon.home.join("fornax.db"))
+            .await
+            .expect("open store db");
+        let session_id = format!("fornx480-{label}-{}", short_id());
+        let event = command_success_event(&session_id);
+        let event_id = event.id;
+        let mut claim = command_executed_claim(&session_id, event_id);
+        claim.subject = "command_succeeded".to_string();
+        claim.text = "the command `cargo build` succeeded".to_string();
+        let mut evidence = legitimate_evidence(&session_id, event_id);
+        evidence.payload = serde_json::json!({"command": "cargo build", "exit_code": exit_code});
+
+        let verdict = submit_and_await_verdict(
+            &daemon.home.join("fornax.sock"),
+            &store,
+            event,
+            evidence,
+            claim,
+        )
+        .await;
+
+        assert_eq!(
+            verdict,
+            Some(expected.to_string()),
+            "{label}: daemon log:\n{}",
+            daemon.log_contents()
+        );
+    }
 }

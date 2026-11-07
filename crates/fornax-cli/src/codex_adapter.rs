@@ -7,27 +7,104 @@ use crate::adapter_registry::AdapterActionResult;
 use crate::guarded_write::{digest_of_bytes, write_guarded, ContentDigest};
 
 /// Filename marker identifying a Fornax-owned `notify` entry in
-/// `~/.codex/config.toml`. Matched by suffix (rather than requiring a
+/// `<codex home>/config.toml`. Matched by suffix (rather than requiring a
 /// byte-for-byte absolute-path match) so uninstall still recognizes an
 /// install made from a different checkout of this repo.
 const CODEX_NOTIFY_SCRIPT_MARKER: &str = "fornax-codex-notify.sh";
 
-pub fn default_path() -> std::path::PathBuf {
-    crate::dirs_home().join(".codex").join("config.toml")
+/// The active Codex root (FORNX-474). An explicit non-empty `CODEX_HOME` wins;
+/// unset or empty keeps `$HOME/.codex`, the same rule Codex itself and
+/// `fornax-adapter-codex` use. Config, hooks, the capture marker's sessions
+/// directory and `doctor` all derive from this one root, so they cannot
+/// disagree about which tree Fornax is wired into.
+pub fn codex_home() -> std::path::PathBuf {
+    codex_home_from(std::env::var_os("CODEX_HOME"), &crate::dirs_home())
 }
 
-/// Absolute path to `scripts/fornax-codex-notify.sh`, resolved relative to
-/// this crate's location in the workspace at compile time — matches the
-/// documented from-source workflow (`cargo build --workspace` from the
-/// repo root; see `docs/dogfooding-codex-notify.md`).
+fn codex_home_from(
+    explicit: Option<std::ffi::OsString>,
+    home: &std::path::Path,
+) -> std::path::PathBuf {
+    match explicit {
+        Some(v) if !v.is_empty() => std::path::PathBuf::from(v),
+        _ => home.join(".codex"),
+    }
+}
+
+/// Refuses a relative `CODEX_HOME` before any write: the capture marker bakes
+/// an absolute sessions directory (the daemon ignores a relative one), and a
+/// relative root would mean a different tree depending on the working
+/// directory. Called by plan, install and uninstall.
+pub fn ensure_codex_home_usable() -> anyhow::Result<()> {
+    check_codex_home(std::env::var_os("CODEX_HOME").as_deref())
+}
+
+fn check_codex_home(explicit: Option<&std::ffi::OsStr>) -> anyhow::Result<()> {
+    match explicit {
+        Some(v) if !v.is_empty() && v.to_str().is_none() => anyhow::bail!(
+            "CODEX_HOME is not valid UTF-8; refusing before changing anything. \
+             Use an absolute UTF-8 directory, or unset it to use ~/.codex"
+        ),
+        Some(v) if !v.is_empty() && !std::path::Path::new(v).is_absolute() => anyhow::bail!(
+            "CODEX_HOME={} is not an absolute path; refusing before changing anything. \
+             Set it to an absolute directory, or unset it to use ~/.codex",
+            std::path::Path::new(v).display()
+        ),
+        _ => Ok(()),
+    }
+}
+
+pub fn default_path() -> std::path::PathBuf {
+    codex_home().join("config.toml")
+}
+
+const NOTIFY_SCRIPT_TEMPLATE: &str = include_str!("../../../scripts/fornax-codex-notify.sh");
+const NOTIFY_BIN_PLACEHOLDER: &str = "__FORNAX_BIN__";
+
+/// Where `install` puts the notify script: under the Fornax home, so the path
+/// written into `<codex home>/config.toml` does not depend on where this binary
+/// was built or checked out (FORNX-469).
 pub fn default_notify_script() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../scripts/fornax-codex-notify.sh")
+    crate::fornax_home()
+        .join("bin")
+        .join(CODEX_NOTIFY_SCRIPT_MARKER)
+}
+
+/// Writes the embedded notify script to `script_path` (0755, atomic) with the
+/// absolute path of this `fornax` binary baked in. Refuses a binary path that
+/// could break out of the shell string it is placed in.
+pub fn write_notify_script(
+    script_path: &std::path::Path,
+    fornax_bin: &std::path::Path,
+) -> anyhow::Result<()> {
+    let bin = fornax_bin.to_string_lossy();
+    anyhow::ensure!(
+        fornax_bin.is_absolute() && !bin.contains(['"', '$', '`', '\\', '\n']),
+        "cannot bake {} into the notify script (not absolute, or contains shell metacharacters)",
+        fornax_bin.display()
+    );
+    let body = NOTIFY_SCRIPT_TEMPLATE.replacen(NOTIFY_BIN_PLACEHOLDER, &bin, 1);
+    if std::fs::read_to_string(script_path).ok().as_deref() == Some(body.as_str()) {
+        return Ok(());
+    }
+    let dir = script_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("notify script path has no parent"))?;
+    std::fs::create_dir_all(dir)?;
+    let tmp = dir.join(format!(".{CODEX_NOTIFY_SCRIPT_MARKER}.tmp"));
+    std::fs::write(&tmp, body)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+    }
+    std::fs::rename(&tmp, script_path)?;
+    Ok(())
 }
 
 /// Parses `path` as a format-preserving TOML document (comments and table
 /// ordering survive edits), or an empty document if `path` does not exist.
-/// Unlike the Claude adapter's JSON equivalent, a `~/.codex/config.toml`
+/// Unlike the Claude adapter's JSON equivalent, a `<codex home>/config.toml`
 /// that fails to parse as TOML is always a hard error — there is no
 /// sensible "treat it as empty" fallback for a file this consequential.
 #[cfg(test)]
@@ -94,6 +171,41 @@ fn notify_is_fornax(item: &toml_edit::Item) -> bool {
         .unwrap_or(false)
 }
 
+/// What `config.toml` actually wires as Codex's `notify`, read-only. Parsed as
+/// TOML, so a mention of the script in a comment or another key is not wiring.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum NotifyState {
+    /// No `notify` entry (or no config file).
+    Absent,
+    /// The first element is a Fornax-owned script at this path.
+    Fornax(std::path::PathBuf),
+    /// `notify` is set to something else; Fornax will not overwrite it.
+    Foreign(String),
+    /// The config cannot be parsed, or `notify` is not an array.
+    Unreadable(String),
+}
+
+pub(crate) fn notify_state_at(config_path: &std::path::Path) -> NotifyState {
+    let doc = match load_codex_config_with_digest(config_path) {
+        Ok((doc, _)) => doc,
+        Err(e) => return NotifyState::Unreadable(e.to_string()),
+    };
+    let Some(item) = doc.get("notify") else {
+        return NotifyState::Absent;
+    };
+    let Some(first) = item
+        .as_array()
+        .map(|a| a.get(0).and_then(|v| v.as_str()).unwrap_or(""))
+    else {
+        return NotifyState::Unreadable("\"notify\" is not an array".into());
+    };
+    if notify_is_fornax(item) {
+        NotifyState::Fornax(std::path::PathBuf::from(first))
+    } else {
+        NotifyState::Foreign(first.to_string())
+    }
+}
+
 enum InstallPlan {
     AlreadyInstalled,
     WouldInstall(Box<toml_edit::DocumentMut>, ContentDigest),
@@ -129,6 +241,14 @@ fn compute_install_plan(
             .and_then(|v| v.as_str());
         if existing_first == Some(script_str.as_str()) {
             return Ok(InstallPlan::AlreadyInstalled);
+        }
+        if notify_is_fornax(existing) {
+            // A Fornax-owned entry left by an older install (a checkout that
+            // moved or was deleted) is ours to repoint, not a foreign command.
+            let mut arr = toml_edit::Array::new();
+            arr.push(script_str);
+            doc["notify"] = toml_edit::Item::Value(toml_edit::Value::Array(arr));
+            return Ok(InstallPlan::WouldInstall(Box::new(doc), digest));
         }
         anyhow::bail!(
             "existing \"notify\" in {} is already wired to {:?} — refusing to overwrite it \
@@ -307,7 +427,7 @@ pub fn plan_install_all(
         Err(e) => (false, format!("notify: refused — {e}")),
     };
     let changed = notify_changed || hooks_changed;
-    let message = format!("{notify_message} | {hooks_message}");
+    let message = format!("{notify_message}\n{hooks_message}");
     Ok(mk(config_path, changed, message))
 }
 
@@ -334,7 +454,7 @@ pub fn install_all(
     };
 
     let changed = hooks_changed || notify_changed;
-    let message = format!("{notify_message} | {hooks_message}");
+    let message = format!("{notify_message}\n{hooks_message}");
     Ok(mk(config_path, changed, message))
 }
 
@@ -347,7 +467,7 @@ pub fn uninstall_all(
     let hooks_result = crate::codex_hooks::uninstall_at(hooks_path)?;
     let notify_result = uninstall_at(config_path)?;
     let changed = hooks_result.changed || notify_result.changed;
-    let message = format!("{} | {}", notify_result.message, hooks_result.message);
+    let message = format!("{}\n{}", notify_result.message, hooks_result.message);
     Ok(mk(config_path, changed, message))
 }
 
@@ -360,6 +480,60 @@ mod tests {
             "fornax-cli-test-codex-{name}-{}.toml",
             uuid::Uuid::new_v4()
         ))
+    }
+
+    #[test]
+    fn written_script_bakes_the_binary_path_and_is_executable() {
+        let dir = std::env::temp_dir().join(format!("fnx-notify-{}", std::process::id()));
+        let script = dir.join("bin").join(CODEX_NOTIFY_SCRIPT_MARKER);
+        write_notify_script(&script, std::path::Path::new("/opt/fornax/bin/fornax")).unwrap();
+        let body = std::fs::read_to_string(&script).unwrap();
+        assert!(body.contains("${FORNAX_BIN:-/opt/fornax/bin/fornax}"));
+        assert!(!body.contains("${FORNAX_BIN:-__FORNAX_BIN__}"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&script).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn script_refuses_a_binary_path_that_could_inject_shell() {
+        let dir = std::env::temp_dir().join(format!("fnx-notify-bad-{}", std::process::id()));
+        let script = dir.join(CODEX_NOTIFY_SCRIPT_MARKER);
+        for bad in ["/tmp/a\"b", "/tmp/$(x)", "/tmp/`x`", "relative/fornax"] {
+            assert!(write_notify_script(&script, std::path::Path::new(bad)).is_err());
+        }
+        assert!(!script.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reinstall_repoints_a_stale_fornax_notify_path() {
+        let path = tmp_config_path("stale-notify");
+        std::fs::write(
+            &path,
+            "notify = [\"/gone/checkout/scripts/fornax-codex-notify.sh\"]\n",
+        )
+        .unwrap();
+        let result = install_at(&path, &fake_script()).expect("install");
+        assert!(result.changed);
+        let doc = load_codex_config(&path).unwrap();
+        assert_eq!(
+            doc["notify"][0].as_str(),
+            Some(fake_script().to_str().unwrap())
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn foreign_notify_is_still_refused() {
+        let path = tmp_config_path("foreign-notify");
+        std::fs::write(&path, "notify = [\"/usr/bin/other-tool\"]\n").unwrap();
+        assert!(install_at(&path, &fake_script()).is_err());
+        std::fs::remove_file(&path).ok();
     }
 
     fn fake_script() -> std::path::PathBuf {
@@ -568,5 +742,40 @@ mod tests {
         let contents = std::fs::read_to_string(&path).unwrap();
         assert_eq!(contents, "notify = [\"/usr/bin/my-other-tool\"]\n");
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn explicit_codex_home_wins_and_unset_or_empty_keeps_the_home_default() {
+        use std::ffi::OsString;
+        let home = std::path::Path::new("/h");
+        assert_eq!(
+            codex_home_from(Some(OsString::from("/custom")), home),
+            std::path::PathBuf::from("/custom")
+        );
+        for unset in [None, Some(OsString::new())] {
+            assert_eq!(
+                codex_home_from(unset, home),
+                std::path::PathBuf::from("/h/.codex")
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_relative_codex_home_is_refused() {
+        use std::ffi::OsStr;
+        assert!(check_codex_home(None).is_ok());
+        assert!(check_codex_home(Some(OsStr::new(""))).is_ok());
+        assert!(check_codex_home(Some(OsStr::new("/abs/codex"))).is_ok());
+        let err = check_codex_home(Some(OsStr::new("rel/codex"))).unwrap_err();
+        assert!(err.to_string().contains("CODEX_HOME"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_codex_home_is_refused() {
+        use std::os::unix::ffi::OsStrExt;
+        let bad = std::ffi::OsStr::from_bytes(b"/tmp/x-\xff");
+        let err = check_codex_home(Some(bad)).unwrap_err();
+        assert!(err.to_string().contains("UTF-8"), "{err}");
     }
 }

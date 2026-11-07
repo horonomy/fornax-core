@@ -37,8 +37,10 @@ use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
 use tokio::time::timeout;
 
 mod audit_checkpoint_submit;
+mod codex_watch;
 mod policy_poll;
 mod retention_sweep;
+mod upload_schedule;
 
 fn fornax_home() -> PathBuf {
     std::env::var("FORNAX_HOME")
@@ -463,6 +465,14 @@ async fn main() -> anyhow::Result<()> {
     // for why it deliberately does not hold `AppState::processing`.
     let retention_sweep_task = retention_sweep::spawn(state.clone(), db_path.clone());
 
+    // FORNX-464: automatic monthly metadata upload. Inert (a no-op tick)
+    // unless a live personal-profile consent exists; see `upload_schedule`.
+    let upload_schedule_task = upload_schedule::spawn(state.clone(), home.clone());
+
+    // FORNX-468: opt-in Codex rollout capture. Inert unless
+    // `$FORNAX_HOME/codex-watch.json` exists; see `codex_watch`.
+    let codex_watch_task = codex_watch::spawn(state.clone(), home.clone());
+
     let app = Router::new()
         .route("/api/status", get(api_status))
         .route("/api/findings/recent", get(api_findings_recent))
@@ -503,6 +513,8 @@ async fn main() -> anyhow::Result<()> {
     poll_task.abort();
     checkpoint_task.abort();
     retention_sweep_task.abort();
+    upload_schedule_task.abort();
+    codex_watch_task.abort();
     let _ = std::fs::remove_file(&sock_path);
     let _ = std::fs::remove_file(&pid_path);
     tracing::info!("fornaxd stopped");
@@ -1478,18 +1490,54 @@ struct StatusQuery {
     session: Option<String>,
 }
 
+/// A finding row as JSON, plus whether its session is a native identity or a
+/// legacy placeholder (FORNX-465) -- never rewritten in storage.
+fn finding_json(row: &fornax_store::FindingRow) -> serde_json::Value {
+    let mut v = serde_json::to_value(row).unwrap_or(serde_json::Value::Null);
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            "attribution".into(),
+            fornax_store::session_attribution(&row.session_id).into(),
+        );
+    }
+    v
+}
+
 async fn api_status(
     State(state): State<AppState>,
     Query(q): Query<StatusQuery>,
 ) -> Json<serde_json::Value> {
-    match q.session {
+    match q.session.filter(|s| !s.trim().is_empty()) {
+        // A legacy placeholder ("unknown", a rollout path) is not a session
+        // identity: never answer it as a session reading (FORNX-465).
+        Some(session_id)
+            if fornax_store::session_attribution(&session_id)
+                == fornax_store::ATTRIBUTION_LEGACY_UNATTRIBUTED =>
+        {
+            Json(serde_json::json!({
+                "latest": null,
+                "session_scoped": false,
+                "scope": "host",
+                "unattributed_session": true,
+            }))
+        }
         Some(session_id) => match state.store.latest_finding_for_session(&session_id).await {
-            Ok(row) => Json(serde_json::json!({ "latest": row, "session_scoped": true })),
+            Ok(row) => Json(serde_json::json!({
+                "latest": row.as_ref().map(finding_json),
+                "session_scoped": true,
+                "scope": "session",
+            })),
             Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
         },
+        // No session asked for: the newest finding across every session on
+        // this machine. `scope: "host"` says so, so no consumer presents it
+        // as the current session's finding (FORNX-465).
         None => match state.store.recent_findings(1).await {
-            Ok(rows) if !rows.is_empty() => Json(serde_json::json!({ "latest": rows[0] })),
-            Ok(_) => Json(serde_json::json!({ "latest": null })),
+            Ok(rows) if !rows.is_empty() => Json(serde_json::json!({
+                "latest": finding_json(&rows[0]),
+                "scope": "host",
+            })),
+            Ok(_) => Json(serde_json::json!({ "latest": null, "scope": "host" })),
             Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
         },
     }
@@ -1497,7 +1545,24 @@ async fn api_status(
 
 async fn api_findings_recent(State(state): State<AppState>) -> Json<serde_json::Value> {
     match state.store.recent_findings(50).await {
-        Ok(rows) => Json(serde_json::json!({ "findings": rows })),
+        Ok(rows) => {
+            // Only needed to explain an empty list; a failed count must not
+            // hide findings that exist.
+            let observed = if rows.is_empty() {
+                state.store.observed_counts().await.ok()
+            } else {
+                None
+            };
+            Json(serde_json::json!({
+                "findings": rows.iter().map(finding_json).collect::<Vec<_>>(),
+                "scope": "host",
+                "observed": observed.map(|(events, sessions, claims)| serde_json::json!({
+                    "events": events,
+                    "sessions": sessions,
+                    "claims": claims,
+                })),
+            }))
+        }
         Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
     }
 }
@@ -2436,8 +2501,26 @@ async fn api_judge(
             let config = SemanticJudgeConfig::load_default();
             let objective = objective_supported_for_disagreement_check(fused.verdict);
 
+            // FORNX-464: a non-loopback endpoint needs the persisted egress
+            // decision (corporate: a recorded authorization with a reference);
+            // loopback needs none. Raw evidence is never sent off-loopback.
+            let judge_classes: std::collections::BTreeSet<_> = [
+                fornax_types::EgressContentClass::ClaimText,
+                fornax_types::EgressContentClass::RedactedEvidencePayload,
+            ]
+            .into();
+            let egress = state
+                .store
+                .decide_egress(
+                    fornax_types::egress::Purpose::SemanticJudge,
+                    &config.endpoint,
+                    &judge_classes,
+                    false,
+                )
+                .await;
+
             let judge_result = tokio::task::spawn_blocking(move || {
-                let provider = LocalSelfHostedJudgeProvider::new(config);
+                let provider = LocalSelfHostedJudgeProvider::new(config).with_egress(egress);
                 provider.judge(&input)
             })
             .await;
@@ -2506,7 +2589,7 @@ async fn api_judge(
 /// `fornax_verify::voi::AcquisitionPolicy` gate both `/api/evidence-plan`
 /// (FORNX-345) and `/api/acquire-evidence` (FORNX-346) use -- never a
 /// fabricated `AUTO_SAFE`/`REQUIRE_APPROVAL`/`FORBIDDEN` model.
-fn build_acquisition_policy(state: &AppState) -> fornax_verify::voi::AcquisitionPolicy {
+async fn build_acquisition_policy(state: &AppState) -> fornax_verify::voi::AcquisitionPolicy {
     use fornax_types::experiment::{SideEffectAllowList, SideEffectClass};
     let granted_side_effects = SideEffectAllowList::new(
         [
@@ -2518,9 +2601,16 @@ fn build_acquisition_policy(state: &AppState) -> fornax_verify::voi::Acquisition
         .into_iter()
         .filter(|class| state.experiment_policy.permits(*class)),
     );
+    // FORNX-464: an acquisition that must send data out is only plannable
+    // under the personal profile AND the legacy kill switch. Unconfigured,
+    // corporate, or an unreadable egress policy all mean "no egress".
+    let personal = matches!(
+        state.store.egress_state().await,
+        Ok(s) if s.profile == fornax_types::egress::Profile::Personal
+    );
     fornax_verify::voi::AcquisitionPolicy {
         granted_side_effects,
-        egress_allowed: fornax_types::privacy::cloud_sync_allowed(),
+        egress_allowed: personal && fornax_types::privacy::cloud_sync_allowed(),
         disabled_sensors: (*state.sensor_disable).clone(),
     }
 }
@@ -2591,7 +2681,7 @@ async fn api_evidence_plan(
         })),
         FusionOutcome::Found(found) => {
             let recommendation = DefaultRiskPolicy.decide(&found.fused, risk);
-            let acquisition = build_acquisition_policy(&state);
+            let acquisition = build_acquisition_policy(&state).await;
             let input = PlanInput {
                 claim: &found.claim,
                 graph: &found.graph,
@@ -2692,7 +2782,7 @@ async fn api_acquire_evidence(
     };
     let fused_before = found.fused.clone();
 
-    let acquisition = build_acquisition_policy(&state);
+    let acquisition = build_acquisition_policy(&state).await;
     let plan_input = PlanInput {
         claim: &found.claim,
         graph: &found.graph,
@@ -3303,7 +3393,8 @@ async fn dashboard(State(state): State<AppState>) -> axum::response::Html<String
          <style>body{font-family:monospace;margin:2rem;background:#0b0e14;color:#d6dee8}\
          table{border-collapse:collapse;width:100%}td,th{padding:.4rem .6rem;border-bottom:1px solid #2a3140;text-align:left}\
          .verified{color:#4caf50}.contradicted{color:#e5534b}.unverified{color:#c9a227}.review{color:#4a9dd6}.unavailable{color:#7d8798}\
-         </style></head><body><h2>🛡 Fornax — recent findings</h2><table>\
+         </style></head><body><h2>🛡 Fornax — recent findings</h2>\
+         <p>Host-wide: the newest findings across every session on this machine.</p><table>\
          <tr><th>Verdict</th><th>Claim</th><th>Verifier</th><th>Rationale</th><th>When</th></tr>",
     );
     for r in rows {
@@ -3332,7 +3423,37 @@ mod tests {
     use fornax_types::{AgentEvent, Claim, EventKind, Provider};
     use uuid::Uuid;
 
-    async fn test_state() -> AppState {
+    /// A loopback "server" that only counts the connections it accepts.
+    pub(crate) async fn counting_listener() -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 500 x\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+        (addr, accepted)
+    }
+
+    pub(crate) async fn test_state() -> AppState {
         let db_path = std::env::temp_dir().join(format!("fornax-test-{}.db", Uuid::new_v4()));
         let store = fornax_store::Store::open(&db_path)
             .await
@@ -3957,6 +4078,40 @@ mod tests {
     /// leak the CLI's `scope: "session"` claim depends on this endpoint
     /// never committing.
     #[tokio::test]
+    async fn api_findings_recent_explains_an_empty_list_with_observed_counts() {
+        let state = test_state().await;
+        let observed = |v: &Json<serde_json::Value>| v.0["observed"].clone();
+
+        let empty = api_findings_recent(State(state.clone())).await;
+        assert_eq!(
+            observed(&empty),
+            serde_json::json!({"events": 0, "sessions": 0, "claims": 0})
+        );
+
+        state
+            .store
+            .insert_event(&AgentEvent {
+                id: Uuid::new_v4(),
+                session_id: "s1".to_string(),
+                provider: Provider::Codex,
+                kind: EventKind::PostToolUse,
+                observed_at: "2026-10-24T00:00:00Z".to_string(),
+                tool_name: Some("exec_command".to_string()),
+                tool_input: None,
+                tool_response: None,
+                raw: serde_json::json!({}),
+            })
+            .await
+            .expect("insert event");
+        let after_event = api_findings_recent(State(state)).await;
+        assert_eq!(
+            observed(&after_event),
+            serde_json::json!({"events": 1, "sessions": 1, "claims": 0})
+        );
+        assert_eq!(after_event.0["findings"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
     async fn api_status_with_session_confirms_scoping_and_isolates_sessions() {
         let state = test_state().await;
 
@@ -4062,6 +4217,11 @@ mod tests {
             cross_session.0.get("session_scoped").is_none(),
             "no `session` query param -> no session_scoped confirmation at all"
         );
+        // FORNX-465: the unscoped answer must declare itself host-wide so no
+        // consumer can present it as the current session's finding.
+        assert_eq!(cross_session.0["scope"], "host");
+        assert_eq!(scoped.0["scope"], "session");
+        assert_eq!(scoped.0["latest"]["attribution"], "native");
         assert_eq!(
             cross_session.0["latest"]["verdict"].as_str(),
             Some("verified"),
@@ -4069,7 +4229,7 @@ mod tests {
         );
 
         let unknown_session = api_status(
-            State(state),
+            State(state.clone()),
             Query(StatusQuery {
                 session: Some("sess-never-seen".to_string()),
             }),
@@ -4080,6 +4240,51 @@ mod tests {
             unknown_session.0["latest"].is_null(),
             "a known-good session query for a session with no findings must not fall back to any other session's finding"
         );
+
+        // FORNX-465: a legacy placeholder is never answered as a session reading,
+        // even when rows are filed under it.
+        record_finding(
+            &state,
+            "unknown",
+            fornax_types::Verdict::Contradicted,
+            "2026-01-01T00:00:09Z",
+        )
+        .await;
+        let legacy = api_status(
+            State(state.clone()),
+            Query(StatusQuery {
+                session: Some("unknown".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(legacy.0["session_scoped"], false);
+        assert_eq!(legacy.0["scope"], "host");
+        assert!(legacy.0["latest"].is_null());
+    }
+
+    /// FORNX-465 follow-up: a blank or whitespace-only `session` is absent,
+    /// so it gets the host-scope answer, never an empty session reading.
+    #[tokio::test]
+    async fn api_status_treats_blank_session_as_absent() {
+        let state = test_state().await;
+        for blank in ["", " ", "   ", "\t"] {
+            let resp = api_status(
+                State(state.clone()),
+                Query(StatusQuery {
+                    session: Some(blank.to_string()),
+                }),
+            )
+            .await;
+            assert_eq!(resp.0["scope"], "host", "session={blank:?}");
+            assert_ne!(
+                resp.0["session_scoped"], true,
+                "session={blank:?} must not be answered as a session reading"
+            );
+            assert!(
+                resp.0.get("unattributed_session").is_none(),
+                "session={blank:?} is absent, not a legacy placeholder"
+            );
+        }
     }
 
     /// FORNX-85: `/api/capabilities?session=<id>` must surface the exact
@@ -7500,7 +7705,8 @@ mod tests {
         let entries = [
             serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
                 "id":"item_fornx446_command","type":"CommandExecution","status":"completed",
-                "exit_code":0,"command":["pytest"],"source":"agent"
+                "exit_code":0,"command":["pytest"],"source":"agent",
+                "aggregated_output":"3 passed in 0.03s\n"
             }}}),
             serde_json::json!({"type":"event_msg","ordinal":20,"timestamp":"2026-10-15T12:00:00Z",
                 "payload":{"type":"task_complete","turn_id":turn_id,"last_agent_message":last_agent_message,
@@ -7589,7 +7795,8 @@ mod tests {
             (2, 1, 1)
         );
         assert_eq!(first.findings.len(), 1);
-        assert_eq!(first.findings[0].verdict, "verified");
+        // FORNX-477: a transcript-derived pass is capped at review.
+        assert_eq!(first.findings[0].verdict, "review");
 
         process_codex_completion(
             &state,
@@ -7646,7 +7853,8 @@ mod tests {
             (2, 1, 1)
         );
         assert_eq!(first.findings.len(), 1);
-        assert_eq!(first.findings[0].verdict, "verified");
+        // FORNX-477: a transcript-derived pass is capped at review.
+        assert_eq!(first.findings[0].verdict, "review");
 
         process_codex_completion(
             &state,
@@ -7694,11 +7902,13 @@ mod tests {
             .iter()
             .find(|row| row.claim_id == later_claim.0.to_string())
             .unwrap();
+        // FORNX-477: an unattested pass is capped at review, so it is never
+        // Verified and never recorded as consumed; the cross-turn replay guard
+        // acts on Verified findings and is exercised by provenance_enforcement.rs.
         assert_eq!(later_finding.verdict, "review");
-        assert!(later_finding.rationale.contains("already consumed"));
         assert!(later_finding
             .rationale
-            .contains(&first.claims[0].0.to_string()));
+            .contains("not independently attested"));
         assert_eq!(later.quarantine, 1);
         drop(state);
         remove_codex_test_store(&path);
@@ -7794,7 +8004,8 @@ mod tests {
             ),
             (2, 1, 1, 1)
         );
-        assert_eq!(first.findings[0].verdict, "verified");
+        // FORNX-477: a transcript-derived pass is capped at review.
+        assert_eq!(first.findings[0].verdict, "review");
         assert_eq!(first.quarantine, 1);
         process_codex_completion(
             &reopened,
@@ -7830,7 +8041,8 @@ mod tests {
         let before = codex_completion_snapshot(&state, session).await;
         assert_eq!(before.claims.len(), 1);
         assert_eq!(before.findings.len(), 1);
-        assert_eq!(before.findings[0].verdict, "verified");
+        // FORNX-477: a transcript-derived pass is capped at review.
+        assert_eq!(before.findings[0].verdict, "review");
         assert!(!before.claims[0].2.contains(&canary));
         assert!(before.claims[0].2.starts_with("All tests passed."));
         let event = state

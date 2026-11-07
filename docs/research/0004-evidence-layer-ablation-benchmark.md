@@ -114,7 +114,7 @@ precision=undefined (0/0) recall=0% evidence_coverage=0% benign_review_burden=10
 
 === Configuration: B=C=D (ExitCode evidence, full verifier pipeline) ===
 verdicts: verified=7 unverified=12 contradicted=4 unavailable=1 review=0
-precision=100% recall=22% evidence_coverage=79% benign_review_burden=0% (n=24, benign_n=6)
+precision=100% recall=22% evidence_coverage=79% benign_review_burden=67% (n=24, benign_n=6)
 
 === Configuration: capability-blind (evidence present, runtime opaque) ===
 verdicts: verified=0 unverified=0 contradicted=0 unavailable=24 review=0
@@ -149,7 +149,7 @@ behavior that no longer exists.
 | Recall | 0% (see note) | 22% | **+22pp** |
 | Precision | undefined (0/0) | 100% | now defined |
 | Evidence coverage | 0% | 79% (19/24) | +79pp |
-| Benign review burden | 100% (every case is `Unverified`, so every benign case burdens review) | 0% (0/6) | **−100pp** |
+| Benign review burden | 100% (every case is `Unverified`, so every benign case burdens review) | 67% (4/6) | **−33pp** |
 
 Note on config A's recall: with zero detections and 18 ground-truth-positive
 cases (5 false-completion + 5 unsupported + 5 hallucinated + 3 of 4
@@ -159,10 +159,10 @@ omitted), recall = 0/18 = 0%, not undefined — recall's denominator
 
 **Going from claim-only to claim+ExitCode evidence is the entire
 measurable effect in this codebase today.** It moves 4 genuine detections
-from impossible to real, and it cuts benign review burden by 100 percentage
+from impossible to real, and it cuts benign review burden by 33 percentage
 points (from "every healthy session looks the same as every unhealthy one,
-because nothing is ever verified" to "no healthy session requires a human
-look"). That is a real, substantial, honestly-measured
+because nothing is ever verified" to "two thirds of the healthy sessions still
+require a human look", see the FORNX-477 updates below). That is a real, substantial, honestly-measured
 effect — attributable entirely to the first evidence layer.
 
 ### Two real detectability gaps this benchmark surfaced (not fixture bugs)
@@ -250,7 +250,28 @@ about the current verifiers, not artifacts of fixture phrasing:
   review-burden figure in config B. **Fixed same-day as FORNX-295**
   (`is_test_runner_evidence` now reuses the shared `command_text()`
   space-joined normalization instead of a raw `Value::to_string()`); benign
-  review burden in config B is now 0%.
+  review burden in config B was 0%.
+
+  **FORNX-477 update:** a pass is now `Verified` only with the runner's own
+  passing-test summary, which is read for pytest and `cargo test` only. The two
+  benign `cargo nextest run` / `jest` passes stay recognised runners but can no
+  longer be `Verified`, so config B's benign review burden is now 33% (2/6).
+  This is the deliberate cost of not trusting runner name plus exit 0.
+
+  **FORNX-477 update 2 (2026-10-29, founder Option A):** a `test_result`
+  derived from the agent's own transcript (trust class `AgentAdjacent`) can no
+  longer be `Verified` at all; the most it can be is `Review`. `Verified`
+  needs a test-run attestor collector with trust class `HostObserved` or
+  `IndependentExternal`, and none ships in v0.0.9. The benign pytest pass is
+  therefore `Review` too, so config B's benign review burden is now 50% (3/6).
+  The raw result block above was not regenerated for this update: only the
+  `benign_review_burden` figure was changed; its `verified`/`review` verdict
+  counts predate this change and should be re-run before being quoted.
+
+  **FORNX-480 update (2026-10-29, founder Option B):** a `command_succeeded`
+  claim on agent-adjacent exit-code evidence is capped at `Review` as well, so
+  config B's benign review burden is now 67% (4/6). Same caveat: only the
+  `benign_review_burden` figure was changed.
 
 ## Capability-blind axis
 
@@ -270,7 +291,7 @@ owner's decision per the ticket's "final business interpretation remains
 owner decision," not as a declared conclusion.
 
 - Not **PIVOT**: the one evidence layer that exists produces a real,
-  substantial, honestly-measured effect (0 → 4 detections, 100% → 0% drop
+  substantial, honestly-measured effect (0 → 4 detections, 100% → 67% drop
   in benign review burden). The underlying thesis — that evidence improves
   verification over claim-only — is not falsified by anything measured
   here. It has one real, positive data point behind it.

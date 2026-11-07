@@ -111,6 +111,21 @@ pub enum AuditTarget {
     GoldLabel {
         target_id: String,
     },
+    /// FORNX-464: the egress profile, a consent, or an allowlist entry
+    /// (`target_id` names which, never its content).
+    EgressPolicy {
+        target_id: String,
+    },
+    /// FORNX-467: an `agent_events` row purged or deleted by the retention
+    /// sweep (`target_id` is the row id, never its content).
+    AgentEvent {
+        target_id: String,
+    },
+    /// FORNX-467: a `claims` row purged or deleted by the retention sweep
+    /// (`target_id` is the row id, never its content).
+    Claim {
+        target_id: String,
+    },
     #[serde(other)]
     Unrecognized,
 }
@@ -131,6 +146,11 @@ pub enum AuditAction {
     /// its retention window elapsed. See
     /// `docs/adr/0011-audit-event-model.md` §2's table.
     EvidencePurged,
+    /// FORNX-467: the retention sweep hard-deleted an `agent_events`/`claims`
+    /// row, or purged its raw content in place because a surviving row still
+    /// references it. The event's `attributes.disposition` is `"deleted"` or
+    /// `"purged_in_place"`; no record content is ever embedded.
+    RecordPurged,
     /// FORNX-322: `fornax audit report` generated a local compliance report.
     /// Recording this as its own auditable action means generating a report
     /// is itself evidenced in the very ledger the report reads from.
@@ -140,6 +160,25 @@ pub enum AuditAction {
     /// dataset's provenance chain is independently verifiable, not just
     /// asserted by the `gold_labels` table's own `revision_digest`.
     GoldLabelFrozen,
+    /// FORNX-464: the egress profile (personal / corporate / unconfigured)
+    /// was set or changed.
+    EgressProfileChanged,
+    /// FORNX-464: a consent to send one purpose's data to one destination
+    /// was recorded.
+    EgressConsentGranted,
+    /// FORNX-464: a consent was revoked (explicitly, or all of them on
+    /// entering the corporate profile).
+    EgressConsentRevoked,
+    /// FORNX-464: a destination was added to or removed from the allowlist.
+    EgressAllowlistChanged,
+    /// FORNX-464: a batch of metadata records was sealed for upload.
+    UploadBatchSealed,
+    /// FORNX-464: the receiver acknowledged a sealed batch.
+    UploadBatchAcknowledged,
+    /// FORNX-464: a sealed batch was permanently rejected by the receiver.
+    UploadBatchPoisoned,
+    /// FORNX-464: records were dropped from the upload outbox at its bound.
+    UploadGapRecorded,
     /// Forward-compatibility catch-all. Preserves and round-trips the
     /// original wire string verbatim — see the module docs' "Two enum
     /// shapes" section.
@@ -497,6 +536,30 @@ mod tests {
         assert_eq!(back, target);
     }
 
+    /// FORNX-467: the new retention targets round-trip with explicit tags.
+    #[test]
+    fn audit_target_agent_event_and_claim_round_trip_with_explicit_wire_tags() {
+        for (target, tag) in [
+            (
+                AuditTarget::AgentEvent {
+                    target_id: "e-1".to_string(),
+                },
+                "agent_event",
+            ),
+            (
+                AuditTarget::Claim {
+                    target_id: "c-1".to_string(),
+                },
+                "claim",
+            ),
+        ] {
+            let json = serde_json::to_value(&target).unwrap();
+            assert_eq!(json["target_kind"], serde_json::json!(tag));
+            let back: AuditTarget = serde_json::from_value(json).unwrap();
+            assert_eq!(back, target);
+        }
+    }
+
     /// FORNX-322: `AuditTarget::ComplianceReport` round-trips with the
     /// explicit `compliance_report` wire tag.
     #[test]
@@ -532,6 +595,7 @@ mod tests {
                 AuditAction::RoleAssignmentChanged,
             ),
             ("\"evidence_purged\"", AuditAction::EvidencePurged),
+            ("\"record_purged\"", AuditAction::RecordPurged),
             (
                 "\"compliance_report_generated\"",
                 AuditAction::ComplianceReportGenerated,

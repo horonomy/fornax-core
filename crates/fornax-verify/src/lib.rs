@@ -5,7 +5,7 @@
 //! return `Unavailable`, not `Verified`.
 
 use fornax_types::{
-    Claim, Evidence, EvidenceKind, Finding, RuntimeCapabilities, SignalClass, Verdict,
+    Claim, Evidence, EvidenceKind, Finding, RuntimeCapabilities, SignalClass, TrustClass, Verdict,
 };
 use uuid::Uuid;
 
@@ -17,6 +17,7 @@ pub mod independence;
 pub mod judge;
 pub mod meta_verification;
 pub mod reliability;
+mod runner_command;
 pub mod verification_budget;
 pub mod voi;
 
@@ -85,9 +86,9 @@ impl Verifier for TestResultVerifier {
         // Find the most recent exit-code-bearing evidence for a test-runner
         // invocation in this session, most recent first (evidence is stored
         // oldest-first; scan from the end).
-        let test_evidence = evidence.iter().rev().find(|e| is_test_runner_evidence(e));
+        let test_evidence = evidence.iter().rposition(is_test_runner_evidence);
 
-        let Some(ev) = test_evidence else {
+        let Some(ev_idx) = test_evidence else {
             return Finding {
                 id: Uuid::new_v4(),
                 claim_id: claim.id,
@@ -100,7 +101,16 @@ impl Verifier for TestResultVerifier {
             };
         };
 
+        let ev = &evidence[ev_idx];
         let exit_code = ev.payload.get("exit_code").and_then(|v| v.as_i64());
+
+        // FORNX-477: only *identified* runner rows are evidence, but a newer
+        // exit-code row that merely mentions a runner (`cd repo && pytest`
+        // exiting 1, `pytest | tail`, ...) may be the real run -- failing,
+        // passing or masked. An older result must not decide over it.
+        let newer_unidentified_runner_mention = evidence[ev_idx + 1..]
+            .iter()
+            .any(mentions_unidentified_runner);
 
         match exit_code {
             // FORNX-433 follow-up: a heuristic `exit_code=0` (no real exit
@@ -119,6 +129,57 @@ impl Verifier for TestResultVerifier {
                      exit_code=0 (no stderr/failure marker seen), which does not prove the \
                      test runner actually succeeded -- flagged for review, not verified \
                      ({})",
+                    ev.provenance
+                ),
+                computed_at: now,
+            },
+            Some(0) if newer_unidentified_runner_mention => Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Unverified,
+                evidence_ids: vec![ev.id],
+                verifier_name: self.name().to_string(),
+                rationale: "an earlier test-runner run exited 0, but a more recent command that \
+                            mentions a test runner could not be identified as a test run"
+                    .to_string(),
+                computed_at: now,
+            },
+            // FORNX-477: a runner name and exit status 0 do not show any test
+            // ran (a script called `pytest` that only does `exit 0`, or
+            // `cargo test no_such_test`, also exit 0). `Verified` needs the
+            // runner's own passing summary, attributable to this command.
+            Some(0) if !execution_proven(ev) => Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Unverified,
+                evidence_ids: vec![ev.id],
+                verifier_name: self.name().to_string(),
+                rationale:
+                    "the test runner exited 0, but no passing-test summary from that runner \
+                            was observed for this command, so it is not shown that any test ran"
+                        .to_string(),
+                computed_at: now,
+            },
+            // FORNX-477 trust boundary: the runner's exit status and summary
+            // are written by whatever program the agent ran. A QA-owned
+            // script named `pytest` can print `3 passed` and exit 0 without
+            // running a test, and nothing in the transcript can tell it apart
+            // from the real runner. Evidence that only the agent's own
+            // provider account carries (`AgentAdjacent`, or no recorded
+            // source at all) therefore tops out at `Review`; `Verified` needs
+            // evidence Fornax or an outside system observed (ADR-0025
+            // options 1-3, FORNX-443).
+            Some(0) if !is_independently_attested(ev) => Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Review,
+                evidence_ids: vec![ev.id],
+                verifier_name: self.name().to_string(),
+                rationale: format!(
+                    "claim states tests passed and the agent's transcript shows a test runner \
+                     exiting 0 with a passing summary, but that output is written by the \
+                     program the agent ran and is not independently attested, so it does not \
+                     show the tests ran -- flagged for review, not verified ({})",
                     ev.provenance
                 ),
                 computed_at: now,
@@ -189,14 +250,6 @@ impl CommandExecutedVerifier {
         let t = text.to_lowercase();
         t.contains("ran ") || t.contains("i ran") || t.contains("executed") || t.contains("running")
     }
-
-    /// Extract the literal command the claim names, from backtick- or
-    /// double-quote-delimited text (e.g. "I ran `npm install`."). Returns
-    /// `None` when the claim names no literal command to check against
-    /// evidence — such a claim is `Unverified`, not fabricated a match for.
-    fn extract_command_literal(text: &str) -> Option<String> {
-        extract_delimited(text, '`').or_else(|| extract_delimited(text, '"'))
-    }
 }
 
 impl Verifier for CommandExecutedVerifier {
@@ -228,48 +281,118 @@ impl Verifier for CommandExecutedVerifier {
             );
         }
 
-        let Some(claimed) = Self::extract_command_literal(&claim.text) else {
+        let claimed = match command_literal(&claim.text) {
+            CommandLiteral::One(literal) => literal,
+            CommandLiteral::Several => {
+                return Finding {
+                    id: Uuid::new_v4(),
+                    claim_id: claim.id,
+                    verdict: Verdict::Unverified,
+                    evidence_ids: vec![],
+                    verifier_name: self.name().to_string(),
+                    rationale: "claim names more than one command; it cannot be bound to a \
+                                single command's evidence"
+                        .to_string(),
+                    computed_at: now,
+                };
+            }
+            CommandLiteral::None => {
+                return Finding {
+                    id: Uuid::new_v4(),
+                    claim_id: claim.id,
+                    verdict: Verdict::Unverified,
+                    evidence_ids: vec![],
+                    verifier_name: self.name().to_string(),
+                    rationale:
+                        "claim text does not name a literal command to check against evidence"
+                            .to_string(),
+                    computed_at: now,
+                };
+            }
+        };
+        if !runner_command::claim_command_parses(&claimed) {
             return Finding {
                 id: Uuid::new_v4(),
                 claim_id: claim.id,
                 verdict: Verdict::Unverified,
                 evidence_ids: vec![],
                 verifier_name: self.name().to_string(),
-                rationale: "claim text does not name a literal command to check against evidence"
-                    .to_string(),
+                rationale: format!(
+                    "the claimed command \"{claimed}\" cannot be parsed as a command"
+                ),
                 computed_at: now,
             };
-        };
-        let claimed_lower = claimed.to_lowercase();
+        }
 
-        let matching = evidence.iter().rev().find(|e| {
-            e.kind == EvidenceKind::ExitCode && command_text(&e.payload).contains(&claimed_lower)
-        });
+        // FORNX-477 exact binding: the claimed command must be the command the
+        // row ran, step for step. A row that merely contains its text
+        // (`echo npm install`) never supports the claim.
+        let mut prefix_row = None;
+        let mut mentioned = false;
+        for ev in evidence
+            .iter()
+            .rev()
+            .filter(|e| e.kind == EvidenceKind::ExitCode)
+        {
+            match runner_command::bind_command(
+                &claimed,
+                ev.payload.get("command"),
+                &command_text(&ev.payload),
+                exit_zero_reliable(ev),
+            ) {
+                runner_command::CommandBinding::Exact => {
+                    return Finding {
+                        id: Uuid::new_v4(),
+                        claim_id: claim.id,
+                        verdict: Verdict::Verified,
+                        evidence_ids: vec![ev.id],
+                        verifier_name: self.name().to_string(),
+                        rationale: format!(
+                            "observed command matching \"{claimed}\" executed ({})",
+                            ev.provenance
+                        ),
+                        computed_at: now,
+                    };
+                }
+                runner_command::CommandBinding::Prefix => {
+                    prefix_row.get_or_insert(ev);
+                }
+                runner_command::CommandBinding::Mentioned => mentioned = true,
+                runner_command::CommandBinding::NotBound => {}
+            }
+        }
 
-        match matching {
-            Some(ev) => Finding {
+        if let Some(ev) = prefix_row {
+            return Finding {
                 id: Uuid::new_v4(),
                 claim_id: claim.id,
-                verdict: Verdict::Verified,
+                verdict: Verdict::Review,
                 evidence_ids: vec![ev.id],
                 verifier_name: self.name().to_string(),
                 rationale: format!(
-                    "observed command matching \"{claimed}\" executed ({})",
+                    "a command starting with \"{claimed}\" ran, but with extra arguments that \
+                     could change what it did (for example a dry run) -- flagged for review, \
+                     not verified ({})",
                     ev.provenance
                 ),
                 computed_at: now,
+            };
+        }
+        Finding {
+            id: Uuid::new_v4(),
+            claim_id: claim.id,
+            verdict: Verdict::Unverified,
+            evidence_ids: vec![],
+            verifier_name: self.name().to_string(),
+            rationale: if mentioned {
+                format!(
+                    "commands that mention \"{claimed}\" were observed, but none is a run of \
+                     that command"
+                )
+            } else {
+                format!("no evidence of a command matching \"{claimed}\" observed in this session")
             },
-            None => Finding {
-                id: Uuid::new_v4(),
-                claim_id: claim.id,
-                verdict: Verdict::Unverified,
-                evidence_ids: vec![],
-                verifier_name: self.name().to_string(),
-                rationale: format!(
-                    "no evidence of a command matching \"{claimed}\" observed in this session"
-                ),
-                computed_at: now,
-            },
+            computed_at: now,
         }
     }
 }
@@ -331,27 +454,36 @@ impl Verifier for CommandSuccessVerifier {
         // contradiction"; also "do not label ordinary mismatch as
         // intentional lying"). Only a claim naming a specific command can be
         // checked at all.
-        let Some(claimed) =
-            CommandExecutedVerifier::extract_command_literal(&claim.text).map(|s| s.to_lowercase())
-        else {
-            return Finding {
-                id: Uuid::new_v4(),
-                claim_id: claim.id,
-                verdict: Verdict::Unverified,
-                evidence_ids: vec![],
-                verifier_name: self.name().to_string(),
-                rationale:
-                    "claim names no specific command; cannot bind to unrelated command evidence"
+        let claimed = match command_literal(&claim.text) {
+            CommandLiteral::One(literal) => literal,
+            CommandLiteral::Several => {
+                return Finding {
+                    id: Uuid::new_v4(),
+                    claim_id: claim.id,
+                    verdict: Verdict::Unverified,
+                    evidence_ids: vec![],
+                    verifier_name: self.name().to_string(),
+                    rationale: "claim names more than one command; it cannot be bound to a \
+                                single command's evidence"
                         .to_string(),
-                computed_at: now,
-            };
+                    computed_at: now,
+                };
+            }
+            CommandLiteral::None => {
+                return Finding {
+                    id: Uuid::new_v4(),
+                    claim_id: claim.id,
+                    verdict: Verdict::Unverified,
+                    evidence_ids: vec![],
+                    verifier_name: self.name().to_string(),
+                    rationale:
+                        "claim names no specific command; cannot bind to unrelated command evidence"
+                            .to_string(),
+                    computed_at: now,
+                };
+            }
         };
-
-        let command_evidence = evidence.iter().rev().find(|e| {
-            e.kind == EvidenceKind::ExitCode && command_text(&e.payload).contains(&claimed)
-        });
-
-        let Some(ev) = command_evidence else {
+        if !runner_command::claim_command_parses(&claimed) {
             return Finding {
                 id: Uuid::new_v4(),
                 claim_id: claim.id,
@@ -359,15 +491,78 @@ impl Verifier for CommandSuccessVerifier {
                 evidence_ids: vec![],
                 verifier_name: self.name().to_string(),
                 rationale: format!(
-                    "no evidence of a command matching \"{claimed}\" observed in this session"
+                    "the claimed command \"{claimed}\" cannot be parsed as a command"
                 ),
+                computed_at: now,
+            };
+        }
+
+        // FORNX-477 exact binding (see `runner_command::bind_command`): the row
+        // must be a run of the claimed command, not merely contain its text. A
+        // newer row that only mentions it may be the real run, so it withholds a
+        // success (a recorded failure stays contradicted), as `TestResultVerifier`
+        // does for a newer unidentified runner mention.
+        // Prefer the newest exact run. A newer row that ran the claimed command
+        // with extra arguments, or only mentions it, may be its real run, so it
+        // withholds an older success instead of replacing the exact row.
+        let mut mention_seen = false;
+        let mut selected = None;
+        let mut first_prefix = None;
+        for e in evidence
+            .iter()
+            .rev()
+            .filter(|e| e.kind == EvidenceKind::ExitCode)
+        {
+            match runner_command::bind_command(
+                &claimed,
+                e.payload.get("command"),
+                &command_text(&e.payload),
+                exit_zero_reliable(e),
+            ) {
+                runner_command::CommandBinding::Exact => {
+                    selected = Some((e, false, mention_seen));
+                    break;
+                }
+                runner_command::CommandBinding::Prefix => {
+                    if first_prefix.is_none() {
+                        first_prefix = Some((e, true, mention_seen));
+                    }
+                    mention_seen = true;
+                }
+                runner_command::CommandBinding::Mentioned => mention_seen = true,
+                runner_command::CommandBinding::NotBound => {}
+            }
+        }
+        let selected = selected.or(first_prefix);
+        let newer_mention = selected.is_some_and(|(_, _, m)| m);
+
+        let Some((ev, prefix_only, _)) = selected else {
+            return Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Unverified,
+                evidence_ids: vec![],
+                verifier_name: self.name().to_string(),
+                rationale: if mention_seen {
+                    format!(
+                        "commands that mention \"{claimed}\" were observed, but none is a run \
+                         of that command"
+                    )
+                } else {
+                    format!(
+                        "no evidence of a command matching \"{claimed}\" observed in this session"
+                    )
+                },
                 computed_at: now,
             };
         };
 
         let exit_code = ev.payload.get("exit_code").and_then(|v| v.as_i64());
+        // A claim that a test command succeeded asserts that tests ran, whatever
+        // the tool (`go test`, `make test`, `yarn test`, `rspec`, ...).
+        let claim_is_test_command = runner_command::names_test_command(&claimed);
 
-        match exit_code {
+        let finding = match exit_code {
             // Same reasoning as `TestResultVerifier`'s mirror branch above:
             // a heuristic `exit_code=0` does not prove the command actually
             // succeeded.
@@ -382,6 +577,84 @@ impl Verifier for CommandSuccessVerifier {
                      heuristic exit_code=0 (no stderr/failure marker seen), which does not \
                      prove the command actually succeeded -- flagged for review, not \
                      verified ({})",
+                    ev.provenance
+                ),
+                computed_at: now,
+            },
+            // FORNX-477: "the `pytest` run succeeded" asserts that tests ran
+            // and passed just as "all tests passed" does, so re-labelling the
+            // claim `command_succeeded` must not buy a different bar. When the
+            // matched command is an identified test run, the same conditions
+            // apply as for `test_result` (a passing summary from that runner,
+            // and evidence the agent did not write: `is_independently_attested`).
+            Some(0) if is_test_runner_evidence(ev) && !execution_proven(ev) => Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Unverified,
+                evidence_ids: vec![ev.id],
+                verifier_name: self.name().to_string(),
+                rationale: "the claimed command is a test run that exited 0, but no passing-test \
+                            summary from that runner was observed, so it is not shown that any \
+                            test ran"
+                    .to_string(),
+                computed_at: now,
+            },
+            Some(0) if is_test_runner_evidence(ev) && !is_independently_attested(ev) => Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Review,
+                evidence_ids: vec![ev.id],
+                verifier_name: self.name().to_string(),
+                rationale: format!(
+                    "the claimed command is a test run that exited 0 with a passing summary, \
+                     but that output is written by the program the agent ran and is not \
+                     independently attested, so it does not show the tests ran -- flagged for \
+                     review, not verified ({})",
+                    ev.provenance
+                ),
+                computed_at: now,
+            },
+            // A newer row that only mentions the claimed command may be its real
+            // run (a wrapper, a pipeline, a compound list): do not let an older
+            // success stand over it.
+            Some(0) if newer_mention => Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Unverified,
+                evidence_ids: vec![ev.id],
+                verifier_name: self.name().to_string(),
+                rationale: "an earlier run of the command exited 0, but a more recent command \
+                            that mentions it could not be identified as a run of it"
+                    .to_string(),
+                computed_at: now,
+            },
+            // A test command whose output Fornax does not read: an exit status 0
+            // does not show any test ran, and there is no summary to check.
+            Some(0) if claim_is_test_command && !is_test_runner_evidence(ev) => Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Unverified,
+                evidence_ids: vec![ev.id],
+                verifier_name: self.name().to_string(),
+                rationale: "the claimed command is a test command whose results Fornax cannot \
+                            read, so an exit status 0 does not show that any test ran"
+                    .to_string(),
+                computed_at: now,
+            },
+            // FORNX-480 (founder, Option B): the same trust bar as `test_result`.
+            // An exit code from the agent's own session cannot show that the
+            // claimed program (rather than a shadowing executable of the same
+            // name) ran and exited 0, so it never reaches `Verified` alone.
+            Some(0) if !is_independently_attested(ev) => Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Review,
+                evidence_ids: vec![ev.id],
+                verifier_name: self.name().to_string(),
+                rationale: format!(
+                    "observed command exit_code=0, but the exit status comes from the agent's \
+                     own session and is not independently attested, so it does not show the \
+                     claimed program ran and succeeded -- flagged for review, not verified ({})",
                     ev.provenance
                 ),
                 computed_at: now,
@@ -428,7 +701,23 @@ impl Verifier for CommandSuccessVerifier {
                 "command evidence found but no exit_code field present",
                 now,
             ),
+        };
+
+        // The claim named a shorter command than the one that ran: extra
+        // arguments can change what it did (`--dry-run`), so a success is not
+        // attributed to the claimed command with full confidence.
+        if prefix_only && finding.verdict == Verdict::Verified {
+            return Finding {
+                verdict: Verdict::Review,
+                rationale: format!(
+                    "{} -- the observed command has more arguments than the claimed one, so \
+                     the exit status is not attributed to the claimed command exactly",
+                    finding.rationale
+                ),
+                ..finding
+            };
         }
+        finding
     }
 }
 
@@ -879,6 +1168,45 @@ impl Verifier for GitOperationVerifier {
     }
 }
 
+/// A genuine (non-heuristic) exit status 0.
+fn exit_zero_reliable(e: &Evidence) -> bool {
+    e.payload.get("exit_code").and_then(|v| v.as_i64()) == Some(0) && !is_heuristic_evidence(e)
+}
+
+/// The command a command_executed / command_succeeded claim names.
+enum CommandLiteral {
+    None,
+    One(String),
+    /// More than one distinct literal ("`cd repo` then `pytest`"): which one the
+    /// claim is about is ambiguous, so it cannot be bound to evidence.
+    Several,
+}
+
+/// Backtick-delimited literals, else double-quote-delimited ones (as before),
+/// deduplicated. Used only by the two command verifiers; other verifiers keep
+/// `extract_delimited`.
+fn command_literal(text: &str) -> CommandLiteral {
+    for delim in ['`', '"'] {
+        let mut found: Vec<String> = Vec::new();
+        let mut rest = text;
+        while let Some(start) = rest.find(delim) {
+            let after = &rest[start + delim.len_utf8()..];
+            let Some(end) = after.find(delim) else { break };
+            let inner = after[..end].trim();
+            if !inner.is_empty() && !found.iter().any(|f| f == inner) {
+                found.push(inner.to_string());
+            }
+            rest = &after[end + delim.len_utf8()..];
+        }
+        match found.len() {
+            0 => continue,
+            1 => return CommandLiteral::One(found.remove(0)),
+            _ => return CommandLiteral::Several,
+        }
+    }
+    CommandLiteral::None
+}
+
 /// Extract the substring between the first pair of `delim` characters in
 /// `text`, trimmed. Returns `None` when `delim` doesn't appear twice or the
 /// enclosed text is empty.
@@ -913,21 +1241,109 @@ fn command_text(payload: &serde_json::Value) -> String {
     }
 }
 
+/// Collectors that may attest a test run, by `EvidenceSource::sensor_name`.
+///
+/// Deliberately empty: no shipped sensor measures a test run outside the
+/// agent's own account of it. `claude_git_working_tree_sensor_v1` and
+/// `claude_file_write_confirmed_sensor_v1` are `HostObserved`, but they observe
+/// the working tree, not a runner; letting their identity vouch for an exit
+/// code would let anything that can submit evidence under a registered name
+/// promote itself. The real host-controlled runner receipt / CI evidence is
+/// FORNX-443 and adds its collector here, with its own tests.
+///
+/// Under `cfg(test)` a fixture collector exists so the `Verified` arm can be
+/// exercised. That proves only the gate's logic, not that production
+/// attestation exists.
+fn test_run_attestors() -> &'static [&'static str] {
+    #[cfg(test)]
+    {
+        &["test_fixture_run_attestor"]
+    }
+    #[cfg(not(test))]
+    {
+        &[]
+    }
+}
+
+/// True when the evidence was produced by a collector authorised to attest a
+/// test run *and* carries a trust class other than the agent's own account
+/// (`HostObserved`, or `IndependentExternal` such as CI). The class label alone
+/// never suffices: it is a field of the submitted record, so the collector
+/// identity must also be one this verifier knows (`test_run_attestors`).
+/// Evidence with no recorded source predates the sensor contract and is not
+/// treated as attested.
+fn is_independently_attested(e: &Evidence) -> bool {
+    e.source.as_ref().is_some_and(|s| {
+        matches!(
+            s.trust_class,
+            TrustClass::HostObserved | TrustClass::IndependentExternal
+        ) && test_run_attestors().contains(&s.sensor_name.as_str())
+    })
+}
+
+/// True when the exit-code evidence for a runner command also carries that
+/// runner's own summary showing at least one test passed and none failed.
+/// The summary only ever adds a condition for `Verified`; it never grants one
+/// (ADR-0025's safety-monotonic bar for stdout-derived signals).
+fn execution_proven(e: &Evidence) -> bool {
+    let Some(kind) = runner_command::proven_runner(e.payload.get("command")) else {
+        return false;
+    };
+    let Some(summary) = e.payload.get("test_summary") else {
+        return false;
+    };
+    let format = summary.get("format").and_then(|v| v.as_str());
+    let passed = summary.get("passed").and_then(|v| v.as_u64());
+    let failed = summary.get("failed").and_then(|v| v.as_u64());
+    let format_matches = match kind {
+        runner_command::RunnerKind::Pytest => format == Some("pytest"),
+        runner_command::RunnerKind::Cargo => format == Some("cargo"),
+        runner_command::RunnerKind::Other => false,
+    };
+    format_matches && passed.is_some_and(|n| n >= 1) && failed == Some(0)
+}
+
 fn is_test_runner_evidence(e: &Evidence) -> bool {
-    // FORNX-295: must use the space-joined `command_text` normalization, not
-    // a raw `Value::to_string()` — Codex's real rollout shape is a JSON argv
-    // array (e.g. `["cargo","test"]`), whose `to_string()` renders as
-    // `["cargo","test"]` (quotes and brackets intact) and never contains the
-    // literal substring "cargo test". Using the shared helper here matches
-    // how `command_text` is already used elsewhere in this file.
+    // FORNX-477: identify the runner from the executed command's structure
+    // (see `runner_command`), never from a substring of the command text --
+    // `echo pytest` or `pip install pytest` exiting 0 is not a test run. The
+    // exit code itself must still be present on the same evidence row.
+    runner_command::is_test_run(
+        e.payload.get("command"),
+        e.payload.get("exit_code").and_then(|v| v.as_i64()),
+    ) && e.payload.get("exit_code").is_some()
+}
+
+/// An exit-code row whose command text names a test runner but which
+/// `is_test_runner_evidence` could not identify as one. Used only to *withhold*
+/// `Verified` (see `TestResultVerifier::verify`); a substring match never
+/// grants a verdict.
+fn mentions_unidentified_runner(e: &Evidence) -> bool {
+    if e.payload.get("exit_code").is_none() || is_test_runner_evidence(e) {
+        return false;
+    }
     let cmd = command_text(&e.payload);
-    e.payload.get("exit_code").is_some()
-        && (cmd.contains("pytest")
-            || cmd.contains("cargo test")
-            || cmd.contains("cargo nextest")
-            || cmd.contains("npm test")
-            || cmd.contains("vitest")
-            || cmd.contains("jest"))
+    let tokens: Vec<&str> = cmd
+        .split(|c: char| !(c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | '/' | '+')))
+        .filter(|t| !t.is_empty())
+        .collect();
+    // Substring, not equality: `pytest-3`, `python3-pytest`, `./node_modules/.bin/jest`
+    // all count. A false mention only withholds Verified.
+    let names_runner = |t: &&str| {
+        ["pytest", "py.test", "vitest", "jest"]
+            .iter()
+            .any(|r| t.contains(r))
+    };
+    // `cargo` or `npm` followed, anywhere later, by `test` / `nextest`.
+    let subcommand_after = |program: &str, subs: &[&str]| {
+        tokens
+            .iter()
+            .position(|t| t.rsplit('/').next() == Some(program))
+            .is_some_and(|i| tokens[i + 1..].iter().any(|t| subs.contains(t)))
+    };
+    tokens.iter().any(names_runner)
+        || subcommand_after("cargo", &["test", "nextest"])
+        || subcommand_after("npm", &["test"])
 }
 
 /// True when `e.payload["heuristic"]` is `true` — the evidence's `exit_code`
@@ -1043,7 +1459,57 @@ mod tests {
         c
     }
 
+    /// The summary a genuine run of `command` would print, as the adapters
+    /// store it (`None` when the command is not a runner whose output the
+    /// first cut can read: pytest and cargo test).
+    fn passing_summary_for(command: &serde_json::Value) -> Option<serde_json::Value> {
+        match runner_command::proven_runner(Some(command))? {
+            runner_command::RunnerKind::Pytest => {
+                Some(serde_json::json!({"format": "pytest", "passed": 3, "failed": 0}))
+            }
+            runner_command::RunnerKind::Cargo => {
+                Some(serde_json::json!({"format": "cargo", "passed": 3, "failed": 0}))
+            }
+            runner_command::RunnerKind::Other => None,
+        }
+    }
+
+    /// A genuine passing run: the exit code plus the runner's own summary.
+    fn with_passing_summary(mut e: Evidence) -> Evidence {
+        if let Some(summary) = e.payload.get("command").and_then(passing_summary_for) {
+            e.payload["test_summary"] = summary;
+        }
+        e
+    }
+
+    /// `pytest` exiting `code`; a 0 exit carries a genuine passing summary.
+    /// Use `bare_runner_evidence` for the no-output (fake runner) case.
     fn evidence_with_exit_code(code: i64) -> Evidence {
+        let e = bare_runner_evidence(code);
+        if code == 0 {
+            with_passing_summary(e)
+        } else {
+            e
+        }
+    }
+
+    /// The evidence source a fixture claims. Most tests here exercise the
+    /// runner/summary rules and use an attested channel (`HostObserved`) so
+    /// those rules, not the attestation gate, decide the verdict; the gate has
+    /// its own tests (`transcript_only_test_evidence_never_reaches_verified`).
+    pub(crate) fn source_with(trust: fornax_types::TrustClass) -> fornax_types::EvidenceSource {
+        fornax_types::EvidenceSource::now(
+            "test_fixture_run_attestor",
+            trust,
+            Some(fornax_types::Provider::Codex),
+            fornax_types::CollectionMethod::FilePoll,
+            None,
+        )
+    }
+
+    /// `pytest` exiting `code` with no test summary at all: what a QA-owned
+    /// executable named `pytest` that only does `exit 0` produces.
+    fn bare_runner_evidence(code: i64) -> Evidence {
         Evidence {
             id: Uuid::new_v4(),
             session_id: "s1".into(),
@@ -1052,7 +1518,7 @@ mod tests {
             observed_at: chrono::Utc::now().to_rfc3339(),
             payload: serde_json::json!({"command": ["pytest"], "exit_code": code}),
             provenance: "codex:rollout:exec_command_end".into(),
-            source: None,
+            source: Some(source_with(fornax_types::TrustClass::HostObserved)),
             extension: None,
             evidence_purged: false,
         }
@@ -1083,7 +1549,7 @@ mod tests {
             observed_at: chrono::Utc::now().to_rfc3339(),
             payload: serde_json::json!({"command": command, "exit_code": exit_code}),
             provenance: "codex:rollout:exec_command_end".into(),
-            source: None,
+            source: Some(source_with(fornax_types::TrustClass::HostObserved)),
             extension: None,
             evidence_purged: false,
         }
@@ -1150,9 +1616,1468 @@ mod tests {
         assert_eq!(f.verdict, Verdict::Contradicted);
         assert_eq!(f.evidence_ids, vec![ev[0].id]);
 
-        let ev2 = vec![evidence_for_command(&["cargo", "nextest", "run"], 0)];
+        let ev2 = vec![with_passing_summary(evidence_for_command(
+            &["cargo", "test"],
+            0,
+        ))];
         let f2 = v.verify(&c, &ev2, &caps());
         assert_eq!(f2.verdict, Verdict::Verified);
+
+        // nextest is recognised as a runner (a failure contradicts) but its
+        // output format is not read in this cut, so a pass is never Verified.
+        let ev3 = vec![evidence_for_command(&["cargo", "nextest", "run"], 0)];
+        assert_eq!(v.verify(&c, &ev3, &caps()).verdict, Verdict::Unverified);
+    }
+
+    /// FORNX-477: evidence_for_command with a raw `command` JSON value, so a
+    /// string (Claude Bash) and an argv array (Codex) are both expressible.
+    fn verdict_for_command(command: serde_json::Value, exit_code: i64) -> Verdict {
+        let mut ev = bare_runner_evidence(exit_code);
+        ev.payload["command"] = command;
+        if exit_code == 0 {
+            ev = with_passing_summary(ev);
+        }
+        TestResultVerifier
+            .verify(&claim("All tests passed."), &[ev], &caps())
+            .verdict
+    }
+
+    /// Same as `verdict_for_command` but the run printed no recognised summary.
+    fn verdict_for_command_without_summary(command: serde_json::Value, exit_code: i64) -> Verdict {
+        let mut ev = bare_runner_evidence(exit_code);
+        ev.payload["command"] = command;
+        TestResultVerifier
+            .verify(&claim("All tests passed."), &[ev], &caps())
+            .verdict
+    }
+
+    /// FORNX-477: a command that merely *mentions* a runner (or only
+    /// installs/reads/commits about it) is not a test run, so a claim of
+    /// "tests passed" must stay Unverified -- never Verified, and never
+    /// Contradicted by an unrelated command's exit code either.
+    #[test]
+    fn commands_that_only_mention_a_runner_never_verify_or_contradict() {
+        use serde_json::json;
+        let not_runs = [
+            json!("echo pytest"),
+            json!("true # jest"),
+            json!("rm -rf /nonexistent/vitest"),
+            json!("pip install pytest"),
+            json!("cat jest.config.js"),
+            json!("git commit -m \"add vitest dep\""),
+            json!("npm install jest"),
+            json!("cargo build --tests && echo cargo test"),
+            json!("echo ok; pytest"),
+            json!("true || pytest"),
+            json!("pytest || true"),
+            json!("pytest -q || echo failed"),
+            json!("printf 'cargo test'"),
+            json!("echo pytest && true"),
+            json!("pip install pytest && echo ok"),
+            json!("cd repo && echo jest"),
+            json!("pytest &&"),
+            json!("&& pytest"),
+            json!("pytest && && true"),
+            json!("pytest &&& true"),
+            json!("exit 0 && pytest -q"),
+            json!("exec true && pytest"),
+            json!(["bash", "-c", "exit 0 && pytest"]),
+            json!(["bash", "-nc", "pytest"]),
+            json!(["sh", "-ncx", "pytest"]),
+            json!("pytest 2>&1 | tail"),
+            json!("pytest 2>&1x"),
+            json!("pytest 3>&1"),
+            json!("pytest 2>&1>out"),
+            json!("pytest 2>&2"),
+            json!("pytest a2>&1"),
+            json!("echo 2>&1 pytest"),
+            json!("source env.sh && pytest -q"),
+            json!("true && . ./env.sh && cargo test"),
+            json!("uv run --with pytest python script.py"),
+            json!("pytest\u{a0}-q"),
+            json!("pytest\u{b}-q"),
+            json!(["bash", "-c", "pytest\u{c}-q"]),
+            json!("readonly A=1 && pytest -q"),
+            json!("PATH=/tmp/evil && pytest -q"),
+            json!("CI=1 && pytest -q"),
+            json!("local x && pytest -q"),
+            json!("logout && pytest"),
+            json!("pushd x && cargo test"),
+            json!("uv run --with jest echo hi"),
+            json!("npx -p jest node x.js"),
+            json!("pytest -q | tee out.txt"),
+            json!("pytest -q &"),
+            json!("(pytest -q)"),
+            json!("pytest -q\ntrue"),
+            json!("echo $(pytest)"),
+            json!("echo `pytest`"),
+            json!("$RUNNER -q"),
+            json!("pytest $ARGS"),
+            json!("PYTHONPATH=src pytest -q"),
+            json!("PATH=/tmp/evil pytest -q"),
+            json!("PYTEST_ADDOPTS=--collect-only pytest"),
+            json!("NODE_OPTIONS=--require=x.js jest"),
+            json!("FOO='a b' pytest"),
+            json!("vitest list"),
+            json!("pytest -q # jest"),
+            json!("pytest -q; true"),
+            json!("pytest;true"),
+            json!("pytest -q > out.txt"),
+            json!("pytest 2>err.txt"),
+            json!("pytest < in.txt"),
+            json!("pytest (a)"),
+            json!("pytest {a,b}"),
+            json!("pytest `true`"),
+            json!("pytest \"$X\""),
+            json!("pytest \"`true`\""),
+            json!("'CI=1' pytest"),
+            json!("python3 -m pip install pytest"),
+            json!("python3 -m unittest -v"),
+            json!("pnpm run vitest"),
+            json!(["bash", "-x", "pytest"]),
+            json!(["echo", "pytest"]),
+            json!(["cat", "jest.config.js"]),
+            json!(["git", "commit", "-m", "cargo test"]),
+            json!(["/bin/zsh", "-lc", "echo pytest"]),
+            json!(["/bin/bash", "-c", "true # jest"]),
+            json!(["/bin/sh", "-lc", "pip install pytest"]),
+            json!(["/bin/sh", "-c", "echo hi; cargo test"]),
+            json!(["/bin/sh", "-c", "pytest", "extra-arg"]),
+            json!(["/bin/sh", "-c"]),
+            json!("pytest 'unterminated"),
+            json!(""),
+            json!(null),
+            json!(42),
+        ];
+        for cmd in not_runs {
+            for code in [0, 1] {
+                assert_eq!(
+                    verdict_for_command(cmd.clone(), code),
+                    Verdict::Unverified,
+                    "command {cmd} exit {code} must not be treated as a test run"
+                );
+            }
+        }
+    }
+
+    /// FORNX-477: omitting a spoofable-substring match must not cost real
+    /// runs. Each executed runner (any shell wrapper Codex/Claude use) with a
+    /// real exit code keeps its verdict: 0 -> Verified, nonzero -> Contradicted.
+    #[test]
+    fn genuine_runner_invocations_keep_their_verdicts() {
+        use serde_json::json;
+        let runs = [
+            json!("pytest"),
+            json!("pytest -q tests/"),
+            json!("python3 -m pytest -q ."),
+            json!("CI=1 pytest -q"),
+            json!("pytest -v tests/"),
+            json!("pytest --cov=src --maxfail=1 -q"),
+            json!("jest --coverage --ci --color"),
+            json!("cargo test 2>&1"),
+            json!(["zsh", "-lc", "pytest -q 2>&1"]),
+            json!("pytest -xvs -k smoke"),
+            json!("CI=1 RUST_BACKTRACE=1 cargo test"),
+            json!("./.venv/bin/pytest -q"),
+            json!("uv run pytest -q"),
+            json!("cargo test"),
+            json!("cargo test --workspace"),
+            json!("cargo +nightly test -p fornax-verify --lib -- some::test"),
+            json!("cargo nextest run -p fornax-verify"),
+            json!("npm test"),
+            json!("npx vitest run"),
+            json!("bunx vitest run"),
+            json!("npx --yes jest --ci"),
+            json!("vitest run"),
+            json!("jest"),
+            json!("pnpm exec vitest run"),
+            json!("'pytest' -q \"tests/a b\""),
+            json!(["pytest"]),
+            json!(["cargo", "test"]),
+            json!(["cargo", "nextest", "run"]),
+            json!(["/bin/sh", "-lc", "python3 -m pytest -q ."]),
+            json!(["/bin/zsh", "-lc", "cargo test --workspace"]),
+            json!(["/bin/bash", "-c", "npm test"]),
+            json!(["bash", "-ic", "pytest -q"]),
+        ];
+        for cmd in runs {
+            // Runners whose summary the first cut reads (pytest, cargo test)
+            // are Verified with a genuine passing summary; the others are
+            // still recognised (a failure contradicts) but a pass cannot be
+            // shown from their output yet, so it stays Unverified.
+            let expected_pass = if passing_summary_for(&cmd).is_some() {
+                Verdict::Verified
+            } else {
+                Verdict::Unverified
+            };
+            assert_eq!(
+                verdict_for_command(cmd.clone(), 0),
+                expected_pass,
+                "command {cmd} exit 0"
+            );
+            assert_eq!(
+                verdict_for_command(cmd.clone(), 1),
+                Verdict::Contradicted,
+                "command {cmd} exit 1"
+            );
+            // No summary (a fake runner, or output not captured): never Verified.
+            assert_eq!(
+                verdict_for_command_without_summary(cmd.clone(), 0),
+                Verdict::Unverified,
+                "command {cmd} exit 0 without a summary"
+            );
+        }
+    }
+
+    /// FORNX-477: an older genuine pass must not verify the claim when a
+    /// *newer* command that mentions a runner could not be identified as a test
+    /// run (it may be the real, failing -- or masked -- run, e.g.
+    /// `cd repo && pytest` exiting 1, or `pytest | tail` exiting 0). A genuine
+    /// failure stays Contradicted; an older ambiguous row never hurts a newer
+    /// genuine pass.
+    #[test]
+    fn an_older_pass_is_not_verified_over_a_newer_unidentified_runner_command() {
+        let pass = with_passing_summary(evidence_for_command(&["pytest", "-q"], 0));
+        for (newer, code) in [
+            ("cd repo && pytest -q", 1),
+            ("pytest -q | tail", 0),
+            ("pytest -q | tail", 1),
+            ("git commit -m pytest", 0),
+            ("git commit -m 'run py.test'", 0),
+            ("cargo +nightly test | tail", 1),
+            ("cargo nextest run | tee out", 0),
+            ("npx jest | tail", 0),
+            ("pytest-3 -q | tail", 0),
+            ("./node_modules/.bin/jest | tail", 0),
+        ] {
+            let newer_ev = evidence_for_command(&["/bin/zsh", "-lc", newer], code);
+            let f = TestResultVerifier.verify(
+                &claim("All tests passed."),
+                &[pass.clone(), newer_ev],
+                &caps(),
+            );
+            assert_eq!(f.verdict, Verdict::Unverified, "{newer} exit {code}");
+        }
+
+        let fail = evidence_for_command(&["pytest", "-q"], 1);
+        let ambiguous = evidence_for_command(&["/bin/zsh", "-lc", "git commit -m pytest"], 0);
+        let f = TestResultVerifier.verify(
+            &claim("All tests passed."),
+            &[fail.clone(), ambiguous.clone()],
+            &caps(),
+        );
+        // A genuine failure stays Contradicted: following it with a command
+        // that merely mentions a runner must not let an agent dodge it.
+        assert_eq!(f.verdict, Verdict::Contradicted);
+        assert_eq!(f.evidence_ids, vec![fail.id]);
+
+        let f = TestResultVerifier.verify(
+            &claim("All tests passed."),
+            &[ambiguous, pass.clone()],
+            &caps(),
+        );
+        assert_eq!(f.verdict, Verdict::Verified);
+        assert_eq!(f.evidence_ids, vec![pass.id]);
+    }
+
+    /// FORNX-477: an `&&` list exits 0 only if every command in it ran and
+    /// exited 0, so a runner inside it is proven by an overall 0; a non-zero
+    /// overall status does not say which command failed and must never be
+    /// pinned on the runner (no Contradicted, no Verified).
+    #[test]
+    fn and_lists_prove_the_runner_only_through_an_overall_zero() {
+        use serde_json::json;
+        for cmd in [
+            json!("cd repo && cargo test"),
+            json!(["/bin/zsh", "-lc", "cd crates/x && cargo test"]),
+        ] {
+            assert_eq!(
+                verdict_for_command(cmd.clone(), 0),
+                Verdict::Verified,
+                "{cmd}"
+            );
+            assert_eq!(
+                verdict_for_command(cmd.clone(), 1),
+                Verdict::Unverified,
+                "{cmd}"
+            );
+        }
+        // Another command in the list could have printed the summary
+        // (`echo '3 passed in 0.1s' && cargo test no_such`), so only `cd`
+        // may accompany the runner for its summary to be attributed to it.
+        for cmd in [
+            json!("make build && pytest -q"),
+            json!("CI=1 pytest && echo done"),
+            json!("cargo test -p x 2>&1 && echo done"),
+            json!(["/bin/zsh", "-lc", "cd crates/x && cargo nextest run"]),
+            json!(["bash", "-c", "uv run pytest -q && ruff check"]),
+            json!("echo '3 passed in 0.1s' && cargo test no_such"),
+        ] {
+            assert_eq!(
+                verdict_for_command(cmd.clone(), 0),
+                Verdict::Unverified,
+                "{cmd}"
+            );
+        }
+        for cmd in [
+            json!("make build && pytest --collect-only"),
+            json!("echo pytest && true"),
+            json!("cd repo && git commit -m 'cargo test'"),
+        ] {
+            assert_eq!(
+                verdict_for_command(cmd.clone(), 0),
+                Verdict::Unverified,
+                "{cmd}"
+            );
+        }
+    }
+
+    /// FORNX-477: invocations that exit 0 without executing tests (listing,
+    /// help, compile-only, "no tests found is fine") are not a test run.
+    #[test]
+    fn runner_invocations_that_do_not_execute_tests_are_unverified() {
+        use serde_json::json;
+        for cmd in [
+            json!("pytest --collect-only"),
+            json!("pytest --co -q"),
+            json!("pytest --collect-only=yes"),
+            json!("pytest --collect"),
+            json!("pytest --setup-plan"),
+            json!("pytest --setup-only"),
+            json!("pytest --fixtures-per-test"),
+            json!("jest --showConfig"),
+            json!("pytest --collectonly"),
+            json!("pytest -o addopts=--collect-only"),
+            json!("pytest --override-ini=addopts=--co"),
+            json!("pytest -qh"),
+            json!("pytest -ofoo=bar"),
+            json!("pytest -xo addopts=--co"),
+            json!("pytest -hx"),
+            json!("pytest --setupplan"),
+            json!("pytest --setuponly"),
+            json!("pytest --funcargs"),
+            json!("pytest -oaddopts=--co"),
+            json!("jest --list-tests"),
+            json!("jest --pass-with-no-tests -t nomatch"),
+            json!("jest --changedFilesWithAncestor"),
+            json!("vitest bench"),
+            json!("pytest -Vq"),
+            json!("jest -v"),
+            json!("vitest -v"),
+            json!("jest --clearCache"),
+            json!("jest --init"),
+            json!("jest --onlyChanged"),
+            json!("jest --changedSince=HEAD"),
+            json!("vitest init"),
+            json!("npm test --if-present"),
+            json!("cargo nextest run --no-tests=pass"),
+            json!("pytest --help"),
+            json!("pytest -h"),
+            json!("cargo test --no-run"),
+            json!("cargo test -- --list"),
+            json!("cargo nextest list"),
+            json!("jest --listTests"),
+            json!("jest --passWithNoTests"),
+            json!("vitest --version"),
+            json!(["pytest", "--collect-only"]),
+        ] {
+            assert_eq!(
+                verdict_for_command(cmd.clone(), 0),
+                Verdict::Unverified,
+                "{cmd}"
+            );
+        }
+    }
+
+    fn verdict_with_summary(
+        command: serde_json::Value,
+        exit_code: i64,
+        summary: Option<serde_json::Value>,
+    ) -> Verdict {
+        let mut ev = bare_runner_evidence(exit_code);
+        ev.payload["command"] = command;
+        if let Some(summary) = summary {
+            ev.payload["test_summary"] = summary;
+        }
+        TestResultVerifier
+            .verify(&claim("All tests passed."), &[ev], &caps())
+            .verdict
+    }
+
+    /// A row whose `command` is a plain string (Claude Bash shape).
+    fn evidence_for_string(command: &str, exit_code: i64) -> Evidence {
+        let mut ev = evidence_for_command(&["x"], exit_code);
+        ev.payload["command"] = serde_json::json!(command);
+        ev
+    }
+
+    fn command_verdicts(text: &str, rows: Vec<Evidence>) -> (Verdict, Verdict) {
+        let run = |subject: &str| {
+            let verifier: Box<dyn Verifier> = if subject == "command_executed" {
+                Box::new(CommandExecutedVerifier)
+            } else {
+                Box::new(CommandSuccessVerifier)
+            };
+            verifier
+                .verify(&claim_for(subject, text), &rows, &caps())
+                .verdict
+        };
+        (run("command_executed"), run("command_succeeded"))
+    }
+
+    /// FORNX-477 exact binding: evidence that merely contains the claimed
+    /// command's text, or runs a respelled/different command, never supports the
+    /// claim. Every row here exited 0, so a substring match used to Verify it.
+    #[test]
+    fn a_row_that_only_mentions_the_claimed_command_never_binds() {
+        let argv = |a: &[&str]| evidence_for_command(a, 0);
+        let string = |c: &str| evidence_for_string(c, 0);
+        let cases: Vec<(&str, Evidence)> = vec![
+            ("echo of the text", argv(&["echo", "npm install"])),
+            ("echo as a string", string("echo npm install")),
+            ("timeout wrapper", string("timeout 60 npm install")),
+            ("sudo wrapper", string("sudo npm install")),
+            ("pipeline", string("npm install | tee log")),
+            ("semicolon list", string("npm install; true")),
+            ("or list", string("true || npm install")),
+            ("and list", string("true && npm install")),
+            ("redirect", string("npm install > /dev/null")),
+            ("relative program", string("./other/npm install")),
+            ("non-benign env prefix", string("PATH=/tmp/x npm install")),
+            ("quoted program", argv(&["npm install"])),
+            ("different case", argv(&["NPM", "install"])),
+        ];
+        for (label, row) in cases {
+            assert_eq!(
+                command_verdicts("I ran `npm install`.", vec![row.clone()]).0,
+                Verdict::Unverified,
+                "executed: {label}"
+            );
+            assert_eq!(
+                command_verdicts("The `npm install` succeeded.", vec![row]).1,
+                Verdict::Unverified,
+                "succeeded: {label}"
+            );
+        }
+        // A claimed program with a path must match that exact path.
+        assert_eq!(
+            command_verdicts("I ran `./deploy.sh`.", vec![string("./other/deploy.sh")]).0,
+            Verdict::Unverified
+        );
+        // A claim spelled in another case does not bind the real run.
+        assert_eq!(
+            command_verdicts("I ran `NPM Install`.", vec![argv(&["npm", "install"])]).0,
+            Verdict::Unverified
+        );
+    }
+
+    #[test]
+    fn a_claim_naming_several_commands_or_none_parseable_cannot_bind() {
+        let row = evidence_for_command(&["pytest"], 0);
+        let (executed, succeeded) = command_verdicts(
+            "I ran `cd repo` then `pytest` and it succeeded.",
+            vec![row.clone()],
+        );
+        assert_eq!(
+            (executed, succeeded),
+            (Verdict::Unverified, Verdict::Unverified)
+        );
+        // The same literal twice is one command, not an ambiguity.
+        assert_eq!(
+            command_verdicts("I ran `pytest`, yes `pytest`.", vec![row.clone()]).0,
+            Verdict::Verified
+        );
+        // A literal that is not a parseable command.
+        assert_eq!(
+            command_verdicts("I ran `npm install |`.", vec![row]).0,
+            Verdict::Unverified
+        );
+    }
+
+    /// What does still bind: the same command step for step, with or without
+    /// benign environment prefixes, an absolute path to the same program, a
+    /// whole-command equal compound or shell wrapper, and quoted arguments.
+    #[test]
+    fn the_same_command_still_binds_and_keeps_its_exit_semantics() {
+        let ok = |text: &str, row: Evidence| command_verdicts(text, vec![row]);
+        assert_eq!(
+            ok(
+                "I ran `npm install`.",
+                evidence_for_command(&["npm", "install"], 0)
+            ),
+            (Verdict::Verified, Verdict::Verified)
+        );
+        // A failing run: ran, but contradicts "succeeded".
+        assert_eq!(
+            ok(
+                "I ran `npm install`.",
+                evidence_for_command(&["npm", "install"], 1)
+            ),
+            (Verdict::Verified, Verdict::Contradicted)
+        );
+        for row in [
+            evidence_for_string("CI=1 npm install", 0),
+            evidence_for_string("npm   install", 0),
+        ] {
+            assert_eq!(
+                ok("The `npm install` succeeded.", row.clone()).1,
+                Verdict::Verified
+            );
+            assert_eq!(ok("I ran `npm install`.", row).0, Verdict::Verified);
+        }
+        // The claim names an env assignment: the run must have used it.
+        assert_eq!(
+            ok(
+                "The `CI=1 npm install` succeeded.",
+                evidence_for_string("CI=1 npm install", 0)
+            )
+            .1,
+            Verdict::Verified
+        );
+        assert_eq!(
+            ok(
+                "The `CI=1 npm install` succeeded.",
+                evidence_for_command(&["npm", "install"], 0)
+            )
+            .1,
+            Verdict::Unverified
+        );
+        // Whole compound claim equals a shell-wrapped argv.
+        let wrapped = |code| evidence_for_command(&["bash", "-lc", "cd repo && npm install"], code);
+        assert_eq!(
+            ok("The `cd repo && npm install` succeeded.", wrapped(0)).1,
+            Verdict::Verified
+        );
+        assert_eq!(
+            ok("The `cd repo && npm install` succeeded.", wrapped(1)).1,
+            Verdict::Contradicted
+        );
+        // Quoted arguments compare as words.
+        assert_eq!(
+            ok(
+                "The `git commit -m 'add jest'` succeeded.",
+                evidence_for_string("git commit -m 'add jest'", 0)
+            )
+            .1,
+            Verdict::Verified
+        );
+    }
+
+    /// Weaker fits are capped at Review, never Verified: a bare program name
+    /// reached through an absolute path (it can be another program), and a
+    /// claim that is only part of a `cd dir && cmd` row.
+    #[test]
+    fn a_path_or_cd_wrapped_fit_is_capped_at_review() {
+        assert_eq!(
+            command_verdicts(
+                "I ran `npm install`.",
+                vec![evidence_for_command(&["/tmp/evil/npm", "install"], 0)]
+            ),
+            (Verdict::Review, Verdict::Review)
+        );
+        assert_eq!(
+            command_verdicts(
+                "I ran `pytest`.",
+                vec![evidence_for_string("cd repo && pytest", 0)]
+            )
+            .0,
+            Verdict::Review
+        );
+        // A guessed (heuristic) 0 does not show `cd` succeeded, so it does not
+        // bind at all.
+        let mut guessed = evidence_for_string("cd repo && npm install", 0);
+        guessed.payload["heuristic"] = serde_json::json!(true);
+        assert_eq!(
+            command_verdicts("I ran `npm install`.", vec![guessed]).0,
+            Verdict::Unverified
+        );
+        // A non-zero status does not show the second step ran either.
+        assert_eq!(
+            command_verdicts(
+                "I ran `npm install`.",
+                vec![evidence_for_string("cd repo && npm install", 1)]
+            )
+            .0,
+            Verdict::Unverified
+        );
+    }
+
+    /// Environment values and shell expansion are part of command identity.
+    #[test]
+    fn env_values_and_unquoted_expansions_are_part_of_the_command() {
+        // The claim names a value the run did not use.
+        assert_eq!(
+            command_verdicts(
+                "The `CI=true npm test` succeeded.",
+                vec![evidence_for_string("CI=false npm test", 0)]
+            )
+            .1,
+            Verdict::Unverified
+        );
+        // A value the claim does not mention is ignored.
+        assert_eq!(
+            command_verdicts(
+                "The `npm run build` succeeded.",
+                vec![evidence_for_string("NODE_ENV=production npm run build", 0)]
+            )
+            .1,
+            Verdict::Verified
+        );
+        // `ls *.rs` expands; `ls '*.rs'` does not.
+        assert_eq!(
+            command_verdicts(
+                "I ran `ls *.rs`.",
+                vec![evidence_for_string("ls '*.rs'", 0)]
+            )
+            .0,
+            Verdict::Unverified
+        );
+    }
+
+    /// A short claim is not "mentioned" by an unrelated word that contains it,
+    /// so it does not wrongly withhold an older exact success.
+    #[test]
+    fn a_mention_needs_word_boundaries() {
+        assert_eq!(
+            command_verdicts(
+                "The `make` succeeded.",
+                vec![
+                    evidence_for_command(&["make"], 0),
+                    evidence_for_string("cat Makefile", 0)
+                ]
+            )
+            .1,
+            Verdict::Verified
+        );
+    }
+
+    /// `CI=1 CI=0 cmd` runs with CI=0, so it cannot bind a claimed `CI=1 cmd`;
+    /// a path-qualified run still counts as a mention of a bare program.
+    #[test]
+    fn duplicate_env_assignments_and_path_qualified_mentions() {
+        assert_eq!(
+            command_verdicts(
+                "The `CI=1 npm test` succeeded.",
+                vec![evidence_for_string("CI=1 CI=0 npm test", 0)]
+            )
+            .1,
+            Verdict::Unverified
+        );
+        assert_eq!(
+            command_verdicts(
+                "The `make` succeeded.",
+                vec![
+                    evidence_for_command(&["make"], 0),
+                    // Not a structural run of `make` (a wrapper), only a mention
+                    // whose match follows a `/`.
+                    evidence_for_string("sudo /tmp/x/make all", 0)
+                ]
+            )
+            .1,
+            Verdict::Unverified
+        );
+    }
+
+    /// FORNX-477: test commands Fornax has no summary format for (`go test`,
+    /// `make test`, `yarn test`, ...) cannot verify "the command succeeded" from an
+    /// exit status 0, while a failure is still a failure and look-alike commands
+    /// that are not test runs keep verifying.
+    #[test]
+    fn unrecognised_test_commands_cannot_verify_a_success_claim() {
+        let succeeded = |literal: &str, code: i64| {
+            command_verdicts(
+                &format!("The `{literal}` succeeded."),
+                vec![evidence_for_string(literal, code)],
+            )
+            .1
+        };
+        for literal in [
+            "go test ./...",
+            "make test",
+            "make -C crates/x test",
+            "yarn test",
+            "yarn --silent test",
+            "pnpm test",
+            "bun test",
+            "npm t",
+            "npm run test",
+            "npm run test:unit",
+            "yarn run test",
+            "tox",
+            "tox -e py312",
+            "nox -s tests",
+            "python3 -m unittest discover",
+            "mvn test",
+            "./gradlew test",
+            "dotnet test",
+            "deno test",
+            "swift test",
+            "mix test",
+            "bazel test //...",
+            "rspec",
+            "bundle exec rspec",
+            "phpunit",
+            "ctest",
+            "mocha",
+            "pdm run pytest",
+            "hatch run test",
+            "uv run pytest -q",
+            "CI=1 go test ./...",
+            // Non-benign env prefixes and wrappers.
+            "GOFLAGS=-count=1 go test ./...",
+            "timeout 60 go test ./...",
+            "time make test",
+            "sudo -E go test ./...",
+            "env CI=1 yarn test",
+            "bash -lc 'go test ./...'",
+            // Script and target spellings.
+            "yarn test:unit",
+            "pnpm test:e2e",
+            "make test-unit",
+            "just test_all",
+            "npm run --silent test:unit",
+            "npm run -w pkg test",
+            // Lifecycle goals that run the suite.
+            "mvn verify",
+            "./gradlew check",
+            "make check",
+            "node --test",
+            "playwright test",
+            "turbo test",
+            "gotestsum",
+            "bats tests/",
+            // A flag value named like a package verb is not the verb.
+            "go -C build test",
+            "dart pub run test",
+            "flutter pub run test",
+            "pnpm exec jest",
+            "sudo -u root go test ./...",
+            "nice -n 10 go test ./...",
+            "sudo -n go test ./...",
+            "env -C crates go test ./...",
+            "nice -n go test ./...",
+            "timeout -k 5 60 go test ./...",
+            "pnpm exec --silent jest",
+            "pnpm -r exec jest",
+            "pnpm exec -- vitest",
+            "timeout -s KILL 60 go test ./...",
+            "ionice -c 2 go test ./...",
+            "time -p go test ./...",
+            "setsid go test ./...",
+            "caffeinate go test ./...",
+            "npm it",
+            "npm install-test",
+            "mvn install",
+            "gradle build",
+            "dart pub global run test",
+        ] {
+            assert_eq!(succeeded(literal, 0), Verdict::Unverified, "{literal}");
+            assert_eq!(succeeded(literal, 1), Verdict::Contradicted, "{literal}");
+        }
+        // Not test commands: still verify from a literal exit status.
+        for literal in [
+            "go build ./...",
+            "go vet ./...",
+            "make build",
+            "make install",
+            "yarn install",
+            "npm run build",
+            "npm install test-utils",
+            "pip install pytest",
+            "dotnet build",
+            "tox -e lint",
+            "nox -s lint",
+            "cargo build",
+            "bundle install",
+            "uv run ruff check",
+            "python3 script.py",
+            // A package or topic named `test`, not a suite.
+            "go build -tags test",
+            "go help test",
+            "go doc test",
+            "npm install test",
+            "yarn add test",
+            "dotnet add package test",
+            "dart pub add test",
+            "tox -e lint,format",
+            "make install",
+            "time make build",
+            "timeout 60 npm install",
+        ] {
+            assert_eq!(succeeded(literal, 0), Verdict::Verified, "{literal}");
+        }
+        // "I ran" only asserts execution and is untouched.
+        assert_eq!(
+            command_verdicts(
+                "I ran `go test ./...`.",
+                vec![evidence_for_string("go test ./...", 0)]
+            )
+            .0,
+            Verdict::Verified
+        );
+    }
+
+    /// A recorded failure of the exact command stays Contradicted however it is
+    /// followed: a later run with extra arguments, or a mere mention, must not
+    /// let an agent soften a failure it caused.
+    #[test]
+    fn a_recorded_exact_failure_is_not_softened_by_later_rows() {
+        for later in [
+            evidence_for_command(&["npm", "install", "--legacy-peer-deps"], 0),
+            evidence_for_string("npm install | cat", 0),
+        ] {
+            assert_eq!(
+                command_verdicts(
+                    "The `npm install` succeeded.",
+                    vec![evidence_for_command(&["npm", "install"], 1), later]
+                )
+                .1,
+                Verdict::Contradicted
+            );
+        }
+    }
+
+    /// An older exact success is not replaced by a newer failing run of the same
+    /// command with extra arguments: that run may be the real one, so the
+    /// success is withheld rather than contradicted or confirmed.
+    #[test]
+    fn a_newer_prefix_run_withholds_instead_of_overriding_an_exact_success() {
+        let rows = vec![
+            evidence_for_command(&["npm", "install"], 0),
+            evidence_for_command(&["npm", "install", "left-pad"], 1),
+        ];
+        assert_eq!(
+            command_verdicts("The `npm install` succeeded.", rows.clone()).1,
+            Verdict::Unverified
+        );
+        // "I ran" still holds: the exact run happened.
+        assert_eq!(
+            command_verdicts("I ran `npm install`.", rows).0,
+            Verdict::Verified
+        );
+    }
+
+    /// The claim is a strict prefix of what ran: extra arguments (a dry run)
+    /// can change what the command did, so success is capped at Review.
+    #[test]
+    fn a_longer_command_than_claimed_is_capped_at_review() {
+        for extra in [
+            vec!["--dry-run"],
+            vec!["left-pad"],
+            vec!["--legacy-peer-deps"],
+        ] {
+            let mut argv = vec!["npm", "install"];
+            argv.extend(extra);
+            let row = evidence_for_command(&argv, 0);
+            assert_eq!(
+                command_verdicts("I ran `npm install`.", vec![row.clone()]),
+                (Verdict::Review, Verdict::Review),
+                "{argv:?}"
+            );
+        }
+        // A failure is still a failure.
+        assert_eq!(
+            command_verdicts(
+                "The `npm install` succeeded.",
+                vec![evidence_for_command(&["npm", "install", "--dry-run"], 1)]
+            )
+            .1,
+            Verdict::Contradicted
+        );
+    }
+
+    /// A newer row that only mentions the command may be its real run.
+    #[test]
+    fn a_newer_mention_withholds_a_success_but_not_a_recorded_failure_or_an_execution() {
+        let mention = || evidence_for_string("npm install | cat", 0);
+        assert_eq!(
+            command_verdicts(
+                "The `npm install` succeeded.",
+                vec![evidence_for_command(&["npm", "install"], 0), mention()]
+            )
+            .1,
+            Verdict::Unverified
+        );
+        assert_eq!(
+            command_verdicts(
+                "The `npm install` succeeded.",
+                vec![evidence_for_command(&["npm", "install"], 1), mention()]
+            )
+            .1,
+            Verdict::Contradicted
+        );
+        // An older real run is not undone by a later mention for "I ran".
+        assert_eq!(
+            command_verdicts(
+                "I ran `npm install`.",
+                vec![evidence_for_command(&["npm", "install"], 0), mention()]
+            )
+            .0,
+            Verdict::Verified
+        );
+    }
+
+    /// FORNX-477 (QA 29513 residual): "the `pytest` run succeeded" asserts that
+    /// tests passed as much as "all tests passed" does. Re-labelling the claim
+    /// `command_succeeded` must neither skip the runner/summary conditions nor
+    /// the trust bar, while commands that are not test runs keep verifying.
+    #[test]
+    fn a_test_run_relabelled_as_command_succeeded_gets_the_test_result_bar() {
+        use fornax_types::TrustClass;
+        let verdict = |text: &str, ev: Evidence, trust: Option<TrustClass>| {
+            let mut ev = ev;
+            if let Some(trust) = trust {
+                ev.source = Some(source_with(trust));
+            }
+            CommandSuccessVerifier
+                .verify(&claim_for("command_succeeded", text), &[ev], &caps())
+                .verdict
+        };
+        let passing = |cmd: &[&str]| with_passing_summary(evidence_for_command(cmd, 0));
+        let agent = || Some(TrustClass::AgentAdjacent);
+
+        // RED before the fix: these were Verified from the agent's own account.
+        assert_eq!(
+            verdict(
+                "The `pytest -q` run succeeded.",
+                passing(&["pytest", "-q"]),
+                agent()
+            ),
+            Verdict::Review
+        );
+        assert_eq!(
+            verdict(
+                "The `cargo test` run completed successfully.",
+                passing(&["cargo", "test"]),
+                agent()
+            ),
+            Verdict::Review
+        );
+        // No recorded source is not attested either.
+        let mut unsourced = passing(&["pytest", "-q"]);
+        unsourced.source = None;
+        assert_eq!(
+            verdict("The `pytest -q` run succeeded.", unsourced, None),
+            Verdict::Review
+        );
+        // Fake runner (exit 0, no summary) and a zero-test run stay Unverified.
+        assert_eq!(
+            verdict(
+                "The `pytest` run succeeded.",
+                evidence_for_command(&["pytest"], 0),
+                agent()
+            ),
+            Verdict::Unverified
+        );
+        let mut zero = evidence_for_command(&["cargo", "test", "no_such_test"], 0);
+        zero.payload["test_summary"] =
+            serde_json::json!({"format": "cargo", "passed": 0, "failed": 0});
+        assert_eq!(
+            verdict(
+                "The `cargo test no_such_test` run succeeded.",
+                zero,
+                agent()
+            ),
+            Verdict::Unverified
+        );
+        // The claim names a runner but the matched evidence merely mentions it.
+        assert_eq!(
+            verdict(
+                "The `pytest` run succeeded.",
+                evidence_for_command(&["echo", "pytest"], 0),
+                agent()
+            ),
+            Verdict::Unverified
+        );
+        // Runners whose output is not read (jest, vitest, npm test, nextest) and
+        // env-prefixed spellings are still test assertions: evidence that merely
+        // mentions them must not verify, and a real run has no summary format.
+        for (text, mention) in [
+            ("The `jest` run succeeded.", vec!["cat", "jest.config.js"]),
+            ("The `npx jest` run succeeded.", vec!["echo", "npx jest"]),
+            ("The `npm test` run succeeded.", vec!["echo", "npm test"]),
+            ("The `vitest` run succeeded.", vec!["echo", "vitest"]),
+            (
+                "The `cargo nextest run` run succeeded.",
+                vec!["echo", "cargo nextest run"],
+            ),
+            (
+                "The `CI=1 pytest` run succeeded.",
+                vec!["echo", "CI=1 pytest"],
+            ),
+            // Spelling that differs only in case still matches the (lowercased)
+            // evidence text, so it must be recognised as naming a runner.
+            ("The `PYTEST` run succeeded.", vec!["echo", "pytest"]),
+            ("The `Jest` run succeeded.", vec!["echo", "jest"]),
+            ("The `Npm Test` run succeeded.", vec!["echo", "npm test"]),
+        ] {
+            assert_eq!(
+                verdict(text, evidence_for_command(&mention, 0), agent()),
+                Verdict::Unverified,
+                "{text}"
+            );
+        }
+        assert_eq!(
+            verdict(
+                "The `jest` run succeeded.",
+                evidence_for_command(&["jest"], 0),
+                Some(TrustClass::HostObserved)
+            ),
+            Verdict::Unverified,
+            "a real jest run has no readable summary, so it cannot verify"
+        );
+        // A real failing run is still contradicted.
+        assert_eq!(
+            verdict(
+                "The `pytest -q` run succeeded.",
+                evidence_for_command(&["pytest", "-q"], 1),
+                agent()
+            ),
+            Verdict::Contradicted
+        );
+        // Positive control: an attested channel still verifies a real run
+        // (fixture attestor; production ships none).
+        assert_eq!(
+            verdict(
+                "The `pytest -q` run succeeded.",
+                passing(&["pytest", "-q"]),
+                Some(TrustClass::HostObserved)
+            ),
+            Verdict::Verified
+        );
+        // Non-test commands are capped at Review on agent-adjacent evidence
+        // (FORNX-480) and verify only when attested; a failure is still
+        // contradicted. This includes commands that merely mention a runner's name.
+        for (text, cmd) in [
+            ("The `npm install` succeeded.", vec!["npm", "install"]),
+            ("The `cargo build` succeeded.", vec!["cargo", "build"]),
+            (
+                "The `pip install pytest` succeeded.",
+                vec!["pip", "install", "pytest"],
+            ),
+        ] {
+            assert_eq!(
+                verdict(text, evidence_for_command(&cmd, 0), agent()),
+                Verdict::Review,
+                "{text}"
+            );
+            assert_eq!(
+                verdict(
+                    text,
+                    evidence_for_command(&cmd, 0),
+                    Some(TrustClass::HostObserved)
+                ),
+                Verdict::Verified,
+                "{text}"
+            );
+            assert_eq!(
+                verdict(text, evidence_for_command(&cmd, 1), agent()),
+                Verdict::Contradicted,
+                "{text}"
+            );
+        }
+    }
+
+    /// FORNX-480 (founder, Option B): a program-success claim is not `Verified`
+    /// from exit-code evidence the agent's own session produced. A shadowing
+    /// executable that exits 0 is indistinguishable from the real program there.
+    #[test]
+    fn command_success_needs_an_attested_source_to_verify() {
+        use fornax_types::{CollectionMethod, EvidenceSource, Provider, TrustClass};
+        let claim = claim_for("command_succeeded", "The `npm install` succeeded.");
+        let run = |ev: Evidence| {
+            CommandSuccessVerifier
+                .verify(&claim, &[ev], &caps())
+                .verdict
+        };
+        let with = |name: &'static str, trust: TrustClass, code: i64| {
+            let mut ev = evidence_for_command(&["npm", "install"], code);
+            ev.source = Some(EvidenceSource::now(
+                name,
+                trust,
+                Some(Provider::Codex),
+                CollectionMethod::FilePoll,
+                None,
+            ));
+            ev
+        };
+        // RED before the fix: an executable named `npm` that only exits 0.
+        assert_eq!(
+            run(with("codex_exec_sensor", TrustClass::AgentAdjacent, 0)),
+            Verdict::Review
+        );
+        // Unregistered sensor claiming a host-observed class: the label alone is
+        // not enough.
+        assert_eq!(
+            run(with("forged_sensor", TrustClass::HostObserved, 0)),
+            Verdict::Review
+        );
+        assert_eq!(
+            run(with("forged_sensor", TrustClass::IndependentExternal, 0)),
+            Verdict::Review
+        );
+        // A registered attestor labelled agent-adjacent is not attested either.
+        assert_eq!(
+            run(with(
+                "test_fixture_run_attestor",
+                TrustClass::AgentAdjacent,
+                0
+            )),
+            Verdict::Review
+        );
+        // No recorded source.
+        let mut unsourced = with("x", TrustClass::HostObserved, 0);
+        unsourced.source = None;
+        assert_eq!(run(unsourced), Verdict::Review);
+        // GREEN control: registered attestor with an independent class.
+        assert_eq!(
+            run(with(
+                "test_fixture_run_attestor",
+                TrustClass::HostObserved,
+                0
+            )),
+            Verdict::Verified
+        );
+        assert_eq!(
+            run(with(
+                "test_fixture_run_attestor",
+                TrustClass::IndependentExternal,
+                0
+            )),
+            Verdict::Verified
+        );
+        // Failure semantics are preserved: a recorded non-zero exit is still
+        // contradicted, whatever the source.
+        assert_eq!(
+            run(with("codex_exec_sensor", TrustClass::AgentAdjacent, 1)),
+            Verdict::Contradicted
+        );
+        // `command_executed` keeps its meaning (ran, not succeeded): unchanged.
+        let executed = claim_for("command_executed", "I ran `npm install`.");
+        assert_eq!(
+            CommandExecutedVerifier
+                .verify(
+                    &executed,
+                    &[with("codex_exec_sensor", TrustClass::AgentAdjacent, 0)],
+                    &caps()
+                )
+                .verdict,
+            Verdict::Verified
+        );
+    }
+
+    /// FORNX-477 trust boundary (QA 29501): a forged passing summary printed
+    /// by an executable named `pytest` is indistinguishable, in the agent's
+    /// transcript, from the real runner's. Evidence that only the agent's own
+    /// provider account carries must never be `Verified`; only evidence Fornax
+    /// or an outside system observed may be.
+    #[test]
+    fn transcript_only_test_evidence_never_reaches_verified() {
+        use fornax_types::TrustClass;
+        let verdict_for = |source: Option<fornax_types::EvidenceSource>| {
+            let mut ev = evidence_with_exit_code(0);
+            ev.source = source;
+            TestResultVerifier
+                .verify(&claim("All tests passed."), &[ev], &caps())
+                .verdict
+        };
+        // RED before the gate: the forged-but-well-formed summary verified.
+        assert_eq!(
+            verdict_for(Some(source_with(TrustClass::AgentAdjacent))),
+            Verdict::Review
+        );
+        // No recorded source (pre-sensor-contract evidence) is not attested.
+        assert_eq!(verdict_for(None), Verdict::Review);
+        assert_eq!(
+            verdict_for(Some(source_with(TrustClass::ModelInternal))),
+            Verdict::Review
+        );
+        assert_eq!(
+            verdict_for(Some(source_with(TrustClass::Unrecognized("x".into())))),
+            Verdict::Review
+        );
+        // Positive controls: an attested channel still verifies a real run.
+        assert_eq!(
+            verdict_for(Some(source_with(TrustClass::HostObserved))),
+            Verdict::Verified
+        );
+        assert_eq!(
+            verdict_for(Some(source_with(TrustClass::IndependentExternal))),
+            Verdict::Verified
+        );
+    }
+
+    /// FORNX-477 founder decision: a trust-class label alone is not enough.
+    /// Anything that can submit evidence could write `HostObserved` or
+    /// `IndependentExternal` into the record, or borrow the name of a shipped
+    /// `HostObserved` sensor (git working tree, file-write confirmation) that
+    /// does not observe test runs. Only a collector this verifier lists as a
+    /// test-run attestor may promote, and none ships in production.
+    #[test]
+    fn a_trusted_class_label_without_an_attesting_collector_never_verifies() {
+        use fornax_types::{CollectionMethod, EvidenceSource, TrustClass};
+        let source = |name: &'static str, trust: TrustClass| {
+            EvidenceSource::now(name, trust, None, CollectionMethod::FilePoll, None)
+        };
+        for (name, trust) in [
+            // A shipped HostObserved sensor's identity, on exit-code evidence.
+            (
+                "claude_git_working_tree_sensor_v1",
+                TrustClass::HostObserved,
+            ),
+            (
+                "claude_file_write_confirmed_sensor_v1",
+                TrustClass::HostObserved,
+            ),
+            // The agent's own sensor claiming a trusted class (forged label).
+            ("codex_exec_command_end_sensor_v1", TrustClass::HostObserved),
+            (
+                "codex_exec_command_end_sensor_v1",
+                TrustClass::IndependentExternal,
+            ),
+            // An unregistered name claiming either trusted class.
+            ("made_up_ci_sensor", TrustClass::IndependentExternal),
+            ("made_up_host_sensor", TrustClass::HostObserved),
+            // A look-alike of the fixture attestor name.
+            ("test_fixture_run_attestor ", TrustClass::HostObserved),
+        ] {
+            let mut ev = evidence_with_exit_code(0);
+            ev.source = Some(source(name, trust.clone()));
+            assert_eq!(
+                TestResultVerifier
+                    .verify(&claim("All tests passed."), &[ev], &caps())
+                    .verdict,
+                Verdict::Review,
+                "{name} / {trust:?}"
+            );
+        }
+    }
+
+    /// The gate only lowers a verdict: it never touches `Contradicted` for a
+    /// failing run, and an unattested run without a passing summary is still
+    /// `Unverified` (the stronger refusal), not `Review`.
+    #[test]
+    fn attestation_gate_only_lowers_and_keeps_other_protections() {
+        use fornax_types::TrustClass;
+        for trust in [TrustClass::AgentAdjacent, TrustClass::HostObserved] {
+            let mut failing = evidence_with_exit_code(1);
+            failing.source = Some(source_with(trust.clone()));
+            assert_eq!(
+                TestResultVerifier
+                    .verify(&claim("All tests passed."), &[failing], &caps())
+                    .verdict,
+                Verdict::Contradicted
+            );
+            let mut fake = bare_runner_evidence(0);
+            fake.source = Some(source_with(trust));
+            assert_eq!(
+                TestResultVerifier
+                    .verify(&claim("All tests passed."), &[fake], &caps())
+                    .verdict,
+                Verdict::Unverified
+            );
+        }
+    }
+
+    /// FORNX-477 residual: a runner name plus exit 0 is not proof that tests
+    /// ran. A QA-owned executable named `pytest` that only does `exit 0`
+    /// (and `cargo test no_such_test`) exits 0 with no passing-test summary.
+    #[test]
+    fn a_runner_name_with_exit_zero_and_no_passing_summary_is_unverified() {
+        use serde_json::json;
+        // RED: the fake `pytest` (empty output) and zero-selected cargo run.
+        assert_eq!(
+            verdict_with_summary(json!(["pytest"]), 0, None),
+            Verdict::Unverified
+        );
+        assert_eq!(
+            verdict_with_summary(
+                json!("/tmp/qa/bin/pytest"),
+                0,
+                Some(json!({"format": "pytest", "passed": 0, "failed": 0}))
+            ),
+            Verdict::Unverified
+        );
+        assert_eq!(
+            verdict_with_summary(
+                json!(["cargo", "test", "no_such_test"]),
+                0,
+                Some(json!({"format": "cargo", "passed": 0, "failed": 0}))
+            ),
+            Verdict::Unverified
+        );
+        // A summary that reports failures cannot verify, even with exit 0.
+        assert_eq!(
+            verdict_with_summary(
+                json!(["pytest"]),
+                0,
+                Some(json!({"format": "pytest", "passed": 2, "failed": 1}))
+            ),
+            Verdict::Unverified
+        );
+        // The summary must come from the runner kind that was identified.
+        assert_eq!(
+            verdict_with_summary(
+                json!(["pytest"]),
+                0,
+                Some(json!({"format": "cargo", "passed": 3, "failed": 0}))
+            ),
+            Verdict::Unverified
+        );
+        // Malformed summary shapes fail closed.
+        for bad in [
+            json!({"format": "pytest"}),
+            json!({"format": "pytest", "passed": "3", "failed": 0}),
+            json!({"format": "pytest", "passed": 3}),
+            json!("3 passed"),
+        ] {
+            assert_eq!(
+                verdict_with_summary(json!(["pytest"]), 0, Some(bad.clone())),
+                Verdict::Unverified,
+                "{bad}"
+            );
+        }
+        // GREEN: a genuine run with a matching passing summary is Verified.
+        assert_eq!(
+            verdict_with_summary(
+                json!(["pytest"]),
+                0,
+                Some(json!({"format": "pytest", "passed": 1, "failed": 0}))
+            ),
+            Verdict::Verified
+        );
+        assert_eq!(
+            verdict_with_summary(
+                json!(["/bin/zsh", "-lc", "cd crates/x && cargo test"]),
+                0,
+                Some(json!({"format": "cargo", "passed": 12, "failed": 0}))
+            ),
+            Verdict::Verified
+        );
+    }
+
+    /// The summary only ever withholds `Verified`: a genuine failing runner
+    /// stays Contradicted whatever (or nothing) the output claimed, and a
+    /// summary on non-runner evidence neither verifies nor contradicts.
+    #[test]
+    fn the_summary_never_grants_verified_or_contradicted() {
+        use serde_json::json;
+        let good = || Some(json!({"format": "pytest", "passed": 5, "failed": 0}));
+        assert_eq!(
+            verdict_with_summary(json!(["pytest"]), 1, good()),
+            Verdict::Contradicted
+        );
+        assert_eq!(
+            verdict_with_summary(json!(["pytest"]), 1, None),
+            Verdict::Contradicted
+        );
+        assert_eq!(
+            verdict_with_summary(json!(["echo", "pytest"]), 0, good()),
+            Verdict::Unverified
+        );
+        assert_eq!(
+            verdict_with_summary(json!("echo '5 passed in 0.1s' && pytest"), 0, good()),
+            Verdict::Unverified
+        );
+        assert_eq!(
+            verdict_with_summary(json!("pytest --collect-only"), 0, good()),
+            Verdict::Unverified
+        );
+        // Recognised runners whose output format is not read in this cut
+        // can never be Verified, even with a (forged) pytest-shaped summary.
+        for cmd in [
+            json!("npm test"),
+            json!("npx jest"),
+            json!("cargo nextest run"),
+        ] {
+            assert_eq!(
+                verdict_with_summary(cmd.clone(), 0, good()),
+                Verdict::Unverified,
+                "{cmd}"
+            );
+        }
+    }
+
+    /// The summary must belong to the row that is judged: a later runner row
+    /// without one withholds Verified, a later failure still contradicts, and
+    /// a cargo command cannot be vouched for by a pytest-format summary (nor
+    /// the reverse).
+    #[test]
+    fn the_judged_row_must_carry_its_own_matching_summary() {
+        use serde_json::json;
+        let pass = with_passing_summary(evidence_for_command(&["pytest", "-q"], 0));
+        let later_bare = evidence_for_command(&["pytest", "-k", "x"], 0);
+        let later_fail = evidence_for_command(&["pytest", "-k", "x"], 1);
+        let judge = |rows: &[Evidence]| {
+            TestResultVerifier
+                .verify(&claim("All tests passed."), rows, &caps())
+                .verdict
+        };
+        assert_eq!(judge(&[pass.clone(), later_bare]), Verdict::Unverified);
+        assert_eq!(judge(&[pass, later_fail]), Verdict::Contradicted);
+        assert_eq!(
+            verdict_with_summary(
+                json!(["cargo", "test"]),
+                0,
+                Some(json!({"format": "pytest", "passed": 3, "failed": 0}))
+            ),
+            Verdict::Unverified
+        );
+        assert_eq!(
+            verdict_with_summary(
+                json!("python -m pytest"),
+                0,
+                Some(json!({"format": "cargo", "passed": 3, "failed": 0}))
+            ),
+            Verdict::Unverified
+        );
+    }
+
+    /// A heuristic exit 0 (inferred from empty stderr) stays Review even
+    /// when a summary is present; the summary does not raise the ceiling.
+    #[test]
+    fn a_summary_does_not_raise_the_heuristic_ceiling() {
+        let mut ev = with_passing_summary(evidence_for_command(&["pytest", "-q"], 0));
+        ev.payload["heuristic"] = serde_json::json!(true);
+        let f = TestResultVerifier.verify(&claim("All tests passed."), &[ev], &caps());
+        assert_eq!(f.verdict, Verdict::Review);
+    }
+
+    /// FORNX-477: the heuristic ceiling (FORNX-433) must survive the
+    /// stricter matcher -- a heuristic exit 0 from a genuine runner stays
+    /// Review, and a spoof-shaped command with a heuristic exit stays
+    /// Unverified (it never reaches the exit-code branch at all).
+    #[test]
+    fn heuristic_ceiling_is_unchanged_by_command_identification() {
+        let mut real = with_passing_summary(evidence_for_command(&["pytest", "-q"], 0));
+        real.payload["heuristic"] = serde_json::json!(true);
+        let f = TestResultVerifier.verify(&claim("All tests passed."), &[real], &caps());
+        assert_eq!(f.verdict, Verdict::Review);
+
+        let mut spoof = evidence_for_command(&["echo", "pytest"], 0);
+        spoof.payload["heuristic"] = serde_json::json!(true);
+        let f = TestResultVerifier.verify(&claim("All tests passed."), &[spoof], &caps());
+        assert_eq!(f.verdict, Verdict::Unverified);
+    }
+
+    /// FORNX-477: a spoof-shaped command appearing *after* a genuine failing
+    /// run must not mask it, and one appearing before must not satisfy it:
+    /// only genuine runner evidence is selected.
+    #[test]
+    fn spoof_commands_neither_mask_nor_replace_genuine_runner_evidence() {
+        let genuine_fail = evidence_for_command(&["pytest", "-q"], 1);
+        let spoof_after = evidence_for_command(&["echo", "pytest"], 0);
+        let f = TestResultVerifier.verify(
+            &claim("All tests passed."),
+            &[genuine_fail.clone(), spoof_after],
+            &caps(),
+        );
+        assert_eq!(f.verdict, Verdict::Contradicted);
+        assert_eq!(f.evidence_ids, vec![genuine_fail.id]);
+
+        let spoof_only = evidence_for_command(&["echo", "pytest"], 0);
+        let f = TestResultVerifier.verify(&claim("All tests passed."), &[spoof_only], &caps());
+        assert_eq!(f.verdict, Verdict::Unverified);
     }
 
     #[test]

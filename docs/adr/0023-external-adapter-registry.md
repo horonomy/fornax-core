@@ -55,7 +55,9 @@ ADR-0004 observation semantics and ADR-0022 acquisition remain unchanged.
 ### What an install actually is
 
 Both built-ins do the same narrow thing. Claude Code: ensure a hook group
-carrying `command: "fornax-hook-claude"` exists under
+running `fornax-hook-claude` (the absolute path beside the installed
+`fornax` binary when it is usable, else the bare name; an existing Fornax
+entry with another location is updated in place, never duplicated) exists under
 `hooks.<event>[]` in `~/.claude/settings.json`, idempotently, refusing to
 overwrite a value of unexpected shape, writing via temp-file + rename.
 Codex: ensure a `notify` entry bearing the `fornax-codex-notify.sh` marker

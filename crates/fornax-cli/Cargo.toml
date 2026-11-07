@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 fornax-types = { path = "../fornax-types" }
+fornax-adapter-codex = { path = "../fornax-adapter-codex" }
 fornax-store = { path = "../fornax-store" }
 fornax-verify = { path = "../fornax-verify" }
 fornax-replay = { path = "../fornax-replay" }
@@ -17,6 +18,7 @@ fornax-corpus = { path = "../fornax-corpus" }
 fornax-bench = { path = "../fornax-bench" }
 fornax-experiment-runner = { path = "../fornax-experiment-runner" }
 fornax-receipt = { path = "../fornax-receipt" }
+fornax-upload = { path = "../fornax-upload" }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -31,4 +33,7 @@ chrono.workspace = true
 thiserror.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "=1.1.5", features = ["fs"] }
+rustix = { version = "=1.1.5", features = ["fs", "process"] }
+
+[dev-dependencies]
+sqlx.workspace = true

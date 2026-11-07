@@ -14,6 +14,7 @@ serde_json = { workspace = true, features = ["raw_value"] }
 num-bigint = "0.5.1"
 num-traits = "0.2.19"
 chrono.workspace = true
+url = "2"
 uuid.workspace = true
 thiserror.workspace = true
 toml_edit.workspace = true

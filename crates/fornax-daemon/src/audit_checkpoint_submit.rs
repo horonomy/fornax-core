@@ -69,6 +69,18 @@ struct SubmitConfig {
     interval: Duration,
 }
 
+/// The one HTTP client the checkpoint push uses. No redirects: an allowlisted
+/// host must not be able to forward the push (and its bearer credential) to a
+/// destination nobody authorized. If the builder fails there is no fallback
+/// to a default client (which would follow redirects); the push is skipped.
+fn build_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("static reqwest client configuration is valid")
+}
+
 /// Spawns the checkpoint submission supervisor task. Always returns a
 /// `JoinHandle`, even when disabled, so `main()` can `.abort()` it
 /// unconditionally at shutdown -- mirroring `policy_poll::spawn`.
@@ -92,10 +104,7 @@ async fn supervisor_loop(state: AppState, home: PathBuf) {
         return;
     };
 
-    let http = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+    let http = build_http_client();
 
     let mut first_tick = true;
     loop {
@@ -173,7 +182,51 @@ async fn submit_one_cycle(
     url: &reqwest::Url,
     credential: &str,
 ) {
-    if !fornax_types::privacy::cloud_sync_allowed() {
+    submit_one_cycle_with_gate(
+        state,
+        http,
+        url,
+        credential,
+        fornax_types::privacy::cloud_sync_allowed(),
+    )
+    .await;
+}
+
+/// [`submit_one_cycle`] with the legacy env kill switch passed in, so tests
+/// need not race on a process-global env var.
+///
+/// FORNX-464: every cycle re-asks the persisted egress policy, so revoking a
+/// consent or entering the corporate profile stops the very next push. A
+/// denial (or an unreadable policy) sends nothing and opens no connection.
+async fn submit_one_cycle_with_gate(
+    state: &AppState,
+    http: &reqwest::Client,
+    url: &reqwest::Url,
+    credential: &str,
+    legacy_cloud_sync_gate_open: bool,
+) {
+    let classes: std::collections::BTreeSet<_> =
+        [fornax_types::EgressContentClass::EvidenceMetadata].into();
+    let permit = match state
+        .store
+        .decide_egress(
+            fornax_types::egress::Purpose::AuditCheckpoint,
+            url.as_str(),
+            &classes,
+            legacy_cloud_sync_gate_open,
+        )
+        .await
+    {
+        Ok(permit) => permit,
+        Err(denial) => {
+            tracing::info!(
+                reason = denial.code(),
+                "audit checkpoint submission skipped: denied by egress policy"
+            );
+            return;
+        }
+    };
+    if !permit.authorizes(fornax_types::egress::Purpose::AuditCheckpoint, url.as_str()) {
         return;
     }
 
@@ -444,6 +497,172 @@ mod tests {
         assert!(resolve_submit_config(&home).is_none());
         std::env::remove_var(CHECKPOINT_URL_ENV);
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    use crate::tests::counting_listener;
+
+    async fn state_with_ledger() -> AppState {
+        let state = crate::tests::test_state().await;
+        // A non-empty audit ledger, so a permitted cycle would reach the network.
+        state
+            .store
+            .set_egress_profile(fornax_types::egress::Profile::Unconfigured, "test", false)
+            .await
+            .unwrap();
+        state
+    }
+
+    async fn run_cycle(state: &AppState, addr: std::net::SocketAddr, gate: bool) {
+        let url = reqwest::Url::parse(&format!("http://{addr}/checkpoints")).unwrap();
+        let http = build_http_client();
+        submit_one_cycle_with_gate(state, &http, &url, "test-credential", gate).await;
+    }
+
+    fn connections(c: &std::sync::atomic::AtomicUsize) -> usize {
+        c.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// FORNX-464: denial is proven by ZERO accepted connections, not log text.
+    #[tokio::test]
+    async fn unconfigured_corporate_and_missing_consent_open_no_connection() {
+        use fornax_types::egress::{Profile, Purpose};
+        let (addr, accepted) = counting_listener().await;
+        let state = state_with_ledger().await;
+
+        // Unconfigured (default), kill switch open.
+        run_cycle(&state, addr, true).await;
+        assert_eq!(connections(&accepted), 0, "unconfigured must send nothing");
+
+        // Personal but no allowlist or consent.
+        state
+            .store
+            .set_egress_profile(Profile::Personal, "test", false)
+            .await
+            .unwrap();
+        run_cycle(&state, addr, true).await;
+        assert_eq!(
+            connections(&accepted),
+            0,
+            "no allowlist/consent must send nothing"
+        );
+
+        // Fully authorized personal, but the kill switch is off.
+        let dest = format!("http://{addr}/checkpoints");
+        let classes: std::collections::BTreeSet<_> =
+            [fornax_types::EgressContentClass::EvidenceMetadata].into();
+        state
+            .store
+            .add_egress_allowlist(Purpose::AuditCheckpoint, &dest, "test")
+            .await
+            .unwrap();
+        state
+            .store
+            .grant_egress_consent(Purpose::AuditCheckpoint, &dest, &classes, 30, None, "test")
+            .await
+            .unwrap();
+        run_cycle(&state, addr, false).await;
+        assert_eq!(connections(&accepted), 0, "the kill switch only tightens");
+
+        // Corporate overrides all of it.
+        state
+            .store
+            .set_egress_profile(Profile::Corporate, "test", false)
+            .await
+            .unwrap();
+        run_cycle(&state, addr, true).await;
+        assert_eq!(connections(&accepted), 0, "corporate must send nothing");
+    }
+
+    #[tokio::test]
+    async fn a_fully_authorized_personal_install_does_connect_and_revocation_stops_it() {
+        use fornax_types::egress::{Profile, Purpose};
+        let (addr, accepted) = counting_listener().await;
+        let state = state_with_ledger().await;
+        let dest = format!("http://{addr}/checkpoints");
+        let classes: std::collections::BTreeSet<_> =
+            [fornax_types::EgressContentClass::EvidenceMetadata].into();
+        state
+            .store
+            .set_egress_profile(Profile::Personal, "test", false)
+            .await
+            .unwrap();
+        state
+            .store
+            .add_egress_allowlist(Purpose::AuditCheckpoint, &dest, "test")
+            .await
+            .unwrap();
+        let consent = state
+            .store
+            .grant_egress_consent(Purpose::AuditCheckpoint, &dest, &classes, 30, None, "test")
+            .await
+            .unwrap();
+
+        run_cycle(&state, addr, true).await;
+        assert_eq!(connections(&accepted), 1, "an authorized push must connect");
+
+        state
+            .store
+            .revoke_egress_consent(&consent, "test", "test")
+            .await
+            .unwrap();
+        run_cycle(&state, addr, true).await;
+        assert_eq!(
+            connections(&accepted),
+            1,
+            "revocation must stop the next push"
+        );
+    }
+
+    /// An allowlisted host that redirects must not move the push elsewhere.
+    #[tokio::test]
+    async fn a_redirect_from_an_allowlisted_host_is_never_followed() {
+        use fornax_types::egress::{Profile, Purpose};
+        let (target_addr, target_hits) = counting_listener().await;
+        // The "allowlisted" server answers every request with a 302 to the target.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let location = format!("http://{target_addr}/stolen");
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let location = location.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    let _ = socket
+                        .write_all(
+                            format!("HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                                .as_bytes(),
+                        )
+                        .await;
+                });
+            }
+        });
+        let state = state_with_ledger().await;
+        let dest = format!("http://{addr}/checkpoints");
+        let classes: std::collections::BTreeSet<_> =
+            [fornax_types::EgressContentClass::EvidenceMetadata].into();
+        state
+            .store
+            .set_egress_profile(Profile::Personal, "test", false)
+            .await
+            .unwrap();
+        state
+            .store
+            .add_egress_allowlist(Purpose::AuditCheckpoint, &dest, "test")
+            .await
+            .unwrap();
+        state
+            .store
+            .grant_egress_consent(Purpose::AuditCheckpoint, &dest, &classes, 30, None, "test")
+            .await
+            .unwrap();
+        run_cycle(&state, addr, true).await;
+        assert_eq!(
+            connections(&target_hits),
+            0,
+            "the redirect target must see zero connections"
+        );
     }
 
     #[test]

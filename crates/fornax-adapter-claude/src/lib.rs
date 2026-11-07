@@ -43,6 +43,9 @@ impl CapabilityProbe for ClaudeAdapter {
     /// `ProcessResult` is `Unsupported`: Claude Code's Bash `tool_response`
     /// never carries a literal exit code, only a heuristic derived from
     /// stdout/stderr/interrupted (see `normalize`'s `PostToolUse` handling).
+    /// The one exception is a failing command: its `PostToolUseFailure`
+    /// `error` starts `Exit code <N>`, a literal non-zero exit (FORNX-487).
+    /// Passing runs stay heuristic exit 0, so the class stays `Unsupported`.
     fn probe(&self) -> RuntimeCapabilities {
         use fornax_types::{CapabilitySignal, SignalAvailability, SignalClass};
         RuntimeCapabilities {
@@ -84,7 +87,9 @@ impl CapabilityProbe for ClaudeAdapter {
                     state: SignalAvailability::Unsupported,
                     detail: Some(
                         "Bash tool_response carries no literal exit code as of v2.1.238; \
-                         ExitCode evidence is heuristic from stdout/stderr/interrupted"
+                         ExitCode evidence is heuristic from stdout/stderr/interrupted. \
+                         The only literal exit code is a failure: the `Exit code <N>` prefix \
+                         of a PostToolUseFailure `error` (FORNX-487)"
                             .to_string(),
                     ),
                 },
@@ -214,10 +219,19 @@ impl EvidenceSensor for ClaudeBashExitCodeSensor {
         let (code, provenance) = match explicit_code {
             Some(code) => (
                 Some(code),
-                format!(
-                    "claude_code:{v}:PostToolUse:Bash#tool_response",
-                    v = self.adapter_version
-                ),
+                if event.raw.get("hook_event_name").and_then(|v| v.as_str())
+                    == Some("PostToolUseFailure")
+                {
+                    format!(
+                        "claude_code:{v}:PostToolUseFailure:Bash#error_prefix",
+                        v = self.adapter_version
+                    )
+                } else {
+                    format!(
+                        "claude_code:{v}:PostToolUse:Bash#tool_response",
+                        v = self.adapter_version
+                    )
+                },
             ),
             None => {
                 let interrupted = resp
@@ -272,16 +286,23 @@ impl EvidenceSensor for ClaudeBashExitCodeSensor {
             source_event_id: event.id,
             kind: EvidenceKind::ExitCode,
             observed_at: event.observed_at.clone(),
-            payload: serde_json::json!({
-                "command": event
-                    .tool_input
-                    .as_ref()
-                    .and_then(|ti| ti.get("command"))
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null),
-                "exit_code": code,
-                "heuristic": explicit_code.is_none(),
-            }),
+            payload: {
+                let mut payload = serde_json::json!({
+                    "command": event
+                        .tool_input
+                        .as_ref()
+                        .and_then(|ti| ti.get("command"))
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                    "exit_code": code,
+                    "heuristic": explicit_code.is_none(),
+                });
+                fornax_types::test_output::attach_summary(
+                    &mut payload,
+                    resp.get("stdout").and_then(|v| v.as_str()),
+                );
+                payload
+            },
             provenance,
             source: Some(EvidenceSource::now(
                 self.name(),
@@ -1208,6 +1229,46 @@ impl EvidenceSensor for ClaudeGitWorkingTreeSensor {
     }
 }
 
+/// FORNX-487: rebuild a Bash `tool_response` from a `PostToolUseFailure`
+/// payload. Claude Code reports a non-zero Bash exit as
+/// `error: "Exit code <N>\n<combined output>"`; that prefix is the only source
+/// of the literal exit code. Returns `None` (no evidence) for a non-Bash tool,
+/// an interrupt, a missing/unprefixed `error`, or `Exit code 0` -- a failure
+/// event must never mint a success signal.
+fn failure_tool_response(
+    raw: &serde_json::Value,
+    tool_name: Option<&str>,
+) -> Option<serde_json::Value> {
+    if tool_name != Some("Bash")
+        || raw
+            .get("is_interrupt")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    {
+        return None;
+    }
+    let error = raw.get("error")?.as_str()?;
+    let after = error.strip_prefix("Exit code ")?;
+    let (digits, output) = match after.split_once('\n') {
+        Some((d, rest)) => (d, rest),
+        None => (after, ""),
+    };
+    let code: i64 = digits
+        .bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| digits.parse().ok())
+        .flatten()?;
+    if code == 0 {
+        return None;
+    }
+    Some(serde_json::json!({
+        "exit_code": code,
+        "stdout": output,
+        "stderr": "",
+        "interrupted": false,
+    }))
+}
+
 fn translate(
     adapter: &ClaudeAdapter,
     // FORNX-433 AC3: no longer used as a fallback session id (see below) --
@@ -1229,7 +1290,7 @@ fn translate(
     let session_id = match raw
         .get("session_id")
         .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.trim().is_empty())
     {
         Some(s) => s.to_string(),
         None => {
@@ -1242,7 +1303,10 @@ fn translate(
 
     let kind = match hook_event {
         "PreToolUse" => EventKind::PreToolUse,
-        "PostToolUse" => EventKind::PostToolUse,
+        // FORNX-487: a failing tool call fires `PostToolUseFailure`, not
+        // `PostToolUse`. It feeds the same post-tool path; `tool_response`
+        // is rebuilt below from the failure payload's `error` text.
+        "PostToolUse" | "PostToolUseFailure" => EventKind::PostToolUse,
         "SessionStart" => EventKind::SessionStart,
         "Stop" => EventKind::SessionEnd,
         "UserPromptSubmit" => EventKind::UserPromptSubmit,
@@ -1270,7 +1334,11 @@ fn translate(
         .and_then(|v| v.as_str())
         .map(String::from);
     let tool_input = raw.get("tool_input").cloned();
-    let tool_response = raw.get("tool_response").cloned();
+    let tool_response = if hook_event == "PostToolUseFailure" {
+        failure_tool_response(raw, tool_name.as_deref())
+    } else {
+        raw.get("tool_response").cloned()
+    };
 
     let event = AgentEvent {
         id: event_id,
@@ -1375,10 +1443,12 @@ fn translate(
         out.extend(outcome.evidence.into_iter().map(IngestMessage::Evidence));
     }
 
-    // Stop: best-effort claim extraction from the transcript's last
-    // assistant message, if Claude Code gave us a transcript_path.
+    // Stop: best-effort claim extraction. Prefer the payload's own
+    // `last_assistant_message` (FORNX-488: a live host fires the hook before
+    // the final assistant line is flushed to the transcript); fall back to
+    // the transcript's last assistant text.
     if kind == EventKind::SessionEnd {
-        if let Some(text) = last_assistant_text(raw) {
+        if let Some(text) = stop_assistant_text(raw) {
             if fornax_verify_claims_tests_passed(&text) {
                 out.push(IngestMessage::Claim(Claim {
                     id: Uuid::new_v4(),
@@ -1406,6 +1476,14 @@ fn fornax_verify_claims_tests_passed(text: &str) -> bool {
     (t.contains("test") || t.contains("tests"))
         && (t.contains("passed") || t.contains("succeeded") || t.contains("all green"))
         && !t.contains("failed")
+}
+
+fn stop_assistant_text(raw: &serde_json::Value) -> Option<String> {
+    raw.get("last_assistant_message")
+        .and_then(|v| v.as_str())
+        .filter(|t| !t.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| last_assistant_text(raw))
 }
 
 fn last_assistant_text(raw: &serde_json::Value) -> Option<String> {
@@ -1498,6 +1576,24 @@ mod tests {
         match normalize(&raw) {
             NormalizationOutcome::Ignored { .. } => {}
             other => panic!("expected Ignored, got {other:?}"),
+        }
+    }
+
+    /// Execution-identity contract: a whitespace-only native id is absent.
+    #[test]
+    fn whitespace_only_session_id_is_ignored_not_accepted() {
+        for blank in [" ", "\t", "  \n"] {
+            let raw = serde_json::json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": blank,
+                "tool_name": "Bash",
+                "tool_input": {"command": "pytest"},
+                "tool_response": {"exit_code": 0}
+            });
+            assert!(
+                matches!(normalize(&raw), NormalizationOutcome::Ignored { .. }),
+                "{blank:?} must be treated as no identity"
+            );
         }
     }
 
@@ -1608,6 +1704,35 @@ mod tests {
         }
     }
 
+    /// FORNX-477: a runner's final summary in the Bash stdout rides on the
+    /// exit-code evidence as counts only; empty or unrelated stdout adds none.
+    /// The exit code stays heuristic here, so the verifier still caps it at Review.
+    #[test]
+    fn post_tool_use_attaches_runner_summary_counts_only() {
+        let raw = |stdout: &str| {
+            serde_json::json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": "sess-1",
+                "tool_name": "Bash",
+                "tool_input": {"command": "pytest -q"},
+                "tool_response": {"stdout": stdout, "stderr": "", "interrupted": false}
+            })
+        };
+        let evidence = |stdout: &str| match normalize(&raw(stdout)).into_messages().remove(2) {
+            IngestMessage::Evidence(ev) => ev,
+            other => panic!("expected Evidence, got {other:?}"),
+        };
+        let ev = evidence("..\n2 passed in 0.02s\n");
+        assert_eq!(
+            ev.payload["test_summary"],
+            serde_json::json!({"format": "pytest", "passed": 2, "failed": 0})
+        );
+        assert_eq!(ev.payload["heuristic"], true);
+        assert!(!ev.payload.to_string().contains("0.02s"));
+        assert!(evidence("").payload.get("test_summary").is_none());
+        assert!(evidence("hello\n").payload.get("test_summary").is_none());
+    }
+
     #[test]
     fn post_tool_use_real_shape_stderr_nonempty_infers_heuristic_failure() {
         let raw = serde_json::json!({
@@ -1676,6 +1801,90 @@ mod tests {
             IngestMessage::Claim(c) => assert_eq!(c.text, "all tests passed"),
             _ => panic!("expected Claim"),
         }
+    }
+
+    fn write_transcript(text: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("fornax-test-transcript-{}.jsonl", Uuid::new_v4()));
+        let line = serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": text}]}
+        })
+        .to_string();
+        std::fs::write(&path, line).unwrap();
+        path
+    }
+
+    fn claims_of(raw: &serde_json::Value) -> Vec<Claim> {
+        normalize(raw)
+            .into_messages()
+            .into_iter()
+            .filter_map(|m| match m {
+                IngestMessage::Claim(c) => Some(c),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stop_last_assistant_message_without_transcript_yields_claim() {
+        let raw = serde_json::json!({
+            "hook_event_name": "Stop",
+            "session_id": "sess-1",
+            "last_assistant_message": "All tests passed: `pytest -q test_ok.py` reported 1 passed in 0.00s.",
+            "stop_hook_active": false
+        });
+        let claims = claims_of(&raw);
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].subject, "test_result");
+    }
+
+    #[test]
+    fn stop_payload_message_wins_over_stale_transcript() {
+        let path = write_transcript("working on it");
+        let raw = serde_json::json!({
+            "hook_event_name": "Stop",
+            "session_id": "sess-1",
+            "transcript_path": path.to_str().unwrap(),
+            "last_assistant_message": "All tests passed."
+        });
+        let claims = claims_of(&raw);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].text, "All tests passed.");
+    }
+
+    #[test]
+    fn stop_blank_or_non_string_message_falls_back_to_transcript() {
+        let path = write_transcript("all tests passed");
+        for msg in [
+            serde_json::json!(""),
+            serde_json::json!("   \n"),
+            serde_json::json!(null),
+            serde_json::json!(42),
+            serde_json::json!({"text": "x"}),
+        ] {
+            let raw = serde_json::json!({
+                "hook_event_name": "Stop",
+                "session_id": "sess-1",
+                "transcript_path": path.to_str().unwrap(),
+                "last_assistant_message": msg
+            });
+            let claims = claims_of(&raw);
+            assert_eq!(claims.len(), 1, "{msg}");
+            assert_eq!(claims[0].text, "all tests passed");
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn stop_failing_payload_message_yields_no_claim() {
+        let raw = serde_json::json!({
+            "hook_event_name": "Stop",
+            "session_id": "sess-1",
+            "last_assistant_message": "Tests ran: 1 failed, 2 passed."
+        });
+        assert!(claims_of(&raw).is_empty());
     }
 
     #[test]

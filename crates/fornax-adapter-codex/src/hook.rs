@@ -185,7 +185,7 @@ fn translate(raw: &serde_json::Value) -> NormalizationOutcome {
     let session_id = match raw
         .get("session_id")
         .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.trim().is_empty())
     {
         Some(s) => s.to_string(),
         None => {
@@ -399,6 +399,21 @@ mod tests {
             normalize(&raw),
             NormalizationOutcome::Ignored { .. }
         ));
+    }
+
+    #[test]
+    fn whitespace_only_session_id_is_ignored_like_a_missing_one() {
+        for blank in [" ", "\t", "  \n"] {
+            let raw = serde_json::json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": blank,
+                "tool_use_id": "exec-abc"
+            });
+            assert!(
+                matches!(normalize(&raw), NormalizationOutcome::Ignored { .. }),
+                "{blank:?} must be treated as no identity"
+            );
+        }
     }
 
     #[test]

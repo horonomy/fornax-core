@@ -40,6 +40,7 @@ impl Scratch {
         Command::new(fornax_bin())
             .args(args)
             .env("HOME", &self.home)
+            .env_remove("CODEX_HOME")
             .env("FORNAX_HOME", &self.fornax_home)
             .output()
             .unwrap()
