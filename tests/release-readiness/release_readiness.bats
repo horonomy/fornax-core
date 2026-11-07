@@ -25,6 +25,8 @@ run_case_version() {
     --evidence-dir "${FIXTURES}/${case_name}/evidence" \
     --repo-fixture-dir "${FIXTURES}/${case_name}/repos" \
     --cargo-toml "${FIXTURES}/${case_name}/workspace-cargo.toml" \
+    --changelog "${FIXTURES}/${case_name}/CHANGELOG.md" \
+    --release-notes "${FIXTURES}/${case_name}/release-notes.md" \
     --this-repo-owner horonomy \
     --this-repo-name fornax-core
 }
@@ -139,3 +141,23 @@ run_case_version() {
   [ "$ready" = "false" ]
   echo "$output" | jq -e '.checks[] | select(.name=="repo.horonomy/fornax-core.workspace_version_matches_candidate" and .status=="fail" and (.detail | test("0.0.1")) and (.detail | test("v0.0.8")))'
 }
+
+@test "CHANGELOG has the candidate section and release notes exist -> both checks pass (FORNX-461)" {
+  run_case_version version_match
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.checks[] | select(.name=="repo.horonomy/fornax-core.changelog_has_candidate_section" and .status=="pass")'
+  echo "$output" | jq -e '.checks[] | select(.name=="repo.horonomy/fornax-core.release_notes_exist" and .status=="pass")'
+}
+
+@test "CHANGELOG still has only [Unreleased] for the candidate -> fails closed, exit 1 (FORNX-461)" {
+  run_case_version changelog_missing_section
+  [ "$status" -eq 1 ]
+  echo "$output" | jq -e '.checks[] | select(.name=="repo.horonomy/fornax-core.changelog_has_candidate_section" and .status=="fail" and (.detail | test("promote")))'
+}
+
+@test "release notes file missing -> fails closed, exit 1 (FORNX-461)" {
+  run_case_version release_notes_missing
+  [ "$status" -eq 1 ]
+  echo "$output" | jq -e '.checks[] | select(.name=="repo.horonomy/fornax-core.release_notes_exist" and .status=="fail")'
+}
+
