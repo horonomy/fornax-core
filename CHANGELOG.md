@@ -194,6 +194,16 @@ claims more than the recorded evidence supports.
   FORNX-480 entry below: a clean exit 0 on agent-adjacent evidence is now
   `Review` for those commands too.)*
 
+- **`command_executed` is capped at `Review` without an attested source**
+  (FORNX-477 QA-477-2, founder decision Option C, 2026-11-11). A socket-supplied
+  `AgentAdjacent` exit-code row naming "I ran `printf qa477`." used to verify the
+  claim although nothing showed the program ran. It now needs the same gate as
+  `command_succeeded` and `test_result` (`HostObserved` or `IndependentExternal`
+  class *and* a collector `fornax-verify` lists; a label alone is not enough),
+  so the most it reaches in v0.0.9 is `Review`. Only lowers verdicts: an unseen
+  command stays `Unverified`, a prefix match stays `Review`. Ablation benchmark
+  config B: `verified` 3 to 0, `review` 2 to 5, benign review burden 4 of 6 to 6 of 6.
+
 - **`command_succeeded` is capped at `Review` without an attested source**
   (FORNX-480, founder decision Option B, 2026-10-29). An exit status from the
   agent's own session cannot show that the claimed program ran and exited 0 (a
@@ -202,9 +212,8 @@ claims more than the recorded evidence supports.
   attested-collector gate as `test_result` (`HostObserved` or
   `IndependentExternal` class *and* a collector `fornax-verify` lists; a label
   alone is not enough). None ships in v0.0.9. A recorded non-zero exit stays
-  `Contradicted`; `command_executed` ("I ran ...") is unchanged, and its
-  remaining trust limits (it asserts a command row exists, not that the program
-  is the one named) are tracked separately, not resolved. In the ablation
+  `Contradicted`; `command_executed` ("I ran ...") was left unchanged here and
+  is capped at `Review` by the FORNX-477 Option C entry above. In the ablation
   benchmark the benign review burden in config B is 4 of 6. Production adapters
   never mint `command_succeeded`; it reaches the daemon through the ingest
   socket.

@@ -273,6 +273,16 @@ about the current verifiers, not artifacts of fixture phrasing:
   config B's benign review burden is now 67% (4/6). Same caveat: only the
   `benign_review_burden` figure was changed.
 
+  **FORNX-477 update 3 (2026-11-11, founder Option C):** a `command_executed`
+  claim on agent-adjacent exit-code evidence is capped at `Review` too. The
+  three remaining `Verified` verdicts in config B (the nonzero-exit
+  `command_executed` false completion, the omitted-field `command_executed`
+  and one benign `command_executed`) become `Review`, so the benign review
+  burden is now 100% (6/6). Measured on the current harness, config B went from
+  `verified=3 unverified=14 contradicted=4 unavailable=1 review=2` to
+  `verified=0 unverified=14 contradicted=4 unavailable=1 review=5`. The raw
+  result block above still predates FORNX-477 and was not regenerated.
+
 ## Capability-blind axis
 
 When `ToolTrace` and `FinalResponse` are both reported `Unknown` — the

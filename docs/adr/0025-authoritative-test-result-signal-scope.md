@@ -196,11 +196,63 @@ Decision (founder, approved):
   prefix match stays capped at `Review`.
 - `command_executed` keeps its meaning (a matching command row was observed)
   and is not changed here. It does not show that the program was the one named;
-  that limitation is tracked separately and is not resolved by this change.
+  that limitation was resolved by the FORNX-477 Option C addendum below.
 - Distinct from FORNX-443, which supplies an authoritative signal (runner
   receipts / CI) for test results. A future host-observed process-exit
   collector listed as an attestor would restore `Verified` for plain commands.
 - Effect: ablation benchmark config B benign review burden 4 of 6 (67%).
+
+## Addendum (FORNX-477 QA-477-2, 2026-11-11): `command_executed` gets the same bar (founder decision, Option C)
+
+QA of candidate c0e467d showed that a socket-supplied `AgentAdjacent` exit-code
+row made "I ran `printf qa477`." `Verified` although the command was never
+executed: `CommandExecutedVerifier` returned `Verified` on an exact command
+binding with no attestation check, the one remaining claim class below the
+FORNX-477/480 bar.
+
+Decision (founder, approved):
+
+- An exact command binding on evidence that is not independently attested is
+  `Review`. `Verified` requires the same `is_independently_attested` gate as
+  `command_succeeded` and `test_result`: a collector listed in
+  `test_run_attestors()` with trust class `HostObserved` or
+  `IndependentExternal`; the label alone is not enough. The production list is
+  empty, so in v0.0.9 the most such a claim reaches is `Review`.
+- The change only lowers verdicts. Unchanged: no matching row or an unparseable,
+  multi-command or no-literal claim is `Unverified`; a prefix match stays
+  `Review`; the capability gate stays `Unavailable`. A recorded non-zero exit is
+  still not a contradiction for this claim (it asserts a run, not success).
+- Effect: ablation benchmark config B `verified` 3 to 0, `review` 2 to 5, benign
+  review burden 4 of 6 to 6 of 6 (100%).
+
+### Reconciliation of QA-477-1 (PATH-shadowed `pytest` printing a passing summary)
+
+The QA packet expected `UNVERIFIED` for a QA-authored `pytest` on `PATH` that
+prints `7 passed in 0.07s` and exits 0; the finding reports `REVIEW`. The
+behaviour matches this ADR; the expectation does not. Option A caps every
+`AgentAdjacent` `test_result` at `Review`, and the "fake runner `Unverified`"
+cases (a runner name with exit 0 and *no* passing summary, zero tests, a
+malformed or failing summary) are exactly the ones where the summary is absent
+or unusable. A fabricated, well-formed passing summary is indistinguishable from
+a real one in the agent's transcript, which is why Option A caps it at `Review`
+rather than `Verified`. Verdict order is `Contradicted` (non-zero exit), then
+`Unverified` (no usable summary), then `Review` (usable summary, unattested),
+then `Verified` (attested). The control in the same run (the shadow executable
+printing a failing summary with exit 4) was `Contradicted`, as specified.
+No shape reaches `Verified` for `test_result`, `command_succeeded` or
+`command_executed` without an attested collector, including no-source evidence,
+an unregistered sensor, a registered `AgentAdjacent` collector and a forged
+`HostObserved`/`IndependentExternal` label.
+
+Proposed packet wording: "A fake or shadowed runner must never be `VERIFIED`;
+with no usable passing summary it is `UNVERIFIED`, and with a well-formed
+passing summary but no attested collector it is `REVIEW` (ADR 0025 Option A)."
+
+Residual, outside this decision: `git_commit`/`git_push` claims still reach
+`Verified` from the `AgentAdjacent` git-outcome observation (the commit SHA and
+branch are parsed from the provider's own `tool_response`), so a `PATH`-shadowed
+`git` that prints a plausible commit line is the same class of gap. It needs its
+own founder decision.
 
 ## Addendum (FORNX-487, 2026-11-06): failing Claude Code commands arrive as `PostToolUseFailure`
 

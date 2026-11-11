@@ -260,8 +260,12 @@ runner or zero tests), not `Verified`. Commands that are not test runs, such as
 `npm install`, `cargo build` or `pip install pytest`, are capped at `Review` in
 the same way (FORNX-480): the exit status comes from the agent's own session and
 cannot show that the claimed program, rather than a same-named executable, ran
-and succeeded. A literal non-zero exit is still `Contradicted`, and a
-`command_executed` claim ("I ran `cargo build`") keeps its current meaning.
+and succeeded. A literal non-zero exit is still `Contradicted`. A
+`command_executed` claim ("I ran `cargo build`") gets the same cap
+(FORNX-477, founder decision Option C): a row from the agent's own session that
+names the command does not show the program ran, so it is `Review`, not
+`Verified`, unless an attested collector vouches for it. A command not seen at
+all stays `Unverified`.
 
 The conditions below are therefore necessary but not sufficient. A recognised
 runner exiting 0 is not enough even for `Review`. The runner's
