@@ -163,17 +163,30 @@ fn command_success_event(session_id: &str) -> AgentEvent {
     }
 }
 
+/// FORNX-477 (founder, Option C): `command_executed` from agent-adjacent
+/// evidence is capped at Review, so the durability machinery is exercised with
+/// a claim that still reaches `Verified` from admitted evidence: a `git_commit`
+/// claim backed by the Claude git-outcome sensor's `created` observation.
 fn legitimate_evidence(session_id: &str, source_event_id: Uuid) -> Evidence {
     Evidence {
         id: Uuid::new_v4(),
         session_id: session_id.to_string(),
         source_event_id,
-        kind: EvidenceKind::ExitCode,
+        kind: EvidenceKind::ProcessObservation,
         observed_at: chrono::Utc::now().to_rfc3339(),
-        payload: serde_json::json!({"command": "cargo build", "exit_code": 0}),
-        provenance: "fornx434-restart-durability-fixture".to_string(),
+        payload: serde_json::json!({
+            "description": "git commit created",
+            "observation": {
+                "observation_kind": "vcs_operation",
+                "operation": "commit",
+                "outcome": "created",
+                "commit_sha": "0e2fbd4",
+                "branch": "main"
+            }
+        }),
+        provenance: "claude_code:1.2.3:PostToolUse:Bash#tool_response:git_commit".to_string(),
         source: Some(EvidenceSource::now(
-            "claude_bash_exit_code_sensor_v1",
+            "claude_git_outcome_sensor_v1",
             TrustClass::AgentAdjacent,
             Some(Provider::ClaudeCode),
             CollectionMethod::HookCallback,
@@ -184,13 +197,13 @@ fn legitimate_evidence(session_id: &str, source_event_id: Uuid) -> Evidence {
     }
 }
 
-fn command_executed_claim(session_id: &str, source_event_id: Uuid) -> Claim {
+fn git_commit_claim(session_id: &str, source_event_id: Uuid) -> Claim {
     Claim {
         id: Uuid::new_v4(),
         session_id: session_id.to_string(),
         source_event_id,
-        text: "I ran `cargo build`".to_string(),
-        subject: "command_executed".to_string(),
+        text: "I committed the change with SHA `0e2fbd4`.".to_string(),
+        subject: "git_commit".to_string(),
         claimed_at: chrono::Utc::now().to_rfc3339(),
     }
 }
@@ -218,7 +231,7 @@ async fn critical_evidence_submitted_through_real_pipeline_survives_a_hard_resta
     let session_id = format!("fornx434-restart-{}", short_id());
     let event = command_success_event(&session_id);
     let event_id = event.id;
-    let claim = command_executed_claim(&session_id, event_id);
+    let claim = git_commit_claim(&session_id, event_id);
     let claim_id = claim.id;
     let evidence = legitimate_evidence(&session_id, event_id);
 

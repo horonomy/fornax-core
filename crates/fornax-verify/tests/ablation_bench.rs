@@ -711,9 +711,10 @@ fn evidence_layer_ablation_benchmark() {
     // Config B: 4 of the 5 false-completion cases are detected.
     // `false_completion_npm_install` is routed through
     // `CommandExecutedVerifier` (subject `command_executed`), which by
-    // design only checks that a command ran, never its exit code ->
-    // Verified regardless of the nonzero exit code. A genuine, documented
-    // verifier-scope gap (see FORNX-296).
+    // design only checks that a command ran, never its exit code. It used to
+    // be Verified regardless of the nonzero exit code (a documented
+    // verifier-scope gap, see FORNX-296); since FORNX-477 Option C it is
+    // capped at Review (agent-adjacent evidence), still not a detection.
     //
     // FORNX-295 (fixed): `false_completion_cargo_test` used to survive
     // undetected because `is_test_runner_evidence` matched via a literal
@@ -765,8 +766,13 @@ fn evidence_layer_ablation_benchmark() {
     //
     // FORNX-480 (founder decision, Option B): the benign `command_succeeded`
     // claim is the same agent-adjacent exit code, so it joins the burden: 4 of 6.
+    //
+    // FORNX-477 (founder decision, Option C): the benign `command_executed`
+    // claims are agent-adjacent too and are capped at Review under the same
+    // gate, so the last two benign sessions join the burden: 6 of 6. Only an
+    // attested collector (FORNX-443) removes it.
     assert_eq!(
-        b.benign_review_burden, 4,
+        b.benign_review_burden, 6,
         "benign review burden in config B drifted from the doc's reported value"
     );
 }
