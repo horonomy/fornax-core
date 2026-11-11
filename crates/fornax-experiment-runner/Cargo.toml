@@ -25,6 +25,6 @@ tempfile = "3"
 # workload that benefits from `tokio`. `bundled` avoids requiring a system
 # SQLite install, keeping the shadow database self-contained like every
 # other resource this crate's isolation mechanism creates.
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41.0", features = ["bundled"] }
 
 [dev-dependencies]
