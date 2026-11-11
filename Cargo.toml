@@ -37,3 +37,20 @@ hex = "0.4"
 ed25519-dalek = { version = "3", default-features = false }
 base64 = "0.23"
 proptest = "1"
+
+# FORNX-495: RUSTSEC-2026-0459 -- libsqlite3-sys < 0.39.0 bundles a vulnerable
+# SQLite. No published sqlx release allows libsqlite3-sys >= 0.39 (sqlx-sqlite
+# 0.9.0 caps it at < 0.38), and two libsqlite3-sys versions cannot coexist
+# (`links = "sqlite3"`), so rusqlite and sqlx must move together. Pin the
+# reviewed upstream commit that widens the bound to < 0.40.0
+# (launchbadge/sqlx#4502). Review: fornax-evidence/d37f473-qa-handoff/sqlx-pin-review-FORNX-495.md
+# Removal condition: delete this section and use the registry release as soon
+# as a published sqlx/sqlx-sqlite release allows libsqlite3-sys >= 0.39.
+[patch.crates-io]
+sqlx = { git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }
+sqlx-core = { git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }
+sqlx-macros = { git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }
+sqlx-macros-core = { git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }
+sqlx-sqlite = { git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }
+sqlx-mysql = { git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }
+sqlx-postgres = { git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }
