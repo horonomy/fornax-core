@@ -341,6 +341,27 @@ impl Verifier for CommandExecutedVerifier {
                 exit_zero_reliable(ev),
             ) {
                 runner_command::CommandBinding::Exact => {
+                    // FORNX-477 (founder, Option C): same trust bar as
+                    // `command_succeeded`/`test_result`. A row from the agent's
+                    // own session cannot show the claimed program (rather than
+                    // a shadowing executable or a forged row) actually ran.
+                    if !is_independently_attested(ev) {
+                        return Finding {
+                            id: Uuid::new_v4(),
+                            claim_id: claim.id,
+                            verdict: Verdict::Review,
+                            evidence_ids: vec![ev.id],
+                            verifier_name: self.name().to_string(),
+                            rationale: format!(
+                                "a row naming \"{claimed}\" was reported by the agent's \
+                                 provider, but the program identity and its execution are not \
+                                 independently attested, so it does not show the command ran -- \
+                                 flagged for review, not verified ({})",
+                                ev.provenance
+                            ),
+                            computed_at: now,
+                        };
+                    }
                     return Finding {
                         id: Uuid::new_v4(),
                         claim_id: claim.id,
@@ -2752,17 +2773,74 @@ mod tests {
             run(with("codex_exec_sensor", TrustClass::AgentAdjacent, 1)),
             Verdict::Contradicted
         );
-        // `command_executed` keeps its meaning (ran, not succeeded): unchanged.
-        let executed = claim_for("command_executed", "I ran `npm install`.");
-        assert_eq!(
+    }
+
+    /// FORNX-477 (founder, Option C): `command_executed` meets the same trust
+    /// bar as `command_succeeded`. An agent-supplied row naming the command
+    /// does not show that the program (rather than a shadowing executable or a
+    /// forged row) ran, so it never reaches `Verified` alone.
+    #[test]
+    fn command_executed_needs_an_attested_source_to_verify() {
+        use fornax_types::{CollectionMethod, EvidenceSource, Provider, TrustClass};
+        let claim = claim_for("command_executed", "I ran `printf qa477`.");
+        let run = |ev: Evidence| {
             CommandExecutedVerifier
-                .verify(
-                    &executed,
-                    &[with("codex_exec_sensor", TrustClass::AgentAdjacent, 0)],
-                    &caps()
-                )
-                .verdict,
-            Verdict::Verified
+                .verify(&claim, &[ev], &caps())
+                .verdict
+        };
+        let with = |name: &'static str, trust: TrustClass, code: i64| {
+            let mut ev = evidence_for_command(&["printf", "qa477"], code);
+            ev.source = Some(EvidenceSource::now(
+                name,
+                trust,
+                Some(Provider::Codex),
+                CollectionMethod::FilePoll,
+                None,
+            ));
+            ev
+        };
+        // RED before the fix: a socket-supplied agent-adjacent exit-code row.
+        assert_eq!(
+            run(with("codex_exec_sensor", TrustClass::AgentAdjacent, 0)),
+            Verdict::Review
+        );
+        // The class label alone is not enough: unregistered collectors.
+        for trust in [TrustClass::HostObserved, TrustClass::IndependentExternal] {
+            assert_eq!(run(with("forged_sensor", trust, 0)), Verdict::Review);
+        }
+        // A registered attestor labelled agent-adjacent is not attested.
+        assert_eq!(
+            run(with(
+                "test_fixture_run_attestor",
+                TrustClass::AgentAdjacent,
+                0
+            )),
+            Verdict::Review
+        );
+        // No recorded source.
+        let mut unsourced = with("x", TrustClass::HostObserved, 0);
+        unsourced.source = None;
+        assert_eq!(run(unsourced), Verdict::Review);
+        // The cap applies whatever the exit status the row reports.
+        assert_eq!(
+            run(with("codex_exec_sensor", TrustClass::AgentAdjacent, 1)),
+            Verdict::Review
+        );
+        // GREEN controls: registered attestor with an independent class.
+        for trust in [TrustClass::HostObserved, TrustClass::IndependentExternal] {
+            assert_eq!(
+                run(with("test_fixture_run_attestor", trust, 0)),
+                Verdict::Verified
+            );
+        }
+        // Unchanged: no evidence of the command stays unverified, an attested
+        // row for a different command never binds.
+        let mut other = evidence_for_command(&["ls"], 0);
+        other.source = with("test_fixture_run_attestor", TrustClass::HostObserved, 0).source;
+        assert_eq!(run(other), Verdict::Unverified);
+        assert_eq!(
+            CommandExecutedVerifier.verify(&claim, &[], &caps()).verdict,
+            Verdict::Unverified
         );
     }
 
