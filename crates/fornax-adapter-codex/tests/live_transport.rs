@@ -70,6 +70,44 @@ use common::free_tcp_port;
 /// already up to date is a fast no-op; a stale or foreign binary gets
 /// genuinely rebuilt, every time, rather than guessed about.
 fn fresh_daemon_bin() -> PathBuf {
+    // Independent-QA hook: a runner with no toolchain supplies a prebuilt
+    // daemon plus its expected SHA-256. Both variables are required together
+    // and the file is hashed before use, so a stale or foreign binary can
+    // never be run silently; a mismatch or a half-set pair fails loudly
+    // rather than falling back to the cargo build below.
+    let prebuilt = std::env::var_os("FORNAX_QA_PREBUILT_DAEMON");
+    let expected = std::env::var("FORNAX_QA_PREBUILT_DAEMON_SHA256").ok();
+    if prebuilt.is_some() || expected.is_some() {
+        let bin =
+            PathBuf::from(prebuilt.expect(
+                "FORNAX_QA_PREBUILT_DAEMON_SHA256 is set without FORNAX_QA_PREBUILT_DAEMON",
+            ));
+        let expected = expected
+            .expect("FORNAX_QA_PREBUILT_DAEMON is set without FORNAX_QA_PREBUILT_DAEMON_SHA256");
+        assert!(
+            bin.is_absolute() && bin.is_file(),
+            "FORNAX_QA_PREBUILT_DAEMON must be an absolute path to an existing file: {}",
+            bin.display()
+        );
+        let out = Command::new("/usr/bin/shasum")
+            .args(["-a", "256"])
+            .arg(&bin)
+            .output()
+            .expect("spawn /usr/bin/shasum");
+        assert!(out.status.success(), "shasum failed for {}", bin.display());
+        let actual = String::from_utf8_lossy(&out.stdout);
+        let actual = actual.split_whitespace().next().unwrap_or_default();
+        assert!(
+            actual.eq_ignore_ascii_case(expected.trim()),
+            "prebuilt daemon {} SHA-256 {actual} != expected {expected}",
+            bin.display()
+        );
+        eprintln!(
+            "live_transport: using prebuilt daemon {} (sha256 {actual})",
+            bin.display()
+        );
+        return bin;
+    }
     let mut dir = std::env::current_exe().expect("current_exe");
     let profile_dir = loop {
         let is_profile_dir = dir
