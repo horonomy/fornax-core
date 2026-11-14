@@ -2112,7 +2112,15 @@ mod fusion_tests {
                     "observation": observation,
                 }),
                 provenance: "claude_code:1.2.3:PostToolUse:Bash#tool_response:git_commit".into(),
-                source: None,
+                // An attested collector: the Verified arm is only reachable with one
+                // (FORNX-497); the unattested outcome is asserted below.
+                source: Some(fornax_types::EvidenceSource::now(
+                    "test_fixture_vcs_attestor",
+                    fornax_types::TrustClass::HostObserved,
+                    Some(fornax_types::Provider::ClaudeCode),
+                    fornax_types::CollectionMethod::FilePoll,
+                    None,
+                )),
                 extension: None,
                 evidence_purged: false,
             }
@@ -2153,6 +2161,24 @@ mod fusion_tests {
             "2026-01-02T00:00:00Z",
         );
         assert_eq!(fused.verdict, Verdict::Verified);
+
+        // The same outcome from the agent's own tool output (no source) caps at Review.
+        let mut unattested = ev.clone();
+        unattested.source = None;
+        let capped = v.verify(&c, std::slice::from_ref(&unattested), &caps);
+        assert_eq!(capped.verdict, Verdict::Review);
+        let capped_graph = project_graph(&c, std::slice::from_ref(&capped));
+        let capped_fused = policy.fuse(
+            &FusionInput {
+                claim: &c,
+                graph: &capped_graph,
+                evidence: std::slice::from_ref(&unattested),
+            },
+            "2026-01-02T00:00:00Z",
+        );
+        // Documented Review -> Neutral fidelity gap: fusion never re-promotes a capped Review,
+        // and it must never reach Verified.
+        assert_eq!(capped_fused.verdict, Verdict::Unverified);
 
         // Contradicted: git reported nothing to commit.
         let c2 = crate::tests::claim_for("git_commit", "I committed the change.");
