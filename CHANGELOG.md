@@ -18,6 +18,12 @@ claims more than the recorded evidence supports.
 
 ### Fixed
 
+- **`git_commit` / `git_push` claims no longer reach Verified from the agent's
+  own tool output** (FORNX-497). A `git` earlier on `PATH` can print a plausible
+  commit line or ref update, so a commit `created` or push `ref_updated` is now
+  `Review` unless a registered, independently attested collector observed it (none
+  ships; ADR-0025 addendum). Contradicted outcomes (SHA mismatch, nothing to
+  commit, rejected push) are unchanged.
 - **`fornax doctor` no longer says Claude Code "gives no exit code"**
   (FORNX-489). Since FORNX-487 a failing Bash command carries a literal
   non-zero exit code, so a "tests passed" claim is Contradicted; a passing run

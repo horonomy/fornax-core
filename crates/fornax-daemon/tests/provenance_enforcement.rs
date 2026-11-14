@@ -7,28 +7,37 @@
 //! daemon process over its real UDS path -- not any function called
 //! in-process.
 //!
+//! Verified is unreachable in production from agent-adjacent evidence, by
+//! design (FORNX-477, FORNX-497): no shipped collector is an attested source,
+//! so the strongest outcome admitted evidence can produce is Review. The
+//! vehicle used here is a `git_commit` claim: a legitimately admitted
+//! evidence row yields a `review` finding that CITES that evidence, while a
+//! row the guard rejects yields no finding citing it. That distinction is what
+//! the admission/consumption machinery is observed through.
+//!
 //! AC1 (forged/foreign/invalid/replayed evidence can never promote a claim
-//! to VERIFIED): `forged_host_observed_label_never_reaches_verified`,
+//! to VERIFIED, nor get cited by a finding): `forged_host_observed_label_never_reaches_verified`,
 //! `unregistered_sensor_never_reaches_verified`,
 //! `uds_evidence_with_no_source_never_reaches_verified`,
 //! `cross_anchor_replay_is_downgraded_not_verified`.
 //!
-//! AC2 (an authorized source still verifies correctly; related-claim reuse
-//! and identical retry don't false-contradict):
-//! `legitimate_evidence_still_reaches_verified` (positive control --
-//! if this fails, the guard broke the normal path, not just attacks),
-//! `same_anchor_related_claims_both_reach_verified_without_downgrade`.
+//! AC2 (an authorized source is still admitted and cited; related-claim
+//! reuse and identical retry don't false-contradict or downgrade):
+//! `legitimate_evidence_still_reaches_review_citing_evidence` (positive
+//! control -- if this fails, the guard broke the normal path, not just
+//! attacks), `same_anchor_related_claims_both_reach_review_without_downgrade`.
 //!
 //! Fixture potency (AC4): each negative fixture is also run directly
-//! through the raw `Verifier` (bypassing admission) to confirm it WOULD
-//! have verified without the guard -- proving the guard is doing
-//! something, not that the fixture is simply inert input.
+//! through the raw `Verifier` (bypassing admission) to confirm it yields
+//! Review citing the evidence -- proving the guard is doing something (the
+//! admitted twin of the same row would be cited), not that the fixture is
+//! simply inert input.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use fornax_store::Store;
+use fornax_store::{FindingRow, Store};
 use fornax_types::{
     AgentEvent, Claim, CollectionMethod, EventKind, Evidence, EvidenceKind, EvidenceSource,
     IngestMessage, Provider, TrustClass,
@@ -171,13 +180,14 @@ fn command_success_event(session_id: &str) -> AgentEvent {
     }
 }
 
-/// FORNX-477 (founder, Option C): `command_executed` is capped at Review for
-/// agent-adjacent evidence, so it can no longer serve as the vehicle that
-/// reaches a production `Verified`. The machinery under test here (admission,
-/// consumption anchors, retry) is verdict-agnostic, so it is exercised with a
-/// claim whose verifier still reaches `Verified` from admitted evidence: a
-/// `git_commit` claim backed by the Claude git-outcome sensor's `created`
-/// observation (`GitOperationVerifier`).
+/// Verified is unreachable in production from agent-adjacent evidence by
+/// design (FORNX-477 for `command_executed`/`test_result`, FORNX-497 for git
+/// outcomes: a forged `git` on PATH prints the same output). The machinery
+/// under test here (admission, consumption anchors, retry) is verdict-agnostic,
+/// so it is exercised with a `git_commit` claim backed by the Claude
+/// git-outcome sensor's `created` observation (`GitOperationVerifier`): admitted
+/// evidence yields a `review` finding that cites the evidence row, rejected
+/// evidence yields no such finding.
 fn vehicle_claim(session_id: &str, source_event_id: Uuid) -> Claim {
     Claim {
         id: Uuid::new_v4(),
@@ -322,6 +332,27 @@ async fn submit_and_await_verdict(
     evidence: Evidence,
     claim: Claim,
 ) -> Option<String> {
+    submit_and_await_finding(sock_path, store, event, evidence, claim)
+        .await
+        .map(|f| f.verdict)
+}
+
+/// Whether `finding` cites `evidence_id` in its persisted `evidence_ids`.
+fn cites(finding: &FindingRow, evidence_id: Uuid) -> bool {
+    serde_json::from_str::<Vec<Uuid>>(&finding.evidence_ids)
+        .expect("findings.evidence_ids is a JSON array of UUIDs")
+        .contains(&evidence_id)
+}
+
+/// Same as [`submit_and_await_verdict`] but returns the whole finding row so
+/// callers can also check which evidence it cites.
+async fn submit_and_await_finding(
+    sock_path: &Path,
+    store: &Store,
+    event: AgentEvent,
+    evidence: Evidence,
+    claim: Claim,
+) -> Option<FindingRow> {
     let session_id = claim.session_id.clone();
     send_line(sock_path, &capability_announcement(&session_id)).await;
     send_line(sock_path, &IngestMessage::Event(event)).await;
@@ -331,8 +362,11 @@ async fn submit_and_await_verdict(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         if let Ok(findings) = store.findings_for_session(&session_id).await {
-            if let Some(f) = findings.iter().find(|f| f.claim_id == claim.id.to_string()) {
-                return Some(f.verdict.clone());
+            if let Some(f) = findings
+                .into_iter()
+                .find(|f| f.claim_id == claim.id.to_string())
+            {
+                return Some(f);
             }
         }
         if tokio::time::Instant::now() >= deadline {
@@ -353,8 +387,9 @@ async fn forged_host_observed_label_never_reaches_verified() {
     let event_id = event.id;
     let claim = vehicle_claim(&session_id, event_id);
     let evidence = evidence_with_forged_trust_class(&session_id, event_id);
+    let evidence_id = evidence.id;
 
-    let verdict = submit_and_await_verdict(
+    let finding = submit_and_await_finding(
         &daemon.home.join("fornax.sock"),
         &store,
         event,
@@ -362,6 +397,12 @@ async fn forged_host_observed_label_never_reaches_verified() {
         claim,
     )
     .await;
+    let verdict = finding.as_ref().map(|f| f.verdict.clone());
+    assert!(
+        !finding.as_ref().is_some_and(|f| cites(f, evidence_id)),
+        "a finding must never cite evidence the guard rejected; daemon log:\n{}",
+        daemon.log_contents()
+    );
 
     assert_ne!(
         verdict,
@@ -382,8 +423,9 @@ async fn unregistered_sensor_never_reaches_verified() {
     let event_id = event.id;
     let claim = vehicle_claim(&session_id, event_id);
     let evidence = evidence_with_unregistered_sensor(&session_id, event_id);
+    let evidence_id = evidence.id;
 
-    let verdict = submit_and_await_verdict(
+    let finding = submit_and_await_finding(
         &daemon.home.join("fornax.sock"),
         &store,
         event,
@@ -391,6 +433,12 @@ async fn unregistered_sensor_never_reaches_verified() {
         claim,
     )
     .await;
+    let verdict = finding.as_ref().map(|f| f.verdict.clone());
+    assert!(
+        !finding.as_ref().is_some_and(|f| cites(f, evidence_id)),
+        "a finding must never cite evidence the guard rejected; daemon log:\n{}",
+        daemon.log_contents()
+    );
 
     assert_ne!(
         verdict,
@@ -411,8 +459,9 @@ async fn uds_evidence_with_no_source_never_reaches_verified() {
     let event_id = event.id;
     let claim = vehicle_claim(&session_id, event_id);
     let evidence = evidence_with_no_source(&session_id, event_id);
+    let evidence_id = evidence.id;
 
-    let verdict = submit_and_await_verdict(
+    let finding = submit_and_await_finding(
         &daemon.home.join("fornax.sock"),
         &store,
         event,
@@ -420,6 +469,12 @@ async fn uds_evidence_with_no_source_never_reaches_verified() {
         claim,
     )
     .await;
+    let verdict = finding.as_ref().map(|f| f.verdict.clone());
+    assert!(
+        !finding.as_ref().is_some_and(|f| cites(f, evidence_id)),
+        "a finding must never cite evidence the guard rejected; daemon log:\n{}",
+        daemon.log_contents()
+    );
 
     assert_ne!(
         verdict,
@@ -433,9 +488,10 @@ async fn uds_evidence_with_no_source_never_reaches_verified() {
 
 /// Positive control: if this fails, the guard broke the normal path, not
 /// just attacks -- a real registered sensor, correct trust class, matching
-/// provider, must still verify exactly as before FORNX-431.
+/// provider, must still be admitted and cited. Verified is unreachable for
+/// agent-adjacent git output (FORNX-497), so the outcome is `review`.
 #[tokio::test]
-async fn legitimate_evidence_still_reaches_verified() {
+async fn legitimate_evidence_still_reaches_review_citing_evidence() {
     let daemon = start_daemon().await;
     let store = Store::open(daemon.home.join("fornax.db"))
         .await
@@ -445,21 +501,31 @@ async fn legitimate_evidence_still_reaches_verified() {
     let event_id = event.id;
     let claim = vehicle_claim(&session_id, event_id);
     let evidence = legitimate_evidence(&session_id, event_id);
+    let evidence_id = evidence.id;
 
-    let verdict = submit_and_await_verdict(
+    let finding = submit_and_await_finding(
         &daemon.home.join("fornax.sock"),
         &store,
         event,
         evidence,
         claim,
     )
-    .await;
+    .await
+    .expect("a finding must be computed for the legitimate claim");
 
     assert_eq!(
-        verdict,
-        Some("verified".to_string()),
-        "a correctly-admitted, legitimate evidence row must still reach Verified \
-         -- the guard must not break the normal path; daemon log:\n{}",
+        finding.verdict,
+        "review",
+        "a correctly-admitted, legitimate evidence row must still be judged \
+         (Review: agent-adjacent git output is never Verified) -- the guard must \
+         not break the normal path; daemon log:\n{}",
+        daemon.log_contents()
+    );
+    assert!(
+        cites(&finding, evidence_id),
+        "the review finding must cite the admitted evidence row; evidence_ids = {}; \
+         daemon log:\n{}",
+        finding.evidence_ids,
         daemon.log_contents()
     );
 }
@@ -523,8 +589,8 @@ async fn test_run_relabelled_as_command_succeeded_never_reaches_verified() {
 /// adapter descriptor via the real `fornax` CLI binary (not a copy of its
 /// logic), disables it, then submits an ordinary legitimate claim over the
 /// real daemon's UDS socket in that exact `FORNAX_HOME` and asserts it still
-/// reaches `Verified` -- identical to `legitimate_evidence_still_reaches_verified`
-/// above, just with a disabled registration sitting in the same home
+/// reaches `review` citing its evidence -- identical to
+/// `legitimate_evidence_still_reaches_review_citing_evidence` above, just with a disabled registration sitting in the same home
 /// directory the whole time.
 #[tokio::test]
 async fn disabled_adapter_registration_does_not_affect_live_verdict_computation() {
@@ -627,19 +693,25 @@ async fn disabled_adapter_registration_does_not_affect_live_verdict_computation(
     let event_id = event.id;
     let claim = vehicle_claim(&session_id, event_id);
     let evidence = legitimate_evidence(&session_id, event_id);
+    let evidence_id = evidence.id;
 
-    let verdict = submit_and_await_verdict(
+    let finding = submit_and_await_finding(
         &daemon.home.join("fornax.sock"),
         &store,
         event,
         evidence,
         claim,
     )
-    .await;
+    .await
+    .expect("a finding must be computed for the legitimate claim");
 
+    assert!(
+        cites(&finding, evidence_id),
+        "the finding must cite the admitted evidence row despite the disabled registration"
+    );
     assert_eq!(
-        verdict,
-        Some("verified".to_string()),
+        finding.verdict,
+        "review",
         "a disabled host-adapter registration present in the same FORNAX_HOME \
          must have zero effect on live verdict computation for an unrelated, \
          legitimate claim -- daemon log:\n{}",
@@ -821,10 +893,10 @@ async fn main_session_claim_without_any_test_evidence_stays_unverified() {
 }
 
 /// AC2: two claims minted from the *same* turn (same anchor) both reach
-/// Verified against the same evidence row -- the anchor rule's whole
+/// Review citing the same evidence row -- the anchor rule's whole
 /// point, not a false cross-claim replay.
 #[tokio::test]
-async fn same_anchor_related_claims_both_reach_verified_without_downgrade() {
+async fn same_anchor_related_claims_both_reach_review_without_downgrade() {
     let daemon = start_daemon().await;
     let store = Store::open(daemon.home.join("fornax.db"))
         .await
@@ -833,6 +905,7 @@ async fn same_anchor_related_claims_both_reach_verified_without_downgrade() {
     let event = command_success_event(&session_id);
     let event_id = event.id;
     let evidence = legitimate_evidence(&session_id, event_id);
+    let evidence_id = evidence.id;
     let sock_path = daemon.home.join("fornax.sock");
 
     send_line(&sock_path, &capability_announcement(&session_id)).await;
@@ -861,16 +934,27 @@ async fn same_anchor_related_claims_both_reach_verified_without_downgrade() {
         if let (Some(a), Some(b)) = (a, b) {
             assert_eq!(
                 a.verdict,
-                "verified",
-                "claim A (same anchor, first consumer) must reach Verified; log:\n{}",
+                "review",
+                "claim A (same anchor, first consumer) must reach Review; log:\n{}",
+                daemon.log_contents()
+            );
+            assert!(
+                cites(a, evidence_id),
+                "claim A's review must cite the admitted evidence; log:\n{}",
                 daemon.log_contents()
             );
             assert_eq!(
                 b.verdict,
-                "verified",
+                "review",
                 "claim B (same anchor as A, legitimately related) must ALSO reach \
-                 Verified, not be downgraded -- that's the anchor rule's whole point; \
+                 Review, not be downgraded -- that's the anchor rule's whole point; \
                  log:\n{}",
+                daemon.log_contents()
+            );
+            assert!(
+                cites(b, evidence_id),
+                "claim B's review must cite the same admitted evidence (no downgrade \
+                 to a finding without it); log:\n{}",
                 daemon.log_contents()
             );
             return;
@@ -897,10 +981,11 @@ async fn cross_anchor_replay_is_downgraded_not_verified() {
     let session_id = format!("fornx431-crossanchor-{}", short_id());
     let sock_path = daemon.home.join("fornax.sock");
 
-    // Claim A: a real turn, real evidence, reaches Verified.
+    // Claim A: a real turn, real evidence, reaches Review citing it.
     let event_a = command_success_event(&session_id);
     let event_a_id = event_a.id;
     let evidence = legitimate_evidence(&session_id, event_a_id);
+    let evidence_id = evidence.id;
     send_line(&sock_path, &capability_announcement(&session_id)).await;
     send_line(&sock_path, &IngestMessage::Event(event_a)).await;
     send_line(&sock_path, &IngestMessage::Evidence(evidence.clone())).await;
@@ -917,7 +1002,7 @@ async fn cross_anchor_replay_is_downgraded_not_verified() {
                 .await
                 .unwrap_or_default()
                 .iter()
-                .any(|f| f.claim_id == claim_id && f.verdict == "verified")
+                .any(|f| f.claim_id == claim_id && f.verdict == "review" && cites(f, evidence_id))
         }
     })
     .await;
@@ -956,6 +1041,17 @@ async fn cross_anchor_replay_is_downgraded_not_verified() {
                 "verified",
                 "claim B, a different turn citing the same already-consumed evidence \
                  row as claim A, must be downgraded -- never Verified; log:\n{}",
+                daemon.log_contents()
+            );
+            // The replay guard in `run_verifiers_and_persist_findings` only
+            // acts on a `Verified` verdict (downgrading it to Review). Verified is
+            // unreachable for this vehicle now (FORNX-497), so claim B is already
+            // at the Review cap and the guard has nothing left to downgrade: B
+            // is Review, exactly like A, never stronger.
+            assert_eq!(
+                b.verdict,
+                "review",
+                "claim B must be capped at Review, never above claim A's outcome; log:\n{}",
                 daemon.log_contents()
             );
             return;
@@ -1006,8 +1102,16 @@ async fn foreign_session_provider_claim_is_quarantined_not_verified() {
     let event_id = event.id;
     let claim = vehicle_claim(&session_id, event_id);
     let evidence = legitimate_evidence(&session_id, event_id);
+    let evidence_id = evidence.id;
 
-    let verdict = submit_and_await_verdict(&sock_path, &store, event, evidence, claim).await;
+    let finding = submit_and_await_finding(&sock_path, &store, event, evidence, claim).await;
+    let verdict = finding.as_ref().map(|f| f.verdict.clone());
+    assert!(
+        !finding.as_ref().is_some_and(|f| cites(f, evidence_id)),
+        "a finding must never cite evidence quarantined for a provider/session-owner \
+         mismatch; daemon log:\n{}",
+        daemon.log_contents()
+    );
 
     assert_ne!(
         verdict,
@@ -1041,6 +1145,7 @@ async fn concurrent_cross_anchor_replay_is_serialized_not_double_verified() {
     let event_a = command_success_event(&session_id);
     let event_a_id = event_a.id;
     let evidence = legitimate_evidence(&session_id, event_a_id);
+    let evidence_id = evidence.id;
     send_line(&sock_path, &capability_announcement(&session_id)).await;
     send_line(&sock_path, &IngestMessage::Event(event_a)).await;
     send_line(&sock_path, &IngestMessage::Evidence(evidence)).await;
@@ -1064,7 +1169,7 @@ async fn concurrent_cross_anchor_replay_is_serialized_not_double_verified() {
                 .await
                 .unwrap_or_default()
                 .iter()
-                .any(|f| f.claim_id == claim_id && f.verdict == "verified")
+                .any(|f| f.claim_id == claim_id && f.verdict == "review" && cites(f, evidence_id))
         }
     })
     .await;
@@ -1112,12 +1217,26 @@ async fn concurrent_cross_anchor_replay_is_serialized_not_double_verified() {
                  row even under real concurrency; daemon log:\n{}",
                 daemon.log_contents()
             );
+            assert_eq!(
+                b.verdict,
+                "review",
+                "claim B must stay capped at Review (the replay guard only acts on \
+                 Verified, FORNX-497); daemon log:\n{}",
+                daemon.log_contents()
+            );
             assert_ne!(
                 c.verdict,
                 "verified",
                 "claim C races claim B over an already-owned evidence row (owned by \
                  claim A) -- a different anchor must never reach Verified via this \
                  row even under real concurrency; daemon log:\n{}",
+                daemon.log_contents()
+            );
+            assert_eq!(
+                c.verdict,
+                "review",
+                "claim C must stay capped at Review (the replay guard only acts on \
+                 Verified, FORNX-497); daemon log:\n{}",
                 daemon.log_contents()
             );
             return;
@@ -1139,10 +1258,11 @@ async fn concurrent_cross_anchor_replay_is_serialized_not_double_verified() {
 /// proves the store-level primitive is idempotent in isolation; this test
 /// proves the live daemon path built on top of it (the `is_new_claim`
 /// check in `handle_message`'s `Claim` arm, which skips re-verification
-/// entirely on a duplicate) actually preserves the original Verified
-/// outcome end-to-end, not just that the second insert doesn't error.
+/// entirely on a duplicate) actually preserves the original Review
+/// outcome (Review citing the evidence) end-to-end, not just that the second
+/// insert doesn't error.
 #[tokio::test]
-async fn identical_claim_retry_over_uds_stays_verified_not_downgraded() {
+async fn identical_claim_retry_over_uds_stays_review_not_downgraded() {
     let daemon = start_daemon().await;
     let store = Store::open(daemon.home.join("fornax.db"))
         .await
@@ -1153,6 +1273,7 @@ async fn identical_claim_retry_over_uds_stays_verified_not_downgraded() {
     let event = command_success_event(&session_id);
     let event_id = event.id;
     let evidence = legitimate_evidence(&session_id, event_id);
+    let evidence_id = evidence.id;
     let claim = vehicle_claim(&session_id, event_id);
 
     send_line(&sock_path, &capability_announcement(&session_id)).await;
@@ -1170,7 +1291,7 @@ async fn identical_claim_retry_over_uds_stays_verified_not_downgraded() {
                 .await
                 .unwrap_or_default()
                 .iter()
-                .any(|f| f.claim_id == claim_id && f.verdict == "verified")
+                .any(|f| f.claim_id == claim_id && f.verdict == "review" && cites(f, evidence_id))
         }
     })
     .await;
@@ -1180,7 +1301,7 @@ async fn identical_claim_retry_over_uds_stays_verified_not_downgraded() {
     send_line(&sock_path, &IngestMessage::Claim(claim.clone())).await;
 
     // Give the daemon a moment to have processed (or, correctly, skipped
-    // re-processing) the retry, then confirm the original Verified finding
+    // re-processing) the retry, then confirm the original Review finding
     // is unchanged -- no second/duplicate finding row, no downgrade.
     tokio::time::sleep(Duration::from_millis(500)).await;
     let findings = store
@@ -1201,20 +1322,26 @@ async fn identical_claim_retry_over_uds_stays_verified_not_downgraded() {
     );
     assert_eq!(
         matching[0].verdict,
-        "verified",
-        "a retried identical claim_id must leave the original Verified finding \
+        "review",
+        "a retried identical claim_id must leave the original Review finding \
          intact, not downgrade it; daemon log:\n{}",
+        daemon.log_contents()
+    );
+    assert!(
+        cites(matching[0], evidence_id),
+        "the retained finding must still cite the admitted evidence; daemon log:\n{}",
         daemon.log_contents()
     );
 }
 
 /// Fixture potency (AC4): confirms each negative fixture is not simply
 /// inert -- run directly through the raw `Verifier` (bypassing admission
-/// entirely), it WOULD have verified. This proves the guard is actually
-/// doing something, not that these fixtures could never have verified
-/// anyway.
+/// entirely), it WOULD have been judged: Review citing the evidence (Verified
+/// is unreachable for unattested git output, FORNX-497). This proves the guard
+/// is actually doing something -- admission is what keeps the row from being
+/// cited -- not that these fixtures could never have been used anyway.
 #[test]
-fn negative_fixtures_would_have_verified_without_the_guard() {
+fn negative_fixtures_would_have_been_cited_without_the_guard() {
     let session_id = "fornx431-potency";
     let event_id = Uuid::new_v4();
     let caps = fornax_types::RuntimeCapabilities {
@@ -1244,9 +1371,15 @@ fn negative_fixtures_would_have_verified_without_the_guard() {
         let finding = verifier.verify(&claim, std::slice::from_ref(&evidence), &caps);
         assert_eq!(
             finding.verdict,
-            fornax_types::Verdict::Verified,
-            "fixture {name:?} must verify when the guard is bypassed entirely -- \
+            fornax_types::Verdict::Review,
+            "fixture {name:?} must yield Review when the guard is bypassed entirely -- \
              otherwise it is not a meaningful negative control for AC4"
+        );
+        assert_eq!(
+            finding.evidence_ids,
+            vec![evidence.id],
+            "fixture {name:?} must be cited by the raw verifier when the guard is \
+             bypassed -- otherwise it is inert and proves nothing"
         );
     }
 }
@@ -1273,7 +1406,7 @@ fn negative_fixtures_would_have_verified_without_the_guard() {
 /// exercise the owner-mismatch branch -- that branch has its own coverage
 /// elsewhere (see `fornax_types::provenance_guard`'s own module tests).
 #[test]
-fn admit_evidence_rows_rejects_every_fixture_that_would_have_verified_without_it() {
+fn admit_evidence_rows_rejects_every_fixture_the_raw_verifier_would_cite() {
     use fornax_types::provenance_guard::{
         admit_evidence_rows, CollectorAuthority, EvidenceOrigin, SessionOwner,
     };

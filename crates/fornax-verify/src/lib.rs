@@ -1014,6 +1014,24 @@ impl GitOperationVerifier {
                             computed_at: now,
                         }
                     }
+                    // The `git` output this outcome was parsed from is the agent's
+                    // own account (a forged `git` on PATH prints the same lines), so
+                    // only an attested collector may promote it (ADR 0025 residual,
+                    // FORNX-497).
+                    _ if !is_vcs_operation_attested(ev) => Finding {
+                        id: Uuid::new_v4(),
+                        claim_id: claim.id,
+                        verdict: Verdict::Review,
+                        evidence_ids: vec![ev.id],
+                        verifier_name: self.name().to_string(),
+                        rationale: format!(
+                            "git commit output was observed, but it comes from the agent's own \
+                             tool output with no independently attested collector -- flagged for \
+                             review, not verified ({})",
+                            ev.provenance
+                        ),
+                        computed_at: now,
+                    },
                     _ => Finding {
                         id: Uuid::new_v4(),
                         claim_id: claim.id,
@@ -1096,6 +1114,20 @@ impl GitOperationVerifier {
                             computed_at: now,
                         }
                     }
+                    _ if !is_vcs_operation_attested(ev) => Finding {
+                        id: Uuid::new_v4(),
+                        claim_id: claim.id,
+                        verdict: Verdict::Review,
+                        evidence_ids: vec![ev.id],
+                        verifier_name: self.name().to_string(),
+                        rationale: format!(
+                            "git push output was observed, but it comes from the agent's own \
+                             tool output with no independently attested collector -- flagged for \
+                             review, not verified ({})",
+                            ev.provenance
+                        ),
+                        computed_at: now,
+                    },
                     _ => Finding {
                         id: Uuid::new_v4(),
                         claim_id: claim.id,
@@ -1294,11 +1326,41 @@ fn test_run_attestors() -> &'static [&'static str] {
 /// Evidence with no recorded source predates the sensor contract and is not
 /// treated as attested.
 fn is_independently_attested(e: &Evidence) -> bool {
+    is_attested_by(e, test_run_attestors())
+}
+
+/// Collectors that may attest a git commit/push outcome, by
+/// `EvidenceSource::sensor_name`.
+///
+/// Deliberately empty, for the same reason as `test_run_attestors`: the only
+/// shipped sensor for these outcomes (`ClaudeGitOutcomeSensor`) parses the
+/// agent-visible `tool_response` and is `AgentAdjacent`, and a forged `git`
+/// prints the identical text. A host-controlled collector (the real `git`
+/// invoked by Fornax itself, or forge/CI evidence) adds its name here with its
+/// own tests. The epistemic contract's `commit_push_completed` already requires
+/// `HostObserved` evidence; this list is what keeps the verifier consistent
+/// with it.
+fn vcs_operation_attestors() -> &'static [&'static str] {
+    #[cfg(test)]
+    {
+        &["test_fixture_vcs_attestor"]
+    }
+    #[cfg(not(test))]
+    {
+        &[]
+    }
+}
+
+fn is_vcs_operation_attested(e: &Evidence) -> bool {
+    is_attested_by(e, vcs_operation_attestors())
+}
+
+fn is_attested_by(e: &Evidence, attestors: &[&str]) -> bool {
     e.source.as_ref().is_some_and(|s| {
         matches!(
             s.trust_class,
             TrustClass::HostObserved | TrustClass::IndependentExternal
-        ) && test_run_attestors().contains(&s.sensor_name.as_str())
+        ) && attestors.contains(&s.sensor_name.as_str())
     })
 }
 
@@ -3886,6 +3948,26 @@ mod git_operation_verifier_tests {
         }
     }
 
+    fn vcs_source(sensor: &'static str, trust: TrustClass) -> fornax_types::EvidenceSource {
+        fornax_types::EvidenceSource::now(
+            sensor,
+            trust,
+            Some(Provider::ClaudeCode),
+            fornax_types::CollectionMethod::FilePoll,
+            None,
+        )
+    }
+
+    /// Evidence from the registered fixture collector with an independent trust
+    /// class: the only shape that may reach `Verified` for a git outcome.
+    fn attested(mut e: Evidence) -> Evidence {
+        e.source = Some(vcs_source(
+            "test_fixture_vcs_attestor",
+            TrustClass::HostObserved,
+        ));
+        e
+    }
+
     fn commit_evidence(outcome: &str, commit_sha: Option<&str>, branch: Option<&str>) -> Evidence {
         vcs_evidence(serde_json::json!({
             "observation_kind": "vcs_operation",
@@ -3911,7 +3993,11 @@ mod git_operation_verifier_tests {
     fn created_with_no_sha_literal_in_claim_is_verified() {
         let v = GitOperationVerifier;
         let c = crate::tests::claim_for("git_commit", "I committed the change.");
-        let ev = vec![commit_evidence("created", Some("0e2fbd4"), Some("main"))];
+        let ev = vec![attested(commit_evidence(
+            "created",
+            Some("0e2fbd4"),
+            Some("main"),
+        ))];
         let f = v.verify(&c, &ev, &caps());
         assert_eq!(f.verdict, Verdict::Verified);
         assert_eq!(f.evidence_ids, vec![ev[0].id]);
@@ -3921,7 +4007,11 @@ mod git_operation_verifier_tests {
     fn created_with_matching_sha_literal_is_verified() {
         let v = GitOperationVerifier;
         let c = crate::tests::claim_for("git_commit", "I committed with sha `0e2fbd4`.");
-        let ev = vec![commit_evidence("created", Some("0e2fbd4"), Some("main"))];
+        let ev = vec![attested(commit_evidence(
+            "created",
+            Some("0e2fbd4"),
+            Some("main"),
+        ))];
         let f = v.verify(&c, &ev, &caps());
         assert_eq!(f.verdict, Verdict::Verified);
     }
@@ -3963,7 +4053,7 @@ mod git_operation_verifier_tests {
     fn ref_updated_is_verified() {
         let v = GitOperationVerifier;
         let c = crate::tests::claim_for("git_push", "I pushed the branch.");
-        let ev = vec![push_evidence("ref_updated", Some("main"))];
+        let ev = vec![attested(push_evidence("ref_updated", Some("main")))];
         let f = v.verify(&c, &ev, &caps());
         assert_eq!(f.verdict, Verdict::Verified);
         assert_eq!(f.evidence_ids, vec![ev[0].id]);
@@ -3973,7 +4063,7 @@ mod git_operation_verifier_tests {
     fn ref_updated_with_matching_branch_literal_is_verified() {
         let v = GitOperationVerifier;
         let c = crate::tests::claim_for("git_push", "I pushed to `main`.");
-        let ev = vec![push_evidence("ref_updated", Some("main"))];
+        let ev = vec![attested(push_evidence("ref_updated", Some("main")))];
         let f = v.verify(&c, &ev, &caps());
         assert_eq!(f.verdict, Verdict::Verified);
     }
@@ -4014,6 +4104,133 @@ mod git_operation_verifier_tests {
         let f = v.verify(&c, &[], &caps());
         assert_eq!(f.verdict, Verdict::Unverified);
         assert!(f.evidence_ids.is_empty());
+    }
+
+    // --- provenance gate (FORNX-497): agent-visible git output never reaches Verified ---
+
+    fn forged(sensor: &'static str, trust: TrustClass, base: Evidence) -> Evidence {
+        let mut e = base;
+        e.source = Some(vcs_source(sensor, trust));
+        e
+    }
+
+    #[test]
+    fn commit_created_from_unsourced_evidence_is_review_never_verified() {
+        let v = GitOperationVerifier;
+        let c = crate::tests::claim_for("git_commit", "I committed the change.");
+        let ev = vec![commit_evidence("created", Some("0e2fbd4"), Some("main"))];
+        let f = v.verify(&c, &ev, &caps());
+        assert_eq!(f.verdict, Verdict::Review);
+        assert_eq!(f.evidence_ids, vec![ev[0].id]);
+    }
+
+    #[test]
+    fn push_ref_updated_from_unsourced_evidence_is_review_never_verified() {
+        let v = GitOperationVerifier;
+        let c = crate::tests::claim_for("git_push", "I pushed the branch.");
+        let ev = vec![push_evidence("ref_updated", Some("main"))];
+        let f = v.verify(&c, &ev, &caps());
+        assert_eq!(f.verdict, Verdict::Review);
+        assert_eq!(f.evidence_ids, vec![ev[0].id]);
+    }
+
+    /// The claim carries `HostObserved`/`IndependentExternal` as a field of the
+    /// submitted record, so the label alone must not promote it: the sensor
+    /// identity must be a registered attestor, and the real Claude sensor
+    /// (agent-adjacent, parses `tool_response`) is not.
+    #[test]
+    fn forged_or_agent_adjacent_git_evidence_never_reaches_verified() {
+        let v = GitOperationVerifier;
+        let cc = crate::tests::claim_for("git_commit", "I committed the change.");
+        let cp = crate::tests::claim_for("git_push", "I pushed the branch.");
+        for (sensor, trust) in [
+            ("forged_sensor", TrustClass::HostObserved),
+            ("forged_sensor", TrustClass::IndependentExternal),
+            ("claude_git_outcome_sensor_v1", TrustClass::AgentAdjacent),
+            (
+                "claude_git_working_tree_sensor_v1",
+                TrustClass::HostObserved,
+            ),
+            ("test_fixture_vcs_attestor", TrustClass::AgentAdjacent),
+        ] {
+            let commit = forged(
+                sensor,
+                trust.clone(),
+                commit_evidence("created", Some("0e2fbd4"), None),
+            );
+            let push = forged(
+                sensor,
+                trust.clone(),
+                push_evidence("ref_updated", Some("main")),
+            );
+            assert_eq!(
+                v.verify(&cc, &[commit], &caps()).verdict,
+                Verdict::Review,
+                "commit from {sensor} {trust:?}"
+            );
+            assert_eq!(
+                v.verify(&cp, &[push], &caps()).verdict,
+                Verdict::Review,
+                "push from {sensor} {trust:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn attested_independent_class_git_evidence_is_verified() {
+        let v = GitOperationVerifier;
+        let cc = crate::tests::claim_for("git_commit", "I committed the change.");
+        let cp = crate::tests::claim_for("git_push", "I pushed the branch.");
+        for trust in [TrustClass::HostObserved, TrustClass::IndependentExternal] {
+            let commit = forged(
+                "test_fixture_vcs_attestor",
+                trust.clone(),
+                commit_evidence("created", Some("0e2fbd4"), None),
+            );
+            let push = forged(
+                "test_fixture_vcs_attestor",
+                trust.clone(),
+                push_evidence("ref_updated", Some("main")),
+            );
+            assert_eq!(v.verify(&cc, &[commit], &caps()).verdict, Verdict::Verified);
+            assert_eq!(v.verify(&cp, &[push], &caps()).verdict, Verdict::Verified);
+        }
+    }
+
+    /// The gate only ever caps a positive outcome; failure semantics are
+    /// unchanged, whatever the source: a mismatching SHA, nothing-to-commit and a
+    /// rejected push stay Contradicted, with or without attestation.
+    #[test]
+    fn negative_git_outcomes_stay_contradicted_with_or_without_attestation() {
+        let v = GitOperationVerifier;
+        let mismatch = crate::tests::claim_for("git_commit", "I committed with sha `deadbee`.");
+        let plain_commit = crate::tests::claim_for("git_commit", "I committed the change.");
+        let push = crate::tests::claim_for("git_push", "I pushed the branch.");
+        for wrap in [|e: Evidence| e, attested] {
+            assert_eq!(
+                v.verify(
+                    &mismatch,
+                    &[wrap(commit_evidence("created", Some("abc1234"), None))],
+                    &caps()
+                )
+                .verdict,
+                Verdict::Contradicted
+            );
+            assert_eq!(
+                v.verify(
+                    &plain_commit,
+                    &[wrap(commit_evidence("nothing_to_commit", None, None))],
+                    &caps()
+                )
+                .verdict,
+                Verdict::Contradicted
+            );
+            assert_eq!(
+                v.verify(&push, &[wrap(push_evidence("rejected", None))], &caps())
+                    .verdict,
+                Verdict::Contradicted
+            );
+        }
     }
 
     // --- capability gate --------------------------------------------------
