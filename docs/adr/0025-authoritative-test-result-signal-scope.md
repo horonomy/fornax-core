@@ -248,11 +248,11 @@ Proposed packet wording: "A fake or shadowed runner must never be `VERIFIED`;
 with no usable passing summary it is `UNVERIFIED`, and with a well-formed
 passing summary but no attested collector it is `REVIEW` (ADR 0025 Option A)."
 
-Residual, outside this decision: `git_commit`/`git_push` claims still reach
-`Verified` from the `AgentAdjacent` git-outcome observation (the commit SHA and
-branch are parsed from the provider's own `tool_response`), so a `PATH`-shadowed
-`git` that prints a plausible commit line is the same class of gap. It needs its
-own founder decision.
+Residual, outside this decision (closed by the FORNX-497 addendum below):
+`git_commit`/`git_push` claims reached `Verified` from the `AgentAdjacent`
+git-outcome observation (the commit SHA and branch are parsed from the
+provider's own `tool_response`), so a `PATH`-shadowed `git` that prints a
+plausible commit line was the same class of gap.
 
 ## Addendum (FORNX-487, 2026-11-06): failing Claude Code commands arrive as `PostToolUseFailure`
 
@@ -289,3 +289,33 @@ message in a live host. The adapter now prefers the Stop payload's non-empty
 string `last_assistant_message` and falls back to the transcript. The
 pre-filter, the `Review` ceiling and the stored claim text are unchanged; no
 path to `Verified` is added.
+
+## Addendum (FORNX-497, 2026-11-14): git commit/push outcomes are capped at `Review`
+
+`GitOperationVerifier` never checked where its evidence came from, although the
+epistemic contract's `commit_push_completed` already requires `HostObserved`
+evidence. The shipped sensor (`claude_git_outcome_sensor_v1`) is `AgentAdjacent`
+and parses the commit line or push ref update from the agent-visible
+`tool_response`; a `git` earlier on `PATH` prints identical text. The founder
+directed the fix on 2026-11-14.
+
+Change:
+
+- A commit with outcome `created` and a push with outcome `ref_updated` reach
+  `Verified` only when the evidence has a trust class of `HostObserved` or
+  `IndependentExternal` *and* its sensor name is in `vcs_operation_attestors()`.
+  That list is empty by design, as `test_run_attestors()` is, so in a shipped
+  build these outcomes are `Review`. A real host-controlled collector adds its
+  name there with its own tests.
+- No other outcome changes. A mismatching SHA, `nothing_to_commit` and a rejected
+  push stay `Contradicted`; `up_to_date` stays `Review`; a branch mismatch stays
+  `Unverified`. The gate only ever caps a positive outcome.
+- Evidence with no source, an unregistered sensor, the registered Claude sensor
+  (`AgentAdjacent`) and a forged `HostObserved`/`IndependentExternal` label on an
+  unregistered or agent-adjacent sensor are all `Review`. The `Verified` arm is
+  exercised only by a `cfg(test)` fixture collector, which proves the gate's
+  logic, not that production attestation exists.
+
+Consequence: no shipped claim class can now reach `Verified` from agent-adjacent
+evidence. `Verified` for git, test and command claims depends on a future
+attested collector (FORNX-443).
