@@ -7,8 +7,9 @@
 //! the real verification pipeline. That leaves a real gap this file closes:
 //! evidence submitted through the real UDS ingest path (capability
 //! announcement, event, evidence, claim -- the same real pipeline
-//! `provenance_enforcement.rs` exercises), committed to a real `Verified`
-//! finding, must survive a hard kill (`SIGKILL`, not a graceful shutdown)
+//! `provenance_enforcement.rs` exercises), committed to a real `Review`
+//! finding (citing that evidence; Verified is unreachable for agent-adjacent
+//! git output, FORNX-497), must survive a hard kill (`SIGKILL`, not a graceful shutdown)
 //! and restart of the daemon process against the same `$FORNAX_HOME`. A
 //! session that was never submitted at all must still, after that same
 //! restart, answer "no finding" rather than fabricating one -- loss and
@@ -163,10 +164,10 @@ fn command_success_event(session_id: &str) -> AgentEvent {
     }
 }
 
-/// FORNX-477 (founder, Option C): `command_executed` from agent-adjacent
-/// evidence is capped at Review, so the durability machinery is exercised with
-/// a claim that still reaches `Verified` from admitted evidence: a `git_commit`
-/// claim backed by the Claude git-outcome sensor's `created` observation.
+/// Verified is unreachable in production from agent-adjacent evidence by
+/// design (FORNX-477, FORNX-497), so the durability machinery is exercised with
+/// a `git_commit` claim backed by the Claude git-outcome sensor's `created`
+/// observation: admitted evidence yields a `review` finding citing the row.
 fn legitimate_evidence(session_id: &str, source_event_id: Uuid) -> Evidence {
     Evidence {
         id: Uuid::new_v4(),
@@ -208,12 +209,19 @@ fn git_commit_claim(session_id: &str, source_event_id: Uuid) -> Claim {
     }
 }
 
-async fn wait_for_verdict(store: &Store, session_id: &str, claim_id: Uuid) -> Option<String> {
+/// Returns `(verdict, evidence_ids)` of the claim's finding once it exists.
+async fn wait_for_verdict(
+    store: &Store,
+    session_id: &str,
+    claim_id: Uuid,
+) -> Option<(String, Vec<Uuid>)> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         if let Ok(findings) = store.findings_for_session(session_id).await {
             if let Some(f) = findings.iter().find(|f| f.claim_id == claim_id.to_string()) {
-                return Some(f.verdict.clone());
+                let ids = serde_json::from_str(&f.evidence_ids)
+                    .expect("findings.evidence_ids is a JSON array of UUIDs");
+                return Some((f.verdict.clone(), ids));
             }
         }
         if tokio::time::Instant::now() >= deadline {
@@ -234,6 +242,7 @@ async fn critical_evidence_submitted_through_real_pipeline_survives_a_hard_resta
     let claim = git_commit_claim(&session_id, event_id);
     let claim_id = claim.id;
     let evidence = legitimate_evidence(&session_id, event_id);
+    let evidence_id = evidence.id;
 
     // Phase 1: submit through the real pipeline and confirm it actually
     // reaches a verdict before we kill anything.
@@ -251,9 +260,9 @@ async fn critical_evidence_submitted_through_real_pipeline_survives_a_hard_resta
     let verdict_before = wait_for_verdict(&store, &session_id, claim_id).await;
     assert_eq!(
         verdict_before,
-        Some("verified".to_string()),
-        "setup failed: the claim must reach Verified before a restart can even be \
-         meaningfully tested; daemon log:\n{}",
+        Some(("review".to_string(), vec![evidence_id])),
+        "setup failed: the claim must reach Review citing the admitted evidence \
+         before a restart can even be meaningfully tested; daemon log:\n{}",
         daemon1.log_contents()
     );
 
@@ -282,10 +291,15 @@ async fn critical_evidence_submitted_through_real_pipeline_survives_a_hard_resta
          FORNAX_HOME -- it must not be lost; daemon log:\n{}",
         daemon2.log_contents()
     );
+    let finding_after = finding_after.unwrap();
     assert_eq!(
-        finding_after.unwrap().verdict,
-        "verified",
+        finding_after.verdict, "review",
         "the surviving finding's verdict must be unchanged by the restart"
+    );
+    assert_eq!(
+        serde_json::from_str::<Vec<Uuid>>(&finding_after.evidence_ids).unwrap(),
+        vec![evidence_id],
+        "the surviving finding must still cite the same evidence row"
     );
 
     // Phase 4: a session that was NEVER submitted must still, after this
