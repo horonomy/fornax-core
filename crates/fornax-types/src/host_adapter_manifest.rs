@@ -448,10 +448,7 @@ impl ExactDecimal {
     }
 
     fn is_integral(&self) -> bool {
-        if self.sign == 0 || self.exponent >= BigInt::from(0) {
-            return true;
-        }
-        false
+        self.sign == 0 || self.exponent >= BigInt::from(0)
     }
 
     fn bounded_i64(&self) -> Option<i64> {
